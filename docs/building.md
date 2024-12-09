@@ -98,6 +98,15 @@ export JAVA_HOME=/usr/lib/jvm/java-17-temurin/
 
 Outputs will be in `build/outputs/apk/standard/release/WiVRn-standard-release.apk`
 
+#### Building as a Library (`.aar`)
+Optionally, you can build the client as a library to include in another project, such as a Unity project. This is done by running
+
+```bash
+./gradlew assembleRelease -PbuildTarget=library
+```
+
+Following this, you can add the resulting `.aar` file from `build/outputs/aar/WiVRn-standard-release.apk` to your Unity project's `assets/plugins/android/` folder. The WiVRn client API functions will be accessible by using the `WiVRnClient` class.
+
 #### Install apk with adb
 Before using adb you must enable usb debugging on your device:
  * Pico - https://developer.picoxr.com/document/unity-openxr/set-up-the-development-environment/ (see first step)
