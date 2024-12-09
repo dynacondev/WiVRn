@@ -454,3 +454,9 @@ public:
 		return instance().messages_info;
 	}
 };
+
+#ifdef __ANDROID__
+// A simple native function that prints a log message for debugging purposes
+extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
+Java_org_meumeu_wivrn_EmbeddedPlugin_nativeLog(JNIEnv * env, const jobject * /* this */, jstring message);
+#endif

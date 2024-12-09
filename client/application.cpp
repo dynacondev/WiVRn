@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <boost/locale.hpp>
 #include <chrono>
+#include <cstddef>
 #include <ctype.h>
 #include <exception>
 #include <string>
@@ -52,6 +53,7 @@
 #include <sys/system_properties.h>
 
 #include "android/jnipp.h"
+#include "android/log.h"
 #else
 #include "utils/xdg_base_directory.h"
 #include <signal.h>
@@ -1513,3 +1515,18 @@ void application::poll_events()
 		}
 	}
 }
+
+#ifdef __ANDROID__
+extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
+Java_org_meumeu_wivrn_EmbeddedPlugin_nativeLog(JNIEnv * env, const jobject * /* this */, jstring message)
+{
+	// Convert jstring to a C-style string
+	const char * nativeMessage = env->GetStringUTFChars(message, nullptr);
+
+	// Log the message
+	__android_log_print(ANDROID_LOG_INFO, "libwivrn", "Message from WiVRn Native Library: %s", nativeMessage);
+
+	// Release the Java string
+	env->ReleaseStringUTFChars(message, nativeMessage);
+}
+#endif

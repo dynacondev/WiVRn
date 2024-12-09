@@ -179,7 +179,11 @@ android {
 
     sourceSets {
         main {
-            manifest.srcFile 'AndroidManifest.xml'
+            if (buildAsLibrary) {
+                manifest.srcFile 'library/AndroidManifest-lib.xml'
+            } else {
+                manifest.srcFile 'AndroidManifest.xml'
+            }
             java.srcDirs = ['client/java']
             res.srcDirs = [ 'resources', layout.buildDirectory.dir('generated_resources') ]
 
