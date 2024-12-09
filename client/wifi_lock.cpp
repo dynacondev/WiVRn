@@ -30,6 +30,7 @@
 wifi_lock::wifi_lock(decltype(multicast_) m, decltype(wifi_) w) :
         multicast_(std::move(m)), wifi_(std::move(w)) {}
 
+#ifndef __ANDROID_LIB__
 std::shared_ptr<wifi_lock> wifi_lock::make_wifi_lock(jobject activity)
 {
 	jni::object<""> act(application::native_app()->activity->clazz);
@@ -49,6 +50,7 @@ std::shared_ptr<wifi_lock> wifi_lock::make_wifi_lock(jobject activity)
 	                jni::Int(api_level >= 29 ? 4 /*WIFI_MODE_FULL_LOW_LATENCY*/ : 3 /*WIFI_MODE_FULL_HIGH_PERF*/),
 	                lock_name)));
 }
+#endif
 
 void wifi_lock::print_wifi()
 {

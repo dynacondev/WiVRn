@@ -30,14 +30,19 @@ static std::mutex permission_callbacks_mutex;
 static std::map<int, std::pair<std::string, std::function<void(bool)>>> permission_callbacks;
 static int next_permission_request_id;
 
+#ifndef __ANDROID_LIB__
 static bool check_permission(jni::object<jni::details::string_literal<24>{"android/content/Context"}> & ctx, jni::string & permission)
 {
 	auto result = ctx.call<jni::Int>("checkSelfPermission", permission);
 	return result == 0;
 }
+#endif
 
 bool check_permission(const char * permission)
 {
+#ifdef __ANDROID_LIB__
+	return true;
+#else
 	if (not permission)
 		return true;
 
@@ -57,10 +62,14 @@ bool check_permission(const char * permission)
 	if (res)
 		permissions.insert(permission);
 	return res;
+#endif
 }
 
 void request_permission(const char * permission, std::function<void(bool)> callback)
 {
+#ifdef __ANDROID_LIB__
+	return;
+#else
 	if (not permission)
 	{
 		callback(true);
@@ -91,6 +100,7 @@ void request_permission(const char * permission, std::function<void(bool)> callb
 
 		act.call<void>("requestPermissions", permissions, jni::Int(request_code));
 	}
+#endif
 }
 
 extern "C" __attribute__((visibility("default"))) void Java_org_meumeu_wivrn_MainActivity_onRequestPermissionsResult(

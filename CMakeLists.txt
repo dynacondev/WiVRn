@@ -68,6 +68,10 @@ if(ENABLE_COLOURED_OUTPUT)
 	endif()
 endif()
 
+if(DEFINED __ANDROID_LIB__)
+    add_compile_definitions(__ANDROID_LIB__=${__ANDROID_LIB__}) # Add the macro for android library compilation mode
+endif()
+
 find_package(PkgConfig REQUIRED)
 find_package(Vulkan REQUIRED)
 find_package(Git)

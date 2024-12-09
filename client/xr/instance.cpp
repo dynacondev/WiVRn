@@ -41,7 +41,11 @@ static XrBool32 debug_callback(
 }
 
 #if defined(XR_USE_PLATFORM_ANDROID)
+#ifdef __ANDROID_LIB__
+xr::instance::instance(std::string_view application_name, std::vector<const char *> extensions)
+#else
 xr::instance::instance(std::string_view application_name, void * applicationVM, void * applicationActivity, std::vector<const char *> extensions)
+#endif
 #else
 xr::instance::instance(std::string_view application_name, std::vector<const char *> extensions)
 #endif
@@ -67,11 +71,19 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
 	if (XR_SUCCEEDED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)(&initializeLoader))))
 	{
+#ifdef __ANDROID_LIB__
+		XrLoaderInitInfoAndroidKHR loaderInitInfoAndroid = {
+		        .type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR,
+		        .applicationVM = nullptr, // TODOAttempt3035 What do we do about these?
+		        .applicationContext = nullptr,
+		};
+#else
 		XrLoaderInitInfoAndroidKHR loaderInitInfoAndroid = {
 		        .type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR,
 		        .applicationVM = applicationVM,
 		        .applicationContext = applicationActivity,
 		};
+#endif
 		initializeLoader((const XrLoaderInitInfoBaseHeaderKHR *)&loaderInitInfoAndroid);
 	}
 #endif
@@ -131,11 +143,19 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 	strncpy(create_info.applicationInfo.applicationName, application_name.data(), sizeof(create_info.applicationInfo.applicationName) - 1);
 
 #if defined(XR_USE_PLATFORM_ANDROID)
+#ifdef __ANDROID_LIB__
+	XrInstanceCreateInfoAndroidKHR instanceCreateInfoAndroid{
+	        .type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR,
+	        .applicationVM = nullptr,
+	        .applicationActivity = nullptr,
+	};
+#else
 	XrInstanceCreateInfoAndroidKHR instanceCreateInfoAndroid{
 	        .type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR,
 	        .applicationVM = applicationVM,
 	        .applicationActivity = applicationActivity,
 	};
+#endif
 	create_info.next = &instanceCreateInfoAndroid;
 #endif
 

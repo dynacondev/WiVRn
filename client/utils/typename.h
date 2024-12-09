@@ -22,6 +22,7 @@
 #include <cassert>
 #include <cxxabi.h>
 #include <string>
+#include <typeinfo>
 
 template <typename T>
 std::string type_name()

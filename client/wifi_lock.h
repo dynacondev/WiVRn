@@ -40,8 +40,10 @@ class wifi_lock : public std::enable_shared_from_this<wifi_lock>
 	void acquire_multicast();
 	void release_multicast();
 
+#ifndef __ANDROID_LIB__
 public:
 	static std::shared_ptr<wifi_lock> make_wifi_lock(jobject activity);
+#endif
 #endif
 
 public:

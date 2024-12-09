@@ -51,7 +51,11 @@ class instance : public utils::handle<XrInstance, xrDestroyInstance>
 
 public:
 #if defined(XR_USE_PLATFORM_ANDROID)
+	#ifdef __ANDROID_LIB__
+	explicit instance(std::string_view application_name, std::vector<const char *> extensions = {});
+	#else
 	explicit instance(std::string_view application_name, void * applicationVM, void * applicationActivity, std::vector<const char *> extensions = {});
+	#endif
 #else
 	explicit instance(std::string_view application_name, std::vector<const char *> extensions = {});
 #endif

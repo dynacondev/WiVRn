@@ -158,8 +158,10 @@ static bool enabled(const to_headset::tracking_control & control, device_id id)
 void scenes::stream::tracking()
 {
 #ifdef __ANDROID__
+#ifndef __ANDROID_LIB__
 	// Runtime may use JNI and needs the thread to be attached
 	application::instance().setup_jni();
+#endif
 
 	XrTime next_battery_check = 0;
 	const XrDuration battery_check_interval = 30'000'000'000; // 30s

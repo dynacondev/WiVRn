@@ -61,7 +61,9 @@ struct application_info
 	XrViewConfigurationType viewconfig = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 	XrVersion min_vulkan_version = XR_MAKE_VERSION(1, 1, 0);
 
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	// We don't have access to the android_app * because we are a library
+#elif defined(__ANDROID__)
 	android_app * native_app;
 #endif
 };
@@ -178,11 +180,18 @@ class application : public singleton<application>
 
 public:
 	using singleton<application>::instance;
+
+#ifdef __ANDROID_LIB__
+	application(application_info info, std::filesystem::path config_path, std::filesystem::path cache_path);
+#else
 	application(application_info info);
+#endif
 
 	application(const application &) = delete;
 	~application();
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	// We don't setup JNI, asset_manager or native_app because we don't have access to the android_app *
+#elif defined(__ANDROID__)
 	void setup_jni();
 
 	static AAssetManager * asset_manager()

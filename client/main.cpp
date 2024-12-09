@@ -34,7 +34,9 @@
 #include "spdlog/sinks/stdout_color_sinks.h"
 #endif
 
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+void real_main(std::string config_path, std::string cache_path)
+#elif defined(__ANDROID__)
 void real_main(android_app * native_app)
 #else
 void real_main()
@@ -43,12 +45,18 @@ void real_main()
 	try
 	{
 		application_info info;
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+// No native app if we are a library
+#elif defined(__ANDROID__)
 		info.native_app = native_app;
 #endif
 		info.name = "WiVRn";
 		info.version = VK_MAKE_VERSION(1, 0, 0);
+#ifdef __ANDROID_LIB__
+		application app(info, config_path, cache_path);
+#else
 		application app(info);
+#endif
 
 		app.push_scene<scenes::lobby>();
 
@@ -63,7 +71,9 @@ void real_main()
 		spdlog::error("Caught unknown exception");
 	}
 
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+// No need to handle events if we are a library
+#elif defined(__ANDROID__)
 	ANativeActivity_finish(native_app->activity);
 
 	// Read all pending events.
@@ -83,6 +93,33 @@ void real_main()
 #endif
 }
 
+#ifdef __ANDROID_LIB__
+extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
+Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jstring configPath, jstring cachePath);
+extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
+Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jstring configPath, jstring cachePath)
+{
+	static auto logger = spdlog::android_logger_mt("WiVRn", "WiVRn");
+
+	spdlog::set_default_logger(logger);
+
+	spdlog::info("WiVRn Library Started - Launching Main");
+
+	// Convert the Java strings to C++ strings
+	const char * configPathChars = env->GetStringUTFChars(configPath, nullptr);
+	const char * cachePathChars = env->GetStringUTFChars(cachePath, nullptr);
+
+	auto config_path = std::string(configPathChars);
+	auto cache_path = std::string(cachePathChars);
+
+	// Release the Java strings
+	env->ReleaseStringUTFChars(configPath, configPathChars);
+	env->ReleaseStringUTFChars(cachePath, cachePathChars);
+
+	real_main(config_path, cache_path);
+}
+#endif
+
 #ifdef __ANDROID__
 void android_main(android_app * native_app) __attribute__((visibility("default")));
 void android_main(android_app * native_app)
@@ -91,7 +128,11 @@ void android_main(android_app * native_app)
 
 	spdlog::set_default_logger(logger);
 
+#ifdef __ANDROID_LIB__
+	// Never gets run from here - this only runs if android system starts this built as an app
+#else
 	real_main(native_app);
+#endif
 }
 #else
 int main(int argc, char * argv[])

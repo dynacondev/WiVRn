@@ -94,6 +94,12 @@ android {
                           '-DWIVRN_WERROR=ON',
                           '-DWIVRN_SHOW_IMGUI_DEMO_WINDOW=' + showImguiDemo,
                           '-DWIVRN_CSS=' + css
+                
+                // Conditionally add the android lib macro
+                if (buildAsLibrary) {
+                    arguments += '-D__ANDROID_LIB__=1'
+                }
+
                 resValue "string", "app_name", project.hasProperty('wivrn_app_name') ? project.wivrn_app_name : "WiVRn Local"
             }
         }

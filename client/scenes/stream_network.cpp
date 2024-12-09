@@ -25,7 +25,9 @@
 
 void scenes::stream::process_packets()
 {
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	// We don't setup JNI because we don't have access to the android_app *
+#elif defined(__ANDROID__)
 	application::instance().setup_jni();
 #endif
 	while (not exiting)

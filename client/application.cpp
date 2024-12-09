@@ -807,7 +807,9 @@ void application::initialize()
 		extensions.push_back(i.c_str());
 	}
 
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	xr_instance = xr::instance(app_info.name, extensions);
+#elif defined(__ANDROID__)
 	xr_instance =
 	        xr::instance(app_info.name, app_info.native_app->activity->vm, app_info.native_app->activity->clazz, extensions);
 #else
@@ -1024,13 +1026,21 @@ void application::set_server_uri(std::string uri)
 	}
 }
 
+#ifdef __ANDROID_LIB__
+application::application(application_info info, std::filesystem::path config_path, std::filesystem::path cache_path) :
+		app_info(std::move(info)),
+        config_path(config_path),
+		cache_path(cache_path)
+#else
 application::application(application_info info) :
         app_info(std::move(info))
+#endif
 
 {
 #ifdef __ANDROID__
 	// https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/types.html
 
+#ifndef __ANDROID_LIB__ // We don't setup JNI, asset_manager or native_app if this is built as a library
 	setup_jni();
 	{
 		jni::object<""> act(app_info.native_app->activity->clazz);
@@ -1081,8 +1091,11 @@ application::application(application_info info) :
 				break;
 		}
 	};
+#endif
 
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	// TODOAttempt3035 currently no wifi lock due to JNI requirement?
+#elif defined(__ANDROID__)
 	wifi = wifi_lock::make_wifi_lock(app_info.native_app->activity->clazz);
 #else
 	wifi = std::make_shared<wifi_lock>();
@@ -1092,12 +1105,21 @@ application::application(application_info info) :
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
 	if (XR_SUCCEEDED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)(&initializeLoader))))
 	{
+#ifdef __ANDROID_LIB__
+		XrLoaderInitInfoAndroidKHR loaderInitInfoAndroid{
+		        .type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR,
+		        .next = nullptr,
+		        .applicationVM = nullptr,
+		        .applicationContext = nullptr,
+		};
+#else
 		XrLoaderInitInfoAndroidKHR loaderInitInfoAndroid{
 		        .type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR,
 		        .next = nullptr,
 		        .applicationVM = app_info.native_app->activity->vm,
 		        .applicationContext = app_info.native_app->activity->clazz,
 		};
+#endif
 		initializeLoader((const XrLoaderInitInfoBaseHeaderKHR *)&loaderInitInfoAndroid);
 	}
 
@@ -1123,7 +1145,9 @@ application::application(application_info info) :
 	}
 }
 
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+// We don't setup JNI because we don't have access to the android_app *
+#elif defined(__ANDROID__)
 void application::setup_jni()
 {
 	jni::jni_thread::setup_thread(app_info.native_app->activity->vm);
@@ -1203,7 +1227,9 @@ void application::loop()
 void application::run()
 {
 	auto application_thread = utils::named_thread("application_thread", [&]() {
+#ifndef __ANDROID_LIB__
 		setup_jni();
+#endif
 
 		while (!is_exit_requested())
 		{
@@ -1224,6 +1250,7 @@ void application::run()
 		}
 	});
 
+#ifndef __ANDROID_LIB__
 	// Read all pending events.
 	while (!exit_requested)
 	{
@@ -1243,6 +1270,7 @@ void application::run()
 			exit_requested = true;
 		}
 	}
+#endif
 
 	application_thread.join();
 }
