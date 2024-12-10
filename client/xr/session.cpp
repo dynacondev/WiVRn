@@ -31,6 +31,9 @@
 xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance & vk_inst, vk::raii::PhysicalDevice & pdev, vk::raii::Device & dev, int queue_family_index) :
         inst(&inst)
 {
+#ifdef __ANDROID_LIB__
+	id = reinterpret_cast<XrSession>(application::g_session);
+#else
 	XrGraphicsBindingVulkan2KHR vulkan_binding{
 	        .type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
 
@@ -48,6 +51,7 @@ xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance &
 	};
 
 	CHECK_XR(xrCreateSession(inst, &session_info, &id));
+#endif
 }
 
 std::vector<XrReferenceSpaceType> xr::session::get_reference_spaces() const

@@ -61,6 +61,12 @@
 
 using namespace std::chrono_literals;
 
+#ifdef __ANDROID_LIB__
+uint64_t application::g_instance = 0;
+uint64_t application::g_systemId = 0;
+uint64_t application::g_session = 0;
+#endif
+
 struct interaction_profile
 {
 	std::string profile_name;
@@ -1028,9 +1034,9 @@ void application::set_server_uri(std::string uri)
 
 #ifdef __ANDROID_LIB__
 application::application(application_info info, std::filesystem::path config_path, std::filesystem::path cache_path) :
-		app_info(std::move(info)),
+        app_info(std::move(info)),
         config_path(config_path),
-		cache_path(cache_path)
+        cache_path(cache_path)
 #else
 application::application(application_info info) :
         app_info(std::move(info))
@@ -1101,27 +1107,22 @@ application::application(application_info info) :
 	wifi = std::make_shared<wifi_lock>();
 #endif
 
+#ifdef __ANDROID_LIB__
+	// Don't initialize the loader as it comes from Unity
+#else
 	// Initialize the loader for this platform
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
 	if (XR_SUCCEEDED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)(&initializeLoader))))
 	{
-#ifdef __ANDROID_LIB__
-		XrLoaderInitInfoAndroidKHR loaderInitInfoAndroid{
-		        .type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR,
-		        .next = nullptr,
-		        .applicationVM = nullptr,
-		        .applicationContext = nullptr,
-		};
-#else
 		XrLoaderInitInfoAndroidKHR loaderInitInfoAndroid{
 		        .type = XR_TYPE_LOADER_INIT_INFO_ANDROID_KHR,
 		        .next = nullptr,
 		        .applicationVM = app_info.native_app->activity->vm,
 		        .applicationContext = app_info.native_app->activity->clazz,
 		};
-#endif
 		initializeLoader((const XrLoaderInitInfoBaseHeaderKHR *)&loaderInitInfoAndroid);
 	}
+#endif
 
 #else
 	config_path = xdg_config_home() / "wivrn";

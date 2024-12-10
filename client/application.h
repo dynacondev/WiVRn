@@ -85,6 +85,16 @@ class application : public singleton<application>
 	static inline const char engine_name[] = "No engine";
 	static inline const int engine_version = VK_MAKE_VERSION(1, 0, 0);
 
+#ifdef __ANDROID_LIB__
+public:
+	// We need some pointers to objects shared with unity, such as OpenXR
+	static uint64_t g_instance;
+	static uint64_t g_systemId;
+	static uint64_t g_session;
+
+private:
+#endif
+
 	void initialize_vulkan();
 
 	void log_views();

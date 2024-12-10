@@ -53,17 +53,14 @@ void real_main()
 		info.name = "WiVRn";
 		info.version = VK_MAKE_VERSION(1, 0, 0);
 #ifdef __ANDROID_LIB__
-		// Make sure to create the application singleton as it's manually managed in this configuration
-		application::init(info, config_path, cache_path);
+		application app(info, config_path, cache_path);
 #else
 		application app(info);
 #endif
 
-		// app.push_scene<scenes::lobby>(); //TODO Attempt3035
-		// app.run(); //TODO Attempt3035
+		app.push_scene<scenes::lobby>();
 
-		application::instance().push_scene<scenes::lobby>(); // TODO Attempt3035
-		application::instance().run();                       // TODO Attempt3035
+		app.run();
 	}
 	catch (std::exception & e)
 	{
