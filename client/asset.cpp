@@ -30,12 +30,7 @@
 asset::asset(const std::filesystem::path & path)
 {
 	spdlog::debug("Loading Android asset {}", path.string());
-#ifdef __ANDROID_LIB__
-	// TODOAttempt3035 fix assets when compiled as a library
-	android_asset = nullptr;
-#else
 	android_asset = AAssetManager_open(application::asset_manager(), path.c_str(), AASSET_MODE_BUFFER);
-#endif
 
 	if (!android_asset)
 		throw std::runtime_error("Cannot open Android asset " + path.string());

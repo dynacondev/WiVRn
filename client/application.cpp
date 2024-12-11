@@ -32,6 +32,7 @@
 #include "xr/check.h"
 #include "xr/xr.h"
 #include <algorithm>
+#include <android/asset_manager_jni.h>
 #include <boost/locale.hpp>
 #include <chrono>
 #include <cstddef>
@@ -65,6 +66,7 @@ using namespace std::chrono_literals;
 uint64_t application::g_instance = 0;
 uint64_t application::g_systemId = 0;
 uint64_t application::g_session = 0;
+AAssetManager * application::assetManager = nullptr;
 #endif
 
 struct interaction_profile
@@ -1033,7 +1035,7 @@ void application::set_server_uri(std::string uri)
 }
 
 #ifdef __ANDROID_LIB__
-application::application(application_info info, std::filesystem::path config_path, std::filesystem::path cache_path) :
+application::application(application_info info, JNIEnv* env, jobject javaAssetManager, std::filesystem::path config_path, std::filesystem::path cache_path) :
         app_info(std::move(info)),
         config_path(config_path),
         cache_path(cache_path)
@@ -1108,7 +1110,8 @@ application::application(application_info info) :
 #endif
 
 #ifdef __ANDROID_LIB__
-	// Don't initialize the loader as it comes from Unity
+	// Don't initialize the loader as it comes from Unity. Instead, initialise the assets manager
+	assetManager = AAssetManager_fromJava(env, javaAssetManager);
 #else
 	// Initialize the loader for this platform
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;

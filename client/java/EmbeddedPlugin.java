@@ -2,6 +2,7 @@ package org.meumeu.wivrn;
 
 import android.app.NativeActivity;
 import android.content.Context;
+import android.content.res.AssetManager;
 
 public class EmbeddedPlugin extends NativeActivity {
     static {
@@ -20,27 +21,11 @@ public class EmbeddedPlugin extends NativeActivity {
         // Obtain the paths in Java
         String configPath = context.getFilesDir().getAbsolutePath(); // Internal storage
         String cachePath = context.getCacheDir().getAbsolutePath(); // Cache storage
+        AssetManager assetManager = context.getAssets(); // Asset manager
 
         // Pass the paths to C++ via JNI
-        androidLibMain(configPath + "/wivrn", cachePath + "/wivrn", xrInstance, xrSystemId, xrSession);
+        androidLibMain(assetManager, configPath + "/wivrn", cachePath + "/wivrn", xrInstance, xrSystemId, xrSession);
     }
 
-    public static native void androidLibMain(String configPath, String cachePath, long xrInstance, long xrSystemId, long xrSession);
-
-    // private static final String TAG = "MyPlugin";
-
-    // public static void runMain(Activity activity, long xrInstance, long
-    // xrSystemId, long xrSession) {
-    // nativeLog("Received OpenXR handles in Java:");
-    // nativeLog("XrInstance: " + xrInstance);
-    // nativeLog("XrSystemId: " + xrSystemId);
-    // nativeLog("XrSession: " + xrSession);
-
-    // // Pass these references to the native C++ layer if needed
-    // updateNativeOpenXRHandles(xrInstance, xrSystemId, xrSession);
-
-    // // Continue with your main setup logic
-    // nativeLog("Running main setup...");
-    // // Add additional setup logic here
-    // }
+    public static native void androidLibMain(AssetManager assetManager, String configPath, String cachePath, long xrInstance, long xrSystemId, long xrSession);
 }

@@ -168,9 +168,9 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 #endif
 	assert(id != XR_NULL_HANDLE);
 
-#ifndef __ANDROID_LIB__
 	if (debug_utils_found)
 	{
+#ifndef __ANDROID_LIB__
 		XrDebugUtilsMessengerCreateInfoEXT debug_messenger_info{
 		        .type = XR_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
 		        .messageSeverities = XR_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | XR_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
@@ -179,8 +179,8 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 		auto xrCreateDebugUtilsMessengerEXT = get_proc<PFN_xrCreateDebugUtilsMessengerEXT>("xrCreateDebugUtilsMessengerEXT");
 		XrDebugUtilsMessengerEXT messenger;
 		CHECK_XR(xrCreateDebugUtilsMessengerEXT(id, &debug_messenger_info, &messenger));
-	}
 #endif
+	}
 
 	XrInstanceProperties prop{XR_TYPE_INSTANCE_PROPERTIES};
 	CHECK_XR(xrGetInstanceProperties(id, &prop));

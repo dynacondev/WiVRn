@@ -35,7 +35,7 @@
 #endif
 
 #ifdef __ANDROID_LIB__
-void real_main(std::string config_path, std::string cache_path)
+void real_main(JNIEnv * env, jobject javaAssetManager, std::string config_path, std::string cache_path)
 #elif defined(__ANDROID__)
 void real_main(android_app * native_app)
 #else
@@ -53,7 +53,7 @@ void real_main()
 		info.name = "WiVRn";
 		info.version = VK_MAKE_VERSION(1, 0, 0);
 #ifdef __ANDROID_LIB__
-		application app(info, config_path, cache_path);
+		application app(info, env, javaAssetManager, config_path, cache_path);
 #else
 		application app(info);
 #endif
@@ -95,9 +95,9 @@ void real_main()
 
 #ifdef __ANDROID_LIB__
 extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jstring configPath, jstring cachePath, jlong instance, jlong systemId, jlong session);
+Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jobject assetManager, jstring configPath, jstring cachePath, jlong instance, jlong systemId, jlong session);
 extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jstring configPath, jstring cachePath, jlong instance, jlong systemId, jlong session)
+Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jobject assetManager, jstring configPath, jstring cachePath, jlong instance, jlong systemId, jlong session)
 {
 	static auto logger = spdlog::android_logger_mt("WiVRn", "WiVRn");
 
@@ -127,7 +127,7 @@ Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject 
 	env->ReleaseStringUTFChars(cachePath, cachePathChars);
 
 	// Launch the main application
-	real_main(config_path, cache_path);
+	real_main(env, assetManager, config_path, cache_path);
 }
 #endif
 

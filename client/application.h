@@ -93,6 +93,8 @@ public:
 	static uint64_t g_session;
 
 private:
+	// We initialise asset manager differently as a library
+	static AAssetManager * assetManager;
 #endif
 
 	void initialize_vulkan();
@@ -192,7 +194,7 @@ public:
 	using singleton<application>::instance;
 
 #ifdef __ANDROID_LIB__
-	application(application_info info, std::filesystem::path config_path, std::filesystem::path cache_path);
+	application(application_info info, JNIEnv* env, jobject javaAssetManager, std::filesystem::path config_path, std::filesystem::path cache_path);
 #else
 	application(application_info info);
 #endif
@@ -200,7 +202,17 @@ public:
 	application(const application &) = delete;
 	~application();
 #ifdef __ANDROID_LIB__
-	// We don't setup JNI, asset_manager or native_app because we don't have access to the android_app *
+	// We don't setup JNI or native_app because we don't have access to the android_app *
+
+	static AAssetManager * asset_manager()
+	{
+		if (assetManager == nullptr)
+		{
+			throw std::runtime_error("Asset manager is null");
+		}
+		return assetManager;
+	}
+
 #elif defined(__ANDROID__)
 	void setup_jni();
 
