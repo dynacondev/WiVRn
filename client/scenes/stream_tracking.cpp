@@ -158,8 +158,10 @@ static bool enabled(const to_headset::tracking_control & control, device_id id)
 void scenes::stream::tracking()
 {
 #ifdef __ANDROID__
-#ifndef __ANDROID_LIB__
-	// Runtime may use JNI and needs the thread to be attached
+// Runtime may use JNI and needs the thread to be attached
+#ifdef __ANDROID_LIB__
+	application::instance().setup_jni(application::jnienv);
+#else
 	application::instance().setup_jni();
 #endif
 

@@ -1,9 +1,9 @@
 {
-    "sonarlint.pathToCompileCommands": "${workspaceFolder}/.cxx/tools/standardOculus/arm64-v8a/compile_commands.json",
+    "sonarlint.pathToCompileCommands": "${workspaceFolder}/.cxx/tools/standardDebug/arm64-v8a/compile_commands.json",
     "java.configuration.updateBuildConfiguration": "automatic",
     "clangd.arguments": [
         "--header-insertion=never",
-        "--compile-commands-dir=${workspaceFolder}/.cxx/tools/standardOculus/arm64-v8a/",
+        "--compile-commands-dir=${workspaceFolder}/.cxx/tools/standardDebug/arm64-v8a/",
         "--query-driver=**"
     ]
 }
