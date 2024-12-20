@@ -31,6 +31,9 @@
 
 using tid = to_headset::tracking_control::id;
 
+static const XrDuration min_tracking_period = 2'000'000;
+static const XrDuration max_tracking_period = 5'000'000;
+
 static from_headset::tracking::pose locate_space(device_id device, XrSpace space, XrSpace reference, XrTime time)
 {
 	XrSpaceVelocity velocity{
@@ -188,10 +191,10 @@ void scenes::stream::tracking()
 
 	XrSpace view_space = application::space(xr::spaces::view);
 	XrSpace world_space = application::space(xr::spaces::world);
-	XrDuration tracking_period = 1'000'000; // Send tracking data every 1ms
-	const XrDuration dt = 100'000;          // Wake up 0.1ms before measuring the position
+	XrDuration tracking_period = min_tracking_period;
 
 	XrTime t0 = instance.now();
+	XrTime last_hand_sample = t0;
 	std::vector<from_headset::tracking> tracking;
 	std::vector<from_headset::hand_tracking> hands;
 	int skip_samples = 0;
@@ -208,7 +211,7 @@ void scenes::stream::tracking()
 
 			XrTime now = instance.now();
 			if (now < t0)
-				std::this_thread::sleep_for(std::chrono::nanoseconds(t0 - now - dt));
+				std::this_thread::sleep_for(std::chrono::nanoseconds(t0 - now));
 
 			// If thread can't keep up, skip timestamps
 			t0 = std::max(t0, now);
@@ -254,8 +257,11 @@ void scenes::stream::tracking()
 							packet.device_poses.push_back(locate_space(device, space, world_space, t0 + Δt));
 					}
 
-					if (hand_tracking)
+					// Hand tracking data are very large, send fewer samples than other items
+					if (hand_tracking and t0 >= last_hand_sample + period and
+					    (Δt == 0 or Δt >= prediction - 2 * period))
 					{
+						last_hand_sample = t0;
 						if (control.enabled[size_t(tid::left_hand)])
 							hands.emplace_back(
 							        t0,
@@ -292,7 +298,7 @@ void scenes::stream::tracking()
 
 			XrDuration busy_time = t.count();
 			// Target: polling between 1 and 5ms, with 20% busy time
-			tracking_period = std::clamp<XrDuration>(std::lerp(tracking_period, busy_time * 5, 0.2), 1'000'000, 5'000'000);
+			tracking_period = std::clamp<XrDuration>(std::lerp(tracking_period, busy_time * 5, 0.2), min_tracking_period, max_tracking_period);
 
 			if (samples and busy_time / samples > 2'000'000)
 			{
