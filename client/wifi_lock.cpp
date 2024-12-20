@@ -62,36 +62,46 @@ void wifi_lock::print_wifi()
 
 void wifi_lock::acquire_wifi()
 {
+	#ifndef __ANDROID_LIB__
 	std::lock_guard lock(mutex);
 	wifi_.call<void>("acquire");
 	print_wifi();
+	#endif
 }
 void wifi_lock::release_wifi()
 {
+	#ifndef __ANDROID_LIB__
 	std::lock_guard lock(mutex);
 	wifi_.call<void>("release");
 	print_wifi();
+	#endif
 }
 
 void wifi_lock::print_multicast()
 {
+	#ifndef __ANDROID_LIB__
 	if (multicast_.call<jni::Bool>("isHeld"))
 		spdlog::info("MulticastLock acquired");
 	else
 		spdlog::info("MulticastLock released");
+	#endif
 }
 
 void wifi_lock::acquire_multicast()
 {
+	#ifndef __ANDROID_LIB__
 	std::lock_guard lock(mutex);
 	multicast_.call<void>("acquire");
 	print_multicast();
+	#endif
 }
 void wifi_lock::release_multicast()
 {
+	#ifndef __ANDROID_LIB__
 	std::lock_guard lock(mutex);
 	multicast_.call<void>("release");
 	print_multicast();
+	#endif
 }
 
 std::shared_ptr<void> wifi_lock::get_wifi_lock()

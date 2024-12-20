@@ -19,7 +19,7 @@
 
 #include "instance.h"
 
-#include "application.h"
+#include "lib.h"
 #include "xr.h"
 #include "xr/details/enumerate.h"
 #include <cassert>
@@ -54,17 +54,8 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 #endif
 {
 #ifdef __ANDROID_LIB__
-	// Check if Unity provided an XrInstance
-	if (reinterpret_cast<XrInstance>(application::g_instance) == XR_NULL_HANDLE)
-	{
-		spdlog::error("No valid XrInstance provided by Unity. Initialization aborted.");
-		spdlog::info("Value currently assigned g_instance: {}", std::to_string(application::g_instance));
-		throw std::runtime_error("No valid XrInstance provided by Unity");
-	}
-
-	// Use the provided instance instead of creating a new one
-	id = reinterpret_cast<XrInstance>(application::g_instance);
-	spdlog::info("Using OpenXR Instance passed from Unity: {}", (unsigned long long)id);
+	// Use the provided OpenXR instance instead of creating a new one
+	id = reinterpret_cast<XrInstance>(UnityLib::g_instance);
 #endif
 
 #if defined(XR_USE_GRAPHICS_API_VULKAN)
@@ -85,7 +76,7 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 	//     given implementation, an application must make use of it.
 
 	// This must be called before the instance is created
-#ifndef __ANDROID_LIB__
+#ifndef __ANDROID_LIB__ // Not required if Unity has already initialised it
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
 	if (XR_SUCCEEDED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)(&initializeLoader))))
 	{

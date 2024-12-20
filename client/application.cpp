@@ -19,6 +19,7 @@
 
 #include "application.h"
 #include "asset.h"
+#include "lib.h"
 #include "openxr/openxr.h"
 #include "scene.h"
 #include "spdlog/common.h"
@@ -38,6 +39,7 @@
 #include <cstddef>
 #include <ctype.h>
 #include <exception>
+#include <spdlog/sinks/android_sink.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -54,20 +56,12 @@
 #include <sys/system_properties.h>
 
 #include "android/jnipp.h"
-#include "android/log.h"
 #else
 #include "utils/xdg_base_directory.h"
 #include <signal.h>
 #endif
 
 using namespace std::chrono_literals;
-
-#ifdef __ANDROID_LIB__
-uint64_t application::g_instance = 0;
-uint64_t application::g_systemId = 0;
-uint64_t application::g_session = 0;
-AAssetManager * application::assetManager = nullptr;
-#endif
 
 struct interaction_profile
 {
@@ -391,8 +385,327 @@ std::string parse_driver_sersion(const vk::PhysicalDeviceProperties & p)
 	}
 }
 
+#ifdef __ANDROID_LIB__
+XrResult application::initialize_vulkan(XrInstance xrInstance, const XrVulkanInstanceCreateInfoKHR * vulkanCreateInfo, VkInstance * vulkanInstance, VkResult * vulkanResult)
+#else
 void application::initialize_vulkan()
+#endif
 {
+#ifndef __ANDROID_LIB__
+	auto graphics_requirements = xr_system_id.graphics_requirements();
+	XrVersion vulkan_version = std::max(app_info.min_vulkan_version, graphics_requirements.minApiVersionSupported);
+	spdlog::info("OpenXR runtime wants Vulkan {}", xr::to_string(graphics_requirements.minApiVersionSupported));
+	spdlog::info("Requesting Vulkan {}", xr::to_string(vulkan_version));
+#endif
+
+	std::vector<const char *> layers;
+
+#ifdef __ANDROID_LIB__
+	// Clone the original Vulkan instance create info
+	VkInstanceCreateInfo modifiedCreateInfo = *(vulkanCreateInfo->vulkanCreateInfo);
+
+	// Add existing layers
+	if (modifiedCreateInfo.enabledLayerCount > 0)
+	{
+		layers.insert(layers.end(),
+		              modifiedCreateInfo.ppEnabledLayerNames,
+		              modifiedCreateInfo.ppEnabledLayerNames + modifiedCreateInfo.enabledLayerCount);
+	}
+#endif
+
+	spdlog::info("Available Vulkan layers:");
+	[[maybe_unused]] bool validation_layer_found = false;
+
+	for (vk::LayerProperties & i: vk_context.enumerateInstanceLayerProperties())
+	{
+		spdlog::info("    {}", i.layerName.data());
+		if (!strcmp(i.layerName, "VK_LAYER_KHRONOS_validation"))
+		{
+			validation_layer_found = true;
+		}
+	}
+#ifndef NDEBUG
+	if (validation_layer_found)
+	{
+		spdlog::info("Using Vulkan validation layer");
+		layers.push_back("VK_LAYER_KHRONOS_validation");
+	}
+#endif
+
+	std::vector<const char *> instance_extensions{};
+
+#ifdef __ANDROID_LIB__
+	// Add existing extensions
+	if (modifiedCreateInfo.enabledExtensionCount > 0)
+	{
+		instance_extensions.insert(instance_extensions.end(),
+		                           modifiedCreateInfo.ppEnabledExtensionNames,
+		                           modifiedCreateInfo.ppEnabledExtensionNames + modifiedCreateInfo.enabledExtensionCount);
+	}
+#endif
+
+#ifndef NDEBUG
+	bool debug_report_found = false;
+	bool debug_utils_found = false;
+#endif
+	spdlog::info("Available Vulkan instance extensions:");
+	for (vk::ExtensionProperties & i: vk_context.enumerateInstanceExtensionProperties(nullptr))
+	{
+		spdlog::info("    {} (version {})", i.extensionName.data(), i.specVersion);
+
+#ifndef NDEBUG
+		if (!strcmp(i.extensionName, VK_EXT_DEBUG_REPORT_EXTENSION_NAME))
+			debug_report_found = true;
+
+		if (!strcmp(i.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+			debug_utils_found = true;
+#endif
+	}
+
+#ifndef NDEBUG
+	if (debug_utils_found && debug_report_found)
+	{
+		// debug_extensions_found = true;
+		// spdlog::info("Using debug extensions");
+		instance_extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+		// instance_extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+	}
+#endif
+
+	vk_device_extensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+	optional_device_extensions.emplace(VK_IMG_FILTER_CUBIC_EXTENSION_NAME);
+
+#ifdef __ANDROID__
+	vk_device_extensions.push_back(VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_MAINTENANCE1_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
+	vk_device_extensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+	instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+	instance_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+#endif
+
+#ifdef __ANDROID_LIB__
+	// Update the create info with the modified layers and extensions
+	// .vulkanCreateInfo = &(VkInstanceCreateInfo &)instance_create_info,
+	modifiedCreateInfo.enabledLayerCount = static_cast<uint32_t>(layers.size());
+	modifiedCreateInfo.ppEnabledLayerNames = layers.data();
+	modifiedCreateInfo.enabledExtensionCount = static_cast<uint32_t>(instance_extensions.size());
+	modifiedCreateInfo.ppEnabledExtensionNames = instance_extensions.data();
+
+	// Create a new XrVulkanInstanceCreateInfoKHR with the modified Vulkan create info
+	XrVulkanInstanceCreateInfoKHR modifiedXrCreateInfo = *vulkanCreateInfo;
+	modifiedXrCreateInfo.vulkanCreateInfo = &modifiedCreateInfo;
+
+	// Call the original `xrCreateVulkanInstanceKHR` with the modified create info
+	XrResult xresult = UnityLib::s_xrCreateVulkanInstanceKHR(xrInstance, &modifiedXrCreateInfo, vulkanInstance, vulkanResult);
+	CHECK_VK(*vulkanResult, "xrCreateVulkanInstanceKHR");
+	CHECK_XR(xresult, "xrCreateVulkanInstanceKHR");
+
+	vk_instance = vk::raii::Instance(vk_context, *vulkanInstance);
+
+	return xresult;
+}
+
+void application::initialize_vulkan2()
+{
+#else
+	vk::ApplicationInfo application_info{
+	        .pApplicationName = app_info.name.c_str(),
+	        .applicationVersion = (uint32_t)app_info.version,
+	        .pEngineName = engine_name,
+	        .engineVersion = engine_version,
+	        .apiVersion = VK_MAKE_API_VERSION(0, XR_VERSION_MAJOR(vulkan_version), XR_VERSION_MINOR(vulkan_version), 0),
+	};
+
+	vk::InstanceCreateInfo instance_create_info{
+	        .pApplicationInfo = &application_info,
+	};
+	instance_create_info.setPEnabledLayerNames(layers);
+	instance_create_info.setPEnabledExtensionNames(instance_extensions);
+
+	XrVulkanInstanceCreateInfoKHR create_info{
+	        .type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR,
+	        .systemId = xr_system_id,
+	        .createFlags = 0,
+	        .pfnGetInstanceProcAddr = vkGetInstanceProcAddr,
+	        .vulkanCreateInfo = &(VkInstanceCreateInfo &)instance_create_info,
+	        .vulkanAllocator = nullptr,
+	};
+
+	auto xrCreateVulkanInstanceKHR =
+	        xr_instance.get_proc<PFN_xrCreateVulkanInstanceKHR>("xrCreateVulkanInstanceKHR");
+
+	VkResult vresult;
+	VkInstance tmp;
+	XrResult xresult = xrCreateVulkanInstanceKHR(xr_instance, &create_info, &tmp, &vresult);
+	CHECK_VK(vresult, "xrCreateVulkanInstanceKHR");
+	CHECK_XR(xresult, "xrCreateVulkanInstanceKHR");
+	vk_instance = vk::raii::Instance(vk_context, tmp);
+#endif
+
+#ifndef __ANDROID_LIB__
+#ifndef NDEBUG
+	if (debug_report_found)
+	{
+		vk::DebugReportCallbackCreateInfoEXT debug_report_info{
+		        .flags = vk::DebugReportFlagBitsEXT::eInformation |
+		                 vk::DebugReportFlagBitsEXT::eWarning |
+		                 vk::DebugReportFlagBitsEXT::ePerformanceWarning |
+		                 vk::DebugReportFlagBitsEXT::eError |
+		                 vk::DebugReportFlagBitsEXT::eDebug,
+		        .pfnCallback = vulkan_debug_report_callback,
+		};
+		debug_report_callback = vk::raii::DebugReportCallbackEXT(vk_instance, debug_report_info);
+	}
+#endif
+
+	vk_physical_device = xr_system_id.physical_device(vk_instance);
+#else
+	// Check if the createInfo contains Vulkan-specific graphics binding
+	const XrGraphicsBindingVulkanKHR * vulkanBinding =
+	        reinterpret_cast<const XrGraphicsBindingVulkanKHR *>(UnityLib::sessionCreateInfo->next);
+
+	// Traverse the linked structure chain to find XrGraphicsBindingVulkanKHR
+	while (vulkanBinding != nullptr && vulkanBinding->type != XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR)
+	{
+		vulkanBinding = reinterpret_cast<const XrGraphicsBindingVulkanKHR *>(vulkanBinding->next);
+	}
+
+	if (vulkanBinding == nullptr)
+	{
+		throw std::runtime_error("Vulkan instance not found in OpenXR config");
+	}
+
+	spdlog::info("Intercepted xrCreateSession: Capturing Vulkan objects\n");
+	spdlog::info("VkInstance: {}", reinterpret_cast<long>(vulkanBinding->instance));
+	spdlog::info("VkPhysicalDevice: {}", reinterpret_cast<long>(vulkanBinding->physicalDevice));
+	spdlog::info("VkDevice: {}", reinterpret_cast<long>(vulkanBinding->device));
+	spdlog::info("Queue Family Index: {}", vulkanBinding->queueFamilyIndex);
+
+	vk_physical_device = vk::raii::PhysicalDevice(vk_instance, vulkanBinding->physicalDevice);
+#endif
+
+	physical_device_properties = vk_physical_device.getProperties();
+
+	spdlog::info("Available Vulkan device extensions:");
+	for (vk::ExtensionProperties & i: vk_physical_device.enumerateDeviceExtensionProperties())
+	{
+		spdlog::info("    {}", i.extensionName.data());
+		if (auto it = optional_device_extensions.find(i.extensionName); it != optional_device_extensions.end())
+			vk_device_extensions.push_back(it->data());
+	}
+
+	spdlog::info("Initializing Vulkan with device {}", physical_device_properties.deviceName.data());
+	spdlog::info("    Vendor ID: 0x{:04x}", physical_device_properties.vendorID);
+	spdlog::info("    Device ID: 0x{:04x}", physical_device_properties.deviceID);
+	spdlog::info("    Driver version: {}", parse_driver_sersion(physical_device_properties));
+
+	std::vector<vk::QueueFamilyProperties> queue_properties = vk_physical_device.getQueueFamilyProperties();
+
+	vk_queue_family_index = -1;
+	[[maybe_unused]] bool vk_queue_found = false;
+	for (size_t i = 0; i < queue_properties.size(); i++)
+	{
+		if (queue_properties[i].queueFlags & vk::QueueFlagBits::eGraphics)
+		{
+			vk_queue_found = true;
+			vk_queue_family_index = i;
+			break;
+		}
+	}
+	assert(vk_queue_found);
+
+	float queuePriority = 0.0f;
+
+	vk::DeviceQueueCreateInfo queueCreateInfo{
+	        .queueFamilyIndex = vk_queue_family_index,
+	        .queueCount = 1,
+	        .pQueuePriorities = &queuePriority,
+	};
+
+	vk::PhysicalDeviceFeatures device_features{
+	        .shaderClipDistance = true,
+	        // .samplerAnisotropy = true,
+	};
+
+	vk::StructureChain device_create_info{
+	        vk::DeviceCreateInfo{
+	                .queueCreateInfoCount = 1,
+	                .pQueueCreateInfos = &queueCreateInfo,
+	                .enabledExtensionCount = (uint32_t)vk_device_extensions.size(),
+	                .ppEnabledExtensionNames = vk_device_extensions.data(),
+	                .pEnabledFeatures = &device_features,
+	        },
+#ifdef __ANDROID__
+	        vk::PhysicalDeviceSamplerYcbcrConversionFeaturesKHR{
+	                .samplerYcbcrConversion = VK_TRUE,
+	        },
+#endif
+	};
+
+	vk_device = xr_system_id.create_device(vk_physical_device, device_create_info.get());
+
+	vk_queue = vk_device.getQueue(vk_queue_family_index, 0);
+
+	vk::PipelineCacheCreateInfo pipeline_cache_info;
+	std::vector<std::byte> pipeline_cache_bytes;
+
+	try
+	{
+		// TODO Robust pipeline cache serialization
+		// https://zeux.io/2019/07/17/serializing-pipeline-cache/
+		pipeline_cache_bytes = utils::read_whole_file<std::byte>(cache_path / "pipeline_cache");
+
+		pipeline_cache_info.setInitialData<std::byte>(pipeline_cache_bytes);
+	}
+	catch (...)
+	{
+	}
+
+	pipeline_cache = vk::raii::PipelineCache(vk_device, pipeline_cache_info);
+
+	allocator.emplace(VmaAllocatorCreateInfo{
+	        .physicalDevice = *vk_physical_device,
+	        .device = *vk_device,
+	        .instance = *vk_instance,
+	});
+}
+
+void application::initialize_vulkan_unity(const XrSessionCreateInfo * sessionCreateInfo)
+{
+	// Check if the createInfo contains Vulkan-specific graphics binding
+	const XrGraphicsBindingVulkanKHR * vulkanBinding =
+	        reinterpret_cast<const XrGraphicsBindingVulkanKHR *>(sessionCreateInfo->next);
+
+	// Traverse the linked structure chain to find XrGraphicsBindingVulkanKHR
+	while (vulkanBinding != nullptr && vulkanBinding->type != XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR)
+	{
+		vulkanBinding = reinterpret_cast<const XrGraphicsBindingVulkanKHR *>(vulkanBinding->next);
+	}
+
+	if (vulkanBinding == nullptr)
+	{
+		throw std::runtime_error("Vulkan instance not found in OpenXR config");
+	}
+
+	spdlog::info("Intercepted xrCreateSession: Capturing Vulkan objects\n");
+	spdlog::info("VkInstance: {}", reinterpret_cast<long>(vulkanBinding->instance));
+	spdlog::info("VkPhysicalDevice: {}", reinterpret_cast<long>(vulkanBinding->physicalDevice));
+	spdlog::info("VkDevice: {}", reinterpret_cast<long>(vulkanBinding->device));
+	spdlog::info("Queue Family Index: {}", vulkanBinding->queueFamilyIndex);
+
+	// Store these Vulkan objects
+	// vk_instance = vk::raii::Instance(vk_context, vulkanBinding->instance);
+	vk_physical_device = vk::raii::PhysicalDevice(vk_instance, vulkanBinding->physicalDevice);
+	physical_device_properties = vk_physical_device.getProperties();
+	// vk_device = vk::raii::Device(vk_physical_device, vulkanBinding->device);
+	vk_queue_family_index = vulkanBinding->queueFamilyIndex;
+	// vk_queue = vk_device.getQueue(vk_queue_family_index, 0);
+
 	auto graphics_requirements = xr_system_id.graphics_requirements();
 	XrVersion vulkan_version = std::max(app_info.min_vulkan_version, graphics_requirements.minApiVersionSupported);
 	spdlog::info("OpenXR runtime wants Vulkan {}", xr::to_string(graphics_requirements.minApiVersionSupported));
@@ -480,6 +793,9 @@ void application::initialize_vulkan()
 	instance_create_info.setPEnabledLayerNames(layers);
 	instance_create_info.setPEnabledExtensionNames(instance_extensions);
 
+#ifdef __ANDROID_LIB__
+	vk_instance = vk::raii::Instance(vk_context, vulkanBinding->instance);
+#else
 	XrVulkanInstanceCreateInfoKHR create_info{
 	        .type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR,
 	        .systemId = xr_system_id,
@@ -497,7 +813,9 @@ void application::initialize_vulkan()
 	XrResult xresult = xrCreateVulkanInstanceKHR(xr_instance, &create_info, &tmp, &vresult);
 	CHECK_VK(vresult, "xrCreateVulkanInstanceKHR");
 	CHECK_XR(xresult, "xrCreateVulkanInstanceKHR");
+
 	vk_instance = vk::raii::Instance(vk_context, tmp);
+#endif
 
 #ifndef NDEBUG
 	if (debug_report_found)
@@ -770,7 +1088,9 @@ void application::initialize_actions()
 		}
 	}
 
+#ifndef __ANDROID_LIB__
 	xr_session.attach_actionsets(action_sets);
+#endif
 }
 
 void application::initialize()
@@ -878,9 +1198,14 @@ void application::initialize()
 	// Log view configurations and blend modes
 	log_views();
 
+#ifdef __ANDROID_LIB__
+	// We use Unity's OpenXR + Vulkan configuration and session
+	initialize_vulkan2();
+	xr_session = xr::session(xr_instance);
+#else
 	initialize_vulkan();
-
 	xr_session = xr::session(xr_instance, xr_system_id, vk_instance, vk_physical_device, vk_device, vk_queue_family_index);
+#endif
 
 	{
 		auto spaces = xr_session.get_reference_spaces();
@@ -893,6 +1218,7 @@ void application::initialize()
 	spaces[size_t(xr::spaces::world)] = xr_session.create_reference_space(XR_REFERENCE_SPACE_TYPE_STAGE);
 
 	config.emplace(xr_system_id);
+	// #ifndef __ANDROID_LIB__ // Done within Unity instead
 	if (xr_instance.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
 	{
 		try
@@ -917,15 +1243,21 @@ void application::initialize()
 		fb_face_tracker2 = xr_session.create_fb_face_tracker2();
 	}
 
+	// #endif
+
 	vk::CommandPoolCreateInfo cmdpool_create_info;
 	cmdpool_create_info.queueFamilyIndex = vk_queue_family_index;
 	cmdpool_create_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 
 	vk_cmdpool = vk::raii::CommandPool{vk_device, cmdpool_create_info};
 
+	// #ifndef __ANDROID_LIB__ // Done within Unity instead
+
 	initialize_actions();
 
 	interaction_profile_changed();
+
+	// #endif
 
 	gen.add_messages_domain("wivrn");
 	std::locale loc = gen("");
@@ -1035,21 +1367,26 @@ void application::set_server_uri(std::string uri)
 }
 
 #ifdef __ANDROID_LIB__
-application::application(application_info info, JNIEnv* env, jobject javaAssetManager, std::filesystem::path config_path, std::filesystem::path cache_path) :
-        app_info(std::move(info)),
-        config_path(config_path),
-        cache_path(cache_path)
+application::application(application_info info) :
+        app_info(std::move(info))
+{}
+
+void application::create(std::filesystem::path config_path, std::filesystem::path cache_path)
 #else
 application::application(application_info info) :
         app_info(std::move(info))
 #endif
-
 {
 #ifdef __ANDROID__
 	// https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/types.html
+	this->config_path = config_path;
+	this->cache_path = cache_path;
+#ifdef __ANDROID_LIB__
 
-#ifndef __ANDROID_LIB__ // We don't setup JNI, asset_manager or native_app if this is built as a library
+	setup_jni(UnityLib::jnienv);
+#else
 	setup_jni();
+
 	{
 		jni::object<""> act(app_info.native_app->activity->clazz);
 		auto app = act.call<jni::object<"android/app/Application">>("getApplication");
@@ -1109,10 +1446,7 @@ application::application(application_info info) :
 	wifi = std::make_shared<wifi_lock>();
 #endif
 
-#ifdef __ANDROID_LIB__
-	// Don't initialize the loader as it comes from Unity. Instead, initialise the assets manager
-	assetManager = AAssetManager_fromJava(env, javaAssetManager);
-#else
+#ifndef __ANDROID_LIB__ // Don't initialize the loader as Unity already has
 	// Initialize the loader for this platform
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
 	if (XR_SUCCEEDED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)(&initializeLoader))))
@@ -1137,20 +1471,23 @@ application::application(application_info info) :
 	spdlog::debug("Config path: {}", config_path.native());
 	spdlog::debug("Cache path: {}", cache_path.native());
 
-	try
-	{
-		initialize();
-	}
-	catch (std::exception & e)
-	{
-		spdlog::error("Error during initialization: {}", e.what());
-		cleanup();
-		throw;
-	}
+	// try
+	// {
+	initialize();
+	// }
+	// catch (std::exception & e)
+	// {
+	// 	spdlog::error("Error during initialization: {}", e.what());
+	// 	cleanup();
+	// 	throw e;
+	// }
 }
 
 #ifdef __ANDROID_LIB__
-// We don't setup JNI because we don't have access to the android_app *
+void application::setup_jni(JNIEnv * env)
+{
+	jni::jni_thread::setup_thread(env);
+}
 #elif defined(__ANDROID__)
 void application::setup_jni()
 {
@@ -1180,8 +1517,15 @@ void application::cleanup()
 
 application::~application()
 {
-	auto pipeline_cache_bytes = pipeline_cache.getData();
-	utils::write_whole_file(cache_path / "pipeline_cache", pipeline_cache_bytes);
+	try
+	{
+		auto pipeline_cache_bytes = pipeline_cache.getData();
+		utils::write_whole_file(cache_path / "pipeline_cache", pipeline_cache_bytes);
+	}
+	catch (...)
+	{
+		spdlog::error("Caught unknown exception in application destructor");
+	}
 
 	cleanup();
 }
@@ -1203,6 +1547,7 @@ void application::loop()
 		if (scene)
 		{
 			poll_actions();
+
 			if (auto tmp = last_scene.lock(); scene != tmp)
 			{
 				if (tmp)
@@ -1230,11 +1575,17 @@ void application::loop()
 #ifdef __ANDROID__
 void application::run()
 {
-	auto application_thread = utils::named_thread("application_thread", [&]() {
-#ifndef __ANDROID_LIB__
-		setup_jni();
+#ifdef __ANDROID_LIB__
+
+	setup_jni(UnityLib::jnienv);
+#else
+
+	setup_jni();
 #endif
 
+#ifndef __ANDROID_LIB__
+
+	std::thread application_thread = utils::named_thread("application_thread", [&]() {
 		while (!is_exit_requested())
 		{
 			try
@@ -1254,7 +1605,6 @@ void application::run()
 		}
 	});
 
-#ifndef __ANDROID_LIB__
 	// Read all pending events.
 	while (!exit_requested)
 	{
@@ -1274,9 +1624,9 @@ void application::run()
 			exit_requested = true;
 		}
 	}
-#endif
 
 	application_thread.join();
+#endif
 }
 #else
 void application::run()
@@ -1548,17 +1898,39 @@ void application::poll_events()
 	}
 }
 
-#ifdef __ANDROID__
-extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_EmbeddedPlugin_nativeLog(JNIEnv * env, const jobject * /* this */, jstring message)
+#ifdef __ANDROID_LIB__
+AAssetManager * application::asset_manager()
 {
-	// Convert jstring to a C-style string
-	const char * nativeMessage = env->GetStringUTFChars(message, nullptr);
+	if (UnityLib::assetManager == nullptr)
+	{
+		throw std::runtime_error("Asset manager is null");
+	}
+	return UnityLib::assetManager;
+}
 
-	// Log the message
-	__android_log_print(ANDROID_LOG_INFO, "libwivrn", "Message from WiVRn Native Library: %s", nativeMessage);
+void application::run_lib(XrFrameState * framestate)
+{
+	auto scene = current_scene();
+	if (scene)
+	{
+#ifndef __ANDROID_LIB__ // Unity handles actions syncing for now
+		poll_actions();
+#endif
 
-	// Release the Java string
-	env->ReleaseStringUTFChars(message, nativeMessage);
+		if (auto tmp = last_scene.lock(); scene != tmp)
+		{
+			if (tmp)
+				tmp->set_focused(false);
+
+			last_scene = scene;
+		}
+		scene->set_focused(true);
+
+		auto t1 = std::chrono::steady_clock::now();
+
+		scene->render(*framestate);
+
+		last_scene_cpu_time = std::chrono::steady_clock::now() - t1;
+	}
 }
 #endif

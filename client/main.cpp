@@ -21,12 +21,14 @@
 #include "scenes/lobby.h"
 #include "spdlog/spdlog.h"
 
+#include "utils/named_thread.h"
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
 #ifdef __ANDROID__
+#include "lib.h"
 #include "spdlog/sinks/android_sink.h"
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
@@ -34,33 +36,24 @@
 #include "spdlog/sinks/stdout_color_sinks.h"
 #endif
 
-#ifdef __ANDROID_LIB__
-void real_main(JNIEnv * env, jobject javaAssetManager, std::string config_path, std::string cache_path)
-#elif defined(__ANDROID__)
+#ifdef __ANDROID__
 void real_main(android_app * native_app)
 #else
 void real_main()
 #endif
 {
+#ifndef __ANDROID_LIB__
 	try
 	{
+#ifdef __ANDROID__
 		application_info info;
-#ifdef __ANDROID_LIB__
-// No native app if we are a library
-#elif defined(__ANDROID__)
 		info.native_app = native_app;
-#endif
 		info.name = "WiVRn";
 		info.version = VK_MAKE_VERSION(1, 0, 0);
-#ifdef __ANDROID_LIB__
-		application app(info, env, javaAssetManager, config_path, cache_path);
-#else
-		application app(info);
 #endif
 
+		application app(info);
 		app.push_scene<scenes::lobby>();
-
-		app.run();
 	}
 	catch (std::exception & e)
 	{
@@ -71,9 +64,7 @@ void real_main()
 		spdlog::error("Caught unknown exception");
 	}
 
-#ifdef __ANDROID_LIB__
-// No need to handle events if we are a library
-#elif defined(__ANDROID__)
+#ifdef __ANDROID__
 	ANativeActivity_finish(native_app->activity);
 
 	// Read all pending events.
@@ -91,45 +82,8 @@ void real_main()
 	}
 	exit(0);
 #endif
-}
-
-#ifdef __ANDROID_LIB__
-extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jobject assetManager, jstring configPath, jstring cachePath, jlong instance, jlong systemId, jlong session);
-extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_EmbeddedPlugin_androidLibMain(JNIEnv * env, const jobject * /* this */, jobject assetManager, jstring configPath, jstring cachePath, jlong instance, jlong systemId, jlong session)
-{
-	static auto logger = spdlog::android_logger_mt("WiVRn", "WiVRn");
-
-	spdlog::set_default_logger(logger);
-
-	spdlog::info("WiVRn Library Started - Launching Main");
-
-	// Convert the Java strings to C++ strings
-	const char * configPathChars = env->GetStringUTFChars(configPath, nullptr);
-	const char * cachePathChars = env->GetStringUTFChars(cachePath, nullptr);
-
-	auto config_path = std::string(configPathChars);
-	auto cache_path = std::string(cachePathChars);
-
-	application::g_instance = (uint64_t)instance;
-	application::g_systemId = (uint64_t)systemId;
-	application::g_session = (uint64_t)session;
-
-	// Debug logging
-	spdlog::info("Native OpenXR Handles Updated:\n");
-	spdlog::info("Assigned g_instance: {}", std::to_string(application::g_instance));
-	spdlog::info("Assigned g_systemId: {}", std::to_string(application::g_systemId));
-	spdlog::info("Assigned g_session: {}", std::to_string(application::g_session));
-
-	// Release the Java strings
-	env->ReleaseStringUTFChars(configPath, configPathChars);
-	env->ReleaseStringUTFChars(cachePath, cachePathChars);
-
-	// Launch the main application
-	real_main(env, assetManager, config_path, cache_path);
-}
 #endif
+}
 
 #ifdef __ANDROID__
 void android_main(android_app * native_app) __attribute__((visibility("default")));

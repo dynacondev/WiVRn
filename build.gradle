@@ -158,6 +158,11 @@ android {
                 applicationIdSuffix = project.hasProperty('suffix') ? suffix: ".local"
             }
             manifestPlaceholders.ComOculusSupportedDevices = "all"
+            externalNativeBuild {
+                cmake {
+                    arguments "-DCMAKE_BUILD_TYPE=Debug"
+                }
+            }
         }
 
         debugWithValidationLayer {

@@ -61,9 +61,7 @@ struct application_info
 	XrViewConfigurationType viewconfig = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 	XrVersion min_vulkan_version = XR_MAKE_VERSION(1, 1, 0);
 
-#ifdef __ANDROID_LIB__
-	// We don't have access to the android_app * because we are a library
-#elif defined(__ANDROID__)
+#ifdef __ANDROID__
 	android_app * native_app;
 #endif
 };
@@ -87,17 +85,12 @@ class application : public singleton<application>
 
 #ifdef __ANDROID_LIB__
 public:
-	// We need some pointers to objects shared with unity, such as OpenXR
-	static uint64_t g_instance;
-	static uint64_t g_systemId;
-	static uint64_t g_session;
+	XrResult initialize_vulkan(XrInstance xrInstance, const XrVulkanInstanceCreateInfoKHR * vulkanCreateInfo, VkInstance * vulkanInstance, VkResult * vulkanResult);
 
 private:
-	// We initialise asset manager differently as a library
-	static AAssetManager * assetManager;
-#endif
-
+#else
 	void initialize_vulkan();
+#endif
 
 	void log_views();
 
@@ -151,6 +144,7 @@ private:
 	bool debug_extensions_found = false;
 	std::vector<std::string> xr_extensions;
 	std::vector<const char *> vk_device_extensions;
+	std::unordered_set<std::string_view> optional_device_extensions{};
 	std::atomic<bool> exit_requested = false;
 	std::filesystem::path config_path;
 	std::filesystem::path cache_path;
@@ -193,25 +187,18 @@ private:
 public:
 	using singleton<application>::instance;
 
-#ifdef __ANDROID_LIB__
-	application(application_info info, JNIEnv* env, jobject javaAssetManager, std::filesystem::path config_path, std::filesystem::path cache_path);
-#else
 	application(application_info info);
-#endif
 
 	application(const application &) = delete;
 	~application();
 #ifdef __ANDROID_LIB__
-	// We don't setup JNI or native_app because we don't have access to the android_app *
-
-	static AAssetManager * asset_manager()
-	{
-		if (assetManager == nullptr)
-		{
-			throw std::runtime_error("Asset manager is null");
-		}
-		return assetManager;
-	}
+	// We don't setup JNI or native_app the same way because we don't have access to the android_app *
+	static AAssetManager * asset_manager();
+	void setup_jni(JNIEnv * env);
+	void initialize_vulkan_unity(const XrSessionCreateInfo * sessionCreateInfo);
+	void run_lib(XrFrameState * framestate);
+	void initialize_vulkan2();
+	void create(std::filesystem::path config_path, std::filesystem::path cache_path);
 
 #elif defined(__ANDROID__)
 	void setup_jni();
@@ -485,9 +472,3 @@ public:
 		return instance().messages_info;
 	}
 };
-
-#ifdef __ANDROID__
-// A simple native function that prints a log message for debugging purposes
-extern "C" __attribute__((visibility("default"))) JNIEXPORT void JNICALL
-Java_org_meumeu_wivrn_EmbeddedPlugin_nativeLog(JNIEnv * env, const jobject * /* this */, jstring message);
-#endif

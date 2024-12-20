@@ -141,7 +141,11 @@ void configuration::set_feature(feature f, bool state)
 
 configuration::configuration(xr::system & system)
 {
+#ifdef __ANDROID_LIB__
+	passthrough_enabled = false;
+#else
 	passthrough_enabled = system.passthrough_supported() == xr::system::passthrough_type::color;
+#endif
 	features[feature::hand_tracking] = application::get_hand_tracking_supported();
 	try
 	{
@@ -175,8 +179,11 @@ configuration::configuration(xr::system & system)
 			resolution_scale = val.get_double();
 
 		if (auto val = root["passthrough_enabled"]; val.is_bool())
+#ifdef __ANDROID_LIB__
+			passthrough_enabled = false;
+#else
 			passthrough_enabled = val.get_bool();
-
+#endif
 		if (auto val = root["virtual_keyboard_layout"]; val.is_string())
 			virtual_keyboard_layout = val.get_string().value();
 
@@ -198,7 +205,11 @@ configuration::configuration(xr::system & system)
 		preferred_refresh_rate = 0;
 		resolution_scale = 1.4;
 		show_performance_metrics = false;
+#ifdef __ANDROID_LIB__
+		passthrough_enabled = false;
+#else
 		passthrough_enabled = system.passthrough_supported() == xr::system::passthrough_type::color;
+#endif
 	}
 }
 

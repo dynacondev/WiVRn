@@ -22,11 +22,12 @@
 #include "application.h"
 #include "utils/named_thread.h"
 #include <spdlog/spdlog.h>
+#include "lib.h"
 
 void scenes::stream::process_packets()
 {
 #ifdef __ANDROID_LIB__
-	application::instance().setup_jni(application::jnienv);
+	application::instance().setup_jni(UnityLib::jnienv);
 #elif defined(__ANDROID__)
 	application::instance().setup_jni();
 #endif
