@@ -40,7 +40,10 @@ class wifi_lock : public std::enable_shared_from_this<wifi_lock>
 	std::weak_ptr<void> wifi_weak;
 
 public:
+#ifndef __ANDROID_LIB__
+public:
 	static std::shared_ptr<wifi_lock> make_wifi_lock(jobject activity);
+#endif
 #endif
 
 public:

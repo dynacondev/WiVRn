@@ -21,12 +21,14 @@
 #include "scenes/lobby.h"
 #include "spdlog/spdlog.h"
 
+#include "utils/named_thread.h"
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
 #ifdef __ANDROID__
+#include "lib.h"
 #include "spdlog/sinks/android_sink.h"
 #include <android/native_window.h>
 #include <android_native_app_glue.h>
@@ -40,16 +42,17 @@ void real_main(android_app * native_app)
 void real_main()
 #endif
 {
+#ifndef __ANDROID_LIB__
 	try
 	{
-		application_info info;
 #ifdef __ANDROID__
+		application_info info;
 		info.native_app = native_app;
-#endif
 		info.name = "WiVRn";
 		info.version = VK_MAKE_VERSION(1, 0, 0);
-		application app(info);
+#endif
 
+		application app(info);
 		app.push_scene<scenes::lobby>();
 
 		app.run();
@@ -81,6 +84,7 @@ void real_main()
 	}
 	exit(0);
 #endif
+#endif
 }
 
 #ifdef __ANDROID__
@@ -91,7 +95,11 @@ void android_main(android_app * native_app)
 
 	spdlog::set_default_logger(logger);
 
+#ifdef __ANDROID_LIB__
+	// Never gets run from here - this only runs if android system starts this built as an app
+#else
 	real_main(native_app);
+#endif
 }
 #else
 int main(int argc, char * argv[])

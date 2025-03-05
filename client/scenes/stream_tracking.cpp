@@ -27,6 +27,7 @@
 #ifdef __ANDROID__
 #include "android/battery.h"
 #include "android/jnipp.h"
+#include "lib.h"
 #endif
 
 using tid = to_headset::tracking_control::id;
@@ -173,7 +174,11 @@ void scenes::stream::tracking()
 {
 #ifdef __ANDROID__
 	// Runtime may use JNI and needs the thread to be attached
+#ifdef __ANDROID_LIB__
+	application::instance().setup_jni(UnityLib::jnienv);
+#else
 	application::instance().setup_jni();
+#endif
 
 	XrTime next_battery_check = 0;
 	const XrDuration battery_check_interval = 30'000'000'000; // 30s

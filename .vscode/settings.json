@@ -1,0 +1,8 @@
+{
+    "sonarlint.pathToCompileCommands": "${workspaceFolder}/.cxx/Debug/6v2yc5t3/arm64-v8a/compile_commands.json",
+    "clangd.arguments": [
+        "--header-insertion=never",
+        "--compile-commands-dir=${workspaceFolder}/.cxx/tools/standardDebug/arm64-v8a/",
+        "--query-driver=**"
+    ]
+}

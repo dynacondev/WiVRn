@@ -44,7 +44,11 @@ class session : public utils::handle<XrSession, xrDestroySession>
 
 public:
 	session() = default;
+#ifdef __ANDROID_LIB__
+	session(xr::instance & inst);
+#else
 	session(instance &, system &, vk::raii::Instance &, vk::raii::PhysicalDevice &, vk::raii::Device &, int queue_family_index);
+#endif
 
 	std::vector<XrReferenceSpaceType> get_reference_spaces() const;
 	space create_reference_space(XrReferenceSpaceType ref, const XrPosef & pose = {{0, 0, 0, 1}, {0, 0, 0}});

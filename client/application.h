@@ -84,7 +84,14 @@ class application : public singleton<application>
 	static inline const char engine_name[] = "No engine";
 	static inline const int engine_version = VK_MAKE_VERSION(1, 0, 0);
 
+#ifdef __ANDROID_LIB__
+public:
+	XrResult initialize_vulkan(XrInstance xrInstance, const XrVulkanInstanceCreateInfoKHR * vulkanCreateInfo, VkInstance * vulkanInstance, VkResult * vulkanResult);
+
+private:
+#else
 	void initialize_vulkan();
+#endif
 
 	void log_views();
 
@@ -141,6 +148,7 @@ class application : public singleton<application>
 	bool debug_extensions_found = false;
 	std::vector<std::string> xr_extensions;
 	std::vector<const char *> vk_device_extensions;
+	std::unordered_set<std::string_view> optional_device_extensions{};
 	std::atomic<bool> exit_requested = false;
 	std::filesystem::path config_path;
 	std::filesystem::path cache_path;
@@ -193,7 +201,15 @@ public:
 
 	application(const application &) = delete;
 	~application();
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	// We don't setup JNI or native_app the same way because we don't have access to the android_app *
+	static AAssetManager * asset_manager();
+	void setup_jni(JNIEnv * env);
+	void run_lib(XrFrameState * framestate);
+	void initialize_vulkan2();
+	void create(std::filesystem::path config_path, std::filesystem::path cache_path);
+
+#elif defined(__ANDROID__)
 	void setup_jni();
 
 	static AAssetManager * asset_manager()

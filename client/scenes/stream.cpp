@@ -304,7 +304,9 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	                .queryCount = size_gpu_timestamps,
 	        });
 
+#ifndef __ANDROID_LIB__
 	self->wifi = application::get_wifi_lock().get_wifi_lock();
+#endif
 	return self;
 }
 
@@ -506,7 +508,7 @@ std::shared_ptr<shard_accumulator::blit_handle> scenes::stream::accumulator_imag
 {
 	for (auto it = latest_frames.rbegin(); it != latest_frames.rend(); ++it)
 	{
-		if (not *it)
+		if (not*it)
 			continue;
 
 		if ((*it)->feedback.frame_index != id)
@@ -550,7 +552,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	assert(swapchain);
 	for (auto & i: decoders)
 	{
-		if (auto sampler = i.decoder->sampler(); sampler and not *i.blit_pipeline)
+		if (auto sampler = i.decoder->sampler(); sampler and not*i.blit_pipeline)
 		{
 			// Create blit pipeline
 			// Create VkDescriptorSetLayout with an immutable sampler
@@ -731,7 +733,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Blit images from the decoders
 	for (auto [i, blit_handle]: std::views::zip(decoders, current_blit_handles))
 	{
-		if (not blit_handle or not *i.blit_pipeline)
+		if (not blit_handle or not*i.blit_pipeline)
 			continue;
 
 		blit_handle->feedback.blitted = application::now();
@@ -797,7 +799,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		for (const auto & decoder: decoders)
 		{
-			if (not *decoder.blit_pipeline)
+			if (not*decoder.blit_pipeline)
 				continue;
 			if (decoder.alpha() and not use_alpha)
 				continue;

@@ -21,6 +21,7 @@
 
 #include "application.h"
 #include "details/enumerate.h"
+#include "lib.h"
 #include "openxr/openxr.h"
 #include "utils/contains.h"
 #include "xr/instance.h"
@@ -29,6 +30,13 @@
 #include <vulkan/vulkan.h>
 #include <openxr/openxr_platform.h>
 
+#ifdef __ANDROID_LIB__
+xr::session::session(xr::instance & inst) :
+        inst(&inst)
+{
+	id = reinterpret_cast<XrSession>(UnityLib::g_session);
+}
+#else
 xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance & vk_inst, vk::raii::PhysicalDevice & pdev, vk::raii::Device & dev, int queue_family_index) :
         inst(&inst)
 {
@@ -50,6 +58,7 @@ xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance &
 
 	CHECK_XR(xrCreateSession(inst, &session_info, &id));
 }
+#endif
 
 std::vector<XrReferenceSpaceType> xr::session::get_reference_spaces() const
 {
@@ -165,11 +174,43 @@ void xr::session::begin_frame()
 	        .type = XR_TYPE_FRAME_BEGIN_INFO,
 	};
 
+#ifndef __ANDROID_LIB__
+	// WIVRN becomes the slave and responds to already begun frames if built as a library
 	CHECK_XR(xrBeginFrame(id, &begin_info));
+#endif
 }
 
 void xr::session::end_frame(XrTime display_time, const std::vector<XrCompositionLayerBaseHeader *> & layers, XrEnvironmentBlendMode blend_mode)
 {
+#ifdef __ANDROID_LIB__
+	if (UnityLib::layers.empty())
+	{
+		UnityLib::layers = layers;
+	}
+	else
+	{
+		spdlog::error("Rendered before prev frame finished pushing");
+	}
+
+	// UnityLib::render_mtx2.unlock();
+
+	// for (uint32_t i = 0; i < UnityLib::layers.size(); ++i)
+	// {
+	// 	spdlog::info("Layer [{}]: Type: {}, Address: {}", i, static_cast<int>(UnityLib::layers[i]->type), reinterpret_cast<void *>(UnityLib::layers[i]));
+	// }
+
+	// std::vector<XrCompositionLayerBaseHeader> result;
+
+	// for (const auto * ptr: layers)
+	// {
+	// 	if (ptr)
+	// 	{                               // Ensure the pointer is valid
+	// 		result.push_back(*ptr); // Dereference and copy
+	// 	}
+	// }
+
+	// UnityLib::rendered_layers = result;
+#else
 	XrFrameEndInfo end_info{
 	        .type = XR_TYPE_FRAME_END_INFO,
 	        .displayTime = display_time,
@@ -179,6 +220,7 @@ void xr::session::end_frame(XrTime display_time, const std::vector<XrComposition
 	};
 
 	CHECK_XR(xrEndFrame(id, &end_info));
+#endif
 }
 
 void xr::session::begin_session(XrViewConfigurationType view_config)

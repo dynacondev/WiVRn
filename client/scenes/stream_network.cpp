@@ -20,12 +20,15 @@
 #include "stream.h"
 
 #include "application.h"
+#include "lib.h"
 #include "utils/named_thread.h"
 #include <spdlog/spdlog.h>
 
 void scenes::stream::process_packets()
 {
-#ifdef __ANDROID__
+#ifdef __ANDROID_LIB__
+	application::instance().setup_jni(UnityLib::jnienv);
+#elif defined(__ANDROID__)
 	application::instance().setup_jni();
 #endif
 	while (not exiting)

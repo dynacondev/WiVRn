@@ -103,6 +103,7 @@ Optionally, you can build the client as a library to include in another project,
 
 ```bash
 ./gradlew assembleStandardRelease -PbuildTarget=library
+# ./gradlew assembleStandardDebug -PbuildTarget=library # For debug builds
 ```
 
 Following this, you can add the resulting `.aar` file from `build/outputs/aar/WiVRn-standard-release.apk` to your Unity project's `assets/plugins/android/` folder. The WiVRn client API functions will be accessible by using the `WiVRnClient` class.
