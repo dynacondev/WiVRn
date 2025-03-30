@@ -190,7 +190,7 @@ public:
 	viewport & layer(ImVec2 position);
 
 	void new_frame(XrTime display_time);
-	std::vector<std::pair<int, XrCompositionLayerQuad>> end_frame();
+	std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerQuad>>> end_frame();
 
 	ImFont * large_font;
 	size_t get_focused_controller() const

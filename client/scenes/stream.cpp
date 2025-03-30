@@ -534,8 +534,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		// TODO: stop/restart video stream
 		session.begin_frame();
-		session.end_frame(frame_state.predictedDisplayTime, {});
-
+		std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> emptyLayers = {};
+		auto emptySpace = std::make_unique<XrSpace>(nullptr);
+		auto emptyFlags = std::make_unique<std::pair<XrViewStateFlags, std::vector<XrView>>>();
+		session.end_frame(frame_state.predictedDisplayTime, emptyLayers, emptyLayers, std::move(emptySpace), std::move(emptyFlags));
 		std::unique_lock lock(frames_mutex);
 		for (auto & i: decoders)
 		{
@@ -860,7 +862,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	queue.submit(submit_info, *fence);
 
 	XrEnvironmentBlendMode blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	std::vector<XrCompositionLayerBaseHeader *> layers_base;
+	std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> layers_base;
 	std::vector<XrCompositionLayerProjectionView> layer_view(view_count);
 
 	if (use_alpha)
@@ -875,7 +877,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			                blend_mode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
 		                },
 		                [&](auto & p) {
-			                layers_base.push_back(p.layer());
+			                layers_base.push_back(std::make_unique<XrCompositionLayerBaseHeader>(*p.layer()));
 		                }},
 		        session.get_passthrough());
 	}
@@ -905,15 +907,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		        };
 	}
 
-	XrCompositionLayerProjection layer{
+	// Allocate raw memory for the projection layer
+	auto * layer = new XrCompositionLayerProjection{
 	        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
 	        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 	        .space = application::space(xr::spaces::world),
-	        .viewCount = (uint32_t)layer_view.size(),
+	        .viewCount = static_cast<uint32_t>(layer_view.size()),
 	        .views = layer_view.data(),
 	};
 
-	std::vector<XrCompositionLayerQuad> imgui_layers;
+	std::vector<std::unique_ptr<XrCompositionLayerQuad>> imgui_layers;
 	if (imgui_ctx)
 	{
 		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
@@ -921,17 +924,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			imgui_layers = plot_performance_metrics(frame_state.predictedDisplayTime);
 	}
 
-	layers_base.push_back(reinterpret_cast<XrCompositionLayerBaseHeader *>(&layer));
+	// Wrap in a unique_ptr to the base type
+	layers_base.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(layer)));
 
 	if (imgui_ctx and plots_visible)
 	{
 		for (auto & layer: imgui_layers)
-			layers_base.push_back(reinterpret_cast<XrCompositionLayerBaseHeader *>(&layer));
+			layers_base.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(
+			        reinterpret_cast<XrCompositionLayerBaseHeader *>(layer.release())));
 	}
 
 	try
 	{
-		session.end_frame(frame_state.predictedDisplayTime, layers_base, blend_mode);
+		std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> emptyLayers;
+		auto emptySpace = std::make_unique<XrSpace>(nullptr);
+		auto emptyFlags = std::make_unique<std::pair<XrViewStateFlags, std::vector<XrView>>>();
+		session.end_frame(frame_state.predictedDisplayTime, emptyLayers, emptyLayers, std::move(emptySpace), std::move(emptyFlags));
 	}
 	catch (std::system_error & e)
 	{

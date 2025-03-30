@@ -19,9 +19,18 @@ const XrSessionCreateInfo * UnityLib::sessionCreateInfo;
 PFN_xrGetInstanceProcAddr UnityLib::s_xrGetInstanceProcAddr = nullptr;
 // std::vector<XrCompositionLayerBaseHeader *> empty_layers; // Default empty vector
 std::vector<XrCompositionLayerBaseHeader *> UnityLib::layers;
-// std::vector<XrCompositionLayerBaseHeader> UnityLib::rendered_layers;
+std::vector<const XrCompositionLayerBaseHeader *> UnityLib::special_layers;
+std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> UnityLib::very_special_layers;
+std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> UnityLib::noDisplayLayers;
+std::vector<std::shared_ptr<XrCompositionLayerBaseHeader>> UnityLib::persistent_layers;
+std::unique_ptr<XrSpace> UnityLib::space;
+XrFrameEndInfo * UnityLib::frameEndinfo;
+XrResult UnityLib::result;
+XrSession UnityLib::session;
+std::unique_ptr<std::pair<XrViewStateFlags, std::vector<XrView>>> UnityLib::flag_views;
+std::vector<XrCompositionLayerBaseHeader> UnityLib::rendered_layers;
 // std::vector<XrCompositionLayerBaseHeader> UnityLib::rendered_layers_safe;
-static std::vector<XrCompositionLayerBaseHeader> rendered_layers_safe;
+// static std::vector<XrCompositionLayerBaseHeader> rendered_layers_safe;
 static XrCompositionLayerBaseHeader single_layer;
 XrFrameEndInfo UnityLib::modifiedFrameEndInfo;
 PFN_xrEndFrame UnityLib::s_xrEndFrame = nullptr;
@@ -31,10 +40,14 @@ PFN_xrWaitFrame UnityLib::s_xrWaitFrame = nullptr;
 XrFrameState * UnityLib::framestate = nullptr;
 std::mutex UnityLib::render_mtx;
 std::mutex UnityLib::render_mtx2;
+std::mutex UnityLib::special_render_mtx;
 std::mutex UnityLib::app_thread_mtx;
 std::condition_variable UnityLib::app_thread_cv;
 bool UnityLib::app_thread_flag = false;
 std::thread UnityLib::application_thread;
+
+XrCompositionLayerBaseHeader UnityLib::g_layerStorage[6];
+size_t UnityLib::g_numLayers = 0;
 
 // Private constructor to prevent direct instantiation
 UnityLib::UnityLib()
@@ -154,7 +167,9 @@ XRAPI_ATTR XrResult XRAPI_CALL UnityLib::intercepted_xrWaitFrame(
 	// 	render_mtx2.unlock();
 	// }
 
-	app->run_lib(frameState);
+	// app->run_lib(frameState);
+
+	framestate = frameState;
 
 	return result;
 }
@@ -163,76 +178,144 @@ XRAPI_ATTR XrResult XRAPI_CALL UnityLib::intercepted_xrEndFrame(
         XrSession session,
         const XrFrameEndInfo * frameEndInfo)
 {
-	// Add rendered layers
-	// layers.insert(layers.end(), UnityLib::rendered_layers.begin(), UnityLib::rendered_layers.end());
+	UnityLib::frameEndinfo = &const_cast<XrFrameEndInfo &>(*frameEndInfo);
+	UnityLib::session = session;
+	app->run_lib(framestate);
 
-	// static bool doOnce = false;
-	// if (!doOnce)
+	
+
+	// 	// // Add rendered layers
+	// 	// layers.insert(layers.end(), UnityLib::rendered_layers.begin(), UnityLib::rendered_layers.end());
+
+	// 	// // static bool doOnce = false;
+	// 	// // if (!doOnce)
+	// 	// // {
+	// 	// // 	rendered_layers_safe = rendered_layers; // TODO Make thread safe etc
+	// 	// // 	doOnce = true;
+	// 	// // }
+
+	// 	// // spdlog::info("layers: {}", UnityLib::layers.size());
+
+	// 	// // render_mtx2.lock();
+
+	// 	// // for (uint32_t i = 0; i < UnityLib::layers.size(); ++i)
+	// 	// // {
+	// 	// // 	spdlog::info("Layer [{}]: Type: {}, Address: {}", i, static_cast<int>(UnityLib::layers[i]->type), reinterpret_cast<void *>(UnityLib::layers[i]));
+	// 	// // }
+
+	// 	// layers.clear();
+
+	// 	// // render_mtx2.unlock();
+	// 	// // render_mtx.unlock();
+
+	// 	// // single_layer = *const_cast<XrCompositionLayerBaseHeader *>(frameEndInfo->layers[0]);
+	// 	// // layers.push_back(&single_layer);
+
+	// 	// // layers.push_back(const_cast<XrCompositionLayerBaseHeader *>(frameEndInfo->layers[0]));
+
+	// 	// for (uint32_t i = 0; i < rendered_layers.size(); ++i)
+	// 	// {
+	// 	// 	spdlog::info("Planned Layer [{}]: Type: {}", i, static_cast<int>(rendered_layers[i].type));
+	// 	// 	layers.push_back(&rendered_layers[i]); // Problematic?
+	// 	// }
+
+	// 	// Create a local vector to hold all layer data as copies
+	// 	// std::vector<XrCompositionLayerBaseHeader> local_layers;
+
+	// 	// Copy rendered_layers into local_layers
+	// 	// local_layers.insert(local_layers.end(), rendered_layers.begin(), rendered_layers.end());
+
+	// 	// Copy frameEndInfo->layers into local_layers
+	// 	// for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i)
+	// 	// {
+	// 	//     local_layers.push_back(*frameEndInfo->layers[i]);
+	// 	// }
+
+	// 	// // Create a vector of pointers to the objects in local_layers
+	// 	// std::vector<const XrCompositionLayerBaseHeader *> layer_pointers;
+	// 	// // layer_pointers.reserve(frameEndInfo->layerCount + g_numLayers);
+	// 	// for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i)
+	// 	// {
+	// 	// 	spdlog::info("Original Layer [{}]: Type: {}", i, static_cast<int>(frameEndInfo->layers[i]->type));
+	// 	// 	layer_pointers.push_back(frameEndInfo->layers[i]);
+	// 	// }
+	// 	// for (uint32_t i = 0; i < g_numLayers; ++i)
+	// 	// {
+	// 	// 	spdlog::info("Generated Layer [{}]: Type: {}, Address: {}", i, static_cast<int>(g_layerStorage[i].type), reinterpret_cast<void *>(&g_layerStorage[i]));
+	// 	// 	// layer_pointers.push_back(&g_layerStorage[i]);
+	// 	// }
+	// 	// // for (const auto& layer : local_layers)
+	// 	// // {
+	// 	// //     layer_pointers.push_back(&layer);
+	// 	// // }
+
+	// 	// for (uint32_t i = 0; i < modifiedFrameEndInfo.layerCount; ++i)
+	// 	// {
+	// 	// 	spdlog::info("Layer [{}]: Type: {}", i, static_cast<int>(modifiedFrameEndInfo.layers[i]->type));
+	// 	// }
+
+	// 	// for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i)
+	// 	// {
+	// 	// 	layers.push_back(const_cast<XrCompositionLayerBaseHeader *>(frameEndInfo->layers[i]));
+	// 	// }
+
+	// 	// modifiedFrameEndInfo = *frameEndInfo;
+	// 	// // spdlog::info("Actual layer count: {}", modifiedFrameEndInfo.layerCount);
+	// 	// // spdlog::info("Calculated layer count: {}", (uint32_t)layers.size());
+	// 	// modifiedFrameEndInfo.layerCount = (uint32_t)layers.size();
+	// 	// modifiedFrameEndInfo.layers = layers.data();
+
+	// 	// for (uint32_t i = 0; i < layers.size(); ++i)
+	// 	// {
+	// 	// 	spdlog::info("Layer [{}]: Type: {}, Address: {}", i, static_cast<int>(layers[i]->type), reinterpret_cast<void *>(layers[i]));
+	// 	// }
+
+	// for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i)
 	// {
-	// 	rendered_layers_safe = rendered_layers; // TODO Make thread safe etc
-	// 	doOnce = true;
+	// 	special_layers.push_back(frameEndInfo->layers[i]);
 	// }
 
-	// spdlog::info("layers: {}", UnityLib::layers.size());
+	// // Update modifiedFrameEndInfo with the pointer to the array of pointers
+	// modifiedFrameEndInfo = *frameEndInfo;
+	// modifiedFrameEndInfo.layerCount = static_cast<uint32_t>(special_layers.size());
+	// modifiedFrameEndInfo.layers = special_layers.data();
 
-	// render_mtx2.lock();
-
-	// for (uint32_t i = 0; i < UnityLib::layers.size(); ++i)
+	// XrResult result;
+	// try
 	// {
-	// 	spdlog::info("Layer [{}]: Type: {}, Address: {}", i, static_cast<int>(UnityLib::layers[i]->type), reinterpret_cast<void *>(UnityLib::layers[i]));
+	// 	for (uint32_t i = 0; i < modifiedFrameEndInfo.layerCount; ++i)
+	// 	{
+	// 		spdlog::info("A Layer [{}]: Type: {}", i, static_cast<int>(modifiedFrameEndInfo.layers[i]->type));
+	// 	}
+
+	// 	result = s_xrEndFrame(session, &modifiedFrameEndInfo);
+
+	// 	for (uint32_t i = 0; i < modifiedFrameEndInfo.layerCount; ++i)
+	// 	{
+	// 		spdlog::info("B Layer [{}]: Type: {}", i, static_cast<int>(modifiedFrameEndInfo.layers[i]->type));
+	// 	}
+
+	// 	// for (uint32_t i = 0; i < special_layers.size(); ++i)
+	// 	// {
+	// 	// 	FreeCompositionLayer(special_layers[i]);
+	// 	// }
+	// 	special_layers.clear();
+
+	// 	if (XR_FAILED(result))
+	// 	{
+	// 		spdlog::error("xrEndFrame failed with error: {}", xr::to_string(result));
+	// 	}
+
+	// 	// render_mtx.unlock();
 	// }
-
-	// layers.clear();
-
-	// render_mtx2.unlock();
-	// render_mtx.unlock();
-
-	// single_layer = *const_cast<XrCompositionLayerBaseHeader *>(frameEndInfo->layers[0]);
-	// layers.push_back(&single_layer);
-
-	// layers.push_back(const_cast<XrCompositionLayerBaseHeader *>(frameEndInfo->layers[0]));
-
-	// for (uint32_t i = 0; i < rendered_layers_safe.size(); ++i)
+	// catch (std::exception & e)
 	// {
-	// 	layers.push_back(&rendered_layers_safe[i]);
+	// 	spdlog::error("xrEndFrame threw error: {}", e.what());
 	// }
-
-	for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i)
-	{
-		layers.push_back(const_cast<XrCompositionLayerBaseHeader *>(frameEndInfo->layers[i]));
-	}
-
-	modifiedFrameEndInfo = *frameEndInfo;
-	modifiedFrameEndInfo.layerCount = (uint32_t)layers.size();
-	modifiedFrameEndInfo.layers = layers.data();
-
-	// for (uint32_t i = 0; i < layers.size(); ++i)
+	// catch (...)
 	// {
-	// 	spdlog::info("Layer [{}]: Type: {}, Address: {}", i, static_cast<int>(layers[i]->type), reinterpret_cast<void *>(layers[i]));
+	// 	spdlog::error("xrEndFrame threw error");
 	// }
-
-	XrResult result;
-	try
-	{
-		result = s_xrEndFrame(session, &modifiedFrameEndInfo);
-
-		if (XR_FAILED(result))
-		{
-			spdlog::error("xrEndFrame failed with error: {}", xr::to_string(result));
-		}
-
-		// render_mtx.unlock();
-	}
-	catch (std::exception & e)
-	{
-		spdlog::error("xrEndFrame threw error: {}", e.what());
-	}
-	catch (...)
-	{
-		spdlog::error("xrEndFrame threw error");
-	}
-
-	UnityLib::layers.clear();
 
 	return result;
 }

@@ -180,17 +180,96 @@ void xr::session::begin_frame()
 #endif
 }
 
-void xr::session::end_frame(XrTime display_time, const std::vector<XrCompositionLayerBaseHeader *> & layers, XrEnvironmentBlendMode blend_mode)
+void xr::session::end_frame(XrTime display_time, std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> & layers, std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> & noDisplayLayers, std::unique_ptr<XrSpace> space, std::unique_ptr<std::pair<XrViewStateFlags, std::vector<XrView>>> flagViews, XrEnvironmentBlendMode blend_mode)
 {
+	// for (size_t i = 0; i < layers.size(); ++i)
+	// {
+	// 	// UnityLib::special_layers.push_back(layers[i]);
+	// }
+
+	UnityLib::special_render_mtx.lock();
+	UnityLib::space = std::move(space);
+	UnityLib::flag_views = std::move(flagViews);
+	UnityLib::noDisplayLayers = std::move(noDisplayLayers);
+	UnityLib::very_special_layers = std::move(layers);
+	UnityLib::special_render_mtx.unlock();
+
+	for (uint32_t i = 0; i < UnityLib::frameEndinfo->layerCount; ++i)
+	{
+		UnityLib::special_layers.push_back(UnityLib::frameEndinfo->layers[i]);
+	}
+
+	UnityLib::special_render_mtx.lock();
+
+	for (const auto & layer: UnityLib::very_special_layers)
+	{
+		UnityLib::special_layers.push_back(layer.get());
+	}
+	// special_layers.push_back(very_special_layers[0].get());
+
+	// Update modifiedFrameEndInfo with the pointer to the array of pointers
+	UnityLib::modifiedFrameEndInfo = *UnityLib::frameEndinfo;
+	UnityLib::modifiedFrameEndInfo.layerCount = static_cast<uint32_t>(UnityLib::special_layers.size());
+	UnityLib::modifiedFrameEndInfo.layers = UnityLib::special_layers.data();
+
+	try
+	{
+		for (uint32_t i = 0; i < UnityLib::modifiedFrameEndInfo.layerCount; ++i)
+		{
+			spdlog::info("A Layer [{}]: Type: {}", i, static_cast<int>(UnityLib::modifiedFrameEndInfo.layers[i]->type));
+		}
+
+		UnityLib::result = UnityLib::s_xrEndFrame(UnityLib::session, &UnityLib::modifiedFrameEndInfo);
+
+		for (uint32_t i = 0; i < UnityLib::modifiedFrameEndInfo.layerCount; ++i)
+		{
+			spdlog::info("B Layer [{}]: Type: {}", i, static_cast<int>(UnityLib::modifiedFrameEndInfo.layers[i]->type));
+		}
+
+		UnityLib::noDisplayLayers.clear();
+		UnityLib::special_layers.clear();
+		UnityLib::very_special_layers.clear();
+
+		UnityLib::special_render_mtx.unlock();
+
+		if (XR_FAILED(UnityLib::result))
+		{
+			spdlog::error("xrEndFrame failed with error: {}", xr::to_string(UnityLib::result));
+		}
+	}
+	catch (std::exception & e)
+	{
+		spdlog::error("xrEndFrame threw error: {}", e.what());
+	}
+	catch (...)
+	{
+		spdlog::error("xrEndFrame threw error");
+	}
+
+	// for (auto & layer : layers)
+    // {
+    //     if (layer)
+    //     {
+	// 		UnityLib::very_special_layers.push_back(std::move(layer));
+    //         // Store a shared_ptr in persistent_layers to maintain ownership
+    //         // UnityLib::persistent_layers.push_back(std::shared_ptr<XrCompositionLayerBaseHeader>(layer, [](XrCompositionLayerBaseHeader*){}));
+
+    //         // Store the raw pointer in special_layers
+    //         // UnityLib::special_layers.push_back(UnityLib::persistent_layers.back().get());
+	// 		// UnityLib::special_layers.push_back(DeepCopyCompositionLayer(layer));
+	// 		// spdlog::info("Layer []: Type: {}", static_cast<int>(layer->type));
+    //     }
+    // }
+
 #ifdef __ANDROID_LIB__
-	if (UnityLib::layers.empty())
-	{
-		UnityLib::layers = layers;
-	}
-	else
-	{
-		spdlog::error("Rendered before prev frame finished pushing");
-	}
+	// if (UnityLib::rendered_layers.empty())
+	// {
+	// 	UnityLib::rendered_layers = layers;
+	// }
+	// else
+	// {
+	// 	spdlog::error("Rendered before prev frame finished pushing");
+	// }
 
 	// UnityLib::render_mtx2.unlock();
 
@@ -200,16 +279,19 @@ void xr::session::end_frame(XrTime display_time, const std::vector<XrComposition
 	// }
 
 	// std::vector<XrCompositionLayerBaseHeader> result;
+	// UnityLib::g_numLayers = layers.size();
 
-	// for (const auto * ptr: layers)
+	// for (size_t i = 0; i < layers.size(); ++i)
 	// {
-	// 	if (ptr)
-	// 	{                               // Ensure the pointer is valid
-	// 		result.push_back(*ptr); // Dereference and copy
-	// 	}
+	// 	// if (ptr)
+	// 	// {                               // Ensure the pointer is valid
+	// 		// result.push_back(*ptr); // Dereference and copy
+	// 		UnityLib::g_layerStorage[i] = *layers[i];
+	// 	// }
 	// }
 
-	// UnityLib::rendered_layers = result;
+	// UnityLib::special_layers.clear();
+
 #else
 	XrFrameEndInfo end_info{
 	        .type = XR_TYPE_FRAME_END_INFO,

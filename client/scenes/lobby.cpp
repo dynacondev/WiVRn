@@ -115,7 +115,11 @@ scenes::lobby::lobby()
 	if (std::getenv("WIVRN_AUTOCONNECT"))
 		force_autoconnect = true;
 
+#ifdef __ANDROID_LIB__
+	passthrough_supported = xr::system::passthrough_type::no_passthrough;
+#elif defined(__ANDROID__)
 	passthrough_supported = system.passthrough_supported();
+#endif
 
 	auto & servers = application::get_config().servers;
 	spdlog::info("{} known server(s):", servers.size());
@@ -572,7 +576,7 @@ std::optional<glm::vec3> scenes::lobby::check_recenter_gui(glm::vec3 head_positi
 	return std::nullopt;
 }
 
-static std::pair<std::vector<XrCompositionLayerProjectionView>, std::vector<XrCompositionLayerDepthInfoKHR>> render_layer(
+static std::pair<std::vector<std::unique_ptr<XrCompositionLayerProjectionView>>, std::vector<std::unique_ptr<XrCompositionLayerDepthInfoKHR>>> render_layer(
         std::vector<XrView> & views,
         std::vector<xr::swapchain> & color_swapchains,
         std::vector<xr::swapchain> & depth_swapchains,
@@ -583,8 +587,8 @@ static std::pair<std::vector<XrCompositionLayerProjectionView>, std::vector<XrCo
 	std::vector<scene_renderer::frame_info> frames;
 	frames.reserve(views.size());
 
-	std::vector<XrCompositionLayerProjectionView> proj_layer_views;
-	std::vector<XrCompositionLayerDepthInfoKHR> depth_layer_views;
+	std::vector<std::unique_ptr<XrCompositionLayerProjectionView>> proj_layer_views;
+	std::vector<std::unique_ptr<XrCompositionLayerDepthInfoKHR>> depth_layer_views;
 	proj_layer_views.reserve(views.size());
 	depth_layer_views.reserve(views.size());
 
@@ -604,7 +608,7 @@ static std::pair<std::vector<XrCompositionLayerProjectionView>, std::vector<XrCo
 		        .view = view_matrix(view.pose),
 		});
 
-		proj_layer_views.push_back({
+		proj_layer_views.push_back(std::make_unique<XrCompositionLayerProjectionView>(XrCompositionLayerProjectionView{
 		        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
 		        .pose = view.pose,
 		        .fov = view.fov,
@@ -615,9 +619,9 @@ static std::pair<std::vector<XrCompositionLayerProjectionView>, std::vector<XrCo
 		                        .extent = color_swapchain.extent(),
 		                },
 		        },
-		});
+		}));
 
-		depth_layer_views.push_back({
+		depth_layer_views.push_back(std::make_unique<XrCompositionLayerDepthInfoKHR>(XrCompositionLayerDepthInfoKHR{
 		        .type = XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR,
 		        .subImage = {
 		                .swapchain = depth_swapchain,
@@ -630,15 +634,15 @@ static std::pair<std::vector<XrCompositionLayerProjectionView>, std::vector<XrCo
 		        .maxDepth = 1,
 		        .nearZ = std::numeric_limits<float>::infinity(),
 		        .farZ = constants::lobby::near_plane,
-		});
+		}));
 	}
 
 	renderer.render(data, clear_color, frames);
 
-	return {proj_layer_views, depth_layer_views};
+	return {std::move(proj_layer_views), std::move(depth_layer_views)};
 }
 
-static std::vector<XrCompositionLayerProjectionView> render_layer(std::vector<XrView> & views, std::vector<xr::swapchain> & color_swapchains, scene_renderer & renderer, scene_data & data, const std::array<float, 4> & clear_color)
+static std::vector<std::unique_ptr<XrCompositionLayerProjectionView>> render_layer(std::vector<XrView> & views, std::vector<xr::swapchain> & color_swapchains, scene_renderer & renderer, scene_data & data, const std::array<float, 4> & clear_color)
 {
 	std::vector<xr::swapchain> depth_swapchains;
 	depth_swapchains.resize(color_swapchains.size());
@@ -729,20 +733,23 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	if (not frame_state.shouldRender)
 	{
 		session.begin_frame();
-		session.end_frame(frame_state.predictedDisplayTime, {});
+		auto emptySpace = std::make_unique<XrSpace>(nullptr);
+		std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> emptyLayers = {};
+		auto emptyFlags = std::make_unique<std::pair<XrViewStateFlags, std::vector<XrView>>>();
+		session.end_frame(frame_state.predictedDisplayTime, emptyLayers, emptyLayers, std::move(emptySpace), std::move(emptyFlags));
 		return;
 	}
 
 	session.begin_frame();
 
-	XrSpace world_space = application::space(xr::spaces::world);
-	auto [flags, views] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, world_space);
-	assert(views.size() == swapchains_lobby.size());
+	auto world_space = std::make_unique<XrSpace>(application::space(xr::spaces::world));
+	auto flagsViews = std::make_unique<std::pair<XrViewStateFlags, std::vector<XrView>>>(session.locate_views(viewconfig, frame_state.predictedDisplayTime, *world_space.get()));
+	assert(flagsViews.get()->second.size() == swapchains_lobby.size());
 
 	bool hide_left_controller = false;
 	bool hide_right_controller = false;
 
-	std::optional<std::pair<glm::vec3, glm::quat>> head_position = application::locate_controller(application::space(xr::spaces::view), world_space, frame_state.predictedDisplayTime);
+	std::optional<std::pair<glm::vec3, glm::quat>> head_position = application::locate_controller(application::space(xr::spaces::view), *world_space.get(), frame_state.predictedDisplayTime);
 	std::optional<glm::vec3> new_gui_position;
 
 	if (head_position)
@@ -756,7 +763,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		if (left_hand)
 		{
 			auto & hand = application::get_left_hand();
-			auto joints = hand.locate(world_space, frame_state.predictedDisplayTime);
+			auto joints = hand.locate(*world_space.get(), frame_state.predictedDisplayTime);
 			left_hand->apply(joints);
 
 			if (joints and xr::hand_tracker::check_flags(*joints, XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT, 0))
@@ -770,7 +777,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		if (right_hand)
 		{
 			auto & hand = application::get_right_hand();
-			auto joints = hand.locate(world_space, frame_state.predictedDisplayTime);
+			auto joints = hand.locate(*world_space.get(), frame_state.predictedDisplayTime);
 			right_hand->apply(joints);
 
 			if (joints and xr::hand_tracker::check_flags(*joints, XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT, 0))
@@ -790,7 +797,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 		if (hide_left_controller)
 			xyz_axes_left_controller->visible = false;
-		else if (auto location = application::locate_controller(application::space(left), world_space, frame_state.predictedDisplayTime))
+		else if (auto location = application::locate_controller(application::space(left), *world_space.get(), frame_state.predictedDisplayTime))
 		{
 			xyz_axes_left_controller->visible = true;
 			xyz_axes_left_controller->position = location->first;
@@ -801,7 +808,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 		if (hide_right_controller)
 			xyz_axes_right_controller->visible = false;
-		else if (auto location = application::locate_controller(application::space(right), world_space, frame_state.predictedDisplayTime))
+		else if (auto location = application::locate_controller(application::space(right), *world_space.get(), frame_state.predictedDisplayTime))
 		{
 			xyz_axes_right_controller->visible = true;
 			xyz_axes_right_controller->position = location->first;
@@ -822,25 +829,27 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		move_gui(head_position->first, *new_gui_position);
 	}
 
-	std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
+	std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerQuad>>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
 
 	// Get the planes that limit the ray size from the composition layers
 	std::vector<glm::vec4> ray_limits;
 	for (auto & [z_index, layer]: imgui_layers)
 	{
 		if (z_index != constants::lobby::zindex_recenter_tip)
-			ray_limits.push_back(compute_ray_limits(layer.pose));
+			ray_limits.push_back(compute_ray_limits(layer->pose));
 	}
 
-	input->apply(world_space, frame_state.predictedDisplayTime, hide_left_controller, hide_right_controller, ray_limits);
+	input->apply(*world_space.get(), frame_state.predictedDisplayTime, hide_left_controller, hide_right_controller, ray_limits);
 
 	assert(renderer);
 	renderer->start_frame();
 
-	std::vector<XrCompositionLayerProjectionView> lobby_layer_views;
-	std::vector<XrCompositionLayerDepthInfoKHR> lobby_depth_layer_views;
-	std::vector<XrCompositionLayerProjectionView> controllers_layer_views;
-	std::vector<XrCompositionLayerDepthInfoKHR> controllers_depth_layer_views;
+	std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> noDisplayObjects;
+
+	std::vector<std::unique_ptr<XrCompositionLayerProjectionView>> lobby_layer_views;
+	std::vector<std::unique_ptr<XrCompositionLayerDepthInfoKHR>> lobby_depth_layer_views;
+	std::vector<std::unique_ptr<XrCompositionLayerProjectionView>> controllers_layer_views;
+	std::vector<std::unique_ptr<XrCompositionLayerDepthInfoKHR>> controllers_depth_layer_views;
 
 	std::array<float, 4> clear_color;
 
@@ -854,24 +863,24 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	if (composition_layer_depth_test_supported)
 	{
 		std::tie(lobby_layer_views, lobby_depth_layer_views) = render_layer(
-		        views,
+		        flagsViews.get()->second,
 		        swapchains_lobby,
 		        swapchains_lobby_depth,
 		        *renderer,
 		        *lobby_scene,
 		        clear_color);
 		for (auto [color, depth]: std::views::zip(lobby_layer_views, lobby_depth_layer_views))
-			color.next = &depth;
+			color->next = &depth;
 
 		std::tie(controllers_layer_views, controllers_depth_layer_views) = render_layer(
-		        views,
+		        flagsViews.get()->second,
 		        swapchains_controllers,
 		        swapchains_controllers_depth,
 		        *renderer,
 		        *controllers_scene,
 		        {0, 0, 0, 0});
 		for (auto [color, depth]: std::views::zip(controllers_layer_views, controllers_depth_layer_views))
-			color.next = &depth;
+			color->next = &depth;
 
 		renderer->end_frame();
 
@@ -891,14 +900,14 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	else
 	{
 		lobby_layer_views = render_layer(
-		        views,
+		        flagsViews.get()->second,
 		        swapchains_lobby,
 		        *renderer,
 		        *lobby_scene,
 		        clear_color);
 
 		controllers_layer_views = render_layer(
-		        views,
+		        flagsViews.get()->second,
 		        swapchains_controllers,
 		        *renderer,
 		        *controllers_scene,
@@ -914,24 +923,28 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			swapchain.release();
 	}
 
-	XrCompositionLayerProjection lobby_layer{
-	        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
-	        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-	        .space = world_space,
-	        .viewCount = (uint32_t)lobby_layer_views.size(),
-	        .views = lobby_layer_views.data(),
-	};
+	auto lobby_layer =
+	        std::make_unique<XrCompositionLayerProjection>(
+	                XrCompositionLayerProjection{
+	                        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+	                        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+	                        .space = *world_space.get(),
+	                        .viewCount = (uint32_t)lobby_layer_views.size(),
+	                        .views = lobby_layer_views.data()->get(),
+	                });
 
-	XrCompositionLayerProjection controllers_layer{
-	        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
-	        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-	        .space = world_space,
-	        .viewCount = (uint32_t)controllers_layer_views.size(),
-	        .views = controllers_layer_views.data(),
-	};
+	auto controllers_layer =
+	        std::make_unique<XrCompositionLayerProjection>(
+	                XrCompositionLayerProjection{
+	                        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+	                        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+	                        .space = *world_space.get(),
+	                        .viewCount = (uint32_t)controllers_layer_views.size(),
+	                        .views = controllers_layer_views.data()->get(),
+	                });
 
 	XrEnvironmentBlendMode blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	std::vector<std::pair<int, XrCompositionLayerBaseHeader *>> layers_with_z_index;
+	std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerBaseHeader>>> layers_with_z_index;
 
 	if (application::get_config().passthrough_enabled)
 	{
@@ -950,58 +963,77 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 
 	// Dimming settings if a popup window is displayed
-	XrCompositionLayerColorScaleBiasKHR color_scale_bias{
+	auto color_scale_bias = std::make_unique<XrCompositionLayerColorScaleBiasKHR>(XrCompositionLayerColorScaleBiasKHR{
 	        .type = XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR,
 	        .colorScale = constants::lobby::dimming_scale,
 	        .colorBias = constants::lobby::dimming_bias,
-	};
+	});
 
 	// Add XrCompositionLayerDepthTestFB to lobby_layer and imgui_layer
 	// The sky in the lobby layer and the passthrough layer have the same depth, so the operation must be:
 	// - LESS when passthrough is enabled (to avoid overwriting the passthrough)
 	// - LESS_OR_EQUAL when passthrough is disabled (so that the sky is visible)
-	XrCompositionLayerDepthTestFB layer_depth_test{
+	auto layer_depth_test = std::make_unique<XrCompositionLayerDepthTestFB>(XrCompositionLayerDepthTestFB{
 	        .type = XR_TYPE_COMPOSITION_LAYER_DEPTH_TEST_FB,
 	        .next = nullptr,
 	        .depthMask = true,
 	        .compareOp = application::get_config().passthrough_enabled ? XR_COMPARE_OP_LESS_FB : XR_COMPARE_OP_LESS_OR_EQUAL_FB,
-	};
-
-	// if (composition_layer_depth_test_supported or not application::get_config().passthrough_enabled)
-	layers_with_z_index.emplace_back(constants::lobby::zindex_lobby, reinterpret_cast<XrCompositionLayerBaseHeader *>(&lobby_layer));
-
-	for (auto & [z_index, layer]: imgui_layers)
-		layers_with_z_index.emplace_back(z_index, reinterpret_cast<XrCompositionLayerBaseHeader *>(&layer));
-
-	layers_with_z_index.emplace_back(constants::lobby::zindex_controllers, reinterpret_cast<XrCompositionLayerBaseHeader *>(&controllers_layer));
+	});
 
 	if (composition_layer_depth_test_supported)
 	{
-		lobby_layer.next = &layer_depth_test;
+		lobby_layer->next = &layer_depth_test;
 
 		for (auto & [z_index, layer]: imgui_layers)
 		{
 			if (z_index != constants::lobby::zindex_recenter_tip)
-				layer.next = &layer_depth_test;
+				layer->next = &layer_depth_test;
 		}
 
-		controllers_layer.next = &layer_depth_test;
+		controllers_layer->next = &layer_depth_test;
 	}
 
 	if (imgui_ctx->is_modal_popup_shown() and composition_layer_color_scale_bias_supported)
 	{
-		color_scale_bias.next = imgui_layers.front().second.next;
-		imgui_layers.front().second.next = &color_scale_bias;
+		color_scale_bias->next = imgui_layers.front().second->next;
+		imgui_layers.front().second->next = &color_scale_bias;
 	}
+
+	// // if (composition_layer_depth_test_supported or not application::get_config().passthrough_enabled)
+	layers_with_z_index.emplace_back(constants::lobby::zindex_lobby,
+	                                 std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(lobby_layer.release())));
+
+	// for (auto & [z_index, layer]: imgui_layers)
+	// 	layers_with_z_index.emplace_back(z_index, std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(layer.release())));
+
+	// layers_with_z_index.emplace_back(constants::lobby::zindex_controllers,
+	//                                  std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(controllers_layer.release())));
 
 	std::ranges::stable_sort(layers_with_z_index);
 
-	std::vector<XrCompositionLayerBaseHeader *> layers;
+	std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> layers;
 	layers.reserve(layers_with_z_index.size());
 	for (auto & [z_index, layer]: layers_with_z_index)
-		layers.push_back(layer);
+		layers.push_back(std::move(layer));
 
-	session.end_frame(frame_state.predictedDisplayTime, layers, blend_mode);
+	// IMPORTANT - We add these layers to the noDisplayObjects vector so that the raw pointers get wrapped and are passed to the endframe function alive
+	noDisplayObjects.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(color_scale_bias.release())));
+
+	noDisplayObjects.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(layer_depth_test.release())));
+
+	for (auto & view: lobby_layer_views)
+		noDisplayObjects.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(view.release())));
+
+	for (auto & view: lobby_depth_layer_views)
+		noDisplayObjects.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(view.release())));
+
+	for (auto & view: controllers_layer_views)
+		noDisplayObjects.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(view.release())));
+
+	for (auto & view: controllers_depth_layer_views)
+		noDisplayObjects.push_back(std::unique_ptr<XrCompositionLayerBaseHeader>(reinterpret_cast<XrCompositionLayerBaseHeader *>(view.release())));
+
+	session.end_frame(frame_state.predictedDisplayTime, layers, noDisplayObjects, std::move(world_space), std::move(flagsViews), blend_mode);
 }
 
 void scenes::lobby::on_focused()
@@ -1178,7 +1210,9 @@ void scenes::lobby::on_focused()
 	}
 	setup_passthrough();
 	session.set_refresh_rate(application::get_config().preferred_refresh_rate);
+#ifndef __ANDROID_LIB__
 	multicast = application::get_wifi_lock().get_multicast_lock();
+#endif
 }
 
 void scenes::lobby::setup_passthrough()

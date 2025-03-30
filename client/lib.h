@@ -26,6 +26,7 @@ public:
 	static uint64_t g_systemId;
 	static uint64_t g_session;
 
+
 	// JNI related
 	static JNIEnv * jnienv;
 	static AAssetManager * assetManager;
@@ -34,16 +35,30 @@ public:
 	static const XrSessionCreateInfo * sessionCreateInfo;
 	static PFN_xrGetInstanceProcAddr s_xrGetInstanceProcAddr;
 	static std::vector<XrCompositionLayerBaseHeader *> layers;
-	// static std::vector<XrCompositionLayerBaseHeader> rendered_layers;
+	static std::vector<const XrCompositionLayerBaseHeader *> special_layers;
+	static std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> very_special_layers;
+	static std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> noDisplayLayers;
+	static std::unique_ptr<XrSpace> space;
+	static std::unique_ptr<std::pair<XrViewStateFlags, std::vector<XrView>>> flag_views;
+	// std::vector<XrCompositionLayerBaseHeader *> special_layers;
+	static std::vector<std::shared_ptr<XrCompositionLayerBaseHeader>> persistent_layers;
+	static std::vector<XrCompositionLayerBaseHeader> rendered_layers;
 	static XrFrameEndInfo modifiedFrameEndInfo;
 	static PFN_xrEndFrame s_xrEndFrame;
 	static PFN_xrCreateSession s_xrCreateSession;
 	static PFN_xrCreateVulkanInstanceKHR s_xrCreateVulkanInstanceKHR;
 	static PFN_xrWaitFrame s_xrWaitFrame;
 	static XrFrameState * framestate;
+	static XrFrameEndInfo* frameEndinfo;
+	static XrResult result;
+	static XrSession session;
+
+	static XrCompositionLayerBaseHeader g_layerStorage[6];
+	static size_t g_numLayers;
 
 	static std::mutex render_mtx;
 	static std::mutex render_mtx2;
+	static std::mutex special_render_mtx;
 
 	void debugLog(std::string message);
 	void setupOpenXRHooks();

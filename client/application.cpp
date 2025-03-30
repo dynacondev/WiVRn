@@ -1489,7 +1489,7 @@ application::application(application_info info) :
 	spdlog::debug("Config path: {}", config_path.native());
 	spdlog::debug("Cache path: {}", cache_path.native());
 
-#ifndef __ANDROID_LIB__
+// #ifndef __ANDROID_LIB__
 	try
 	{
 		initialize();
@@ -1500,7 +1500,7 @@ application::application(application_info info) :
 		cleanup();
 		throw;
 	}
-#endif
+// #endif
 }
 
 #ifdef __ANDROID_LIB__

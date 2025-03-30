@@ -4,5 +4,6 @@
         "--header-insertion=never",
         "--compile-commands-dir=${workspaceFolder}/.cxx/tools/standardDebug/arm64-v8a/",
         "--query-driver=**"
-    ]
+    ],
+    "cSpell.enabled": false
 }

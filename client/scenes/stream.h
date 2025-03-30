@@ -246,6 +246,6 @@ private:
 	int metrics_offset = 0;
 
 	void accumulate_metrics(XrTime predicted_display_time, const std::vector<std::shared_ptr<wivrn::shard_accumulator::blit_handle>> & blit_handles, const gpu_timestamps & timestamps);
-	std::vector<XrCompositionLayerQuad> plot_performance_metrics(XrTime predicted_display_time);
+	std::vector<std::unique_ptr<XrCompositionLayerQuad>> plot_performance_metrics(XrTime predicted_display_time);
 };
 } // namespace scenes

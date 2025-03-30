@@ -1376,7 +1376,7 @@ static bool is_gui_visible(imgui_context & ctx, XrTime predicted_display_time)
 	return true;
 }
 
-std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTime predicted_display_time)
+std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerQuad>>> scenes::lobby::draw_gui(XrTime predicted_display_time)
 {
 	for (const auto & [key, server]: application::get_config().servers)
 	{

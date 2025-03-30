@@ -879,7 +879,7 @@ void imgui_context::new_frame(XrTime display_time)
 	swapchain.wait();
 }
 
-std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
+std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerQuad>>> imgui_context::end_frame()
 {
 	vk::Image destination = swapchain.images()[image_index].image;
 
@@ -1011,7 +1011,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 
 	swapchain.release();
 
-	std::vector<std::pair<int, XrCompositionLayerQuad>> quads;
+	std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerQuad>>> quads;
 	quads.reserve(layers_.size());
 
 	for (auto & i: layers_)
@@ -1031,41 +1031,42 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 
 		quads.emplace_back(
 		        i.z_index,
-		        XrCompositionLayerQuad{
-		                .type = XR_TYPE_COMPOSITION_LAYER_QUAD,
-		                .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-		                .space = application::space(i.space),
-		                .eyeVisibility = XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
-		                .subImage = {
-		                        .swapchain = swapchain,
-		                        .imageRect = {
-		                                .offset = {
-		                                        .x = i.vp_origin.x,
-		                                        .y = i.vp_origin.y,
+		        std::make_unique<XrCompositionLayerQuad>(
+		                XrCompositionLayerQuad{
+		                        .type = XR_TYPE_COMPOSITION_LAYER_QUAD,
+		                        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+		                        .space = application::space(i.space),
+		                        .eyeVisibility = XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
+		                        .subImage = {
+		                                .swapchain = swapchain,
+		                                .imageRect = {
+		                                        .offset = {
+		                                                .x = i.vp_origin.x,
+		                                                .y = i.vp_origin.y,
+		                                        },
+		                                        .extent = {
+		                                                .width = i.vp_size.x,
+		                                                .height = i.vp_size.y,
+		                                        }},
+		                        },
+		                        .pose = {
+		                                .orientation = {
+		                                        .x = i.orientation.x,
+		                                        .y = i.orientation.y,
+		                                        .z = i.orientation.z,
+		                                        .w = i.orientation.w,
 		                                },
-		                                .extent = {
-		                                        .width = i.vp_size.x,
-		                                        .height = i.vp_size.y,
-		                                }},
-		                },
-		                .pose = {
-		                        .orientation = {
-		                                .x = i.orientation.x,
-		                                .y = i.orientation.y,
-		                                .z = i.orientation.z,
-		                                .w = i.orientation.w,
+		                                .position = {
+		                                        .x = i.position.x,
+		                                        .y = i.position.y,
+		                                        .z = i.position.z,
+		                                },
 		                        },
-		                        .position = {
-		                                .x = i.position.x,
-		                                .y = i.position.y,
-		                                .z = i.position.z,
+		                        .size = {
+		                                .width = i.size.x,
+		                                .height = i.size.y,
 		                        },
-		                },
-		                .size = {
-		                        .width = i.size.x,
-		                        .height = i.size.y,
-		                },
-		        });
+		                }));
 	}
 
 	return quads;

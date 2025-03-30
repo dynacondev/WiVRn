@@ -61,7 +61,7 @@ public:
 
 	XrFrameState wait_frame();
 	void begin_frame();
-	void end_frame(XrTime display_time, const std::vector<XrCompositionLayerBaseHeader *> & layers, XrEnvironmentBlendMode blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
+	void end_frame(XrTime display_time, std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> & layers, std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> & noDisplayLayers, std::unique_ptr<XrSpace> space, std::unique_ptr<std::pair<XrViewStateFlags, std::vector<XrView>>> flagViews, XrEnvironmentBlendMode blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE);
 
 	void begin_session(XrViewConfigurationType view_config);
 	void end_session();
