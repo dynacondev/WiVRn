@@ -20,6 +20,7 @@
 #include "application.h"
 #include "asset.h"
 #include "lib.h"
+#include "lib.h"
 #include "openxr/openxr.h"
 #include "scene.h"
 #include "spdlog/common.h"
@@ -34,12 +35,15 @@
 #include "xr/xr.h"
 #include <algorithm>
 #include <android/asset_manager_jni.h>
+#include <android/asset_manager_jni.h>
 #include <boost/locale.hpp>
 #include <boost/url/parse.hpp>
 #include <chrono>
 #include <cstddef>
+#include <cstddef>
 #include <ctype.h>
 #include <exception>
+#include <spdlog/sinks/android_sink.h>
 #include <spdlog/sinks/android_sink.h>
 #include <string>
 #include <thread>
@@ -647,9 +651,14 @@ std::string parse_driver_sersion(const vk::PhysicalDeviceProperties & p)
 #ifdef __ANDROID_LIB__
 XrResult application::initialize_vulkan(XrInstance xrInstance, const XrVulkanInstanceCreateInfoKHR * vulkanCreateInfo, VkInstance * vulkanInstance, VkResult * vulkanResult)
 #else
+#ifdef __ANDROID_LIB__
+XrResult application::initialize_vulkan(XrInstance xrInstance, const XrVulkanInstanceCreateInfoKHR * vulkanCreateInfo, VkInstance * vulkanInstance, VkResult * vulkanResult)
+#else
 void application::initialize_vulkan()
 #endif
+#endif
 {
+#ifndef __ANDROID_LIB__
 #ifndef __ANDROID_LIB__
 	auto graphics_requirements = xr_system_id.graphics_requirements();
 	XrVersion vulkan_version = std::max(app_info.min_vulkan_version, graphics_requirements.minApiVersionSupported);
@@ -786,6 +795,9 @@ void application::initialize_vulkan2()
 	instance_create_info.setPEnabledLayerNames(layers);
 	instance_create_info.setPEnabledExtensionNames(instance_extensions);
 
+#ifdef __ANDROID_LIB__
+	vk_instance = vk::raii::Instance(vk_context, vulkanBinding->instance);
+#else
 	XrVulkanInstanceCreateInfoKHR create_info{
 	        .type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR,
 	        .systemId = xr_system_id,
@@ -803,7 +815,9 @@ void application::initialize_vulkan2()
 	XrResult xresult = xrCreateVulkanInstanceKHR(xr_instance, &create_info, &tmp, &vresult);
 	CHECK_VK(vresult, "xrCreateVulkanInstanceKHR");
 	CHECK_XR(xresult, "xrCreateVulkanInstanceKHR");
+
 	vk_instance = vk::raii::Instance(vk_context, tmp);
+#endif
 #endif
 
 #ifndef __ANDROID_LIB__
@@ -1105,6 +1119,7 @@ void application::initialize_actions()
 #ifndef __ANDROID_LIB__ // TODO:ATTEMPT3035 Add this back in if needed
 	xr_session.attach_actionsets(action_sets);
 #endif
+#endif
 }
 
 void application::initialize()
@@ -1152,6 +1167,9 @@ void application::initialize()
 		extensions.push_back(i.c_str());
 	}
 
+#ifdef __ANDROID_LIB__
+	xr_instance = xr::instance(app_info.name, extensions);
+#elif defined(__ANDROID__)
 #ifdef __ANDROID_LIB__
 	xr_instance = xr::instance(app_info.name, extensions);
 #elif defined(__ANDROID__)
@@ -1229,9 +1247,14 @@ void application::initialize()
 	initialize_vulkan2();
 	xr_session = xr::session(xr_instance);
 #else
+#ifdef __ANDROID_LIB__
+	// We use Unity's OpenXR + Vulkan configuration and session
+	initialize_vulkan2();
+	xr_session = xr::session(xr_instance);
+#else
 	initialize_vulkan();
-
 	xr_session = xr::session(xr_instance, xr_system_id, vk_instance, vk_physical_device, vk_device, vk_queue_family_index);
+#endif
 #endif
 
 	{
@@ -1272,6 +1295,8 @@ void application::initialize()
 	cmdpool_create_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
 
 	vk_cmdpool = vk::raii::CommandPool{vk_device, cmdpool_create_info};
+
+	// #ifndef __ANDROID_LIB__ // Done within Unity instead
 
 	initialize_actions();
 
@@ -1379,10 +1404,17 @@ void application::set_server_uri(std::string uri)
 }
 
 #ifdef __ANDROID_LIB__
+#ifdef __ANDROID_LIB__
 application::application(application_info info) :
         app_info(std::move(info))
 {}
+{}
 
+void application::create(std::filesystem::path config_path, std::filesystem::path cache_path)
+#else
+application::application(application_info info) :
+        app_info(std::move(info))
+#endif
 void application::create(std::filesystem::path config_path, std::filesystem::path cache_path)
 #else
 application::application(application_info info) :
@@ -1391,6 +1423,9 @@ application::application(application_info info) :
 {
 #ifdef __ANDROID__
 	// https://docs.oracle.com/javase/7/docs/technotes/guides/jni/spec/types.html
+	this->config_path = config_path;
+	this->cache_path = cache_path;
+#ifdef __ANDROID_LIB__
 
 	this->config_path = config_path;
 	this->cache_path = cache_path;
@@ -1399,6 +1434,7 @@ application::application(application_info info) :
 	setup_jni(UnityLib::jnienv);
 #else
 	setup_jni();
+
 
 	{
 		jni::object<""> act(app_info.native_app->activity->clazz);
@@ -1457,7 +1493,11 @@ application::application(application_info info) :
 		}
 	};
 #endif
+#endif
 
+#ifdef __ANDROID_LIB__
+	// TODOAttempt3035 currently no wifi lock due to JNI requirement?
+#elif defined(__ANDROID__)
 #ifdef __ANDROID_LIB__
 	// TODOAttempt3035 currently no wifi lock due to JNI requirement?
 #elif defined(__ANDROID__)
@@ -1509,6 +1549,12 @@ void application::setup_jni(JNIEnv * env)
 	jni::jni_thread::setup_thread(env);
 }
 #elif defined(__ANDROID__)
+#ifdef __ANDROID_LIB__
+void application::setup_jni(JNIEnv * env)
+{
+	jni::jni_thread::setup_thread(env);
+}
+#elif defined(__ANDROID__)
 void application::setup_jni()
 {
 	jni::jni_thread::setup_thread(app_info.native_app->activity->vm);
@@ -1546,6 +1592,16 @@ application::~application()
 	{
 		spdlog::error("Caught unknown exception in application destructor");
 	}
+{
+	try
+	{
+		auto pipeline_cache_bytes = pipeline_cache.getData();
+		utils::write_whole_file(cache_path / "pipeline_cache", pipeline_cache_bytes);
+	}
+	catch (...)
+	{
+		spdlog::error("Caught unknown exception in application destructor");
+	}
 
 	cleanup();
 }
@@ -1567,6 +1623,7 @@ void application::loop()
 		if (scene)
 		{
 			poll_actions();
+
 			if (auto tmp = last_scene.lock(); scene != tmp)
 			{
 				if (tmp)
@@ -1601,7 +1658,17 @@ void application::run()
 
 	setup_jni();
 #endif
+#ifdef __ANDROID_LIB__
 
+	setup_jni(UnityLib::jnienv);
+#else
+
+	setup_jni();
+#endif
+
+#ifndef __ANDROID_LIB__
+
+	std::thread application_thread = utils::named_thread("application_thread", [&]() {
 #ifndef __ANDROID_LIB__
 
 	std::thread application_thread = utils::named_thread("application_thread", [&]() {
@@ -1645,6 +1712,7 @@ void application::run()
 	}
 
 	application_thread.join();
+#endif
 #endif
 }
 #else
@@ -1880,6 +1948,43 @@ void application::poll_events()
 			s->on_xr_event(e);
 	}
 }
+
+#ifdef __ANDROID_LIB__
+AAssetManager * application::asset_manager()
+{
+	if (UnityLib::assetManager == nullptr)
+	{
+		throw std::runtime_error("Asset manager is null");
+	}
+	return UnityLib::assetManager;
+}
+
+void application::run_lib(XrFrameState * framestate)
+{
+	auto scene = current_scene();
+	if (scene)
+	{
+#ifndef __ANDROID_LIB__ // Unity handles actions syncing for now
+		poll_actions();
+#endif
+
+		if (auto tmp = last_scene.lock(); scene != tmp)
+		{
+			if (tmp)
+				tmp->set_focused(false);
+
+			last_scene = scene;
+		}
+		scene->set_focused(true);
+
+		auto t1 = std::chrono::steady_clock::now();
+
+		scene->render(*framestate);
+
+		last_scene_cpu_time = std::chrono::steady_clock::now() - t1;
+	}
+}
+#endif
 
 #ifdef __ANDROID_LIB__
 AAssetManager * application::asset_manager()

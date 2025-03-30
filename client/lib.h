@@ -26,7 +26,6 @@ public:
 	static uint64_t g_systemId;
 	static uint64_t g_session;
 
-
 	// JNI related
 	static JNIEnv * jnienv;
 	static AAssetManager * assetManager;

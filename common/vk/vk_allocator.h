@@ -27,11 +27,31 @@ class vk_allocator : public singleton<vk_allocator>
 	VmaAllocator handle = nullptr;
 
 public:
-	vk_allocator(const VmaAllocatorCreateInfo &);
+	// Constructor
+	explicit vk_allocator(const VmaAllocatorCreateInfo & info);
+
+	// Destructor
 	~vk_allocator();
 
-	operator VmaAllocator()
+	// Deleted copy constructor and assignment operator
+	vk_allocator(const vk_allocator &) = delete;
+	vk_allocator & operator=(const vk_allocator &) = delete;
+
+	// Move constructor
+	vk_allocator(vk_allocator && other) noexcept;
+
+	// Move assignment operator
+	vk_allocator & operator=(vk_allocator && other) noexcept;
+
+	// Conversion operator to VmaAllocator
+	operator VmaAllocator() const
 	{
 		return handle;
+	}
+
+	// Utility function to check if the allocator is valid
+	bool is_valid() const
+	{
+		return handle != nullptr;
 	}
 };

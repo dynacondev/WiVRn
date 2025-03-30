@@ -20,6 +20,7 @@
 #include "instance.h"
 
 #include "lib.h"
+#include "lib.h"
 #include "xr.h"
 #include "xr/details/enumerate.h"
 #include <cassert>
@@ -42,12 +43,17 @@ static XrBool32 debug_callback(
 	return XR_FALSE;
 }
 #endif
+#endif
 
 #if defined(XR_USE_PLATFORM_ANDROID)
 #ifdef __ANDROID_LIB__
 xr::instance::instance(std::string_view application_name, std::vector<const char *> extensions)
 #else
+#ifdef __ANDROID_LIB__
+xr::instance::instance(std::string_view application_name, std::vector<const char *> extensions)
+#else
 xr::instance::instance(std::string_view application_name, void * applicationVM, void * applicationActivity, std::vector<const char *> extensions)
+#endif
 #endif
 #else
 xr::instance::instance(std::string_view application_name, std::vector<const char *> extensions)
@@ -76,6 +82,7 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 
 #ifndef __ANDROID_LIB__ // Not required if Unity has already initialised it
 	// This must be called before the instance is created
+#ifndef __ANDROID_LIB__ // Not required if Unity has already initialised it
 	PFN_xrInitializeLoaderKHR initializeLoader = nullptr;
 	if (XR_SUCCEEDED(xrGetInstanceProcAddr(XR_NULL_HANDLE, "xrInitializeLoaderKHR", (PFN_xrVoidFunction *)(&initializeLoader))))
 	{
@@ -86,6 +93,7 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 		};
 		initializeLoader((const XrLoaderInitInfoBaseHeaderKHR *)&loaderInitInfoAndroid);
 	}
+#endif
 #endif
 #endif
 
@@ -144,21 +152,25 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 	strncpy(create_info.applicationInfo.applicationName, application_name.data(), sizeof(create_info.applicationInfo.applicationName) - 1);
 
 #ifndef __ANDROID_LIB__
+#ifndef __ANDROID_LIB__
 #if defined(XR_USE_PLATFORM_ANDROID)
 	XrInstanceCreateInfoAndroidKHR instanceCreateInfoAndroid{
 	        .type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR,
 	        .applicationVM = applicationVM,
 	        .applicationActivity = applicationActivity,
 	};
+
 	create_info.next = &instanceCreateInfoAndroid;
 #endif
 
 	CHECK_XR(xrCreateInstance(&create_info, &id));
 #endif
+#endif
 	assert(id != XR_NULL_HANDLE);
 
 	if (debug_utils_found)
 	{
+#ifndef __ANDROID_LIB__
 #ifndef __ANDROID_LIB__
 		XrDebugUtilsMessengerCreateInfoEXT debug_messenger_info{
 		        .type = XR_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
@@ -168,6 +180,7 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 		auto xrCreateDebugUtilsMessengerEXT = get_proc<PFN_xrCreateDebugUtilsMessengerEXT>("xrCreateDebugUtilsMessengerEXT");
 		XrDebugUtilsMessengerEXT messenger;
 		CHECK_XR(xrCreateDebugUtilsMessengerEXT(id, &debug_messenger_info, &messenger));
+#endif
 #endif
 	}
 
@@ -182,6 +195,8 @@ xr::instance::instance(std::string_view application_name, std::vector<const char
 
 	runtime_version = to_string(prop.runtimeVersion);
 	runtime_name = prop.runtimeName;
+
+	spdlog::info("OpenXR Runtime: {}, Version: {}", runtime_name, runtime_version);
 }
 
 std::string xr::instance::path_to_string(XrPath path)

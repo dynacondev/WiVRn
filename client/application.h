@@ -90,7 +90,14 @@ public:
 
 private:
 #else
+#ifdef __ANDROID_LIB__
+public:
+	XrResult initialize_vulkan(XrInstance xrInstance, const XrVulkanInstanceCreateInfoKHR * vulkanCreateInfo, VkInstance * vulkanInstance, VkResult * vulkanResult);
+
+private:
+#else
 	void initialize_vulkan();
+#endif
 #endif
 
 	void log_views();
@@ -149,6 +156,7 @@ private:
 	std::vector<std::string> xr_extensions;
 	std::vector<const char *> vk_device_extensions;
 	std::unordered_set<std::string_view> optional_device_extensions{};
+	std::unordered_set<std::string_view> optional_device_extensions{};
 	std::atomic<bool> exit_requested = false;
 	std::filesystem::path config_path;
 	std::filesystem::path cache_path;
@@ -197,6 +205,7 @@ private:
 
 public:
 	using singleton<application>::instance;
+
 	application(application_info info);
 
 	application(const application &) = delete;

@@ -18,15 +18,47 @@
  */
 
 #include "vk_allocator.h"
-#include "vk/check.h"
+#include "vk/check.h" // Assuming CHECK_VK is defined for error checking
 
+// Constructor
 vk_allocator::vk_allocator(const VmaAllocatorCreateInfo & info)
 {
 	CHECK_VK(vmaCreateAllocator(&info, &handle));
+	if (!handle)
+	{
+		throw std::runtime_error("Failed to create Vulkan memory allocator");
+	}
 }
 
+// Destructor
 vk_allocator::~vk_allocator()
 {
 	if (handle)
+	{
 		vmaDestroyAllocator(handle);
+		handle = nullptr;
+	}
+}
+
+// Move constructor
+vk_allocator::vk_allocator(vk_allocator && other) noexcept
+        :
+        handle(other.handle)
+{
+	other.handle = nullptr;
+}
+
+// Move assignment operator
+vk_allocator & vk_allocator::operator=(vk_allocator && other) noexcept
+{
+	if (this != &other)
+	{
+		if (handle)
+		{
+			vmaDestroyAllocator(handle);
+		}
+		handle = other.handle;
+		other.handle = nullptr;
+	}
+	return *this;
 }

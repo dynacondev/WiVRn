@@ -37,6 +37,13 @@ xr::session::session(xr::instance & inst) :
 	id = reinterpret_cast<XrSession>(UnityLib::g_session);
 }
 #else
+#ifdef __ANDROID_LIB__
+xr::session::session(xr::instance & inst) :
+        inst(&inst)
+{
+	id = reinterpret_cast<XrSession>(UnityLib::g_session);
+}
+#else
 xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance & vk_inst, vk::raii::PhysicalDevice & pdev, vk::raii::Device & dev, int queue_family_index) :
         inst(&inst)
 {
@@ -58,6 +65,7 @@ xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance &
 
 	CHECK_XR(xrCreateSession(inst, &session_info, &id));
 }
+#endif
 #endif
 
 std::vector<XrReferenceSpaceType> xr::session::get_reference_spaces() const
@@ -177,6 +185,7 @@ void xr::session::begin_frame()
 #ifndef __ANDROID_LIB__
 	// WIVRN becomes the slave and responds to already begun frames if built as a library
 	CHECK_XR(xrBeginFrame(id, &begin_info));
+#endif
 #endif
 }
 
@@ -302,6 +311,7 @@ void xr::session::end_frame(XrTime display_time, std::vector<std::unique_ptr<XrC
 	};
 
 	CHECK_XR(xrEndFrame(id, &end_info));
+#endif
 #endif
 }
 

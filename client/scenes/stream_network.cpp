@@ -23,6 +23,7 @@
 #include "lib.h"
 #include "utils/named_thread.h"
 #include <spdlog/spdlog.h>
+#include "lib.h"
 
 void scenes::stream::process_packets()
 {

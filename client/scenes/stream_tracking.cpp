@@ -173,7 +173,7 @@ static T & from_pool(std::vector<T> & container, std::vector<T> & pool)
 void scenes::stream::tracking()
 {
 #ifdef __ANDROID__
-	// Runtime may use JNI and needs the thread to be attached
+// Runtime may use JNI and needs the thread to be attached
 #ifdef __ANDROID_LIB__
 	application::instance().setup_jni(UnityLib::jnienv);
 #else

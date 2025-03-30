@@ -742,13 +742,27 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	session.begin_frame();
 
+	static XrSpace world_space;
+	world_space = application::space(xr::spaces::world);
+	auto [flagsx, viewsx] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, world_space);
+	// static unsigned long flags;
+	// flags = flagsx;
+	static std::vector<XrView> views;
+	views = viewsx;
+
+	assert(views.size() == swapchains_lobby.size());
 	auto world_space = std::make_unique<XrSpace>(application::space(xr::spaces::world));
 	auto flagsViews = std::make_unique<std::pair<XrViewStateFlags, std::vector<XrView>>>(session.locate_views(viewconfig, frame_state.predictedDisplayTime, *world_space.get()));
 	assert(flagsViews.get()->second.size() == swapchains_lobby.size());
 
-	bool hide_left_controller = false;
-	bool hide_right_controller = false;
+	static bool hide_left_controller;
+	hide_left_controller = false;
+	static bool hide_right_controller;
+	hide_right_controller = false;
 
+	static std::optional<std::pair<glm::vec3, glm::quat>> head_position;
+	head_position = application::locate_controller(application::space(xr::spaces::view), world_space, frame_state.predictedDisplayTime);
+	static std::optional<glm::vec3> new_gui_position;
 	std::optional<std::pair<glm::vec3, glm::quat>> head_position = application::locate_controller(application::space(xr::spaces::view), *world_space.get(), frame_state.predictedDisplayTime);
 	std::optional<glm::vec3> new_gui_position;
 
@@ -829,6 +843,12 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		move_gui(head_position->first, *new_gui_position);
 	}
 
+#ifdef __ANDROID_LIB__
+	static std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_layers;
+	imgui_layers = draw_gui(frame_state.predictedDisplayTime);
+#else
+	std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
+#endif
 	std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerQuad>>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
 
 	// Get the planes that limit the ray size from the composition layers
@@ -844,6 +864,10 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	assert(renderer);
 	renderer->start_frame();
 
+	static std::vector<XrCompositionLayerProjectionView> lobby_layer_views;
+	static std::vector<XrCompositionLayerDepthInfoKHR> lobby_depth_layer_views;
+	static std::vector<XrCompositionLayerProjectionView> controllers_layer_views;
+	static std::vector<XrCompositionLayerDepthInfoKHR> controllers_depth_layer_views;
 	std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> noDisplayObjects;
 
 	std::vector<std::unique_ptr<XrCompositionLayerProjectionView>> lobby_layer_views;
@@ -851,7 +875,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	std::vector<std::unique_ptr<XrCompositionLayerProjectionView>> controllers_layer_views;
 	std::vector<std::unique_ptr<XrCompositionLayerDepthInfoKHR>> controllers_depth_layer_views;
 
-	std::array<float, 4> clear_color;
+	static std::array<float, 4> clear_color;
 
 	lobby_handle->visible = not application::get_config().passthrough_enabled;
 
@@ -923,6 +947,19 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			swapchain.release();
 	}
 
+#ifdef __ANDROID_LIB__
+	static XrCompositionLayerProjection lobby_layer;
+	lobby_layer =
+#else
+	XrCompositionLayerProjection lobby_layer
+#endif
+	        {
+	                .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+	                .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+	                .space = world_space,
+	                .viewCount = (uint32_t)lobby_layer_views.size(),
+	                .views = lobby_layer_views.data(),
+	        };
 	auto lobby_layer =
 	        std::make_unique<XrCompositionLayerProjection>(
 	                XrCompositionLayerProjection{
@@ -933,6 +970,19 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	                        .views = lobby_layer_views.data()->get(),
 	                });
 
+#ifdef __ANDROID_LIB__
+	static XrCompositionLayerProjection controllers_layer;
+	controllers_layer =
+#else
+	XrCompositionLayerProjection controllers_layer
+#endif
+	        {
+	                .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+	                .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+	                .space = world_space,
+	                .viewCount = (uint32_t)controllers_layer_views.size(),
+	                .views = controllers_layer_views.data(),
+	        };
 	auto controllers_layer =
 	        std::make_unique<XrCompositionLayerProjection>(
 	                XrCompositionLayerProjection{
@@ -944,6 +994,12 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	                });
 
 	XrEnvironmentBlendMode blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+#ifdef __ANDROID_LIB__
+	static std::vector<std::pair<int, XrCompositionLayerBaseHeader *>> layers_with_z_index;
+	layers_with_z_index.clear();
+#else
+	std::vector<std::pair<int, XrCompositionLayerBaseHeader *>> layers_with_z_index;
+#endif
 	std::vector<std::pair<int, std::unique_ptr<XrCompositionLayerBaseHeader>>> layers_with_z_index;
 
 	if (application::get_config().passthrough_enabled)
@@ -963,6 +1019,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 
 	// Dimming settings if a popup window is displayed
+	static XrCompositionLayerColorScaleBiasKHR color_scale_bias{
 	auto color_scale_bias = std::make_unique<XrCompositionLayerColorScaleBiasKHR>(XrCompositionLayerColorScaleBiasKHR{
 	        .type = XR_TYPE_COMPOSITION_LAYER_COLOR_SCALE_BIAS_KHR,
 	        .colorScale = constants::lobby::dimming_scale,
@@ -973,6 +1030,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	// The sky in the lobby layer and the passthrough layer have the same depth, so the operation must be:
 	// - LESS when passthrough is enabled (to avoid overwriting the passthrough)
 	// - LESS_OR_EQUAL when passthrough is disabled (so that the sky is visible)
+	static XrCompositionLayerDepthTestFB layer_depth_test{
 	auto layer_depth_test = std::make_unique<XrCompositionLayerDepthTestFB>(XrCompositionLayerDepthTestFB{
 	        .type = XR_TYPE_COMPOSITION_LAYER_DEPTH_TEST_FB,
 	        .next = nullptr,
@@ -1011,6 +1069,12 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	std::ranges::stable_sort(layers_with_z_index);
 
+#ifdef __ANDROID_LIB__
+	static std::vector<XrCompositionLayerBaseHeader *> layers;
+	layers.clear();
+#else
+	std::vector<XrCompositionLayerBaseHeader *> layers;
+#endif
 	std::vector<std::unique_ptr<XrCompositionLayerBaseHeader>> layers;
 	layers.reserve(layers_with_z_index.size());
 	for (auto & [z_index, layer]: layers_with_z_index)
@@ -1209,9 +1273,11 @@ void scenes::lobby::on_focused()
 		about_picture = imgui_ctx->load_texture("wivrn.png");
 	}
 	setup_passthrough();
+#ifndef __ANDROID_LIB__
 	session.set_refresh_rate(application::get_config().preferred_refresh_rate);
 #ifndef __ANDROID_LIB__
 	multicast = application::get_wifi_lock().get_multicast_lock();
+#endif
 #endif
 }
 

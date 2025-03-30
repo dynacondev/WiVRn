@@ -1,5 +1,7 @@
 def buildAsLibrary = project.hasProperty('buildTarget') && project.buildTarget == 'library'
 
+def buildAsLibrary = project.hasProperty('buildTarget') && project.buildTarget == 'library'
+
 buildscript {
     repositories {
         google()
@@ -17,6 +19,7 @@ allprojects {
   }
 }
 
+apply plugin: buildAsLibrary ? 'com.android.library' : 'com.android.application'
 apply plugin: buildAsLibrary ? 'com.android.library' : 'com.android.application'
 
 task "generatePngs"() {
@@ -64,6 +67,9 @@ android {
     }
 
     defaultConfig {
+        if (!buildAsLibrary) {
+            applicationId "org.meumeu.wivrn"
+        }
         if (!buildAsLibrary) {
             applicationId "org.meumeu.wivrn"
         }
@@ -130,6 +136,9 @@ android {
             if (!buildAsLibrary) {
                 applicationIdSuffix = project.hasProperty('suffix') ? suffix: ".local"
             }
+            if (!buildAsLibrary) {
+                applicationIdSuffix = project.hasProperty('suffix') ? suffix: ".local"
+            }
         }
 
         releaseDebuggable {
@@ -137,17 +146,20 @@ android {
             debuggable true
 
             // Uncomment to have debug symbols
-//             packagingOptions {
-//                 doNotStrip "*/arm64-v8a/*.so"
-//                 doNotStrip "*/armeabi-v7a/*.so"
-//                 doNotStrip "*/x86/*.so"
-//                 doNotStrip "*/x86_64/*.so"
-//             }
+            // packagingOptions {
+            //     doNotStrip "*/arm64-v8a/*.so"
+            //     doNotStrip "*/armeabi-v7a/*.so"
+            //     doNotStrip "*/x86/*.so"
+            //     doNotStrip "*/x86_64/*.so"
+            // }
         }
 
         oculus
         {
             initWith release
+            if (!buildAsLibrary) {
+                applicationIdSuffix = project.hasProperty('suffix') ? suffix: ""
+            }
             if (!buildAsLibrary) {
                 applicationIdSuffix = project.hasProperty('suffix') ? suffix: ""
             }
@@ -158,7 +170,15 @@ android {
             if (!buildAsLibrary) {
                 applicationIdSuffix = project.hasProperty('suffix') ? suffix: ".local"
             }
+            if (!buildAsLibrary) {
+                applicationIdSuffix = project.hasProperty('suffix') ? suffix: ".local"
+            }
             manifestPlaceholders.ComOculusSupportedDevices = "all"
+            externalNativeBuild {
+                cmake {
+                    arguments "-DCMAKE_BUILD_TYPE=Debug"
+                }
+            }
             externalNativeBuild {
                 cmake {
                     arguments "-DCMAKE_BUILD_TYPE=Debug"
@@ -196,6 +216,11 @@ android {
             } else {
                 manifest.srcFile 'AndroidManifest.xml'
             }
+            if (buildAsLibrary) {
+                manifest.srcFile 'library/AndroidManifest-lib.xml'
+            } else {
+                manifest.srcFile 'AndroidManifest.xml'
+            }
             java.srcDirs = ['client/java']
             res.srcDirs = [ 'resources', layout.buildDirectory.dir('generated_resources') ]
 
@@ -222,6 +247,16 @@ android {
             // It probably works with merge${variant.name.capitalize()}Assets too
             tasks["generate${variant.name.capitalize()}Assets"].dependsOn "externalNativeBuild${variant.name.capitalize()}"
         }
+    if (buildAsLibrary) {
+        libraryVariants.all { variant ->
+            // It probably works with merge${variant.name.capitalize()}Assets too
+            tasks["generate${variant.name.capitalize()}Assets"].dependsOn "externalNativeBuild${variant.name.capitalize()}"
+        }
+    } else {
+        applicationVariants.all { variant ->
+            // It probably works with merge${variant.name.capitalize()}Assets too
+            tasks["generate${variant.name.capitalize()}Assets"].dependsOn "externalNativeBuild${variant.name.capitalize()}"
+        }
     }
 
     productFlavors.all { variant ->
@@ -234,6 +269,14 @@ android {
         externalNativeBuild{
             cmake {
                 arguments '-DCMAKE_ANDROID_ASSETS_DIRECTORIES=' + layout.buildDirectory.dir("assets${variant.name.capitalize()}").get().asFile
+            }
+        }
+    }
+
+    if (buildAsLibrary) {
+        packaging {
+            jniLibs {
+                exclude "lib/arm64-v8a/libopenxr_loader.so" // Avoid collision when Unity includes the same .so
             }
         }
     }

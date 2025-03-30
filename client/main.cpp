@@ -54,8 +54,6 @@ void real_main()
 
 		application app(info);
 		app.push_scene<scenes::lobby>();
-
-		app.run();
 	}
 	catch (std::exception & e)
 	{

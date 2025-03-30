@@ -39,6 +39,7 @@ class wifi_lock : public std::enable_shared_from_this<wifi_lock>
 	std::weak_ptr<void> multicast_weak;
 	std::weak_ptr<void> wifi_weak;
 
+#ifndef __ANDROID_LIB__
 public:
 #ifndef __ANDROID_LIB__
 public:

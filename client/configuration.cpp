@@ -190,15 +190,11 @@ configuration::configuration(xr::system & system)
 			resolution_scale = val.get_double();
 
 		if (auto val = root["passthrough_enabled"]; val.is_bool())
-#ifdef __ANDROID_LIB__ //TODO:Attempt3035 instead just set passthrough support to false at the root if built as a lib
+#ifdef __ANDROID_LIB__
 			passthrough_enabled = false;
 #else
 			passthrough_enabled = val.get_bool();
 #endif
-
-		if (auto val = root["mic_unprocessed_audio"]; val.is_bool())
-			mic_unprocessed_audio = val.get_bool();
-
 		if (auto val = root["virtual_keyboard_layout"]; val.is_string())
 			virtual_keyboard_layout = val.get_string().value();
 

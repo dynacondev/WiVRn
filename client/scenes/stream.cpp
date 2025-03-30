@@ -342,6 +342,9 @@ void scenes::stream::on_focused()
 		plots_toggle_2 = get_action("plots_toggle_2").first;
 	}
 
+	#ifndef __ANDROID_LIB__
+	wifi = application::get_wifi_lock().get_wifi_lock();
+	#endif
 	assert(video_stream_description);
 	setup_reprojection_swapchain();
 }
