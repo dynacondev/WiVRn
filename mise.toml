@@ -1,0 +1,44 @@
+# * Backend Priority Order: Core, Aqua, Github, Package Manager (cargo, npm, pipx, conda, ubi)
+
+[env]
+ANDROID_BUILD_TOOLS = "36.0.0"                                  # Should match build tools version flutter uses
+ANDROID_SYSTEM_IMAGE = "android-36;google_apis_ps16k;arm64-v8a" # Image to use for android emulator
+GRADLE_OPTS = "--enable-native-access=ALL-UNNAMED"              # Don't warn about accessing native built binaries outside of JVM
+
+[tools]
+#* Main
+"core:java" = ["temurin-17.0.17+10"]           # 17 for Android client (Gradle 8.13 + docs jdk17-openjdk)
+"aqua:Kitware/CMake" = "4.4.3"                 # Used for Linux builds, also covers Arch cmake dep
+"aqua:ninja-build/ninja" = "1.13.2"            # Used for Linux builds
+"vfox:mise-plugins/vfox-android-sdk" = "23.0"  # Used for aquiring android sdk tools, which install the sdk using the mise postinstall script
+"buildit:clang" = { version = "23.1.1", clang_extras = true }                                         # mise-lint: disable Used for Linux & Windows builds and clangd vscode plugin
+
+#* Android client build deps (Arch: git pkgconf glslang cmake jdk17-openjdk librsvg cli11 ktx-software-bin, see docs/building.md)
+"github:KhronosGroup/glslang" = "16.6.0"       # glslangValidator for shaders (Arch glslang)
+"conda:git" = "2.56.0"                         # Arch git (find_package(Git) for version stamping)
+"conda:pkgconf" = "3.0.7"                      # Arch pkgconf (find_package(PkgConfig REQUIRED); note: provides pkgconf only, pkg-config comes from system brew/apt)
+"conda:librsvg" = "2.62.4"                     # Arch librsvg (provides rsvg-convert for SVG rasterization + Gradle generatePngs)
+"conda:cli11" = "2.7.2"                        # Arch cli11 (header-only, not needed for client-only but required for server/wivrnctl)
+"aqua:KhronosGroup/KTX-Software" = { version = "4.4.2", os = ["linux"] } # Arch ktx-software-bin (ktx CLI for GenerateAssets.cmake); linux-only via mise, macOS needs manual KTX-Software-4.4.2-Darwin-arm64.pkg install from GitHub releases
+
+[plugins] # Used to provide llvm & other tools which must be locally compiled from source
+"vfox-backend:buildit" = "https://github.com/Quasiflo/buildit#v0.1.0"
+
+[hooks]
+postinstall = """
+#!/usr/bin/env bash
+#* Installs required Android SDK components. Uses various envs set earlier in this file
+set -e
+
+echo "--> Installing Android SDK components inside mise tool directory..."
+android sdk install \
+  "build-tools;${ANDROID_BUILD_TOOLS}" \
+  "platform-tools" \
+  "system-images;${ANDROID_SYSTEM_IMAGE}" \
+  "cmake;3.31.5" \
+  "tools"
+
+# build-tools gets auto-installed by flutter but must be installed first to discover the emulated device. Ensure version matches what flutter expects to avoid downloading two versions!
+# "platforms;android-${ANDROID_COMPILE_SDK}" isn't needed as Flutter downloads the correct SDK
+# "ndk;${ANDROID_NDK_VERSION}" isn't needed as Flutter downloads the correct NDK
+"""
