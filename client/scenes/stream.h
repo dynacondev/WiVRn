@@ -33,11 +33,13 @@
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
 #include "xr/space.h"
+#include <filesystem>
 #include <mutex>
 #include <optional>
 #include <queue>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vulkan/vulkan_core.h>
 
 namespace scenes
@@ -204,6 +206,19 @@ private:
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
 
+	// Fiducial-anchored passthrough meshes (ROADMAP.md Phase 1).
+	// Latest map from the server; model files cached under
+	// application::get_config_path() / "fiducial_models" / <hash>.glb.
+	thread_safe<std::vector<to_headset::fiducial_map_entry>> fiducial_entries;
+	struct fiducial_download
+	{
+		uint32_t chunk_count = 0;
+		std::unordered_map<uint32_t, std::vector<std::byte>> chunks;
+	};
+	// Guarded by network thread only (all handlers run there)
+	std::unordered_map<std::string, fiducial_download> fiducial_downloads;
+	static std::filesystem::path fiducial_model_path(const std::string & hash);
+
 	stream(std::string server_name, scene & parent_scene);
 
 	bool forward_hid_input(from_headset::hid::input_t, bool device_enabled);
@@ -246,6 +261,8 @@ public:
 	void operator()(to_headset::application_list &&);
 	void operator()(to_headset::application_icon &&);
 	void operator()(to_headset::running_applications &&);
+	void operator()(to_headset::fiducial_map &&);
+	void operator()(to_headset::fiducial_model_chunk &&);
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);

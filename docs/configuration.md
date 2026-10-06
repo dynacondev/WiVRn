@@ -182,3 +182,42 @@ Change the TCP/UDP port used for the connection.
 Default value: unset
 
 If set, overrides the name displayed in the server list.
+
+## `fiducial-map`
+Default value: unset (feature disabled)
+
+Maps AprilTag 36h11 fiducials to glTF/GLB models for Quest passthrough mesh
+anchoring (see `ROADMAP.md`). The server reads each model file, sends the
+mapping plus content hashes to the headset on connect, and serves model bytes
+on demand. The headset caches models by hash, so files are transferred once.
+
+Each entry has:
+
+- `marker-id`: AprilTag 36h11 marker ID (integer, required)
+- `marker-size-m`: physical marker size in meters (required for pose scale)
+- `model-path`: path to a `.glb`/`.gltf` file on the server (optional, models
+  larger than 64MB are skipped)
+- `position`: `[x, y, z]` marker-to-mesh offset in meters (default `[0,0,0]`)
+- `orientation`: `[x, y, z, w]` marker-to-mesh rotation quaternion (default
+  `[0,0,0,1]`)
+- `scale`: uniform marker-to-mesh scale, number or single-element array
+  (default `1`)
+
+The mesh pose on the headset is
+`meshClientPose = observedMarkerPose * markerToMeshOffset`.
+
+### Example
+```json
+{
+	"fiducial-map": [
+		{
+			"marker-id": 42,
+			"marker-size-m": 0.08,
+			"model-path": "/usr/share/wivrn/meshes/widget.glb",
+			"position": [0, 0.05, 0.1],
+			"orientation": [0, 0, 0, 1],
+			"scale": 1.0
+		}
+	]
+}
+```

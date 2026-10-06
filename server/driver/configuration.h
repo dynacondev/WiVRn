@@ -55,6 +55,20 @@ struct configuration
 	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;
+
+	// Fiducial-anchored passthrough meshes (Quest only, see ROADMAP.md).
+	// Maps an AprilTag 36h11 marker to a glB model + marker-to-mesh offset.
+	struct fiducial_entry
+	{
+		int32_t marker_id = 0;
+		float marker_size_m = 0;
+		std::string model_path;
+		std::array<float, 3> position = {0, 0, 0};
+		std::array<float, 4> orientation = {0, 0, 0, 1};
+		float scale = 1;
+	};
+	std::vector<fiducial_entry> fiducial_map;
+
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;

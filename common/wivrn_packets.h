@@ -718,6 +718,13 @@ struct stop_application
 	uint32_t id;
 };
 
+struct fiducial_model_request
+{
+	// Content hash from to_headset::fiducial_map, hex string.
+	// Sent by the client for each model missing from its local cache.
+	std::string model_hash;
+};
+
 // when changing this, also make sure there are handlers in wivrn_session, etc. or compilation will fail
 using packets = std::variant<
         crypto_handshake,
@@ -747,6 +754,7 @@ using packets = std::variant<
         get_application_list,
         start_app,
         get_running_applications,
+        fiducial_model_request,
         set_active_application,
         hid::input,
         stop_application>;
@@ -963,6 +971,40 @@ struct running_applications
 	std::vector<application> applications;
 };
 
+// Fiducial-anchored passthrough mesh (Quest only, see ROADMAP.md Phase 1).
+// The server is authoritative for the mapping; models are pushed on demand
+// and cached client-side by content hash.
+struct fiducial_map_entry
+{
+	// AprilTag 36h11 marker ID
+	int32_t marker_id;
+	// Physical marker size in meters (needed for pose scale)
+	float marker_size_m;
+	// Hex content hash of the glB model, empty when no model is configured
+	std::string model_hash;
+	// Full model size in bytes (client pre-allocates reassembly buffer)
+	uint64_t model_size;
+	// Marker-to-mesh offset: meshClientPose = observedMarkerPose * offset.
+	// Position in meters, orientation as xyzw quaternion, uniform scale.
+	std::array<float, 3> position;
+	std::array<float, 4> orientation;
+	float scale;
+};
+
+struct fiducial_map
+{
+	std::vector<fiducial_map_entry> entries;
+};
+
+struct fiducial_model_chunk
+{
+	std::string model_hash;
+	uint32_t chunk_index;
+	uint32_t chunk_count;
+	// Raw glB bytes for this chunk (chunk size capped server-side)
+	std::vector<std::byte> data;
+};
+
 using packets = std::variant<
         crypto_handshake,
         pin_check_2,
@@ -981,7 +1023,9 @@ using packets = std::variant<
         stream_tab_change,
         application_list,
         application_icon,
-        running_applications>;
+        running_applications,
+        fiducial_map,
+        fiducial_model_chunk>;
 } // namespace to_headset
 } // namespace wivrn
 

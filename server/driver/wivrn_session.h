@@ -186,6 +186,7 @@ public:
 	void operator()(from_headset::get_application_list &&);
 	void operator()(const from_headset::start_app &);
 	void operator()(const from_headset::get_running_applications &);
+	void operator()(from_headset::fiducial_model_request &&);
 	void operator()(const from_headset::set_active_application &);
 	void operator()(const from_headset::stop_application &);
 	void operator()(audio_data &&);
@@ -241,6 +242,9 @@ private:
 
 	// nullopt for id stops all apps
 	void stop_application(std::optional<uint32_t> id, int64_t timeout_ns);
+
+	// Sends to_headset::fiducial_map from configuration().fiducial_map (ROADMAP.md Phase 1)
+	void send_fiducial_map();
 
 	void update_client_states(bool visible, bool focused);
 	void poll_session_loss();

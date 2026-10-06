@@ -189,6 +189,32 @@ configuration::configuration()
 			}
 		}
 
+		if (auto it = json.find("fiducial-map"); it != json.end())
+		{
+			for (const auto & item: *it)
+			{
+				fiducial_entry e;
+				if (item.contains("marker-id"))
+					e.marker_id = item["marker-id"];
+				if (item.contains("marker-size-m"))
+					e.marker_size_m = item["marker-size-m"];
+				if (item.contains("model-path"))
+					e.model_path = item["model-path"];
+				if (item.contains("position"))
+					e.position = item["position"];
+				if (item.contains("orientation"))
+					e.orientation = item["orientation"];
+				if (item.contains("scale"))
+				{
+					if (item["scale"].is_number())
+						e.scale = item["scale"];
+					else if (item["scale"].is_array() and item["scale"].size() > 0)
+						e.scale = item["scale"].at(0);
+				}
+				fiducial_map.push_back(std::move(e));
+			}
+		}
+
 		// Gates the uinput mirror of forwarded input devices. The OpenXR gamepad needs no
 		// permission, so it is always exposed.
 		if (auto it = json.find("hid-forwarding"); it != json.end())

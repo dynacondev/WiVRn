@@ -54,8 +54,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <magic_enum.hpp>
 #include <multi/comp_multi_interface.h>
+#include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string.h>
 #include <utility>
@@ -463,6 +468,8 @@ void wivrn_session::resume_session()
 	        .country = get_info().country,
 	        .variant = get_info().variant,
 	});
+
+	send_fiducial_map();
 
 	// resume session and notify clients
 
@@ -935,6 +942,118 @@ void wivrn_session::operator()(from_headset::get_application_list && request)
 void wivrn_session::operator()(const from_headset::start_app & request)
 {
 	send_to_main(request);
+}
+
+// Fiducial-anchored passthrough meshes (Quest only, see ROADMAP.md Phase 1).
+// The client caches models by content hash and requests missing ones.
+namespace
+{
+// Max model size served to the headset (MVP cap, see ROADMAP.md Phase 5)
+constexpr uint64_t fiducial_model_max_size = 64ull * 1024 * 1024;
+constexpr size_t fiducial_model_chunk_size = 512 * 1024;
+
+uint64_t fnv1a64(std::span<const std::byte> data)
+{
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (std::byte b: data)
+	{
+		hash ^= static_cast<uint64_t>(b);
+		hash *= 0x100000001b3ull;
+	}
+	return hash;
+}
+
+std::string hash_hex(uint64_t hash)
+{
+	std::ostringstream oss;
+	oss << std::hex << std::setw(16) << std::setfill('0') << hash;
+	return oss.str();
+}
+
+// Reads the whole file, returns nullopt when missing/unreadable/oversize
+std::optional<std::vector<std::byte>> read_model_file(const std::string & path)
+{
+	std::error_code ec;
+	uint64_t size = std::filesystem::file_size(path, ec);
+	if (ec or size == 0 or size > fiducial_model_max_size)
+		return std::nullopt;
+
+	std::ifstream file(path, std::ios::binary);
+	if (not file)
+		return std::nullopt;
+
+	std::vector<std::byte> data(size);
+	if (not file.read(reinterpret_cast<char *>(data.data()), size))
+		return std::nullopt;
+
+	return data;
+}
+} // namespace
+
+void wivrn_session::send_fiducial_map()
+{
+	configuration config;
+	if (config.fiducial_map.empty())
+		return;
+
+	to_headset::fiducial_map msg;
+	for (const auto & entry: config.fiducial_map)
+	{
+		to_headset::fiducial_map_entry e{
+		        .marker_id = entry.marker_id,
+		        .marker_size_m = entry.marker_size_m,
+		        .position = entry.position,
+		        .orientation = entry.orientation,
+		        .scale = entry.scale,
+		};
+
+		if (not entry.model_path.empty())
+		{
+			if (auto data = read_model_file(entry.model_path))
+			{
+				e.model_hash = hash_hex(fnv1a64(*data));
+				e.model_size = data->size();
+			}
+			else
+			{
+				U_LOG_W("Fiducial map: cannot serve model %s, entry will have no model", entry.model_path.c_str());
+			}
+		}
+
+		msg.entries.push_back(std::move(e));
+	}
+
+	send_control(std::move(msg));
+}
+
+void wivrn_session::operator()(from_headset::fiducial_model_request && request)
+{
+	configuration config;
+	for (const auto & entry: config.fiducial_map)
+	{
+		if (entry.model_path.empty())
+			continue;
+
+		auto data = read_model_file(entry.model_path);
+		if (not data or hash_hex(fnv1a64(*data)) != request.model_hash)
+			continue;
+
+		uint32_t chunk_count = (data->size() + fiducial_model_chunk_size - 1) / fiducial_model_chunk_size;
+		for (uint32_t i = 0; i < chunk_count; ++i)
+		{
+			size_t begin = size_t(i) * fiducial_model_chunk_size;
+			size_t end = std::min(begin + fiducial_model_chunk_size, data->size());
+			send_control(to_headset::fiducial_model_chunk{
+			        .model_hash = request.model_hash,
+			        .chunk_index = i,
+			        .chunk_count = chunk_count,
+			        .data = {data->data() + begin, data->data() + end},
+			});
+		}
+		return;
+	}
+
+	U_LOG_W("Fiducial model requested but not found: %s", request.model_hash.c_str());
 }
 
 void wivrn_session::operator()(const from_headset::get_running_applications &)
