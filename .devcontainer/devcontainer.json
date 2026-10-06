@@ -1,0 +1,53 @@
+{
+  "name": "devcontainer",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "options": [
+      "--platform=linux/amd64"
+    ]
+  },
+  "features": {
+    "ghcr.io/devcontainers-extra/features/mise:1": {},
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "configureZshAsDefaultShell": true,
+      "installZsh": true
+    }
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode-remote.remote-containers",
+        "ms-azuretools.vscode-containers",
+        "hverlin.mise-vscode",
+        "sst-dev.opencode"
+      ]
+    }
+  },
+  "mounts": [
+    {
+      "source": "mise-data-volume-amd64",
+      "target": "/mnt/mise-data",
+      "type": "volume"
+    },
+    {
+      "source": "opencode-data-volume-native",
+      "target": "/home/vscode/.local/share/opencode",
+      "type": "volume"
+    },
+    {
+      "source": "cli-history",
+      "target": "/cmdhistory",
+      "type": "volume"
+    }
+  ],
+  "containerEnv": {
+    "MISE_DATA_DIR": "/mnt/mise-data",
+    "MISE_ENV": "devcontainer",
+    "MISE_TRUSTED_CONFIG_PATHS": "/"
+  },
+  "runArgs": [
+    "--platform=linux/amd64"
+  ],
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
+  "postStartCommand": "bash .devcontainer/post-start.sh"
+}
