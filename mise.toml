@@ -37,8 +37,4 @@ android sdk install \
   "system-images;${ANDROID_SYSTEM_IMAGE}" \
   "cmake;3.31.5" \
   "tools"
-
-# build-tools gets auto-installed by flutter but must be installed first to discover the emulated device. Ensure version matches what flutter expects to avoid downloading two versions!
-# "platforms;android-${ANDROID_COMPILE_SDK}" isn't needed as Flutter downloads the correct SDK
-# "ndk;${ANDROID_NDK_VERSION}" isn't needed as Flutter downloads the correct NDK
 """
