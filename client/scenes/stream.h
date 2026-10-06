@@ -204,6 +204,16 @@ private:
 	// Keep a reference to the resources needed to blit the images until vkWaitForFences
 	std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> current_blit_handles;
 
+	// Video stall detection (render thread only). When the decoders stop
+	// delivering frames the compositor keeps submitting an empty layer,
+	// which reads as unexplained grey: surface an explicit toast instead.
+	// ever_received_video latches on the first displayed frame so a slow
+	// first frame doesn't false-positive.
+	XrTime video_starved_since = 0;
+	bool video_stall_toasted = false;
+	bool ever_received_video = false;
+	void update_video_stall_status(bool starved);
+
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
 

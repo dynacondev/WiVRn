@@ -36,6 +36,7 @@
 #include "decoder/shard_accumulator.h"
 #include "inplace_vector.hpp"
 #include "spdlog/spdlog.h"
+#include "utils/i18n.h"
 #include "utils/named_thread.h"
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
@@ -912,6 +913,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Search for frame with desired display time on all decoders
 	// If no such frame exists, use the latest frame for each decoder
 	current_blit_handles = common_frame(frame_state.predictedDisplayTime);
+
+	// Surface an explicit toast on sustained video starvation instead of
+	// rendering an empty layer (reads as unexplained grey).
+	bool video_starved = true;
+	for (size_t i = 0; i < view_count; ++i)
+	{
+		if (current_blit_handles[i])
+		{
+			video_starved = false;
+			ever_received_video = true;
+		}
+	}
+	update_video_stall_status(video_starved and ever_received_video);
 	std::array<XrPosef, view_count> pose;
 	std::array<XrFovf, view_count> fov;
 	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation;
@@ -1284,6 +1298,38 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	query_pool_filled = true;
+}
+
+void scenes::stream::update_video_stall_status(bool starved)
+{
+	static constexpr XrDuration stall_threshold_ns = 1'000'000'000;
+	static const std::string stall_text = _("No video from the server - check the XR app on the PC");
+	XrTime now = instance.now();
+
+	if (not starved)
+	{
+		video_starved_since = 0;
+		if (video_stall_toasted)
+		{
+			video_stall_toasted = false;
+			// Clear only our own toast; a server message may have replaced it
+			auto toast = gui_toast.lock();
+			if (toast->has_value() and (*toast)->content == stall_text)
+				toast->reset();
+		}
+		return;
+	}
+
+	if (not video_starved_since)
+		video_starved_since = now;
+	if (not video_stall_toasted and now - video_starved_since >= stall_threshold_ns)
+	{
+		video_stall_toasted = true;
+		spdlog::warn("Video stalled: no frames from server for over 1s");
+		auto toast = gui_toast.lock();
+		toast->emplace(stall_text, true);
+		gui_status_last_change = instance.now();
+	}
 }
 
 void scenes::stream::exit()
