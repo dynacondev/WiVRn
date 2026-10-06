@@ -186,15 +186,23 @@ If set, overrides the name displayed in the server list.
 ## `fiducial-map`
 Default value: unset (feature disabled)
 
-Maps AprilTag 36h11 fiducials to glTF/GLB models for Quest passthrough mesh
-anchoring (see `ROADMAP.md`). The server reads each model file, sends the
-mapping plus content hashes to the headset on connect, and serves model bytes
-on demand. The headset caches models by hash, so files are transferred once.
+Maps fiducials to glTF/GLB models for Quest passthrough mesh anchoring (see
+`ROADMAP.md`). The Quest runtime tracks **QR codes** (its AprilTag capability
+is not exposed to third-party apps), so each entry identifies its marker by
+the exact decoded QR payload string. The server reads each model file, sends
+the mapping plus content hashes to the headset on connect, and serves model
+bytes on demand. The headset caches models by hash, so files are transferred
+once.
 
 Each entry has:
 
-- `marker-id`: AprilTag 36h11 marker ID (integer, required)
-- `marker-size-m`: physical marker size in meters (required for pose scale)
+- `marker-id`: numeric marker label (integer, required; shown in the
+  headset status UI)
+- `marker-data`: exact QR payload string to match, byte-for-byte
+  (required for QR tracking; empty selects numeric `marker-id` matching for
+  AprilTag-capable runtimes)
+- `marker-size-m`: physical marker size in meters (required for pose scale;
+  measure the printed QR's outer edge)
 - `model-path`: path to a `.glb`/`.gltf` file on the server (optional, models
   larger than 64MB are skipped)
 - `position`: `[x, y, z]` marker-to-mesh offset in meters (default `[0,0,0]`)
@@ -206,12 +214,18 @@ Each entry has:
 The mesh pose on the headset is
 `meshClientPose = observedMarkerPose * markerToMeshOffset`.
 
+Print the QR encoding exactly the `marker-data` string, e.g.
+`qrencode -o marker11.png -s 10 "wivrn:11"`. Matching is exact and
+case-sensitive; any other QR code in view is ignored (the headset logs its
+payload to help you copy it verbatim into the config).
+
 ### Example
 ```json
 {
 	"fiducial-map": [
 		{
-			"marker-id": 42,
+			"marker-id": 11,
+			"marker-data": "wivrn:11",
 			"marker-size-m": 0.08,
 			"model-path": "/usr/share/wivrn/meshes/widget.glb",
 			"position": [0, 0.05, 0.1],

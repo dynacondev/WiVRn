@@ -127,6 +127,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			map_key += ';';
 			map_key += std::to_string(e.marker_id);
 			map_key += ';';
+			map_key += e.marker_data;
+			map_key += ';';
 			map_key += std::to_string(e.marker_size_m);
 			map_key += ';';
 			for (float v: e.position)
@@ -165,7 +167,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		}
 		if (marker_tracker)
 		{
-			marker_tracker->configure(entry->marker_id, entry->marker_size_m);
+			marker_tracker->configure(entry->marker_id, entry->marker_size_m, entry->marker_data);
 			marker_tracker->update(world_space, instance.now(), predicted_display_time);
 		}
 	}

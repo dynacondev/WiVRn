@@ -182,10 +182,13 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 	for (const auto & entry: map.entries)
 	{
 		if (entry.model_hash.empty())
-			spdlog::info("Fiducial map entry: marker {} ({:.0f}mm), no model", entry.marker_id, (double)(entry.marker_size_m * 1000));
-		else
-			spdlog::info("Fiducial map entry: marker {} ({:.0f}mm), model {} ({} bytes)",
+			spdlog::info("Fiducial map entry: marker {} ({:.0f}mm), payload \"{}\", no model",
 			             entry.marker_id, (double)(entry.marker_size_m * 1000),
+			             entry.marker_data.substr(0, 64));
+		else
+			spdlog::info("Fiducial map entry: marker {} ({:.0f}mm), payload \"{}\", model {} ({} bytes)",
+			             entry.marker_id, (double)(entry.marker_size_m * 1000),
+			             entry.marker_data.substr(0, 64),
 			             entry.model_hash.substr(0, 8), entry.model_size);
 	}
 	*fiducial_entries.lock() = std::move(map.entries);

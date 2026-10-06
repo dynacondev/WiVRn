@@ -229,6 +229,8 @@ configuration::configuration()
 					e.marker_id = item["marker-id"];
 				if (item.contains("marker-size-m"))
 					e.marker_size_m = item["marker-size-m"];
+				if (item.contains("marker-data"))
+					e.marker_data = item["marker-data"];
 				if (item.contains("model-path"))
 					e.model_path = item["model-path"];
 				if (item.contains("position"))

@@ -42,6 +42,7 @@ xr::marker_tracker::marker_tracker(instance & inst_, session & sess_, system & s
         xrCreateSpatialDiscoverySnapshotAsyncEXT(inst_.get_proc<PFN_xrCreateSpatialDiscoverySnapshotAsyncEXT>("xrCreateSpatialDiscoverySnapshotAsyncEXT")),
         xrCreateSpatialDiscoverySnapshotCompleteEXT(inst_.get_proc<PFN_xrCreateSpatialDiscoverySnapshotCompleteEXT>("xrCreateSpatialDiscoverySnapshotCompleteEXT")),
         xrQuerySpatialComponentDataEXT(inst_.get_proc<PFN_xrQuerySpatialComponentDataEXT>("xrQuerySpatialComponentDataEXT")),
+        xrGetSpatialBufferStringEXT(inst_.get_proc<PFN_xrGetSpatialBufferStringEXT>("xrGetSpatialBufferStringEXT")),
         xrDestroySpatialContextEXT(inst_.get_proc<PFN_xrDestroySpatialContextEXT>("xrDestroySpatialContextEXT")),
         xrDestroySpatialSnapshotEXT(inst_.get_proc<PFN_xrDestroySpatialSnapshotEXT>("xrDestroySpatialSnapshotEXT")),
         spatial_context{xrDestroySpatialContextEXT}
@@ -75,14 +76,25 @@ bool xr::marker_tracker::poll_ready(XrFutureEXT future, bool & ready)
 	return true;
 }
 
-void xr::marker_tracker::configure(int32_t id, float size_m)
+void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload)
 {
-	if (id == marker_id and size_m == marker_size_m and current_state != state::failed and current_state != state::idle)
+	if (id == marker_id and size_m == marker_size_m and payload == marker_payload and
+	    current_state != state::failed and current_state != state::idle)
 		return;
 
-	spdlog::info("marker_tracker: tracking AprilTag 36h11 marker {} ({:.0f}mm)", id, (double)(size_m * 1000));
+	// Failure backoff: configure() is called every frame, attempts only on
+	// a fresh tracker or once the retry timer elapsed (no per-frame spam).
+	if (current_state == state::failed and last_now < retry_at)
+		return;
+
+	bool qr = not payload.empty();
+	spdlog::info("marker_tracker: tracking {} marker {} ({:.0f}mm){}",
+	             qr ? "QR code" : "AprilTag 36h11", id, (double)(size_m * 1000),
+	             qr ? " payload \"" + payload.substr(0, 64) + "\"" : "");
 	marker_id = id;
 	marker_size_m = size_m;
+	marker_payload = std::move(payload);
+	unknown_payloads_logged.clear();
 	current = sighting{};
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
@@ -96,7 +108,10 @@ void xr::marker_tracker::configure(int32_t id, float size_m)
 		return;
 	}
 
-	// Require the AprilTag capability before creating the context
+	// Require the marker capability before creating the context. QR codes
+	// carry identity in the payload (markerId is 0); an empty payload keeps
+	// the legacy numeric-ID AprilTag path for runtimes advertising it.
+	bool want_qr = not marker_payload.empty();
 	uint32_t count = 0;
 	if (XrResult res = xrEnumerateSpatialCapabilitiesEXT(*inst, system_id, 0, &count, nullptr); res != XR_SUCCESS)
 	{
@@ -111,9 +126,12 @@ void xr::marker_tracker::configure(int32_t id, float size_m)
 	}
 	for (auto c: caps)
 		spdlog::info("marker_tracker: spatial capability {}", (int)c);
-	if (not std::ranges::contains(caps, XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT))
+	XrSpatialCapabilityEXT want_cap = want_qr ? XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT
+	                                          : XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT;
+	if (not std::ranges::contains(caps, want_cap))
 	{
-		fail("AprilTag marker tracking not advertised by runtime");
+		fail(want_qr ? "QR code tracking not advertised by runtime"
+		             : "AprilTag tracking not advertised by runtime");
 		return;
 	}
 
@@ -133,6 +151,13 @@ void xr::marker_tracker::configure(int32_t id, float size_m)
 	        .enabledComponents = components,
 	        .aprilDict = XR_SPATIAL_MARKER_APRIL_TAG_DICT_36H11_EXT,
 	};
+	XrSpatialCapabilityConfigurationQrCodeEXT qr_code{
+	        .type = XR_TYPE_SPATIAL_CAPABILITY_CONFIGURATION_QR_CODE_EXT,
+	        .next = &size,
+	        .capability = XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT,
+	        .enabledComponentCount = 2,
+	        .enabledComponents = components,
+	};
 	static const XrSpatialComponentTypeEXT anchor_components[] = {
 	        XR_SPATIAL_COMPONENT_TYPE_ANCHOR_EXT,
 	};
@@ -143,7 +168,8 @@ void xr::marker_tracker::configure(int32_t id, float size_m)
 	        .enabledComponents = anchor_components,
 	};
 	const XrSpatialCapabilityConfigurationBaseHeaderEXT * configs[] = {
-	        reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&april_tag),
+	        want_qr ? reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&qr_code)
+	                : reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&april_tag),
 	        reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&anchor),
 	};
 	XrSpatialContextCreateInfoEXT create_info{
@@ -159,7 +185,32 @@ void xr::marker_tracker::configure(int32_t id, float size_m)
 
 	current_state = state::creating_context;
 	status_text = "creating spatial context";
-	spdlog::info("marker_tracker: creating spatial context for AprilTag 36h11 marker {}", marker_id);
+	spdlog::info("marker_tracker: creating spatial context for {} marker {}",
+	             want_qr ? "QR code" : "AprilTag 36h11", marker_id);
+}
+
+std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer)
+{
+	// QR payloads are decoded strings; anything else has no usable identity
+	if (buffer.bufferId == XR_NULL_SPATIAL_BUFFER_ID_EXT or
+	    buffer.bufferType != XR_SPATIAL_BUFFER_TYPE_STRING_EXT)
+		return std::nullopt;
+
+	XrSpatialBufferGetInfoEXT info{
+	        .type = XR_TYPE_SPATIAL_BUFFER_GET_INFO_EXT,
+	        .bufferId = buffer.bufferId,
+	};
+	uint32_t count = 0;
+	if (XrResult res = xrGetSpatialBufferStringEXT(snapshot, &info, 0, &count, nullptr); res != XR_SUCCESS or count == 0)
+		return std::nullopt;
+
+	// +1 and explicit trim: runtimes differ on whether count includes NUL
+	std::vector<char> text(count + 1, 0);
+	if (XrResult res = xrGetSpatialBufferStringEXT(snapshot, &info, count, &count, text.data()); res != XR_SUCCESS)
+		return std::nullopt;
+	while (count > 0 and text[count - 1] == 0)
+		--count;
+	return std::string(text.data(), count);
 }
 
 void xr::marker_tracker::complete_context()
@@ -278,8 +329,32 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		bool found = false;
 		for (uint32_t i = 0; i < count; ++i)
 		{
-			if (marker_data[i].capability == XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT and
-			    marker_data[i].markerId == (uint32_t)marker_id)
+			bool match = false;
+			if (marker_payload.empty())
+			{
+				// Legacy numeric matching (AprilTag runtimes)
+				match = marker_data[i].capability == XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT and
+				        marker_data[i].markerId == (uint32_t)marker_id;
+			}
+			else if (marker_data[i].capability == XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT)
+			{
+				// QR runtimes report markerId 0: identity is the payload
+				auto payload = read_payload(snapshot, marker_data[i].data);
+				if (not payload)
+					continue;
+				if (*payload != marker_payload)
+				{
+					// Diagnostic: capped, so a room full of foreign QR
+					// codes shows what strings exist without spamming
+					if (unknown_payloads_logged.size() < 8 and
+					    unknown_payloads_logged.insert(*payload).second)
+						spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
+						             payload->substr(0, 64));
+					continue;
+				}
+				match = true;
+			}
+			if (match)
 			{
 				if (not current.tracked)
 				{
@@ -315,12 +390,13 @@ void xr::marker_tracker::update(XrSpace world_space, XrTime now, XrTime predicte
 			return;
 
 		case state::failed:
-			// Auto-retry with backoff: transient runtime hiccups recover
+			// Auto-retry with backoff: transient runtime hiccups recover.
+			// configure() itself honors retry_at, so this only re-arms idle.
 			if (marker_id >= 0 and now >= retry_at)
 			{
 				retry_at = now + retry_delay_ns;
 				current_state = state::idle;
-				configure(marker_id, marker_size_m);
+				configure(marker_id, marker_size_m, marker_payload);
 			}
 			return;
 
