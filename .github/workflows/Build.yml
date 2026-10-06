@@ -3,17 +3,26 @@ name: Build
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 env:
   BUILD_TYPE: Release
   SERVER_DEPS: libx264-dev libavcodec-dev libavutil-dev libbsd-dev libavahi-client-dev libavahi-glib-dev libeigen3-dev nlohmann-json3-dev librsvg2-dev libdrm-dev libglib2.0-dev-bin libpipewire-0.3-dev libcli11-dev libnotify-dev libarchive-dev libudev-dev
   CSS: images/wivrn-${{(github.ref_type == 'tag' && 'release') || 'nightly'}}.css
+  # TEMPORARY (feat/3d-passthrough iteration): only the flatpak bundle builds.
+  # Set back to 'true' to restore full CI.
+  FULL_CI: 'false'
+
+# Cancel superseded runs so repeated dispatches don't queue hour-long flatpak builds.
+concurrency:
+  group: Build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-linux:
     name: Linux
     runs-on: ubuntu-26.04
-    if: ${{ vars.APK_ONLY == '' }}
+    if: ${{ vars.APK_ONLY == '' && env.FULL_CI == 'true' }}
 
     strategy:
       fail-fast: false
@@ -121,7 +130,7 @@ jobs:
   build-steam-frame:
     name: Steam Frame
     runs-on: ubuntu-24.04-arm
-    if: ${{ vars.APK_ONLY == '' }}
+    if: ${{ vars.APK_ONLY == '' && env.FULL_CI == 'true' }}
     container:
       image: registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk/arm64:4.0.20260805.254769
       volumes:
@@ -228,7 +237,7 @@ jobs:
   nix-test:
     name: Test Nix package and devshell
     runs-on: ubuntu-24.04
-    if: ${{ vars.APK_ONLY == '' }}
+    if: ${{ vars.APK_ONLY == '' && env.FULL_CI == 'true' }}
 
     steps:
     - uses: actions/checkout@v6
@@ -242,7 +251,7 @@ jobs:
   build-android:
     name: Android
     runs-on: ubuntu-24.04
-    if: ${{ vars.APK_ONLY == '' }}
+    if: ${{ vars.APK_ONLY == '' && env.FULL_CI == 'true' }}
 
     strategy:
       matrix:
@@ -396,7 +405,7 @@ jobs:
 
   build-ubuntu:
     name: Build Ubuntu package
-    if: ${{ vars.APK_ONLY == '' }}
+    if: ${{ vars.APK_ONLY == '' && env.FULL_CI == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -471,7 +480,7 @@ jobs:
     name: Create release
     runs-on: ubuntu-22.04
     needs: [build-linux, build-android, build-server-flatpak, build-ubuntu]
-    if: success() && startsWith(github.ref, 'refs/tags/')
+    if: success() && startsWith(github.ref, 'refs/tags/') && env.FULL_CI == 'true'
 
     steps:
     - uses: actions/checkout@v6
@@ -549,7 +558,7 @@ jobs:
     name: Sync fork downstream
     runs-on: ubuntu-24.04
     needs: [build-linux, build-android]
-    if: ${{ vars.APK_ONLY == '' && github.ref == 'refs/heads/master' }}
+    if: ${{ vars.APK_ONLY == '' && github.ref == 'refs/heads/master' && env.FULL_CI == 'true' }}
     steps:
       - name: Check for DOWNSTREAM_GITHUB_TOKEN
         id: downstream-secret-check
