@@ -284,7 +284,7 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 				if (not current.tracked)
 				{
 					const auto & p = anchor_poses[i];
-					spdlog::info("marker_tracker: marker {} first sighted at ({:.2f}, {:.2f}, {:.2f})",
+					spdlog::info("marker_tracker: marker {} sighted at ({:.2f}, {:.2f}, {:.2f})",
 					             marker_id, p.position.x, p.position.y, p.position.z);
 				}
 				current.tracked = true;

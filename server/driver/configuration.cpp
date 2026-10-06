@@ -87,6 +87,32 @@ std::filesystem::path configuration::get_config_file()
 	return config_file;
 }
 
+static void log_effective_config_once(const nlohmann::json & merged)
+{
+	// Process-once: the body is idempotent, so a benign race only risks a repeated line
+	static bool logged = false;
+	if (logged)
+		return;
+	logged = true;
+
+	if (not merged.is_object())
+	{
+		U_LOG_I("Effective configuration: not an object, ignoring");
+		return;
+	}
+
+	std::string keys;
+	for (auto it = merged.begin(); it != merged.end(); ++it)
+	{
+		if (not keys.empty())
+			keys += ", ";
+		keys += it.key();
+	}
+	U_LOG_I("Effective configuration keys: %s", keys.empty() ? "(none)" : keys.c_str());
+	if (auto it = merged.find("fiducial-map"); it != merged.end())
+		U_LOG_I("Effective fiducial-map: %s", it->dump().c_str());
+}
+
 nlohmann::json configuration::read_configuration()
 {
 	if (config_file.empty())
@@ -115,13 +141,17 @@ nlohmann::json configuration::read_configuration()
 				}
 			}
 		}
+		log_effective_config_once(merged);
 		return merged;
 	}
 	else
 	{
+		U_LOG_I("Using configuration file %s", config_file.c_str());
 		try
 		{
-			return nlohmann::json::parse(std::ifstream(config_file));
+			nlohmann::json merged = nlohmann::json::parse(std::ifstream(config_file));
+			log_effective_config_once(merged);
+			return merged;
 		}
 		catch (std::exception & e)
 		{

@@ -274,8 +274,8 @@ void scenes::stream::calibrate_to_marker()
 		calib->z = sighting.pose.position.z;
 	}
 
-	spdlog::info("Calibrated to marker {}: mesh at ({:.2f}, {:.2f}, {:.2f}), origin yaw {:.1f}deg, sighting {}ms old",
-	             entry->marker_id, mesh_pos.x, mesh_pos.y, mesh_pos.z, glm::degrees(yaw),
+	spdlog::info("Calibrated to marker {}: observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), origin yaw {:.1f}deg, sighting {}ms old",
+	             entry->marker_id, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z, glm::degrees(yaw),
 	             (long long)((now - sighting.time) / 1'000'000));
 }
 

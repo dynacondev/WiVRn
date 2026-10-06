@@ -179,11 +179,27 @@ std::filesystem::path scenes::stream::fiducial_model_path(const std::string & ha
 void scenes::stream::operator()(to_headset::fiducial_map && map)
 {
 	spdlog::info("Received fiducial map with {} entries", map.entries.size());
+	for (const auto & entry: map.entries)
+	{
+		if (entry.model_hash.empty())
+			spdlog::info("Fiducial map entry: marker {} ({:.0f}mm), no model", entry.marker_id, (double)(entry.marker_size_m * 1000));
+		else
+			spdlog::info("Fiducial map entry: marker {} ({:.0f}mm), model {} ({} bytes)",
+			             entry.marker_id, (double)(entry.marker_size_m * 1000),
+			             entry.model_hash.substr(0, 8), entry.model_size);
+	}
 	*fiducial_entries.lock() = std::move(map.entries);
 
 	// Request models missing from the local cache
 	std::error_code ec;
-	std::filesystem::create_directories(application::get_config_path() / "fiducial_models", ec);
+	auto cache_dir = application::get_config_path() / "fiducial_models";
+	static bool cache_dir_logged = false;
+	if (not cache_dir_logged)
+	{
+		cache_dir_logged = true;
+		spdlog::info("Fiducial model cache dir: {}", cache_dir.string());
+	}
+	std::filesystem::create_directories(cache_dir, ec);
 	if (ec)
 	{
 		spdlog::warn("Cannot create fiducial model cache dir: {}", ec.message());
@@ -297,7 +313,7 @@ void scenes::stream::operator()(to_headset::fiducial_model_chunk && chunk)
 	}
 	file.write(reinterpret_cast<const char *>(data.data()), data.size());
 	file.close();
-	spdlog::info("Cached fiducial model {} ({} bytes)", chunk.model_hash, data.size());
+	spdlog::info("Cached fiducial model {} ({} bytes) at {}", chunk.model_hash, data.size(), path.string());
 	fiducial_downloads.erase(chunk.model_hash);
 }
 

@@ -1017,9 +1017,10 @@ void wivrn_session::send_fiducial_map()
 			{
 				e.model_hash = hash_hex(fnv1a64(*data));
 				e.model_size = data->size();
-				U_LOG_I("Fiducial map: marker %d (%.0fmm), model %s (%llu bytes)",
+				U_LOG_I("Fiducial map: marker %d (%.0fmm), model %s (%llu bytes) from %s",
 				        entry.marker_id, (double)(entry.marker_size_m * 1000),
-				        e.model_hash.c_str(), (unsigned long long)e.model_size);
+				        e.model_hash.c_str(), (unsigned long long)e.model_size,
+				        entry.model_path.c_str());
 			}
 			else
 			{
