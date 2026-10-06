@@ -100,6 +100,11 @@ compositing can be tested standalone.
    space. Transform update runs locally every frame from headset space, never
    from server timestamps.
 
+   (Superseded after Phase 4: the projected mesh now appears only after the
+   user presses Calibrate, anchored at observedMarkerPose * configOffset.
+   Pre-calibration behavior is stock upstream, which also gives a clean
+   baseline for diagnosing video issues.)
+
 MVP test (must pass before Phase 3):
 
 - Quest 3, WiVRn server with 1-entry `fiducial_map` + small glB (<10MB).

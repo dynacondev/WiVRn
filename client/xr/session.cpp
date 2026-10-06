@@ -366,14 +366,17 @@ void xr::session::enable_passthrough(xr::system & system)
 
 	if (inst->has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
+		spdlog::info("Passthrough enabled (FB)");
 		passthrough.emplace<xr::passthrough_fb>(*inst, *this);
 	}
 	else if (inst->has_extension(XR_HTC_PASSTHROUGH_EXTENSION_NAME))
 	{
+		spdlog::info("Passthrough enabled (HTC)");
 		passthrough.emplace<xr::passthrough_htc>(*inst, *this);
 	}
 	else if (utils::contains(system.environment_blend_modes(XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO), XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND))
 	{
+		spdlog::info("Passthrough enabled (alpha blend)");
 		passthrough.emplace<xr::passthrough_alpha_blend>();
 	}
 }
@@ -382,6 +385,7 @@ void xr::session::disable_passthrough()
 {
 	if (std::holds_alternative<std::monostate>(passthrough))
 		return;
+	spdlog::info("Passthrough disabled");
 	passthrough.emplace<std::monostate>();
 }
 

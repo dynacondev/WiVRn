@@ -925,7 +925,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			ever_received_video = true;
 		}
 	}
-	update_video_stall_status(video_starved and ever_received_video);
+	update_video_stall_status(video_starved);
 	std::array<XrPosef, view_count> pose;
 	std::array<XrFovf, view_count> fov;
 	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation;
@@ -1181,6 +1181,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		// Surface-projected passthrough needs the FB passthrough object
 		// alive even for opaque (non-alpha) server video
+		if (use_alpha != last_use_alpha)
+		{
+			last_use_alpha = use_alpha;
+			spdlog::info("Server video alpha channel: {}", use_alpha ? "on" : "off");
+		}
 		bool want_projected_mesh = fiducial_passthrough_wanted();
 		if (use_alpha or want_projected_mesh)
 			session.enable_passthrough(system);
@@ -1303,10 +1308,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 void scenes::stream::update_video_stall_status(bool starved)
 {
 	static constexpr XrDuration stall_threshold_ns = 1'000'000'000;
+	// Generous grace for a first frame that simply hasn't arrived yet
+	static constexpr XrDuration first_frame_grace_ns = 5'000'000'000;
 	static const std::string stall_text = _("No video from the server - check the XR app on the PC");
 	XrTime now = instance.now();
 
-	if (not starved)
+	// A stall counts when video flowed and stopped (>1s), or when a video
+	// description arrived but the first frame never did (>5s grace).
+	bool desc_old_enough = video_desc_received.load() and (now - video_desc_at.load()) > first_frame_grace_ns;
+	bool stalled = starved and (ever_received_video or desc_old_enough);
+
+	if (not stalled)
 	{
 		video_starved_since = 0;
 		if (video_stall_toasted)
@@ -1325,7 +1337,7 @@ void scenes::stream::update_video_stall_status(bool starved)
 	if (not video_stall_toasted and now - video_starved_since >= stall_threshold_ns)
 	{
 		video_stall_toasted = true;
-		spdlog::warn("Video stalled: no frames from server for over 1s");
+		spdlog::warn("Video stalled: no frames from server (video started: {})", ever_received_video ? "yes" : "never");
 		auto toast = gui_toast.lock();
 		toast->emplace(stall_text, true);
 		gui_status_last_change = instance.now();
@@ -1347,6 +1359,8 @@ void scenes::stream::setup(const to_headset::video_stream_description & descript
 		return;
 	spdlog::info("Creating decoders, size {}x{}", description.width, description.height);
 	video_stream_description = description;
+	video_desc_received = true;
+	video_desc_at = instance.now();
 
 	for (const auto & [stream_index, item]: utils::enumerate(decoders))
 	{

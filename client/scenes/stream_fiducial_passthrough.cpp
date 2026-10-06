@@ -34,19 +34,33 @@
 
 bool scenes::stream::fiducial_passthrough_wanted()
 {
-	if (not instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
-		return false;
-
-	std::error_code ec;
-	auto entries = fiducial_entries.lock();
-	for (const auto & entry: *entries)
+	// Strict gating: nothing mesh-related happens until the user presses
+	// Calibrate. Pre-calibration behavior is stock upstream, so a grey
+	// baseline with zero mesh lines in the log exonerates the mesh path.
+	bool wanted = false;
+	if (fiducial_passthrough.calibrated and instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
 	{
-		if (entry.model_hash.empty())
-			continue;
-		if (std::filesystem::exists(fiducial_model_path(entry.model_hash), ec))
-			return true;
+		std::error_code ec;
+		auto entries = fiducial_entries.lock();
+		for (const auto & entry: *entries)
+		{
+			if (entry.model_hash.empty())
+				continue;
+			if (std::filesystem::exists(fiducial_model_path(entry.model_hash), ec))
+			{
+				wanted = true;
+				break;
+			}
+		}
 	}
-	return false;
+
+	static bool last_wanted = true; // log the initial false once
+	if (wanted != last_wanted)
+	{
+		last_wanted = wanted;
+		spdlog::info("Fiducial passthrough wanted: {}", wanted);
+	}
+	return wanted;
 }
 
 void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
@@ -54,17 +68,30 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto & fp = fiducial_passthrough;
 
-	// Fingerprint of the inputs: reset one-shot state when the map or the
-	// cache contents change (new model pushed, download finished, ...)
-	std::string key;
+	// Fingerprints: map_key covers the server map identity (any entry change
+	// invalidates a calibration); the cache flag only re-arms the upload
+	// (a download finishing must NOT wipe a calibration made before it).
+	std::string map_key;
 	std::optional<to_headset::fiducial_map_entry> entry;
 	bool model_cached = false;
 	{
 		auto entries = fiducial_entries.lock();
 		for (const auto & e: *entries)
 		{
-			key += e.model_hash;
-			key += ';';
+			map_key += e.model_hash;
+			map_key += ';';
+			map_key += std::to_string(e.marker_id);
+			map_key += ';';
+			map_key += std::to_string(e.marker_size_m);
+			map_key += ';';
+			for (float v: e.position)
+				map_key += std::to_string(v) + ',';
+			map_key += ';';
+			for (float v: e.orientation)
+				map_key += std::to_string(v) + ',';
+			map_key += ';';
+			map_key += std::to_string(e.scale);
+			map_key += ';';
 			if (not entry and not e.model_hash.empty())
 				entry = e;
 		}
@@ -73,8 +100,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	{
 		std::error_code ec;
 		model_cached = std::filesystem::exists(fiducial_model_path(entry->model_hash), ec);
-		key += model_cached ? 'C' : 'D';
 	}
+	std::string key = map_key + (model_cached ? 'C' : 'D');
 
 	// Marker tracking (Phase 3): same map entry, independent of mesh state
 	if (not entry)
@@ -103,18 +130,31 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.last_key = key;
 		fp.attempted = false;
 		fp.marker_support_logged = false;
-		fp.calibrated = false;
-		fp.calibrated_marker = -1;
-		if (fp.ready)
+		// Full reset only when the map itself changed: a download finishing
+		// (cache D->C flip) preserves a calibration made before it.
+		if (map_key != fp.last_map_key)
 		{
-			session.clear_projected_passthrough_mesh();
-			fp.ready = false;
+			fp.last_map_key = map_key;
+			fp.calibrated = false;
+			fp.calibrated_marker = -1;
+			if (fp.ready)
+			{
+				spdlog::info("Fiducial map changed, clearing projected mesh");
+				session.clear_projected_passthrough_mesh();
+				fp.ready = false;
+			}
 		}
 		if (not entry)
 			fp.status = "no fiducial map from server";
 		else if (not model_cached)
 			fp.status = "downloading model " + entry->model_hash.substr(0, 8) + "...";
 	}
+
+	// Strict gating: marker tracking above runs unconditionally (needed for
+	// the in-view dot and the Calibrate button), but nothing mesh-related
+	// happens until calibrated.
+	if (not fp.calibrated)
+		return;
 
 	// Re-upload if the runtime lost the mesh (e.g. passthrough re-created)
 	if (fp.ready and not session.has_projected_passthrough_mesh())
@@ -146,21 +186,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	{
 		auto soup = passthrough_mesh::flatten_gltf(fiducial_model_path(entry->model_hash));
 
-		// Phase 2: config pose is the world-space placement
-		XrPosef pose{
-		        .orientation = {entry->orientation[0], entry->orientation[1], entry->orientation[2], entry->orientation[3]},
-		        .position = {entry->position[0], entry->position[1], entry->position[2]},
-		};
-		XrVector3f scale{entry->scale, entry->scale, entry->scale};
-
-		// Phase 2 fallback placement (config pose as world pose), used until
-		// the first calibration. A calibrated anchor is never overwritten.
-		if (not fp.calibrated)
-		{
-			fp.world_pose = pose;
-			fp.world_scale = scale;
-		}
-
+		// Placement always comes from calibrate_to_marker() (strict gating
+		// above guarantees fp.calibrated here).
 		session.set_projected_passthrough_mesh(soup.vertices, soup.indices, world_space, fp.world_pose, fp.world_scale);
 
 		fp.ready = true;

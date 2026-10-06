@@ -280,6 +280,12 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			if (marker_data[i].capability == XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT and
 			    marker_data[i].markerId == (uint32_t)marker_id)
 			{
+				if (not current.tracked)
+				{
+					const auto & p = anchor_poses[i];
+					spdlog::info("marker_tracker: marker {} first sighted at ({:.2f}, {:.2f}, {:.2f})",
+					             marker_id, p.position.x, p.position.y, p.position.z);
+				}
 				current.tracked = true;
 				current.pose = anchor_poses[i];
 				current.time = predicted_time;

@@ -452,6 +452,40 @@ void scene::render_end()
 		openxr_layers.push_back(base);
 	}
 
+	// Log the submitted composition on change: layer order/count issues read
+	// as wrong output with no error, so this is the diagnostic of record.
+	{
+		std::string signature = std::to_string(openxr_layers.size()) + ":";
+		for (auto * base: openxr_layers)
+		{
+			switch (base->type)
+			{
+				case XR_TYPE_COMPOSITION_LAYER_PROJECTION:
+					signature += "proj,";
+					break;
+				case XR_TYPE_COMPOSITION_LAYER_QUAD:
+					signature += "quad,";
+					break;
+				case XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB:
+					signature += "pass,";
+					break;
+				case XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_HTC:
+					signature += "pass_htc,";
+					break;
+				default:
+					signature += "?,";
+					break;
+			}
+		}
+		signature += (blend_mode == XR_ENVIRONMENT_BLEND_MODE_OPAQUE ? "opaque" : "alpha");
+		static std::string last_signature;
+		if (signature != last_signature)
+		{
+			last_signature = signature;
+			spdlog::info("Submitting layers [{}]", signature);
+		}
+	}
+
 	if (renderer)
 		renderer->end_frame();
 

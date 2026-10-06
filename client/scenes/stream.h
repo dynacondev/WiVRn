@@ -214,6 +214,12 @@ private:
 	bool ever_received_video = false;
 	void update_video_stall_status(bool starved);
 
+	// Composition diagnostics (render thread only): logged on change so a
+	// grey-vs-video mystery leaves timestamps in logcat.
+	bool last_use_alpha = false;
+	std::atomic<bool> video_desc_received{false};
+	std::atomic<XrTime> video_desc_at{0};
+
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
 
@@ -242,6 +248,7 @@ private:
 		bool calibrated = false; // mesh anchor came from calibrate_to_marker()
 		XrTime calibrated_at = 0;
 		int32_t calibrated_marker = -1;
+		std::string last_map_key; // map identity; a change invalidates calibration
 		std::string last_key;   // fingerprint of map + cache, resets attempted
 		std::string model_hash;
 		std::string status = "waiting for fiducial map";
