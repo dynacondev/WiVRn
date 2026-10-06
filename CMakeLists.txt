@@ -122,10 +122,14 @@ endif()
 include(VulkanVersion)
 
 if (WIVRN_USE_SYSTEM_BOOST AND NEED_COMMON)
-    if (WIVRN_BUILD_DISSECTOR OR WIVRN_BUILD_CLIENT)
+    # Boost.URL is header-only and only linked by the client. Distro Boost packages
+    # (e.g. Ubuntu 24.04 ships 1.83) do not install a boost_url CMake config file,
+    # and the Boost config file looks up one per component, so requesting it fails
+    # there with "Could NOT find a package configuration file provided by boost_url".
+    if (WIVRN_BUILD_CLIENT)
         find_package(Boost 1.84.0 REQUIRED COMPONENTS locale url iostreams)
     else()
-        find_package(Boost 1.75.0 REQUIRED COMPONENTS locale url iostreams)
+        find_package(Boost 1.75.0 REQUIRED COMPONENTS locale iostreams)
     endif()
 endif()
 
