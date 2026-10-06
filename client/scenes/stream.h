@@ -229,6 +229,9 @@ private:
 		bool attempted = false; // upload tried at least once (no retry spam)
 		bool ready = false;     // mesh live in the runtime
 		bool marker_support_logged = false;
+		bool calibrated = false; // mesh anchor came from calibrate_to_marker()
+		XrTime calibrated_at = 0;
+		int32_t calibrated_marker = -1;
 		std::string last_key;   // fingerprint of map + cache, resets attempted
 		std::string model_hash;
 		std::string status = "waiting for fiducial map";
@@ -244,6 +247,25 @@ private:
 	bool fiducial_passthrough_wanted();
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	void gui_fiducial_status();
+
+	// World-origin calibration (ROADMAP.md Phase 4). The tracking thread
+	// locates all reported poses against a STAGE reference space built from
+	// this offset; the render thread writes it on calibrate. Y always follows
+	// the configured height offset (composed in the tracking loop); yaw + XZ
+	// come from the last calibration. Convention is marker-as-origin: after
+	// calibrate, the marker sits at reported XZ origin with identity yaw.
+	struct origin_calibration
+	{
+		bool active = false;
+		float yaw = 0; // radians about +Y
+		float x = 0;
+		float z = 0;
+	};
+	thread_safe<origin_calibration> tracking_origin_calibration;
+
+	// Snap the mesh to observedMarkerPose * configOffset and recenter the
+	// tracking origin on the marker. Requires a fresh marker sighting.
+	void calibrate_to_marker();
 
 	// AprilTag 36h11 tracking (ROADMAP.md Phase 3). Driven on the render
 	// thread from update_fiducial_passthrough(); empty until the first

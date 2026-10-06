@@ -270,15 +270,16 @@ void scenes::stream::tracking()
 	XrSpace view_space = application::space(xr::spaces::view);
 
 	// poses sent to the PC are located against this space instead of xr::spaces::world
-	// directly, so the configured player height offset applies uniformly to the head, hands
-	// and body. It shares xr::spaces::world's STAGE origin, translated by -offset: locating a
-	// pose in it therefore reports that pose offset up by +offset, i.e. increases perceived
-	// height.
-	auto make_height_offset_space = [&](float offset) {
-		return session.create_reference_space(XR_REFERENCE_SPACE_TYPE_STAGE, {{0, 0, 0, 1}, {0, -offset, 0}});
+	// directly, so the configured player height offset and the fiducial
+	// calibration apply uniformly to the head, hands and body. It shares
+	// xr::spaces::world's STAGE origin, composed with the offset below:
+	// Y always follows the height setting; yaw + XZ follow the last fiducial
+	// calibration (marker-as-origin), if any.
+	auto make_origin_space = [&](const XrPosef & offset) {
+		return session.create_reference_space(XR_REFERENCE_SPACE_TYPE_STAGE, offset);
 	};
-	float applied_height_offset = config.get_height_offset();
-	xr::space height_offset_space = make_height_offset_space(applied_height_offset);
+	XrPosef applied_origin{{0, 0, 0, 1}, {0, -config.get_height_offset(), 0}};
+	xr::space origin_space = make_origin_space(applied_origin);
 
 	XrTime t0 = instance.now();
 	from_headset::tracking tracking;
@@ -298,7 +299,7 @@ void scenes::stream::tracking()
 	const bool body_tracking = config.check_feature(feature::body_tracking);
 	xr::body_tracker body_tracker;
 
-	locate_spaces_functor locate_spaces{instance, height_offset_space};
+	locate_spaces_functor locate_spaces{instance, origin_space};
 
 	on_interaction_profile_changed({});
 
@@ -312,11 +313,23 @@ void scenes::stream::tracking()
 	{
 		try
 		{
-			if (float offset = config.get_height_offset(); offset != applied_height_offset)
+			// Rebuild the origin space when the height setting or the
+			// fiducial calibration changed (exact float compare, same as
+			// the old height-only check: recomputed values are bit-stable).
+			float yaw = 0, ox = 0, oz = 0;
+			if (auto calib = tracking_origin_calibration.lock(); calib->active)
 			{
-				applied_height_offset = offset;
-				height_offset_space = make_height_offset_space(applied_height_offset);
-				locate_spaces = locate_spaces_functor{instance, height_offset_space};
+				yaw = calib->yaw;
+				ox = calib->x;
+				oz = calib->z;
+			}
+			float h = config.get_height_offset();
+			XrPosef desired{{0, std::sin(yaw / 2), 0, std::cos(yaw / 2)}, {ox, -h, oz}};
+			if (memcmp(&desired, &applied_origin, sizeof(XrPosef)) != 0)
+			{
+				applied_origin = desired;
+				origin_space = make_origin_space(applied_origin);
+				locate_spaces = locate_spaces_functor{instance, origin_space};
 			}
 
 			if (pattern_position == pattern.size())
@@ -471,8 +484,8 @@ void scenes::stream::tracking()
 							else
 							{
 								// Pico headsets fail to locate gaze relative to view
-								auto gaze = locate_space(item.device, spaces[item.device], height_offset_space, tracking.timestamp);
-								auto view_pose = locate_space(item.device, view_space, height_offset_space, tracking.timestamp);
+								auto gaze = locate_space(item.device, spaces[item.device], origin_space, tracking.timestamp);
+								auto view_pose = locate_space(item.device, view_space, origin_space, tracking.timestamp);
 								glm::quat gaze_quat(gaze.pose.orientation.w, gaze.pose.orientation.x, gaze.pose.orientation.y, gaze.pose.orientation.z);
 								glm::quat view_quat(view_pose.pose.orientation.w, view_pose.pose.orientation.x, view_pose.pose.orientation.y, view_pose.pose.orientation.z);
 								gaze_quat = glm::conjugate(view_quat) * gaze_quat;
@@ -509,7 +522,7 @@ void scenes::stream::tracking()
 								        t0,
 								        at_time,
 								        from_headset::hand_tracking::left,
-								        locate_hands(*left_hand, height_offset_space, tracking.timestamp));
+								        locate_hands(*left_hand, origin_space, tracking.timestamp));
 							}
 							break;
 						case wivrn::device_id::RIGHT_HAND:
@@ -519,14 +532,14 @@ void scenes::stream::tracking()
 								        t0,
 								        at_time,
 								        from_headset::hand_tracking::right,
-								        locate_hands(*right_hand, height_offset_space, tracking.timestamp));
+								        locate_hands(*right_hand, origin_space, tracking.timestamp));
 							}
 							break;
 						case wivrn::device_id::BODY:
 							std::visit(utils::overloaded{
 							                   [](std::monostate &) {},
-							                   [&](auto & b) {
-								                   auto packet = b.locate_spaces(at_time, height_offset_space);
+						                   [&](auto & b) {
+							                   auto packet = b.locate_spaces(at_time, origin_space);
 								                   packet.timestamp = at_time;
 								                   packet.production_timestamp = tracking.production_timestamp;
 								                   body.push_back(packet);

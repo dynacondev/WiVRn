@@ -28,6 +28,8 @@
 #include "render/passthrough_mesh.h"
 #include "utils/i18n.h"
 
+#include <cmath>
+#include <glm/gtc/quaternion.hpp>
 #include <spdlog/spdlog.h>
 
 bool scenes::stream::fiducial_passthrough_wanted()
@@ -101,6 +103,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.last_key = key;
 		fp.attempted = false;
 		fp.marker_support_logged = false;
+		fp.calibrated = false;
+		fp.calibrated_marker = -1;
 		if (fp.ready)
 		{
 			session.clear_projected_passthrough_mesh();
@@ -149,18 +153,24 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		};
 		XrVector3f scale{entry->scale, entry->scale, entry->scale};
 
-		session.set_projected_passthrough_mesh(soup.vertices, soup.indices, world_space, pose, scale);
+		// Phase 2 fallback placement (config pose as world pose), used until
+		// the first calibration. A calibrated anchor is never overwritten.
+		if (not fp.calibrated)
+		{
+			fp.world_pose = pose;
+			fp.world_scale = scale;
+		}
+
+		session.set_projected_passthrough_mesh(soup.vertices, soup.indices, world_space, fp.world_pose, fp.world_scale);
 
 		fp.ready = true;
 		fp.model_hash = entry->model_hash;
-		fp.world_pose = pose;
-		fp.world_scale = scale;
 		fp.vertex_count = soup.vertices.size();
 		fp.triangle_count = soup.indices.size() / 3;
 		fp.status = "projected";
 		spdlog::info("Fiducial passthrough mesh live: {} vertices, {} triangles", fp.vertex_count, fp.triangle_count);
 
-		session.update_projected_passthrough_transform(world_space, predicted_display_time, pose, scale);
+		session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
 		add_projected_passthrough_layer();
 	}
 	catch (std::exception & e)
@@ -168,6 +178,77 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.status = std::string("mesh error: ") + e.what();
 		spdlog::warn("Fiducial passthrough mesh failed: {}", e.what());
 	}
+}
+
+void scenes::stream::calibrate_to_marker()
+{
+	auto & fp = fiducial_passthrough;
+
+	std::optional<to_headset::fiducial_map_entry> entry;
+	{
+		auto entries = fiducial_entries.lock();
+		for (const auto & e: *entries)
+		{
+			if (not e.model_hash.empty())
+			{
+				entry = e;
+				break;
+			}
+		}
+	}
+	if (not entry)
+	{
+		spdlog::warn("Calibrate: no fiducial map entry");
+		return;
+	}
+	if (not marker_tracker)
+	{
+		spdlog::warn("Calibrate: marker tracking unsupported by runtime");
+		return;
+	}
+
+	// Sighting timestamps use predicted display time and can sit slightly in
+	// the future; only reject clearly stale data.
+	XrTime now = instance.now();
+	auto sighting = marker_tracker->latest();
+	if (not sighting.tracked or sighting.time == 0 or (now - sighting.time) > 3'000'000'000)
+	{
+		spdlog::warn("Calibrate: no fresh marker sighting");
+		return;
+	}
+
+	// Mesh anchor: meshClientPose = observedMarkerPose * markerToMeshOffset.
+	// The offset translation is in meters and is not affected by the scale.
+	glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
+	glm::vec3 marker_pos(sighting.pose.position.x, sighting.pose.position.y, sighting.pose.position.z);
+	glm::quat offset_quat(entry->orientation[3], entry->orientation[0], entry->orientation[1], entry->orientation[2]);
+	glm::vec3 offset_pos(entry->position[0], entry->position[1], entry->position[2]);
+	glm::quat mesh_quat = marker_quat * offset_quat;
+	glm::vec3 mesh_pos = marker_pos + marker_quat * offset_pos;
+	fp.world_pose = {
+	        .orientation = {mesh_quat.x, mesh_quat.y, mesh_quat.z, mesh_quat.w},
+	        .position = {mesh_pos.x, mesh_pos.y, mesh_pos.z},
+	};
+	fp.world_scale = {entry->scale, entry->scale, entry->scale};
+	fp.calibrated = true;
+	fp.calibrated_at = now;
+	fp.calibrated_marker = entry->marker_id;
+
+	// World origin: yaw + XZ from the marker (marker-as-origin: afterwards the
+	// marker reports at XZ origin with identity yaw). Y keeps following the
+	// height setting, composed in the tracking loop.
+	const auto & q = sighting.pose.orientation;
+	float yaw = std::atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x));
+	{
+		auto calib = tracking_origin_calibration.lock();
+		calib->active = true;
+		calib->yaw = yaw;
+		calib->x = sighting.pose.position.x;
+		calib->z = sighting.pose.position.z;
+	}
+
+	spdlog::info("Calibrated to marker {}: mesh at ({:.2f}, {:.2f}, {:.2f}), origin yaw {:.1f}deg",
+	             entry->marker_id, mesh_pos.x, mesh_pos.y, mesh_pos.z, glm::degrees(yaw));
 }
 
 void scenes::stream::gui_fiducial_status()
@@ -201,5 +282,22 @@ void scenes::stream::gui_fiducial_status()
 			            marker_tracker->configured_marker(),
 			            marker_tracker->status().c_str());
 		}
+	}
+
+	if (fp.calibrated)
+	{
+		double age_s = (instance.now() - fp.calibrated_at) * 1e-9;
+		ImGui::Text("%s %d, %.0fs %s", _S("Aligned to marker"), fp.calibrated_marker, age_s, _S("ago"));
+	}
+
+	bool can_calibrate = marker_tracker && marker_tracker->latest().tracked;
+	ImGui::BeginDisabled(!can_calibrate);
+	if (ImGui::Button(_S("Calibrate to marker")))
+		calibrate_to_marker();
+	ImGui::EndDisabled();
+	if (not can_calibrate)
+	{
+		ImGui::SameLine();
+		ImGui::Text("%s", _S("needs marker in view"));
 	}
 }
