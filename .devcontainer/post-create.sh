@@ -14,4 +14,11 @@ echo "Allowing git to read the bind-mounted workspace ..."
 # CMake runs git at build time to stamp the version, so allow it.
 git config --global --add safe.directory '*'
 
+echo "Registering flathub remote for flatpak builds ..."
+# Needed by flatpak-builder --install-deps-from=flathub when packaging
+# wivrn-server.flatpak. Guarded so an offline first launch doesn't fail setup.
+if ! flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo; then
+	echo "WARNING: could not register flathub remote; flatpak builds will fail until it is added" >&2
+fi
+
 echo "Post-create setup finished."
