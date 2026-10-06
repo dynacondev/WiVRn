@@ -206,6 +206,8 @@ scenes::stream::stream(std::string server_name, scene & parent_scene) :
 	auto views = system.view_configuration_views(viewconfig);
 	width = views[0].recommendedImageRectWidth;
 	height = views[0].recommendedImageRectHeight;
+
+	request_spatial_permissions();
 }
 
 static from_headset::visibility_mask_changed::masks get_visibility_mask(xr::instance & inst, xr::session & session, int view)
@@ -1219,9 +1221,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		        application::space(xr::spaces::world),
 		        layer_view);
 
-		// Surface-projected passthrough cutout, submitted last as an overlay
-		if (want_projected_mesh)
-			update_fiducial_passthrough(frame_state.predictedDisplayTime);
+	// Marker tracking runs every frame: the in-view state feeds the Stats-tab
+	// dot and the Calibrate button. Mesh upload and layer submission stay
+	// gated on calibration inside update_fiducial_passthrough().
+	update_fiducial_passthrough(frame_state.predictedDisplayTime);
 
 		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)

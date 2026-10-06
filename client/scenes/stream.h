@@ -265,6 +265,11 @@ private:
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	void gui_fiducial_status();
 
+	// Eager USE_SCENE runtime-permission request (Android): manifest presence
+	// makes the spatial extensions enumerable, but tracking data needs the
+	// user grant. Process-once; the result feeds the Stats-tab hint.
+	void request_spatial_permissions();
+
 	// World-origin calibration (ROADMAP.md Phase 4). The tracking thread
 	// locates all reported poses against a STAGE reference space built from
 	// this offset; the render thread writes it on calibrate. Y always follows

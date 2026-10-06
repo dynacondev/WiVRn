@@ -63,6 +63,16 @@
     <!-- Required for XR_META_boundary_visibility -->
     <uses-permission android:name="com.oculus.permission.BOUNDARY_VISIBILITY" />
 
+    <!-- Required for XR_EXT_spatial_entity / XR_EXT_spatial_anchor (marker tracking).
+         Both namespaces: the runtime checks horizonos.permission on current Horizon OS,
+         com.oculus.permission on older releases. Unknown names are ignored. -->
+    <uses-permission android:name="horizonos.permission.USE_ANCHOR_API" />
+    <uses-permission android:name="com.oculus.permission.USE_ANCHOR_API" />
+    <!-- Required for XR_EXT_spatial_marker_tracking (AprilTag fiducials).
+         USE_SCENE is additionally a runtime permission: requested at stream start. -->
+    <uses-permission android:name="horizonos.permission.USE_SCENE" />
+    <uses-permission android:name="com.oculus.permission.USE_SCENE" />
+
     <!-- See https://hub.vive.com/storage/docs/en-us/ConfigureAppCapabilities.html -->
     <uses-feature android:name="wave.feature.handtracking" android:required="false" />
     <uses-feature android:name="wave.feature.eyetracking" android:required="false" />

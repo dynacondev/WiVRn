@@ -28,9 +28,54 @@
 #include "render/passthrough_mesh.h"
 #include "utils/i18n.h"
 
+#ifdef __ANDROID__
+#include "android/permissions.h"
+#endif
+
 #include <cmath>
 #include <glm/gtc/quaternion.hpp>
 #include <spdlog/spdlog.h>
+
+#ifdef __ANDROID__
+namespace
+{
+// USE_SCENE grant state. Written once from the permission callback (activity
+// thread), read on the render thread for the Stats-tab hint; a torn read only
+// delays the hint by a frame.
+bool scene_permission_granted = false;
+} // namespace
+#endif
+
+void scenes::stream::request_spatial_permissions()
+{
+#ifdef __ANDROID__
+	static bool requested = false;
+	if (requested)
+		return;
+	requested = true;
+
+	// Either namespace counts: the grant survives reinstalls, so a returning
+	// user on either old or new Horizon OS skips the prompt entirely.
+	if (check_permission("horizonos.permission.USE_SCENE") or
+	    check_permission("com.oculus.permission.USE_SCENE"))
+	{
+		scene_permission_granted = true;
+		spdlog::info("Scene permission already granted");
+		return;
+	}
+
+	// Canonical name on current Horizon OS first; the legacy name stays
+	// declared in the manifest for older releases.
+	spdlog::info("Requesting Scene permission for marker tracking");
+	request_permission("horizonos.permission.USE_SCENE", [](bool granted) {
+		scene_permission_granted = granted;
+		if (granted)
+			spdlog::info("Scene permission granted");
+		else
+			spdlog::warn("Scene permission denied, marker tracking unavailable");
+	});
+#endif
+}
 
 bool scenes::stream::fiducial_passthrough_wanted()
 {
@@ -310,6 +355,18 @@ void scenes::stream::gui_fiducial_status()
 			            marker_tracker->configured_marker(),
 			            marker_tracker->status().c_str());
 		}
+	}
+	else
+	{
+		ImGui::Text("%s: %s", _S("Marker"), _S("tracking unavailable"));
+#ifdef __ANDROID__
+		// The tracker only exists when the runtime exposes the spatial
+		// extensions. On Quest that means the manifest permissions (fixed) and
+		// the USE_SCENE runtime grant; extensions enumerate at instance
+		// creation, so a late grant needs an app restart to take effect.
+		if (not scene_permission_granted and not fiducial_entries.lock()->empty())
+			ImGui::Text("%s", _S("On Quest, grant the Scene permission, then restart the app"));
+#endif
 	}
 
 	if (fp.calibrated)
