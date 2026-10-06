@@ -1373,6 +1373,13 @@ void application::initialize()
 	        XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME,
 	        XR_EXT_USER_PRESENCE_EXTENSION_NAME,
 
+	        // Fiducial marker tracking (ROADMAP.md Phase 3, Quest only).
+	        // Probed like all opt extensions; absent runtimes are unaffected.
+	        XR_EXT_FUTURE_EXTENSION_NAME,
+	        XR_EXT_SPATIAL_ENTITY_EXTENSION_NAME,
+	        XR_EXT_SPATIAL_ANCHOR_EXTENSION_NAME,
+	        XR_EXT_SPATIAL_MARKER_TRACKING_EXTENSION_NAME,
+
 	        XR_ANDROID_FACE_TRACKING_EXTENSION_NAME,
 
 	        XR_BD_BODY_TRACKING_EXTENSION_NAME,

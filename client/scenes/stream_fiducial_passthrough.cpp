@@ -74,10 +74,33 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		key += model_cached ? 'C' : 'D';
 	}
 
+	// Marker tracking (Phase 3): same map entry, independent of mesh state
+	if (not entry)
+		marker_tracker.reset();
+	else if (entry->marker_size_m > 0)
+	{
+		if (not marker_tracker)
+		{
+			if (xr::marker_tracker::supported(instance))
+				marker_tracker.emplace(instance, session, system);
+			else if (not fp.marker_support_logged)
+			{
+				fp.marker_support_logged = true;
+				spdlog::info("Spatial marker tracking not supported by runtime");
+			}
+		}
+		if (marker_tracker)
+		{
+			marker_tracker->configure(entry->marker_id, entry->marker_size_m);
+			marker_tracker->update(world_space, instance.now(), predicted_display_time);
+		}
+	}
+
 	if (key != fp.last_key)
 	{
 		fp.last_key = key;
 		fp.attempted = false;
+		fp.marker_support_logged = false;
 		if (fp.ready)
 		{
 			session.clear_projected_passthrough_mesh();
@@ -154,4 +177,29 @@ void scenes::stream::gui_fiducial_status()
 		ImGui::Text("%s: %zu tris (%s)", _S("Passthrough mesh"), fp.triangle_count, fp.model_hash.substr(0, 8).c_str());
 	else
 		ImGui::Text("%s: %s", _S("Passthrough mesh"), fp.status.c_str());
+
+	if (marker_tracker)
+	{
+		auto sighting = marker_tracker->latest();
+		ImVec4 dot = sighting.tracked ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
+		ImGui::TextColored(dot, "%s", sighting.tracked ? "[o]" : "[x]");
+		ImGui::SameLine();
+		if (sighting.tracked)
+		{
+			double age_s = (instance.now() - sighting.time) * 1e-9;
+			ImGui::Text("%s %d (%.0fcm): %s, %.1fs ago",
+			            _S("Marker"),
+			            marker_tracker->configured_marker(),
+			            marker_tracker->configured_size() * 100,
+			            _S("tracked"),
+			            age_s);
+		}
+		else
+		{
+			ImGui::Text("%s %d: %s",
+			            _S("Marker"),
+			            marker_tracker->configured_marker(),
+			            marker_tracker->status().c_str());
+		}
+	}
 }

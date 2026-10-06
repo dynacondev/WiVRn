@@ -32,6 +32,7 @@
 #include "wifi_lock.h"
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
+#include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <filesystem>
 #include <mutex>
@@ -227,6 +228,7 @@ private:
 	{
 		bool attempted = false; // upload tried at least once (no retry spam)
 		bool ready = false;     // mesh live in the runtime
+		bool marker_support_logged = false;
 		std::string last_key;   // fingerprint of map + cache, resets attempted
 		std::string model_hash;
 		std::string status = "waiting for fiducial map";
@@ -242,6 +244,11 @@ private:
 	bool fiducial_passthrough_wanted();
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	void gui_fiducial_status();
+
+	// AprilTag 36h11 tracking (ROADMAP.md Phase 3). Driven on the render
+	// thread from update_fiducial_passthrough(); empty until the first
+	// fiducial map arrives and the runtime supports the spatial extensions.
+	std::optional<xr::marker_tracker> marker_tracker;
 
 	stream(std::string server_name, scene & parent_scene);
 
