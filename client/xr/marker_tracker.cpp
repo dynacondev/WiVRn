@@ -80,6 +80,7 @@ void xr::marker_tracker::configure(int32_t id, float size_m)
 	if (id == marker_id and size_m == marker_size_m and current_state != state::failed and current_state != state::idle)
 		return;
 
+	spdlog::info("marker_tracker: tracking AprilTag 36h11 marker {} ({:.0f}mm)", id, (double)(size_m * 1000));
 	marker_id = id;
 	marker_size_m = size_m;
 	current = sighting{};
@@ -296,6 +297,8 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		}
 		if (not found)
 		{
+			if (current.tracked)
+				spdlog::info("marker_tracker: lost sight of marker {}", marker_id);
 			current.tracked = false;
 			status_text = "marker not in view";
 		}

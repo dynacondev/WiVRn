@@ -191,6 +191,7 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 	}
 
 	std::vector<std::pair<std::string, uint64_t>> missing;
+	size_t cached = 0;
 	{
 		auto entries = fiducial_entries.lock();
 		for (const auto & entry: *entries)
@@ -198,12 +199,18 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 			if (entry.model_hash.empty() or entry.model_size == 0)
 				continue;
 			if (std::filesystem::exists(fiducial_model_path(entry.model_hash), ec))
+			{
+				++cached;
 				continue;
+			}
 			if (fiducial_downloads.contains(entry.model_hash))
 				continue;
 			missing.emplace_back(entry.model_hash, entry.model_size);
 		}
 	}
+
+	if (cached)
+		spdlog::info("Fiducial models already cached: {}", cached);
 
 	for (const auto & [hash, size]: missing)
 	{

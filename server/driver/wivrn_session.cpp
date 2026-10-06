@@ -994,8 +994,12 @@ void wivrn_session::send_fiducial_map()
 {
 	configuration config;
 	if (config.fiducial_map.empty())
+	{
+		U_LOG_I("Fiducial map: no entries configured");
 		return;
+	}
 
+	U_LOG_I("Fiducial map: sending %u entries", (unsigned)config.fiducial_map.size());
 	to_headset::fiducial_map msg;
 	for (const auto & entry: config.fiducial_map)
 	{
@@ -1013,11 +1017,19 @@ void wivrn_session::send_fiducial_map()
 			{
 				e.model_hash = hash_hex(fnv1a64(*data));
 				e.model_size = data->size();
+				U_LOG_I("Fiducial map: marker %d (%.0fmm), model %s (%llu bytes)",
+				        entry.marker_id, (double)(entry.marker_size_m * 1000),
+				        e.model_hash.c_str(), (unsigned long long)e.model_size);
 			}
 			else
 			{
 				U_LOG_W("Fiducial map: cannot serve model %s, entry will have no model", entry.model_path.c_str());
 			}
+		}
+		else
+		{
+			U_LOG_I("Fiducial map: marker %d (%.0fmm), no model configured",
+			        entry.marker_id, (double)(entry.marker_size_m * 1000));
 		}
 
 		msg.entries.push_back(std::move(e));
@@ -1028,6 +1040,7 @@ void wivrn_session::send_fiducial_map()
 
 void wivrn_session::operator()(from_headset::fiducial_model_request && request)
 {
+	U_LOG_I("Fiducial model requested: %s", request.model_hash.c_str());
 	configuration config;
 	for (const auto & entry: config.fiducial_map)
 	{
@@ -1039,6 +1052,8 @@ void wivrn_session::operator()(from_headset::fiducial_model_request && request)
 			continue;
 
 		uint32_t chunk_count = (data->size() + fiducial_model_chunk_size - 1) / fiducial_model_chunk_size;
+		U_LOG_I("Fiducial model %s: sending %u chunks (%llu bytes)",
+		        request.model_hash.c_str(), chunk_count, (unsigned long long)data->size());
 		for (uint32_t i = 0; i < chunk_count; ++i)
 		{
 			size_t begin = size_t(i) * fiducial_model_chunk_size;

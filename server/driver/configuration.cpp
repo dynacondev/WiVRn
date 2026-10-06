@@ -101,6 +101,7 @@ nlohmann::json configuration::read_configuration()
 			auto path = resolve_path(prefix / "wivrn" / "config.json");
 			if (std::filesystem::exists(path))
 			{
+				U_LOG_I("Using configuration file %s", path.c_str());
 				try
 				{
 					for (const auto & [key, value]: nlohmann::json::parse(std::ifstream(path)).get<nlohmann::json::object_t>())
