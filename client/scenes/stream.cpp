@@ -1165,7 +1165,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 #endif
 		swapchain.release();
 
-		if (use_alpha)
+		// Surface-projected passthrough needs the FB passthrough object
+		// alive even for opaque (non-alpha) server video
+		bool want_projected_mesh = fiducial_passthrough_wanted();
+		if (use_alpha or want_projected_mesh)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
@@ -1196,6 +1199,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		        use_alpha ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
 		        application::space(xr::spaces::world),
 		        layer_view);
+
+		// Surface-projected passthrough cutout, submitted last as an overlay
+		if (want_projected_mesh)
+			update_fiducial_passthrough(frame_state.predictedDisplayTime);
 
 		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)

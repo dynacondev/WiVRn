@@ -20,7 +20,10 @@
 #pragma once
 
 #include "openxr/openxr.h"
+#include "triangle_mesh.h"
 #include "utils/handle.h"
+#include <optional>
+#include <span>
 #include <variant>
 
 namespace xr
@@ -44,6 +47,18 @@ class passthrough_fb : public utils::handle<XrPassthroughFB>
 	passthrough_layer_fb passthrough_layer;
 	XrCompositionLayerPassthroughFB composition_layer;
 
+	// Surface-projected passthrough (XR_FB_triangle_mesh, Quest only).
+	// The projected layer shares the XrPassthroughFB above; the runtime
+	// projects camera imagery onto the supplied triangle geometry instead
+	// of doing full-environment reconstruction.
+	instance * inst = nullptr;
+	session * sess = nullptr;
+	bool projected_supported = false;
+	std::optional<passthrough_layer_fb> projected_layer;
+	XrCompositionLayerPassthroughFB projected_composition_layer{};
+	std::optional<triangle_mesh_fb> projected_mesh;
+	std::optional<geometry_instance_fb> projected_geometry;
+
 public:
 	passthrough_fb(instance &, session &);
 
@@ -52,6 +67,34 @@ public:
 	XrCompositionLayerBaseHeader * layer()
 	{
 		return (XrCompositionLayerBaseHeader *)&composition_layer;
+	}
+
+	// True when the runtime supports surface-projected passthrough
+	bool projected_mesh_supported() const
+	{
+		return projected_supported;
+	}
+
+	// (Re)create the projected mesh from baked world-space geometry and
+	// bind it to the projected layer at the given initial transform
+	void set_projected_mesh(
+	        std::span<const XrVector3f> vertices,
+	        std::span<const uint32_t> indices,
+	        XrSpace base_space,
+	        const XrPosef & pose,
+	        const XrVector3f & scale);
+	void clear_projected_mesh();
+
+	bool has_projected_mesh() const
+	{
+		return projected_geometry.has_value();
+	}
+
+	void update_projected_transform(XrSpace base_space, XrTime time, const XrPosef & pose, const XrVector3f & scale);
+
+	XrCompositionLayerBaseHeader * projected_layer_header()
+	{
+		return (XrCompositionLayerBaseHeader *)&projected_composition_layer;
 	}
 };
 

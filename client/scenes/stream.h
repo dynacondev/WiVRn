@@ -219,6 +219,30 @@ private:
 	std::unordered_map<std::string, fiducial_download> fiducial_downloads;
 	static std::filesystem::path fiducial_model_path(const std::string & hash);
 
+	// Surface-projected passthrough mesh (ROADMAP.md Phase 2).
+	// Phase 2 placement: the config position/orientation/scale is used
+	// directly as a world-space pose (no marker yet). Phase 4 reinterprets
+	// it as a marker-to-mesh offset.
+	struct fiducial_passthrough_state
+	{
+		bool attempted = false; // upload tried at least once (no retry spam)
+		bool ready = false;     // mesh live in the runtime
+		std::string last_key;   // fingerprint of map + cache, resets attempted
+		std::string model_hash;
+		std::string status = "waiting for fiducial map";
+		size_t vertex_count = 0;
+		size_t triangle_count = 0;
+		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrVector3f world_scale{1, 1, 1};
+	};
+	fiducial_passthrough_state fiducial_passthrough;
+
+	// True when a cached model + runtime support exist, i.e. the projected
+	// layer should be enabled even for opaque (non-alpha) server video
+	bool fiducial_passthrough_wanted();
+	void update_fiducial_passthrough(XrTime predicted_display_time);
+	void gui_fiducial_status();
+
 	stream(std::string server_name, scene & parent_scene);
 
 	bool forward_hid_input(from_headset::hid::input_t, bool device_enabled);

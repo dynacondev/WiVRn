@@ -181,6 +181,11 @@ protected:
 	        XrPosef pose,
 	        XrExtent2Df size);
 
+	// Append the surface-projected passthrough layer (Quest only) when a
+	// projected mesh is set. Must be called after the video projection
+	// layer so the cutout composites as an overlay. No-op otherwise.
+	void add_projected_passthrough_layer();
+
 	void render_world(
 	        XrCompositionLayerFlags flags,
 	        XrSpace space,

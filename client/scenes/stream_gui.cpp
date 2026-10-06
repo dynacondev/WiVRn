@@ -872,6 +872,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX() - content_margin, 0));
 			ImGui::SetCursorPosY(20);
 			wivrn::ui::page_header(_S("Statistics"), _S("Live streaming performance."));
+			gui_fiducial_status();
 			ImGui::BeginChild("plots", {0, 0});
 			gui_performance_metrics();
 			ImGui::EndChild();

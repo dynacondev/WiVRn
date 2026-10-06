@@ -105,6 +105,22 @@ public:
 		return passthrough;
 	}
 
+	// Surface-projected passthrough mesh (XR_FB_triangle_mesh, Quest only).
+	// All helpers no-op when the runtime lacks support.
+	bool projected_passthrough_supported();
+	void set_projected_passthrough_mesh(
+	        std::span<const XrVector3f> vertices,
+	        std::span<const uint32_t> indices,
+	        XrSpace base_space,
+	        const XrPosef & pose,
+	        const XrVector3f & scale);
+	void clear_projected_passthrough_mesh();
+	bool has_projected_passthrough_mesh();
+	void update_projected_passthrough_transform(XrSpace base_space, XrTime time, const XrPosef & pose, const XrVector3f & scale);
+	// Layer header for the current frame, or nullptr when no mesh is set.
+	// Callers must submit it after the video projection layer (overlay).
+	XrCompositionLayerBaseHeader * projected_passthrough_layer();
+
 	void set_performance_level(XrPerfSettingsDomainEXT, XrPerfSettingsLevelEXT);
 
 	bool boundary_visibility_supported() const

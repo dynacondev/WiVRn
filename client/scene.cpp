@@ -367,6 +367,16 @@ void scene::add_quad_layer(
 	});
 }
 
+void scene::add_projected_passthrough_layer()
+{
+	if (XrCompositionLayerBaseHeader * projected = session.projected_passthrough_layer())
+	{
+		layers.push_back(layer{
+		        .composition_layer = projected,
+		});
+	}
+}
+
 void scene::set_color_scale_bias(XrColor4f scale, XrColor4f bias)
 {
 	assert(not layers.empty());
