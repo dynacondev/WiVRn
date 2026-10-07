@@ -56,15 +56,15 @@ public:
 	// Record silhouette + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
 	// be unused (UNDEFINED is fine); it is left in GENERAL for the
-	// compositor. When rasterize is false only the clear runs (transparent
-	// mask): the full layer stack stays hot while no cutout is applied.
-	// Spread scales the blur taps (feather-px / 8, clamped by the caller).
+	// compositor. Feather selects the tier (0 = hard edge raster direct,
+	// 1 = full-res blur, 2/4/8 = blur at half/quarter/eighth with exact
+	// spread mapping, clamped to 128px); rasterize=false clears only.
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
 	            const std::array<glm::mat4, 2> & mvp,
 	            bool rasterize = true,
-	            float spread = 1.0f);
+	            float feather_px = 24.0f);
 
 	bool has_mesh() const
 	{
@@ -96,13 +96,17 @@ private:
 	vk::raii::RenderPass blur_renderpass{nullptr};
 	vk::raii::PipelineLayout blur_layout{nullptr};
 	vk::raii::Pipeline blur_pipeline{nullptr};
+	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
+	// reads the push block's src_texel prefix).
+	vk::raii::Pipeline downsample_pipeline{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// One set per (pass, eye): descriptor updates are host-side writes
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0,1 = blur-H eyes 0,1; 2,3 = blur-V eyes 0,1.
+	// Index: 0,1 = blur-H eyes 0,1; 2,3 = blur-V eyes 0,1; 4..9 =
+	// downsample levels 1..3 x eyes 0,1.
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
 	vk::raii::Sampler sampler{nullptr};
 
@@ -118,6 +122,12 @@ private:
 	};
 	blur_target target_a;
 	blur_target target_b;
+	// Downsample chain (D) and tier blur workspaces (E) at half, quarter
+	// and eighth mask resolution (index 0..2). Tier k blurs at 1/k size
+	// with the same fixed kernel, so tap density (and cost) stays flat
+	// while feather-px grows; the band stays continuous by exact mapping.
+	blur_target down_targets[3];
+	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
 	void ensure_targets(vk::Extent2D extent);
 	void update_source(vk::ImageView view, uint32_t set);

@@ -1198,18 +1198,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			if (mask_frame)
 			{
-				// Full-resolution mask: the blur below carries the feather,
-				// so shape fidelity no longer depends on tiny targets.
-				// Dims quantized to 64px: defoveated extents flicker with
-				// gaze, and every distinct size would recreate the member.
-				// Spread 0 is the identity (all taps hit center, weights sum
-				// to 1): feather-px 0 means a true hard edge and doubles
-				// as a chain diagnostic (binary through every pass).
-				float spread = 0.0f;
+				// Full-resolution mask target (dims quantized to 64px for
+				// swapchain stability); feather-px selects the blur tier
+				// inside record(), applied live with no recalibration.
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
-				if (fp.feather_px > 0)
-					spread = std::clamp(fp.feather_px / 8.f, 0.5f, 2.0f);
 				glm::quat q(fp.world_pose.orientation.w, fp.world_pose.orientation.x, fp.world_pose.orientation.y, fp.world_pose.orientation.z);
 				glm::vec3 t(fp.world_pose.position.x, fp.world_pose.position.y, fp.world_pose.position.z);
 				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
@@ -1247,7 +1240,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					fp.mask_wait_warned = false;
 					mask_acquired = true;
 					fp.mask_extent = {mw, mh};
-					fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, spread);
+					fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, fp.feather_px);
 				}
 			}
 		}

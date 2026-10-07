@@ -211,8 +211,9 @@ Each entry has:
 - `feather-px`: passthrough window feather width in screen pixels
   (alpha-gradient blend band around the mesh silhouette, default `24`;
   `0` disables feathering). Per object; applied live, no recalibration.
-  Recommended range with the current fixed 9-tap blur is 4-12; larger
-  values widen the tap spread instead of adding taps.
+  The client selects a blur tier automatically (0 hard edge, 1 full-res,
+  2/4/8 half/quarter/eighth with exact spread mapping, clamped to 128px),
+  so tap density and cost stay flat at any width.
 
 The mesh pose on the headset is
 `meshClientPose = observedMarkerPose * markerToMeshOffset`.
