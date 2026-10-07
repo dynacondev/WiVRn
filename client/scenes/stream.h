@@ -275,6 +275,7 @@ private:
 		std::unique_ptr<feather_mask_renderer> mask_renderer;
 		bool mask_ready = false;  // soup uploaded, safe to raster
 		bool mask_active = false; // submitting the mask stack this frame
+		bool mask_wait_warned = false; // image-wait timeout already reported
 		XrExtent2Di mask_extent{0, 0};
 		float feather_px = 24;
 	};

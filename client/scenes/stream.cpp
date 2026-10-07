@@ -879,8 +879,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		application::pop_scene();
 	}
 
-	if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
-		throw std::runtime_error("Vulkan fence timeout");
+	// Bounded wait: a hung GPU used to park the render thread here forever
+	// (frozen frame + live timewarp, zero logs). A timeout can no longer
+	// submit, so fail loudly instead of hanging silently.
+	if (device.waitForFences(*fence, VK_TRUE, 10'000'000'000) == vk::Result::eTimeout)
+		throw std::runtime_error("Vulkan fence timeout: GPU frame never completed (device hung?)");
+
+	// Render-loop heartbeat: proves frames are being submitted (vs the
+	// compositor merely timewarping the last one). Throttled, permanent.
+	{
+		static uint64_t frames_submitted = 0;
+		static XrTime last_heartbeat = 0;
+		++frames_submitted;
+		XrTime now = instance.now();
+		if (now - last_heartbeat > 10'000'000'000)
+		{
+			last_heartbeat = now;
+			spdlog::info("Render loop alive, {} frames submitted", frames_submitted);
+		}
+	}
 
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
@@ -1189,10 +1206,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					spdlog::info("Fiducial mask swapchain: {}x{}", mw, mh);
 				}
 				int mask_index = mask_swapchain.acquire();
-				mask_swapchain.wait();
-				mask_acquired = true;
-				fp.mask_extent = {mw, mh};
-				fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp);
+				if (not mask_swapchain.wait(100'000'000))
+				{
+					// Never park forever on an unavailable image: release
+					// the untouched acquisition to keep pairing and skip
+					// the mask this frame.
+					mask_swapchain.release();
+					mask_frame = false;
+					if (not fp.mask_wait_warned)
+					{
+						fp.mask_wait_warned = true;
+						spdlog::warn("Fiducial mask image wait timed out, skipping");
+					}
+				}
+				else
+				{
+					fp.mask_wait_warned = false;
+					mask_acquired = true;
+					fp.mask_extent = {mw, mh};
+					fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp);
+				}
 			}
 		}
 		catch (std::exception & e)

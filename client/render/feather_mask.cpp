@@ -294,6 +294,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	{
 		if (it != targets.end())
 			targets.erase(it);
+		// NOTE: views below are named locals, not &* temporaries: the
+		// framebuffer create-info stores the pointer, so the VkImageView
+		// must outlive the vk::raii::Framebuffer constructor call.
+		// (&* on a vk::raii handle takes the address of a returned
+		// temporary: freed stack read as an image view, GPU fault, silent
+		// fence hang. That exact bug froze the first mask frame.)
 		std::array<vk::raii::ImageView, 2> views{{
 		        [&] {
 			        vk::ImageViewCreateInfo view_info{
@@ -326,12 +332,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        return vk::raii::ImageView(device, view_info);
 		        }(),
 		}};
+		vk::ImageView raw_view_0 = *views[0];
+		vk::ImageView raw_view_1 = *views[1];
 		std::array<vk::raii::Framebuffer, 2> framebuffers{{
 		        [&] {
 			        vk::FramebufferCreateInfo fb_info{
 			                .renderPass = *renderpass,
 			                .attachmentCount = 1,
-			                .pAttachments = &*views[0],
+			                .pAttachments = &raw_view_0,
 			                .width = extent.width,
 			                .height = extent.height,
 			                .layers = 1,
@@ -342,7 +350,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        vk::FramebufferCreateInfo fb_info{
 			                .renderPass = *renderpass,
 			                .attachmentCount = 1,
-			                .pAttachments = &*views[1],
+			                .pAttachments = &raw_view_1,
 			                .width = extent.width,
 			                .height = extent.height,
 			                .layers = 1,
