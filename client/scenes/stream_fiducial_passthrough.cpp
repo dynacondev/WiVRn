@@ -54,20 +54,24 @@ void scenes::stream::request_spatial_permissions()
 		return;
 	requested = true;
 
-	// Either namespace counts: the grant survives reinstalls, so a returning
-	// user on either old or new Horizon OS skips the prompt entirely.
-	if (check_permission("horizonos.permission.USE_SCENE") or
-	    check_permission("com.oculus.permission.USE_SCENE"))
+	// Canonical name first: the runtime gates context creation on the
+	// com.oculus grant, while extension enumeration keys off the manifest
+	// string. Requesting only the horizonos string auto-grants vacuously
+	// ("already granted", no effective permission) and context creation
+	// then fails with "spatial permission not granted".
+	if (check_permission("com.oculus.permission.USE_SCENE"))
 	{
 		scene_permission_granted = true;
-		spdlog::info("Scene permission already granted");
+		spdlog::info("Scene permission already granted (com.oculus.permission.USE_SCENE)");
 		return;
 	}
+	if (check_permission("horizonos.permission.USE_SCENE"))
+		spdlog::info("horizonos Scene permission granted, still requesting the canonical one");
 
 	// Canonical name on current Horizon OS first; the legacy name stays
 	// declared in the manifest for older releases.
 	spdlog::info("Requesting Scene permission for marker tracking");
-	request_permission("horizonos.permission.USE_SCENE", [](bool granted) {
+	request_permission("com.oculus.permission.USE_SCENE", [](bool granted) {
 		scene_permission_granted = granted;
 		if (granted)
 			spdlog::info("Scene permission granted");

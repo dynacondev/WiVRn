@@ -37,11 +37,11 @@ class system;
 // XR_EXT_spatial_marker_tracking). Quest only; everything else degrades to
 // "unsupported" status, never a crash. The runtime reports markerId 0 for QR
 // codes, so sightings match on the exact decoded payload string. Poses come
-// from the BOUNDED_3D component (the ANCHOR component is not allowed for
+// from the BOUNDED_2D component (the ANCHOR component is not allowed for
 // marker entities on this runtime).
 //
 // Driven from the render thread (one update() per frame): async context
-// creation, then throttled discovery snapshots whose MARKER + BOUNDED_3D
+// creation, then throttled discovery snapshots whose MARKER + BOUNDED_2D
 // components yield the marker pose in the given base space.
 class marker_tracker
 {
@@ -120,7 +120,7 @@ private:
 	std::string marker_payload; // exact QR payload to match (required)
 	// Unconfigured payloads already reported (capped: diagnostic only)
 	std::set<std::string> unknown_payloads_logged;
-	// BOUNDED_3D allowed for the QR capability: the pose source. Without it
+	// BOUNDED_2D allowed for the QR capability: the pose source. Without it
 	// marker entities carry no pose on this runtime.
 	bool bounded_pose = false;
 	bool bounded_warned = false;
@@ -138,9 +138,9 @@ private:
 	std::string status_text = "idle";
 
 	// Query scratch storage (grown on demand, reused across snapshots).
-	// bounds[i] parallels marker_data[i] when BOUNDED_3D is queried.
+	// bounds[i] parallels marker_data[i] when BOUNDED_2D is queried.
 	std::vector<XrSpatialMarkerDataEXT> marker_data;
-	std::vector<XrBoxf> bound_boxes;
+	std::vector<XrSpatialBounded2DDataEXT> bound_boxes;
 
 	static constexpr XrDuration discovery_period_ns = 500'000'000; // 2 Hz
 	static constexpr XrDuration retry_delay_ns = 2'000'000'000;

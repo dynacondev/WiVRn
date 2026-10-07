@@ -159,13 +159,13 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	}
 	for (auto t: comp_list)
 		spdlog::info("marker_tracker: QR capability component {}", (int)t);
-	bounded_pose = std::ranges::contains(comp_list, XR_SPATIAL_COMPONENT_TYPE_BOUNDED_3D_EXT);
+	bounded_pose = std::ranges::contains(comp_list, XR_SPATIAL_COMPONENT_TYPE_BOUNDED_2D_EXT);
 
 	// Marker-only context: ANCHOR is rejected for marker entities, so the
-	// pose comes from BOUNDED_3D when the allowlist offers it.
+	// pose comes from BOUNDED_2D (center is a full 3D pose) when allowlisted.
 	std::vector<XrSpatialComponentTypeEXT> components = {XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT};
 	if (bounded_pose)
-		components.push_back(XR_SPATIAL_COMPONENT_TYPE_BOUNDED_3D_EXT);
+		components.push_back(XR_SPATIAL_COMPONENT_TYPE_BOUNDED_2D_EXT);
 	XrSpatialMarkerSizeEXT size{
 	        .type = XR_TYPE_SPATIAL_MARKER_SIZE_EXT,
 	        .markerSideLength = marker_size_m,
@@ -194,7 +194,7 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	current_state = state::creating_context;
 	status_text = "creating spatial context";
 	spdlog::info("marker_tracker: spatial context creating (pose component: {})",
-	             bounded_pose ? "BOUNDED_3D" : "none: markers carry no pose");
+	             bounded_pose ? "BOUNDED_2D" : "none: markers carry no pose");
 }
 
 std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer)
@@ -229,7 +229,11 @@ void xr::marker_tracker::complete_context()
 	if (XrResult res = xrCreateSpatialContextCompleteEXT(*sess, context_future, &completion); res != XR_SUCCESS or completion.futureResult != XR_SUCCESS)
 	{
 		context_future = XR_NULL_FUTURE_EXT;
-		fail("spatial context creation failed");
+		XrResult cause = res != XR_SUCCESS ? res : completion.futureResult;
+		if (cause == XR_ERROR_PERMISSION_INSUFFICIENT)
+			fail("spatial permission denied: grant Scene access, then restart the app");
+		else
+			fail("spatial context creation failed");
 		return;
 	}
 	context_future = XR_NULL_FUTURE_EXT;
@@ -293,7 +297,7 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 	};
 	static const XrSpatialComponentTypeEXT marker_and_bounds[] = {
 	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
-	        XR_SPATIAL_COMPONENT_TYPE_BOUNDED_3D_EXT,
+	        XR_SPATIAL_COMPONENT_TYPE_BOUNDED_2D_EXT,
 	};
 	XrSpatialComponentDataQueryConditionEXT condition{
 	        .type = XR_TYPE_SPATIAL_COMPONENT_DATA_QUERY_CONDITION_EXT,
@@ -328,8 +332,8 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		        .markerCount = (uint32_t)marker_data.size(),
 		        .markers = marker_data.data(),
 		};
-		XrSpatialComponentBounded3DListEXT bounds_list{
-		        .type = XR_TYPE_SPATIAL_COMPONENT_BOUNDED_3D_LIST_EXT,
+		XrSpatialComponentBounded2DListEXT bounds_list{
+		        .type = XR_TYPE_SPATIAL_COMPONENT_BOUNDED_2D_LIST_EXT,
 		        .next = &marker_list,
 		        .boundCount = (uint32_t)bound_boxes.size(),
 		        .bounds = bound_boxes.data(),
@@ -373,10 +377,10 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			{
 				const auto & c = bound_boxes[i].center;
 				const auto & e = bound_boxes[i].extents;
-				spdlog::info("marker_tracker: marker {} sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f}, {:.3f})",
+				spdlog::info("marker_tracker: marker {} sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f})",
 				             marker_id, c.position.x, c.position.y, c.position.z,
 				             c.orientation.x, c.orientation.y, c.orientation.z, c.orientation.w,
-				             e.width, e.height, e.depth);
+				             e.width, e.height);
 			}
 			current.tracked = true;
 			current.pose = bound_boxes[i].center;
