@@ -208,6 +208,9 @@ Each entry has:
   `[0,0,0,1]`)
 - `scale`: uniform marker-to-mesh scale, number or single-element array
   (default `1`)
+- `feather-px`: passthrough window feather width in screen pixels
+  (alpha-gradient blend band around the mesh silhouette, default `24`;
+  `0` disables feathering). Per object; applied live, no recalibration.
 
 The mesh pose on the headset is
 `meshClientPose = observedMarkerPose * markerToMeshOffset`.
@@ -228,7 +231,8 @@ payload to help you copy it verbatim into the config).
 			"model-path": "/usr/share/wivrn/meshes/widget.glb",
 			"position": [0, 0.05, 0.1],
 			"orientation": [0, 0, 0, 1],
-			"scale": 1.0
+			"scale": 1.0,
+			"feather-px": 24
 		}
 	]
 }

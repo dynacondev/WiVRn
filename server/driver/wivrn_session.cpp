@@ -1010,6 +1010,7 @@ void wivrn_session::send_fiducial_map()
 		        .position = entry.position,
 		        .orientation = entry.orientation,
 		        .scale = entry.scale,
+		        .feather_px = entry.feather_px,
 		};
 
 		if (not entry.model_path.empty())

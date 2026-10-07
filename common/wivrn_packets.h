@@ -992,6 +992,10 @@ struct fiducial_map_entry
 	std::array<float, 3> position;
 	std::array<float, 4> orientation;
 	float scale;
+	// Passthrough window feather width in screen pixels (alpha-gradient
+	// blend band around the mesh silhouette). Per object; the mask layer
+	// renders at screen/feather resolution. 0 disables feathering.
+	float feather_px = 24;
 };
 
 struct fiducial_map

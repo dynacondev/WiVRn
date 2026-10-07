@@ -244,6 +244,8 @@ configuration::configuration()
 					else if (item["scale"].is_array() and item["scale"].size() > 0)
 						e.scale = item["scale"].at(0);
 				}
+				if (item.contains("feather-px"))
+					e.feather_px = item["feather-px"];
 				fiducial_map.push_back(std::move(e));
 			}
 		}

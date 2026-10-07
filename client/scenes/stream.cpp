@@ -23,6 +23,7 @@
 #include "xr/space.h"
 #include "xr/system.h"
 #include <glm/gtc/matrix_access.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <magic_enum.hpp>
 #include <openxr/openxr.h>
@@ -850,6 +851,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	real_display_period = last_display_time ? frame_state.predictedDisplayTime - last_display_time : frame_state.predictedDisplayPeriod;
 	last_display_time = frame_state.predictedDisplayTime;
 
+	// Feathered mask-blend decision for this frame (resources were prepared
+	// by the previous update()). mask_frame gates both the raster record
+	// below and the layer submit after update().
+	auto & fp = fiducial_passthrough;
+	bool mask_frame = false;
+
 	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
 	{
@@ -1149,6 +1156,39 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
+		// Feathered mask record: rasterize the calibrated silhouette into a
+		// tiny swapchain; the compositor's upscale is the feather gradient.
+		// mask_active implies the renderer + mesh are ready (invariant kept
+		// by update()). The swapchain releases automatically at render_end.
+		try
+		{
+			mask_frame = fp.mask_active and fp.mask_renderer and fp.mask_renderer->has_mesh() and view_count == 2;
+			if (mask_frame)
+			{
+				float feather = fp.feather_px > 0 ? std::clamp(fp.feather_px, 4.f, 256.f) : 0;
+				int mw = feather > 0 ? std::max(8, int(extents[0].width / feather)) : extents[0].width;
+				int mh = feather > 0 ? std::max(8, int(extents[0].height / feather)) : extents[0].height;
+				glm::quat q(fp.world_pose.orientation.w, fp.world_pose.orientation.x, fp.world_pose.orientation.y, fp.world_pose.orientation.z);
+				glm::vec3 t(fp.world_pose.position.x, fp.world_pose.position.y, fp.world_pose.position.z);
+				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+				                  glm::scale(glm::mat4(1), glm::vec3(fp.world_scale.x, fp.world_scale.y, fp.world_scale.z));
+				std::array<glm::mat4, 2> mvp;
+				for (uint32_t view = 0; view < 2; ++view)
+					mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]) * model;
+				xr::swapchain & mask_sc = get_swapchain(swapchain_format, mw, mh, 1, view_count);
+				int mask_index = mask_sc.acquire();
+				mask_sc.wait();
+				fp.mask_image_index = mask_index;
+				fp.mask_extent = {mw, mh};
+				fp.mask_renderer->record(command_buffer, mask_sc.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp);
+			}
+		}
+		catch (std::exception & e)
+		{
+			spdlog::warn("Fiducial mask record failed: {}", e.what());
+			mask_frame = false;
+		}
+
 		command_buffer.end();
 		vk::SubmitInfo submit_info;
 		submit_info.setCommandBuffers(*command_buffer);
@@ -1194,7 +1234,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		else
 			session.disable_passthrough();
 
-		render_start(use_alpha, frame_state.predictedDisplayTime);
+		render_start(mask_frame ? false : use_alpha, frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
 		std::array<XrCompositionLayerProjectionView, view_count> layer_view;
@@ -1217,7 +1257,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			        };
 		}
 		add_projection_layer(
-		        use_alpha ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
+		        // Mask-blend mode drives the window from the feather mask;
+		        // server alpha (if any) is ignored so the two never double-cut.
+		        (use_alpha and not mask_frame) ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
 		        application::space(xr::spaces::world),
 		        layer_view);
 
@@ -1225,6 +1267,43 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// dot and the Calibrate button. Mesh upload and layer submission stay
 	// gated on calibration inside update_fiducial_passthrough().
 	update_fiducial_passthrough(frame_state.predictedDisplayTime);
+
+	if (mask_frame)
+	{
+		// Mask-blend stack, submitted last: video (opaque, above) was
+		// already added, then the feather mask, then fullscreen passthrough
+		// on top. The mask overwrites destination alpha without touching
+		// color; passthrough multiplies by it: reality inside the
+		// silhouette, game outside, gradient across the feather band.
+		xr::swapchain & mask_sc = get_swapchain(swapchain_format, fp.mask_extent.width, fp.mask_extent.height, 1, view_count);
+		std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+		for (uint32_t view = 0; view < view_count; ++view)
+		{
+			mask_views[view] = {
+			        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+			        .pose = pose[view],
+			        .fov = fov[view],
+			        .subImage = {
+			                .swapchain = mask_sc,
+			                .imageRect = {
+			                        .offset = {0, 0},
+			                        .extent = fp.mask_extent,
+			                },
+			                .imageArrayIndex = view,
+			        },
+			};
+		}
+		// imageIndex is implicit: the compositor uses the last released
+		// image, which record() acquired above.
+		add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+		                     application::space(xr::spaces::world),
+		                     mask_views);
+		set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
+		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+		add_passthrough_layer();
+		set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+	}
 
 		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)

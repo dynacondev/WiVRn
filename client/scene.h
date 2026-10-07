@@ -112,6 +112,7 @@ protected:
 	vk::Format depth_format;
 	bool composition_layer_depth_test_supported;
 	bool composition_layer_color_scale_bias_supported;
+	bool composition_layer_alpha_blend_supported;
 
 	std::pair<XrAction, XrActionType> get_action(const std::string & name)
 	{
@@ -143,6 +144,7 @@ protected:
 		std::optional<XrCompositionLayerColorScaleBiasKHR> color_scale_bias;
 		std::optional<XrCompositionLayerDepthTestFB> depth_test;
 		std::optional<XrCompositionLayerSettingsFB> settings;
+		std::optional<XrCompositionLayerAlphaBlendFB> alpha_blend;
 	};
 
 	std::vector<layer> layers;
@@ -181,6 +183,11 @@ protected:
 	        XrPosef pose,
 	        XrExtent2Df size);
 
+	// Append the fullscreen passthrough layer on demand. render_start()
+	// pushes it automatically when asked; mask-blend mode calls this last
+	// so the order becomes video, mask, passthrough.
+	void add_passthrough_layer();
+
 	// Append the surface-projected passthrough layer (Quest only) when a
 	// projected mesh is set. Must be called after the video projection
 	// layer so the cutout composites as an overlay. No-op otherwise.
@@ -198,6 +205,7 @@ protected:
 	        bool render_debug_draws = false);
 
 	void set_color_scale_bias(XrColor4f scale, XrColor4f bias);
+	void set_alpha_blend(XrBlendFactorFB src_color, XrBlendFactorFB dst_color, XrBlendFactorFB src_alpha, XrBlendFactorFB dst_alpha);
 	void set_depth_test(bool write, XrCompareOpFB op);
 	void set_layer_settings(XrCompositionLayerSettingsFlagsFB flags);
 

@@ -24,6 +24,7 @@
 #include "audio/audio.h"
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
+#include "render/feather_mask.h"
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
@@ -256,6 +257,21 @@ private:
 		size_t triangle_count = 0;
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
+
+		// Feathered mask-blend state. Replaces the binary triangle-mesh
+		// cutout when XR_FB_composition_layer_alpha_blend is available:
+		// the calibrated mesh silhouette is rasterized into a tiny shared
+		// mask layer whose upscale is the alpha-gradient feather band.
+		// Feather width comes live from the calibrated map entry
+		// (no recalibration needed to change it).
+		passthrough_mesh::triangle_soup mask_soup;
+		std::string mask_hash; // model hash the soup was built from
+		std::unique_ptr<feather_mask_renderer> mask_renderer;
+		bool mask_ready = false;  // soup uploaded, safe to raster
+		bool mask_active = false; // submitting the mask stack this frame
+		int mask_image_index = -1;
+		XrExtent2Di mask_extent{0, 0};
+		float feather_px = 24;
 	};
 	fiducial_passthrough_state fiducial_passthrough;
 

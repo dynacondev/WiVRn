@@ -69,6 +69,8 @@ struct configuration
 		std::array<float, 3> position = {0, 0, 0};
 		std::array<float, 4> orientation = {0, 0, 0, 1};
 		float scale = 1;
+		// Feather width in screen pixels for the passthrough window edges.
+		float feather_px = 24;
 	};
 	std::vector<fiducial_entry> fiducial_map;
 

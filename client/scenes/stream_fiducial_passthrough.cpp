@@ -34,6 +34,7 @@
 
 #include <cmath>
 #include <glm/gtc/quaternion.hpp>
+#include <memory>
 #include <spdlog/spdlog.h>
 
 #ifdef __ANDROID__
@@ -206,6 +207,51 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// happens until calibrated.
 	if (not fp.calibrated)
 		return;
+
+	// Feathered mask-blend path (replaces the binary triangle-mesh cutout
+	// when the alpha-blend extension is present): no runtime mesh upload,
+	// no geometry-instance transform. The soup + raster resources are
+	// (re)built here; raster record and layer submit happen in render().
+	if (composition_layer_alpha_blend_supported)
+	{
+		if (entry and model_cached)
+		{
+			// Live feather value: changing it needs no recalibration.
+			fp.feather_px = entry->feather_px;
+			fp.model_hash = entry->model_hash;
+			if (fp.mask_hash != entry->model_hash)
+			{
+				fp.mask_hash = entry->model_hash;
+				fp.mask_ready = false;
+				fp.mask_active = false;
+				try
+				{
+					fp.mask_soup = passthrough_mesh::flatten_gltf(fiducial_model_path(entry->model_hash));
+					if (not fp.mask_renderer)
+						fp.mask_renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+					fp.mask_renderer->set_soup(fp.mask_soup);
+					fp.mask_ready = fp.mask_renderer->has_mesh();
+					fp.status = "feathered";
+					spdlog::info("Fiducial mask mesh ready: {} triangles, feather {}px",
+					             fp.mask_soup.indices.size() / 3, entry->feather_px);
+				}
+				catch (std::exception & e)
+				{
+					fp.status = std::string("mask error: ") + e.what();
+					spdlog::warn("Fiducial mask mesh failed: {}", e.what());
+				}
+			}
+			fp.mask_active = fp.mask_ready;
+			if (fp.mask_active)
+				return;
+			// Else fall through to the binary mesh path below (mask
+			// unavailable: no soup, no renderer, or no model).
+		}
+		else
+		{
+			fp.mask_active = false;
+		}
+	}
 
 	// Re-upload if the runtime lost the mesh (e.g. passthrough re-created)
 	if (fp.ready and not session.has_projected_passthrough_mesh())

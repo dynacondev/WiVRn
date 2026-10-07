@@ -90,6 +90,8 @@ scene::scene(key, const meta & current_meta, std::span<const vk::Format> support
 
 	composition_layer_color_scale_bias_supported = instance.has_extension(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
 
+	composition_layer_alpha_blend_supported = instance.has_extension(XR_FB_COMPOSITION_LAYER_ALPHA_BLEND_EXTENSION_NAME);
+
 	if (parent_scene)
 	{
 		renderer = parent_scene->renderer;
@@ -308,21 +310,26 @@ void scene::render_start(bool passthrough, XrTime predicted_display_time_)
 
 	if (passthrough)
 	{
-		std::visit(
-		        utils::overloaded{
-		                [&](std::monostate &) {
-			                assert(false);
-		                },
-		                [&](xr::passthrough_alpha_blend & p) {
-			                blend_mode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
-		                },
-		                [&](auto & p) {
-			                layers.push_back(layer{
-			                        .composition_layer = p.layer(),
-			                });
-		                }},
-		        session.get_passthrough());
+		add_passthrough_layer();
 	}
+}
+
+void scene::add_passthrough_layer()
+{
+	std::visit(
+	        utils::overloaded{
+	                [&](std::monostate &) {
+		                assert(false);
+	                },
+	                [&](xr::passthrough_alpha_blend & p) {
+		                blend_mode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+	                },
+	                [&](auto & p) {
+		                layers.push_back(layer{
+		                        .composition_layer = p.layer(),
+		                });
+	                }},
+	        session.get_passthrough());
 }
 
 void scene::add_projection_layer(
@@ -387,6 +394,19 @@ void scene::set_color_scale_bias(XrColor4f scale, XrColor4f bias)
 	};
 }
 
+void scene::set_alpha_blend(XrBlendFactorFB src_color, XrBlendFactorFB dst_color, XrBlendFactorFB src_alpha, XrBlendFactorFB dst_alpha)
+{
+	assert(composition_layer_alpha_blend_supported);
+	assert(not layers.empty());
+	layers.back().alpha_blend = XrCompositionLayerAlphaBlendFB{
+	        .type = XR_TYPE_COMPOSITION_LAYER_ALPHA_BLEND_FB,
+	        .srcFactorColor = src_color,
+	        .dstFactorColor = dst_color,
+	        .srcFactorAlpha = src_alpha,
+	        .dstFactorAlpha = dst_alpha,
+	};
+}
+
 void scene::set_depth_test(bool write, XrCompareOpFB op)
 {
 	assert(not layers.empty());
@@ -434,6 +454,12 @@ void scene::render_end()
 		{
 			i.color_scale_bias->next = base->next;
 			base->next = &*i.color_scale_bias;
+		}
+
+		if (i.alpha_blend)
+		{
+			i.alpha_blend->next = const_cast<void *>(base->next);
+			base->next = &*i.alpha_blend;
 		}
 
 		if (i.depth_test)
