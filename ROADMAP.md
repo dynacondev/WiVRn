@@ -3,7 +3,7 @@
 Goal: on Meta Quest, render a server-provided glTF/GLB model as a
 surface-projected passthrough cutout (passthrough visible only where the mesh
 projects, correct from all angles, composited on-headset), anchored by a
-single AprilTag 36h11 fiducial with one-shot alignment.
+single QR-code fiducial with one-shot alignment.
 
 Locked decisions:
 
@@ -15,9 +15,9 @@ Locked decisions:
   `$XDG_CONFIG_HOME`, `/usr/share` overlay chain, see `docs/configuration.md`)
   extended with a fiducial list; models pushed over the WiVRn protocol on
   connect with hash cache. No HTTP, no manual sync.
-- Marker: single active AprilTag 36h11 via `XR_EXT_spatial_marker_tracking`
-  (+ `XR_EXT_spatial_entity`, `XR_EXT_future`). Size in meters comes from
-  config.
+- Marker: single active QR code via `XR_EXT_spatial_marker_tracking`
+  (+ `XR_EXT_spatial_entity`, `XR_EXT_future`), matched by exact payload
+  string. Size in meters comes from config.
 - Calibration: one-shot + Quest SLAM hold. No freeze on marker loss, no
   continuous follow. Manual realign button in Stream in-VR GUI with in-view
   status. Mesh pose rule: `meshClientPose = observedMarkerPose *
@@ -45,10 +45,10 @@ Current baseline (why this is new):
 Scope: define the mapping and get bytes to the headset. No rendering yet.
 
 1. Server config (`docs/configuration.md`, server config loader):
-   `fiducial_map: [{marker_id, marker_size_m, model_path, position[3],
-   orientation[4 xyzw], scale[3] or float}]`. Pose + scale only, per prior
-   agreement. `marker_id` is the AprilTag 36h11 ID. Paths resolved
-   server-side, blobs read at session start.
+   `fiducial_map: [{marker_id, marker_size_m, marker_data, model_path,
+   position[3], orientation[4 xyzw], scale[3] or float}]`. Pose + scale
+   only, per prior agreement. `marker_data` is the exact QR payload string.
+   Paths resolved server-side, blobs read at session start.
 2. Protocol (`common/wivrn_packets.h`, `common/protocol_version.h`):
    new `to_headset::fiducial_map{entries}` + `to_headset::model_blob{hash,
    bytes}` (glB). Bump/check `protocol_revision` handling so mismatched
@@ -120,7 +120,7 @@ count limits (`maxLayerCount`); Unity `AddSurfaceGeometry` deprecation noise
 does not apply to raw OpenXR but verify against installed Meta OpenXR SDK
 headers and Horizon OS version on test device.
 
-## Phase 3 — AprilTag 36h11 tracking + in-view status
+## Phase 3 — QR-code tracking + in-view status
 
 Scope: detect the marker, report pose + status. No alignment writes yet.
 
@@ -128,18 +128,18 @@ Scope: detect the marker, report pose + status. No alignment writes yet.
    `client/xr/marker_tracker.h/cpp`): enable `XR_EXT_spatial_entity`,
    `XR_EXT_future`, `XR_EXT_spatial_marker_tracking`. Async flow:
    `xrCreateSpatialContextAsyncEXT` with
-   `XrSpatialCapabilityConfigurationAprilTagEXT{aprilDict =
-   36h11, size from config}` -> poll future -> `xrDiscoverSpatialEntities` ->
-   per-entity pose component locate vs client `WORLD`. Single-marker only:
-   filter by `markerId == config.marker_id`.
+   `XrSpatialCapabilityConfigurationQrCodeEXT{size from config}` -> poll
+   future -> discovery snapshots -> per-entity MARKER + BOUNDED_3D locate vs
+   client world space. The runtime reports markerId 0 for QR, so filter by
+   exact decoded payload (`marker-data`). Single-marker only.
 2. Integrate into `client/scenes/stream_tracking.cpp:locate_spaces_functor`
    (same cadence as head/controller locates, same `predicted_display_time`).
    Expose `markerTracked bool + lastPose + timestamp` to scene state.
 3. Stream GUI (`client/scenes/stream_gui.cpp`, `stream_actions.cpp`):
    in-view dot + `markerId/size` + age of last sighting. No button yet.
 
-Accept: point at printed 36h11 tag of configured size/ID -> dot green + pose
-updating; cover tag -> dot red, last pose retained but flagged stale.
+Accept: point at printed QR code of configured size/payload -> dot green +
+pose updating; cover tag -> dot red, last pose retained but flagged stale.
 
 Risks: Horizon OS version skew (known v206 spatial-marker regression report);
 capability absent on older runtimes -> must degrade to Phase-2 static

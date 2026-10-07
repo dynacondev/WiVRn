@@ -198,9 +198,7 @@ Each entry has:
 
 - `marker-id`: numeric marker label (integer, required; shown in the
   headset status UI)
-- `marker-data`: exact QR payload string to match, byte-for-byte
-  (required for QR tracking; empty selects numeric `marker-id` matching for
-  AprilTag-capable runtimes)
+- `marker-data`: exact QR payload string to match, byte-for-byte (required)
 - `marker-size-m`: physical marker size in meters (required for pose scale;
   measure the printed QR's outer edge)
 - `model-path`: path to a `.glb`/`.gltf` file on the server (optional, models

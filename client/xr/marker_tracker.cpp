@@ -36,6 +36,7 @@ xr::marker_tracker::marker_tracker(instance & inst_, session & sess_, system & s
         sess(&sess_),
         system_id(sys),
         xrEnumerateSpatialCapabilitiesEXT(inst_.get_proc<PFN_xrEnumerateSpatialCapabilitiesEXT>("xrEnumerateSpatialCapabilitiesEXT")),
+        xrEnumerateSpatialCapabilityComponentTypesEXT(inst_.get_proc<PFN_xrEnumerateSpatialCapabilityComponentTypesEXT>("xrEnumerateSpatialCapabilityComponentTypesEXT")),
         xrPollFutureEXT(inst_.get_proc<PFN_xrPollFutureEXT>("xrPollFutureEXT")),
         xrCreateSpatialContextAsyncEXT(inst_.get_proc<PFN_xrCreateSpatialContextAsyncEXT>("xrCreateSpatialContextAsyncEXT")),
         xrCreateSpatialContextCompleteEXT(inst_.get_proc<PFN_xrCreateSpatialContextCompleteEXT>("xrCreateSpatialContextCompleteEXT")),
@@ -87,14 +88,11 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	if (current_state == state::failed and last_now < retry_at)
 		return;
 
-	bool qr = not payload.empty();
-	spdlog::info("marker_tracker: tracking {} marker {} ({:.0f}mm){}",
-	             qr ? "QR code" : "AprilTag 36h11", id, (double)(size_m * 1000),
-	             qr ? " payload \"" + payload.substr(0, 64) + "\"" : "");
 	marker_id = id;
 	marker_size_m = size_m;
 	marker_payload = std::move(payload);
 	unknown_payloads_logged.clear();
+	bounded_warned = false;
 	current = sighting{};
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
@@ -102,16 +100,21 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	current_state = state::idle;
 	status_text = "checking capabilities";
 
+	if (marker_payload.empty())
+	{
+		fail("fiducial map entry has no QR payload (marker-data)");
+		return;
+	}
+	spdlog::info("marker_tracker: tracking QR code marker {} ({:.0f}mm) payload \"{}\"",
+	             id, (double)(size_m * 1000), marker_payload.substr(0, 64));
+
 	if (marker_size_m <= 0)
 	{
 		fail("invalid marker size");
 		return;
 	}
 
-	// Require the marker capability before creating the context. QR codes
-	// carry identity in the payload (markerId is 0); an empty payload keeps
-	// the legacy numeric-ID AprilTag path for runtimes advertising it.
-	bool want_qr = not marker_payload.empty();
+	// Require the QR capability before creating the context
 	uint32_t count = 0;
 	if (XrResult res = xrEnumerateSpatialCapabilitiesEXT(*inst, system_id, 0, &count, nullptr); res != XR_SUCCESS)
 	{
@@ -126,55 +129,60 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	}
 	for (auto c: caps)
 		spdlog::info("marker_tracker: spatial capability {}", (int)c);
-	XrSpatialCapabilityEXT want_cap = want_qr ? XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT
-	                                          : XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT;
-	if (not std::ranges::contains(caps, want_cap))
+	if (not std::ranges::contains(caps, XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT))
 	{
-		fail(want_qr ? "QR code tracking not advertised by runtime"
-		             : "AprilTag tracking not advertised by runtime");
+		fail("QR code tracking not advertised by runtime");
 		return;
 	}
 
-	static const XrSpatialComponentTypeEXT components[] = {
-	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
-	        XR_SPATIAL_COMPONENT_TYPE_ANCHOR_EXT,
+	// Component allowlist for the QR capability: the runtime rejects
+	// components it doesn't support per capability (notably ANCHOR is
+	// rejected for marker entities), so the context enables exactly MARKER
+	// plus whatever pose component is allowed.
+	XrSpatialCapabilityComponentTypesEXT comp_types{
+	        .type = XR_TYPE_SPATIAL_CAPABILITY_COMPONENT_TYPES_EXT,
 	};
+	if (XrResult res = xrEnumerateSpatialCapabilityComponentTypesEXT(*inst, system_id, XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT, &comp_types);
+	    res != XR_SUCCESS)
+	{
+		fail("cannot enumerate QR capability components");
+		return;
+	}
+	std::vector<XrSpatialComponentTypeEXT> comp_list(comp_types.componentTypeCountOutput);
+	comp_types.componentTypeCapacityInput = (uint32_t)comp_list.size();
+	comp_types.componentTypes = comp_list.data();
+	if (XrResult res = xrEnumerateSpatialCapabilityComponentTypesEXT(*inst, system_id, XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT, &comp_types);
+	    res != XR_SUCCESS)
+	{
+		fail("cannot enumerate QR capability components");
+		return;
+	}
+	for (auto t: comp_list)
+		spdlog::info("marker_tracker: QR capability component {}", (int)t);
+	bounded_pose = std::ranges::contains(comp_list, XR_SPATIAL_COMPONENT_TYPE_BOUNDED_3D_EXT);
+
+	// Marker-only context: ANCHOR is rejected for marker entities, so the
+	// pose comes from BOUNDED_3D when the allowlist offers it.
+	std::vector<XrSpatialComponentTypeEXT> components = {XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT};
+	if (bounded_pose)
+		components.push_back(XR_SPATIAL_COMPONENT_TYPE_BOUNDED_3D_EXT);
 	XrSpatialMarkerSizeEXT size{
 	        .type = XR_TYPE_SPATIAL_MARKER_SIZE_EXT,
 	        .markerSideLength = marker_size_m,
-	};
-	XrSpatialCapabilityConfigurationAprilTagEXT april_tag{
-	        .type = XR_TYPE_SPATIAL_CAPABILITY_CONFIGURATION_APRIL_TAG_EXT,
-	        .next = &size,
-	        .capability = XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT,
-	        .enabledComponentCount = 2,
-	        .enabledComponents = components,
-	        .aprilDict = XR_SPATIAL_MARKER_APRIL_TAG_DICT_36H11_EXT,
 	};
 	XrSpatialCapabilityConfigurationQrCodeEXT qr_code{
 	        .type = XR_TYPE_SPATIAL_CAPABILITY_CONFIGURATION_QR_CODE_EXT,
 	        .next = &size,
 	        .capability = XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT,
-	        .enabledComponentCount = 2,
-	        .enabledComponents = components,
-	};
-	static const XrSpatialComponentTypeEXT anchor_components[] = {
-	        XR_SPATIAL_COMPONENT_TYPE_ANCHOR_EXT,
-	};
-	XrSpatialCapabilityConfigurationAnchorEXT anchor{
-	        .type = XR_TYPE_SPATIAL_CAPABILITY_CONFIGURATION_ANCHOR_EXT,
-	        .capability = XR_SPATIAL_CAPABILITY_ANCHOR_EXT,
-	        .enabledComponentCount = 1,
-	        .enabledComponents = anchor_components,
+	        .enabledComponentCount = (uint32_t)components.size(),
+	        .enabledComponents = components.data(),
 	};
 	const XrSpatialCapabilityConfigurationBaseHeaderEXT * configs[] = {
-	        want_qr ? reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&qr_code)
-	                : reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&april_tag),
-	        reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&anchor),
+	        reinterpret_cast<const XrSpatialCapabilityConfigurationBaseHeaderEXT *>(&qr_code),
 	};
 	XrSpatialContextCreateInfoEXT create_info{
 	        .type = XR_TYPE_SPATIAL_CONTEXT_CREATE_INFO_EXT,
-	        .capabilityConfigCount = 2,
+	        .capabilityConfigCount = 1,
 	        .capabilityConfigs = configs,
 	};
 	if (XrResult res = xrCreateSpatialContextAsyncEXT(*sess, &create_info, &context_future); res != XR_SUCCESS)
@@ -185,8 +193,8 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 
 	current_state = state::creating_context;
 	status_text = "creating spatial context";
-	spdlog::info("marker_tracker: creating spatial context for {} marker {}",
-	             want_qr ? "QR code" : "AprilTag 36h11", marker_id);
+	spdlog::info("marker_tracker: spatial context creating (pose component: {})",
+	             bounded_pose ? "BOUNDED_3D" : "none: markers carry no pose");
 }
 
 std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer)
@@ -280,15 +288,32 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 	}
 	spatial_snapshot_handle snapshot(completion.snapshot, xrDestroySpatialSnapshotEXT);
 
-	static const XrSpatialComponentTypeEXT components[] = {
+	static const XrSpatialComponentTypeEXT marker_only[] = {
 	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
-	        XR_SPATIAL_COMPONENT_TYPE_ANCHOR_EXT,
+	};
+	static const XrSpatialComponentTypeEXT marker_and_bounds[] = {
+	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
+	        XR_SPATIAL_COMPONENT_TYPE_BOUNDED_3D_EXT,
 	};
 	XrSpatialComponentDataQueryConditionEXT condition{
 	        .type = XR_TYPE_SPATIAL_COMPONENT_DATA_QUERY_CONDITION_EXT,
-	        .componentTypeCount = 2,
-	        .componentTypes = components,
+	        .componentTypeCount = bounded_pose ? 2u : 1u,
+	        .componentTypes = bounded_pose ? marker_and_bounds : marker_only,
 	};
+
+	if (not bounded_pose)
+	{
+		// No pose component was allowlisted: marker entities cannot be
+		// located on this runtime. Loud once, quiet status after.
+		if (not bounded_warned)
+		{
+			bounded_warned = true;
+			spdlog::warn("marker_tracker: QR capability exposes no pose component, markers cannot be located");
+		}
+		current.tracked = false;
+		status_text = "marker has no pose component";
+		return;
+	}
 
 	// Query twice at most: grow scratch storage when the snapshot holds more
 	for (int attempt = 0; attempt < 2; ++attempt)
@@ -296,79 +321,69 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		if (marker_data.empty())
 		{
 			marker_data.resize(8);
-			anchor_poses.resize(8);
+			bound_boxes.resize(8);
 		}
 		XrSpatialComponentMarkerListEXT marker_list{
 		        .type = XR_TYPE_SPATIAL_COMPONENT_MARKER_LIST_EXT,
 		        .markerCount = (uint32_t)marker_data.size(),
 		        .markers = marker_data.data(),
 		};
-		XrSpatialComponentAnchorListEXT anchor_list{
-		        .type = XR_TYPE_SPATIAL_COMPONENT_ANCHOR_LIST_EXT,
+		XrSpatialComponentBounded3DListEXT bounds_list{
+		        .type = XR_TYPE_SPATIAL_COMPONENT_BOUNDED_3D_LIST_EXT,
 		        .next = &marker_list,
-		        .locationCount = (uint32_t)anchor_poses.size(),
-		        .locations = anchor_poses.data(),
+		        .boundCount = (uint32_t)bound_boxes.size(),
+		        .bounds = bound_boxes.data(),
 		};
 		XrSpatialComponentDataQueryResultEXT result{
 		        .type = XR_TYPE_SPATIAL_COMPONENT_DATA_QUERY_RESULT_EXT,
-		        .next = &anchor_list,
+		        .next = &bounds_list,
 		};
 		if (XrResult res = xrQuerySpatialComponentDataEXT(snapshot, &condition, &result); res != XR_SUCCESS)
 		{
 			spdlog::warn("marker_tracker: component query failed");
 			return;
 		}
-		if (marker_list.markerCount > marker_data.size() or anchor_list.locationCount > anchor_poses.size())
+		if (marker_list.markerCount > marker_data.size() or bounds_list.boundCount > bound_boxes.size())
 		{
-			marker_data.resize(std::max(marker_list.markerCount, anchor_list.locationCount));
-			anchor_poses.resize(marker_data.size());
+			size_t n = std::max(marker_list.markerCount, bounds_list.boundCount);
+			marker_data.resize(n);
+			bound_boxes.resize(n);
 			continue;
 		}
 
-		uint32_t count = std::min(marker_list.markerCount, anchor_list.locationCount);
+		uint32_t count = std::min(marker_list.markerCount, bounds_list.boundCount);
 		bool found = false;
 		for (uint32_t i = 0; i < count; ++i)
 		{
-			bool match = false;
-			if (marker_payload.empty())
+			// QR runtimes report markerId 0: identity is the payload
+			auto payload = read_payload(snapshot, marker_data[i].data);
+			if (not payload)
+				continue;
+			if (*payload != marker_payload)
 			{
-				// Legacy numeric matching (AprilTag runtimes)
-				match = marker_data[i].capability == XR_SPATIAL_CAPABILITY_MARKER_TRACKING_APRIL_TAG_EXT and
-				        marker_data[i].markerId == (uint32_t)marker_id;
+				// Diagnostic: capped, so a room full of foreign QR
+				// codes shows what strings exist without spamming
+				if (unknown_payloads_logged.size() < 8 and
+				    unknown_payloads_logged.insert(*payload).second)
+					spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
+					             payload->substr(0, 64));
+				continue;
 			}
-			else if (marker_data[i].capability == XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT)
+			if (not current.tracked)
 			{
-				// QR runtimes report markerId 0: identity is the payload
-				auto payload = read_payload(snapshot, marker_data[i].data);
-				if (not payload)
-					continue;
-				if (*payload != marker_payload)
-				{
-					// Diagnostic: capped, so a room full of foreign QR
-					// codes shows what strings exist without spamming
-					if (unknown_payloads_logged.size() < 8 and
-					    unknown_payloads_logged.insert(*payload).second)
-						spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
-						             payload->substr(0, 64));
-					continue;
-				}
-				match = true;
+				const auto & c = bound_boxes[i].center;
+				const auto & e = bound_boxes[i].extents;
+				spdlog::info("marker_tracker: marker {} sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f}, {:.3f})",
+				             marker_id, c.position.x, c.position.y, c.position.z,
+				             c.orientation.x, c.orientation.y, c.orientation.z, c.orientation.w,
+				             e.width, e.height, e.depth);
 			}
-			if (match)
-			{
-				if (not current.tracked)
-				{
-					const auto & p = anchor_poses[i];
-					spdlog::info("marker_tracker: marker {} sighted at ({:.2f}, {:.2f}, {:.2f})",
-					             marker_id, p.position.x, p.position.y, p.position.z);
-				}
-				current.tracked = true;
-				current.pose = anchor_poses[i];
-				current.time = predicted_time;
-				status_text = "tracking marker";
-				found = true;
-				break;
-			}
+			current.tracked = true;
+			current.pose = bound_boxes[i].center;
+			current.time = predicted_time;
+			status_text = "tracking marker";
+			found = true;
+			break;
 		}
 		if (not found)
 		{

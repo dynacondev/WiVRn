@@ -57,14 +57,13 @@ struct configuration
 	std::vector<std::string> application;
 
 	// Fiducial-anchored passthrough meshes (Quest only, see ROADMAP.md).
-	// Maps a fiducial marker (AprilTag 36h11 by numeric ID, QR code by
-	// exact payload string) to a glB model + marker-to-mesh offset.
+	// Maps a QR-code marker (by exact payload string) to a glB model +
+	// marker-to-mesh offset.
 	struct fiducial_entry
 	{
 		int32_t marker_id = 0;
 		float marker_size_m = 0;
-		// Exact decoded payload identifying the marker (QR codes).
-		// Empty selects numeric marker_id matching (AprilTag).
+		// Exact decoded payload identifying the marker (required).
 		std::string marker_data;
 		std::string model_path;
 		std::array<float, 3> position = {0, 0, 0};

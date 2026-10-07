@@ -976,13 +976,12 @@ struct running_applications
 // and cached client-side by content hash.
 struct fiducial_map_entry
 {
-	// Numeric marker label (AprilTag tag ID); display label for QR payloads
+	// Numeric marker label shown in the headset status UI
 	int32_t marker_id;
 	// Physical marker size in meters (needed for pose scale)
 	float marker_size_m;
 	// Exact decoded payload string identifying this marker (QR codes: the
-	// runtime reports markerId 0, so matching is by payload). Empty means
-	// numeric marker_id matching (AprilTag path).
+	// runtime reports markerId 0, so matching is by payload). Required.
 	std::string marker_data;
 	// Hex content hash of the glB model, empty when no model is configured
 	std::string model_hash;

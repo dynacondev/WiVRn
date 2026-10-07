@@ -289,8 +289,7 @@ private:
 	// tracking origin on the marker. Requires a fresh marker sighting.
 	void calibrate_to_marker();
 
-	// QR-code tracking (ROADMAP.md Phase 3, Quest runtime capability; AprilTag
-	// numeric matching kept for runtimes advertising that capability instead).
+	// QR-code tracking (ROADMAP.md Phase 3, Quest runtime capability).
 	// Driven on the render thread from update_fiducial_passthrough(); empty
 	// until the first fiducial map arrives and the runtime supports it.
 	std::optional<xr::marker_tracker> marker_tracker;

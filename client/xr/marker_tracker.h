@@ -36,12 +36,12 @@ class system;
 // (XR_EXT_future + XR_EXT_spatial_entity + XR_EXT_spatial_anchor +
 // XR_EXT_spatial_marker_tracking). Quest only; everything else degrades to
 // "unsupported" status, never a crash. The runtime reports markerId 0 for QR
-// codes, so sightings match on the exact decoded payload string
-// (marker_data); an empty payload selects numeric marker_id matching for
-// runtimes advertising the AprilTag capability instead.
+// codes, so sightings match on the exact decoded payload string. Poses come
+// from the BOUNDED_3D component (the ANCHOR component is not allowed for
+// marker entities on this runtime).
 //
 // Driven from the render thread (one update() per frame): async context
-// creation, then throttled discovery snapshots whose MARKER + ANCHOR
+// creation, then throttled discovery snapshots whose MARKER + BOUNDED_3D
 // components yield the marker pose in the given base space.
 class marker_tracker
 {
@@ -60,6 +60,7 @@ public:
 	// (Re)configure for a marker; kicks off async context creation.
 	// No-op when already configured for the same marker/size/payload, and
 	// throttled by the failure backoff (no per-frame re-attempt spam).
+	// Payload is required: QR runtimes report markerId 0.
 	void configure(int32_t marker_id, float marker_size_m, std::string marker_payload);
 
 	// Advance the async state machine + throttled discovery.
@@ -89,6 +90,7 @@ private:
 	XrSystemId system_id = XR_NULL_SYSTEM_ID;
 
 	PFN_xrEnumerateSpatialCapabilitiesEXT xrEnumerateSpatialCapabilitiesEXT{};
+	PFN_xrEnumerateSpatialCapabilityComponentTypesEXT xrEnumerateSpatialCapabilityComponentTypesEXT{};
 	PFN_xrPollFutureEXT xrPollFutureEXT{};
 	PFN_xrCreateSpatialContextAsyncEXT xrCreateSpatialContextAsyncEXT{};
 	PFN_xrCreateSpatialContextCompleteEXT xrCreateSpatialContextCompleteEXT{};
@@ -115,9 +117,13 @@ private:
 
 	int32_t marker_id = -1;
 	float marker_size_m = 0;
-	std::string marker_payload; // exact QR payload to match; empty = numeric ID
+	std::string marker_payload; // exact QR payload to match (required)
 	// Unconfigured payloads already reported (capped: diagnostic only)
 	std::set<std::string> unknown_payloads_logged;
+	// BOUNDED_3D allowed for the QR capability: the pose source. Without it
+	// marker entities carry no pose on this runtime.
+	bool bounded_pose = false;
+	bool bounded_warned = false;
 	XrFutureEXT context_future = XR_NULL_FUTURE_EXT;
 	XrFutureEXT discovery_future = XR_NULL_FUTURE_EXT;
 	// Constructed with the destroy proc in the constructor init list
@@ -131,9 +137,10 @@ private:
 	sighting current;
 	std::string status_text = "idle";
 
-	// Query scratch storage (grown on demand, reused across snapshots)
+	// Query scratch storage (grown on demand, reused across snapshots).
+	// bounds[i] parallels marker_data[i] when BOUNDED_3D is queried.
 	std::vector<XrSpatialMarkerDataEXT> marker_data;
-	std::vector<XrPosef> anchor_poses;
+	std::vector<XrBoxf> bound_boxes;
 
 	static constexpr XrDuration discovery_period_ns = 500'000'000; // 2 Hz
 	static constexpr XrDuration retry_delay_ns = 2'000'000'000;
