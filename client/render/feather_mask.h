@@ -98,10 +98,11 @@ private:
 	vk::raii::Pipeline blur_pipeline{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
-	// One set per eye: a single set re-pointed per pass would overwrite
-	// itself before the first draw executes (host-side updates apply
-	// immediately, draws consume at submit), showing each eye the other's
-	// image. Per-eye sets make the binding stable across the frame.
+	// One set per (pass, eye): descriptor updates are host-side writes
+	// that complete before submit, so every draw would otherwise read the
+	// LAST update (all passes sampling the final image, i.e. unwritten
+	// data). Distinct sets make each binding stable across the frame.
+	// Index: 0,1 = blur-H eyes 0,1; 2,3 = blur-V eyes 0,1.
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
 	vk::raii::Sampler sampler{nullptr};
 
@@ -119,7 +120,7 @@ private:
 	blur_target target_b;
 	vk::Extent2D targets_extent{0, 0};
 	void ensure_targets(vk::Extent2D extent);
-	void update_source(vk::ImageView view, uint32_t eye);
+	void update_source(vk::ImageView view, uint32_t set);
 
 	vk::raii::Buffer vertex_buffer{nullptr};
 	vk::raii::DeviceMemory vertex_memory{nullptr};
