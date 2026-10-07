@@ -109,7 +109,7 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	unknown_payloads_logged.clear();
 	bounded_warned = false;
 	discovery_running_logged = false;
-	last_marker_count = UINT32_MAX;
+	last_entity_count = UINT32_MAX;
 	last_unreadable = false;
 	buffer_type_logged = false;
 	entries_dumped = false;
@@ -383,10 +383,14 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 	// Query twice at most: grow scratch storage when the snapshot holds more
 	for (int attempt = 0; attempt < 2; ++attempt)
 	{
-		if (marker_data.empty())
+		if (entity_ids.empty())
 		{
+			entity_ids.assign(8, UINT64_MAX);
+			entity_states.resize(8);
 			marker_data.resize(8);
 			bound_boxes.resize(8);
+			for (auto & m: marker_data)
+				m.markerId = 0xFFFFFFFFu;
 		}
 		XrSpatialComponentMarkerListEXT marker_list{
 		        .type = XR_TYPE_SPATIAL_COMPONENT_MARKER_LIST_EXT,
@@ -402,48 +406,60 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		XrSpatialComponentDataQueryResultEXT result{
 		        .type = XR_TYPE_SPATIAL_COMPONENT_DATA_QUERY_RESULT_EXT,
 		        .next = &bounds_list,
+		        .entityIdCapacityInput = (uint32_t)entity_ids.size(),
+		        .entityIds = entity_ids.data(),
+		        .entityStateCapacityInput = (uint32_t)entity_states.size(),
+		        .entityStates = entity_states.data(),
 		};
 		if (XrResult res = xrQuerySpatialComponentDataEXT(snapshot, &condition, &result); res != XR_SUCCESS)
 		{
 			spdlog::warn("marker_tracker: component query failed");
 			return;
 		}
-		if (marker_list.markerCount > marker_data.size() or bounds_list.boundCount > bound_boxes.size())
+		if (result.entityIdCountOutput > entity_ids.size() or
+		    result.entityStateCountOutput > entity_states.size() or
+		    marker_list.markerCount > marker_data.size() or
+		    bounds_list.boundCount > bound_boxes.size())
 		{
-			size_t n = std::max(marker_list.markerCount, bounds_list.boundCount);
+			size_t n = std::max({(size_t)result.entityIdCountOutput, (size_t)result.entityStateCountOutput,
+			                     (size_t)marker_list.markerCount, (size_t)bounds_list.boundCount});
+			size_t old = entity_ids.size();
+			entity_ids.resize(n);
+			entity_states.resize(n);
 			marker_data.resize(n);
 			bound_boxes.resize(n);
+			for (size_t i = old; i < n; ++i)
+			{
+				entity_ids[i] = UINT64_MAX;
+				marker_data[i].markerId = 0xFFFFFFFFu;
+			}
 			continue;
 		}
 
-		uint32_t count = std::min(marker_list.markerCount, bounds_list.boundCount);
-		if (marker_list.markerCount > 0 and not entries_dumped)
+		// Entity outputs are the source of truth; per-list counts are
+		// capacities the runtime may echo back untouched (sentinels in the
+		// scratch prove what was actually written).
+		uint32_t count = std::min({result.entityIdCountOutput, (uint32_t)marker_data.size(), (uint32_t)bound_boxes.size()});
+		if (result.entityIdCountOutput != last_entity_count)
+		{
+			last_entity_count = result.entityIdCountOutput;
+			spdlog::info("marker_tracker: discovery: {} entities (markers {}, bounds {})",
+			             result.entityIdCountOutput, marker_list.markerCount, bounds_list.boundCount);
+		}
+		if (result.entityIdCountOutput > 0 and not entries_dumped)
 		{
 			entries_dumped = true;
-			for (uint32_t i = 0; i < marker_list.markerCount; ++i)
+			for (uint32_t i = 0; i < count; ++i)
 			{
 				const auto & md = marker_data[i];
-				if (i < bounds_list.boundCount)
-				{
-					const auto & b = bound_boxes[i];
-					spdlog::info("marker_tracker: entry[{}]: cap={} id={} buf={} buftype={} ext=({:.3f},{:.3f}) pos=({:.2f},{:.2f},{:.2f})",
-					             i, (int)md.capability, md.markerId,
-					             (unsigned long long)md.data.bufferId, (int)md.data.bufferType,
-					             b.extents.width, b.extents.height,
-					             b.center.position.x, b.center.position.y, b.center.position.z);
-				}
-				else
-				{
-					spdlog::info("marker_tracker: entry[{}]: cap={} id={} buf={} buftype={} (no bounds)",
-					             i, (int)md.capability, md.markerId,
-					             (unsigned long long)md.data.bufferId, (int)md.data.bufferType);
-				}
+				const auto & b = bound_boxes[i];
+				int estate = i < result.entityStateCountOutput ? (int)entity_states[i] : -1;
+				spdlog::info("marker_tracker: entry[{}]: estate={} cap={} id={} buf={} buftype={} ext=({:.3f},{:.3f}) pos=({:.2f},{:.2f},{:.2f})",
+				             i, estate, (int)md.capability, md.markerId,
+				             (unsigned long long)md.data.bufferId, (int)md.data.bufferType,
+				             b.extents.width, b.extents.height,
+				             b.center.position.x, b.center.position.y, b.center.position.z);
 			}
-		}
-		if (marker_list.markerCount != last_marker_count)
-		{
-			last_marker_count = marker_list.markerCount;
-			spdlog::info("marker_tracker: discovery snapshot holds {} marker(s)", marker_list.markerCount);
 		}
 		bool found = false;
 		uint32_t unreadable = 0;

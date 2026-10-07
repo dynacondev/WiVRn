@@ -124,7 +124,7 @@ private:
 	// Snapshot content diagnostics: count transitions log at info (silence
 	// otherwise means zero markers), unreadable-payload state likewise.
 	// No gating: the first matching payload sights immediately.
-	uint32_t last_marker_count = UINT32_MAX;
+	uint32_t last_entity_count = UINT32_MAX;
 	bool last_unreadable = false;
 	// One-shot per-entry dump (capability/id/buffer/extents/pos) on the
 	// first non-empty snapshot per configure: settles husk-vs-real.
@@ -151,7 +151,12 @@ private:
 	std::string status_text = "idle";
 
 	// Query scratch storage (grown on demand, reused across snapshots).
-	// bounds[i] parallels marker_data[i] when BOUNDED_2D is queried.
+	// bounds[i] parallels marker_data[i]; both parallel entity_ids[i].
+	// Entity outputs are the source of truth: per-list counts are
+	// capacities the runtime may leave untouched, so marker slots are
+	// sentinel-filled (0xFFFFFFFF) to prove what was actually written.
+	std::vector<XrSpatialEntityIdEXT> entity_ids;
+	std::vector<XrSpatialEntityTrackingStateEXT> entity_states;
 	std::vector<XrSpatialMarkerDataEXT> marker_data;
 	std::vector<XrSpatialBounded2DDataEXT> bound_boxes;
 
