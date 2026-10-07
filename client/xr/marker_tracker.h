@@ -58,10 +58,12 @@ public:
 	static bool supported(instance &);
 
 	// (Re)configure for a marker; kicks off async context creation.
-	// No-op when already configured for the same marker/size/payload, and
+	// No-op when already configured for the same size/payload, and
 	// throttled by the failure backoff (no per-frame re-attempt spam).
-	// Payload is required: QR runtimes report markerId 0.
-	void configure(int32_t marker_id, float marker_size_m, std::string marker_payload);
+	// Payload is required: QR runtimes report markerId 0, so identity is
+	// the payload alone. Tag is display-only (UI/logs) and never gates:
+	// a rename updates the label live without restarting tracking.
+	void configure(float marker_size_m, std::string marker_payload, std::string tag);
 
 	// Advance the async state machine + throttled discovery.
 	// Render thread only. predicted_time stamps the discovery snapshot.
@@ -75,9 +77,14 @@ public:
 	{
 		return status_text;
 	}
-	int32_t configured_marker() const
+	const std::string & configured_tag() const
 	{
-		return marker_id;
+		return marker_tag;
+	}
+	// Display label for UI/logs: the tag, or the payload when untagged.
+	const std::string & label() const
+	{
+		return marker_tag.empty() ? marker_payload : marker_tag;
 	}
 	float configured_size() const
 	{
@@ -116,7 +123,8 @@ private:
 	};
 	state current_state = state::idle;
 
-	int32_t marker_id = -1;
+	// Display-only label from the server map (never used for matching)
+	std::string marker_tag;
 	float marker_size_m = 0;
 	std::string marker_payload; // exact QR payload to match (required)
 	// Unconfigured payloads already reported (capped: diagnostic only)

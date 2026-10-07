@@ -254,7 +254,9 @@ private:
 		bool marker_support_logged = false;
 		bool calibrated = false; // mesh anchor came from calibrate_to_marker()
 		XrTime calibrated_at = 0;
-		int32_t calibrated_marker = -1;
+		// Display label resolved at calibrate time (tag, or payload when
+		// untagged). Never used for matching.
+		std::string calibrated_tag;
 		std::string last_map_key; // map identity; a change invalidates calibration
 		std::string last_key;   // fingerprint of map + cache, resets attempted
 		std::string model_hash;

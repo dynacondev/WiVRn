@@ -61,7 +61,9 @@ struct configuration
 	// marker-to-mesh offset.
 	struct fiducial_entry
 	{
-		int32_t marker_id = 0;
+		// Display-only label for the headset status UI (correlates the
+		// GUI row with this config entry). Never used for matching.
+		std::string tag;
 		float marker_size_m = 0;
 		// Exact decoded payload identifying the marker (required).
 		std::string marker_data;

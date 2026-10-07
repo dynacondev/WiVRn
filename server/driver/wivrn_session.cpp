@@ -1004,7 +1004,7 @@ void wivrn_session::send_fiducial_map()
 	for (const auto & entry: config.fiducial_map)
 	{
 		to_headset::fiducial_map_entry e{
-		        .marker_id = entry.marker_id,
+		        .tag = entry.tag,
 		        .marker_size_m = entry.marker_size_m,
 		        .marker_data = entry.marker_data,
 		        .position = entry.position,
@@ -1013,14 +1013,16 @@ void wivrn_session::send_fiducial_map()
 		        .feather_px = entry.feather_px,
 		};
 
+		// Display label: the tag, or the payload when untagged.
+		const char * label = entry.tag.empty() ? entry.marker_data.c_str() : entry.tag.c_str();
 		if (not entry.model_path.empty())
 		{
 			if (auto data = read_model_file(entry.model_path))
 			{
 				e.model_hash = hash_hex(fnv1a64(*data));
 				e.model_size = data->size();
-				U_LOG_I("Fiducial map: marker %d (%.0fmm), payload \"%s\", model %s (%llu bytes) from %s",
-				        entry.marker_id, (double)(entry.marker_size_m * 1000),
+			U_LOG_I("Fiducial map: marker \"%s\" (%.0fmm), payload \"%s\", model %s (%llu bytes) from %s",
+			        label, (double)(entry.marker_size_m * 1000),
 				        entry.marker_data.c_str(),
 				        e.model_hash.c_str(), (unsigned long long)e.model_size,
 				        entry.model_path.c_str());
@@ -1032,8 +1034,8 @@ void wivrn_session::send_fiducial_map()
 		}
 		else
 		{
-			U_LOG_I("Fiducial map: marker %d (%.0fmm), no model configured",
-			        entry.marker_id, (double)(entry.marker_size_m * 1000));
+			U_LOG_I("Fiducial map: marker \"%s\" (%.0fmm), no model configured",
+			        label, (double)(entry.marker_size_m * 1000));
 		}
 
 		msg.entries.push_back(std::move(e));

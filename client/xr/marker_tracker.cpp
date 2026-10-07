@@ -92,9 +92,12 @@ bool xr::marker_tracker::poll_ready(XrFutureEXT future, bool & ready)
 	return true;
 }
 
-void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload)
+void xr::marker_tracker::configure(float size_m, std::string payload, std::string tag)
 {
-	if (id == marker_id and size_m == marker_size_m and payload == marker_payload and
+	// The tag is display-only: store it before the no-op check so a
+	// rename updates the UI label without restarting tracking.
+	marker_tag = std::move(tag);
+	if (size_m == marker_size_m and payload == marker_payload and
 	    current_state != state::failed and current_state != state::idle)
 		return;
 
@@ -103,7 +106,6 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	if (current_state == state::failed and last_now < retry_at)
 		return;
 
-	marker_id = id;
 	marker_size_m = size_m;
 	marker_payload = std::move(payload);
 	unknown_payloads_logged.clear();
@@ -125,8 +127,8 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 		fail("fiducial map entry has no QR payload (marker-data)");
 		return;
 	}
-	spdlog::info("marker_tracker: tracking QR code marker {} ({:.0f}mm) payload \"{}\"",
-	             id, (double)(size_m * 1000), marker_payload.substr(0, 64));
+	spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\"",
+	             label(), (double)(size_m * 1000), marker_payload.substr(0, 64));
 
 	if (marker_size_m <= 0)
 	{
@@ -486,8 +488,8 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			{
 				const auto & c = bound_boxes[i].center;
 				const auto & e = bound_boxes[i].extents;
-				spdlog::info("marker_tracker: marker {} sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f})",
-				             marker_id, c.position.x, c.position.y, c.position.z,
+				spdlog::info("marker_tracker: marker \"{}\" sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f})",
+				             label(), c.position.x, c.position.y, c.position.z,
 				             c.orientation.x, c.orientation.y, c.orientation.z, c.orientation.w,
 				             e.width, e.height);
 			}
@@ -511,7 +513,7 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 					spdlog::info("marker_tracker: markers visible but payload unreadable");
 			}
 			if (current.tracked)
-				spdlog::info("marker_tracker: lost sight of marker {}", marker_id);
+				spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
 			current.tracked = false;
 			status_text = "marker not in view";
 		}
@@ -530,11 +532,11 @@ void xr::marker_tracker::update(XrSpace world_space, XrTime now, XrTime predicte
 		case state::failed:
 			// Auto-retry with backoff: transient runtime hiccups recover.
 			// configure() itself honors retry_at, so this only re-arms idle.
-			if (marker_id >= 0 and now >= retry_at)
+			if (not marker_payload.empty() and now >= retry_at)
 			{
 				retry_at = now + retry_delay_ns;
 				current_state = state::idle;
-				configure(marker_id, marker_size_m, marker_payload);
+				configure(marker_size_m, marker_payload, marker_tag);
 			}
 			return;
 

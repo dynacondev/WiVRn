@@ -130,8 +130,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		{
 			map_key += e.model_hash;
 			map_key += ';';
-			map_key += std::to_string(e.marker_id);
-			map_key += ';';
+			// Identity is payload + size; the tag is display-only and
+			// deliberately excluded so a rename doesn't wipe calibration.
 			map_key += e.marker_data;
 			map_key += ';';
 			map_key += std::to_string(e.marker_size_m);
@@ -172,7 +172,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		}
 		if (marker_tracker)
 		{
-			marker_tracker->configure(entry->marker_id, entry->marker_size_m, entry->marker_data);
+			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag);
 			marker_tracker->update(world_space, instance.now(), predicted_display_time);
 		}
 	}
@@ -188,7 +188,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		{
 			fp.last_map_key = map_key;
 			fp.calibrated = false;
-			fp.calibrated_marker = -1;
+			fp.calibrated_tag.clear();
 			if (fp.ready)
 			{
 				spdlog::info("Fiducial map changed, clearing projected mesh");
@@ -356,7 +356,8 @@ void scenes::stream::calibrate_to_marker()
 	fp.world_scale = {entry->scale, entry->scale, entry->scale};
 	fp.calibrated = true;
 	fp.calibrated_at = now;
-	fp.calibrated_marker = entry->marker_id;
+	// Display label: the tag, or the payload when untagged.
+	fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
 
 	// Deliberately no world-origin change: shifting the client origin moves
 	// it out from under the server-rendered video (the game is rendered
@@ -365,8 +366,8 @@ void scenes::stream::calibrate_to_marker()
 	// the headset holds drift-free. Virtual-world moves belong server-side
 	// (see ROADMAP.md future phase), never as a client origin shift.
 
-	spdlog::info("Calibrated to marker {}: observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), sighting {}ms old",
-	             entry->marker_id, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z,
+	spdlog::info("Calibrated to marker \"{}\": observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), sighting {}ms old",
+	             fp.calibrated_tag, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z,
 	             (long long)((now - sighting.time) / 1'000'000));
 }
 
@@ -387,18 +388,18 @@ void scenes::stream::gui_fiducial_status()
 		if (sighting.tracked)
 		{
 			double age_s = (instance.now() - sighting.time) * 1e-9;
-			ImGui::Text("%s %d (%.0fcm): %s, %.1fs ago",
+			ImGui::Text("%s %.40s (%.0fcm): %s, %.1fs ago",
 			            _S("Marker"),
-			            marker_tracker->configured_marker(),
+			            marker_tracker->label().c_str(),
 			            marker_tracker->configured_size() * 100,
 			            _S("tracked"),
 			            age_s);
 		}
 		else
 		{
-			ImGui::Text("%s %d: %s",
+			ImGui::Text("%s %.40s: %s",
 			            _S("Marker"),
-			            marker_tracker->configured_marker(),
+			            marker_tracker->label().c_str(),
 			            marker_tracker->status().c_str());
 		}
 	}
@@ -418,7 +419,7 @@ void scenes::stream::gui_fiducial_status()
 	if (fp.calibrated)
 	{
 		double age_s = (instance.now() - fp.calibrated_at) * 1e-9;
-		ImGui::Text("%s %d, %.0fs %s", _S("Aligned to marker"), fp.calibrated_marker, age_s, _S("ago"));
+		ImGui::Text("%s %.40s, %.0fs %s", _S("Aligned to marker"), fp.calibrated_tag.c_str(), age_s, _S("ago"));
 	}
 
 	bool can_calibrate = marker_tracker && marker_tracker->latest().tracked;

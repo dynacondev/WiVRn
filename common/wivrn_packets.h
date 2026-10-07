@@ -976,8 +976,9 @@ struct running_applications
 // and cached client-side by content hash.
 struct fiducial_map_entry
 {
-	// Numeric marker label shown in the headset status UI
-	int32_t marker_id;
+	// Display-only label for the headset status UI (correlates the GUI
+	// row with the server config entry). Never used for matching.
+	std::string tag;
 	// Physical marker size in meters (needed for pose scale)
 	float marker_size_m;
 	// Exact decoded payload string identifying this marker (QR codes: the

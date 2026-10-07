@@ -196,8 +196,9 @@ once.
 
 Each entry has:
 
-- `marker-id`: numeric marker label (integer, required; shown in the
-  headset status UI)
+- `tag`: display-only label shown in the headset status UI, so the GUI
+  row correlates with this config entry (optional; matching is by
+  `marker-data` alone, and renaming never invalidates a calibration)
 - `marker-data`: exact QR payload string to match, byte-for-byte (required)
 - `marker-size-m`: physical marker size in meters (required for pose scale;
   measure the printed QR's outer edge)
@@ -228,7 +229,7 @@ payload to help you copy it verbatim into the config).
 {
 	"fiducial-map": [
 		{
-			"marker-id": 11,
+			"tag": "window",
 			"marker-data": "wivrn:11",
 			"marker-size-m": 0.08,
 			"model-path": "/usr/share/wivrn/meshes/widget.glb",
