@@ -125,6 +125,12 @@ private:
 
 	xr::swapchain swapchain;
 
+	// Dedicated feather-mask swapchain (NOT from the shared get_swapchain
+	// pool: pooled entries are release-all at render_end, which unpaired a
+	// re-fetched handle and killed the app with CALL_ORDER_INVALID).
+	// Acquired + released explicitly around the raster record each frame.
+	xr::swapchain mask_swapchain;
+
 	std::optional<audio> audio_handle;
 
 	std::optional<xr::hand_tracker> left_hand;
@@ -269,7 +275,6 @@ private:
 		std::unique_ptr<feather_mask_renderer> mask_renderer;
 		bool mask_ready = false;  // soup uploaded, safe to raster
 		bool mask_active = false; // submitting the mask stack this frame
-		int mask_image_index = -1;
 		XrExtent2Di mask_extent{0, 0};
 		float feather_px = 24;
 	};

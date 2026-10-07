@@ -856,6 +856,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// below and the layer submit after update().
 	auto & fp = fiducial_passthrough;
 	bool mask_frame = false;
+	bool mask_acquired = false;
 
 	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
@@ -1159,15 +1160,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Feathered mask record: rasterize the calibrated silhouette into a
 		// tiny swapchain; the compositor's upscale is the feather gradient.
 		// mask_active implies the renderer + mesh are ready (invariant kept
-		// by update()). The swapchain releases automatically at render_end.
+		// by update()). Dedicated member swapchain with explicit
+		// acquire/release pairing (never the shared pool).
 		try
 		{
 			mask_frame = fp.mask_active and fp.mask_renderer and fp.mask_renderer->has_mesh() and view_count == 2;
 			if (mask_frame)
 			{
+				// Dims quantized to 16px: defoveated extents flicker with
+				// gaze, and every distinct size would recreate the member.
 				float feather = fp.feather_px > 0 ? std::clamp(fp.feather_px, 4.f, 256.f) : 0;
-				int mw = feather > 0 ? std::max(8, int(extents[0].width / feather)) : extents[0].width;
-				int mh = feather > 0 ? std::max(8, int(extents[0].height / feather)) : extents[0].height;
+				int mw = feather > 0 ? std::max(16, int(extents[0].width / feather + 8) / 16 * 16) : extents[0].width;
+				int mh = feather > 0 ? std::max(16, int(extents[0].height / feather + 8) / 16 * 16) : extents[0].height;
 				glm::quat q(fp.world_pose.orientation.w, fp.world_pose.orientation.x, fp.world_pose.orientation.y, fp.world_pose.orientation.z);
 				glm::vec3 t(fp.world_pose.position.x, fp.world_pose.position.y, fp.world_pose.position.z);
 				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
@@ -1175,17 +1179,39 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				std::array<glm::mat4, 2> mvp;
 				for (uint32_t view = 0; view < 2; ++view)
 					mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]) * model;
-				xr::swapchain & mask_sc = get_swapchain(swapchain_format, mw, mh, 1, view_count);
-				int mask_index = mask_sc.acquire();
-				mask_sc.wait();
-				fp.mask_image_index = mask_index;
+				if (not mask_swapchain or mask_swapchain.width() != mw or mask_swapchain.height() != mh)
+				{
+					// Rare path (first frame, feather/config change):
+					// nothing outstanding (previous image released last
+					// frame), mirroring setup_reprojection_swapchain.
+					device.waitIdle();
+					mask_swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
+					spdlog::info("Fiducial mask swapchain: {}x{}", mw, mh);
+				}
+				int mask_index = mask_swapchain.acquire();
+				mask_swapchain.wait();
+				mask_acquired = true;
 				fp.mask_extent = {mw, mh};
-				fp.mask_renderer->record(command_buffer, mask_sc.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp);
+				fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp);
 			}
 		}
 		catch (std::exception & e)
 		{
 			spdlog::warn("Fiducial mask record failed: {}", e.what());
+			// An acquire already happened: release it here, otherwise the
+			// image stays outstanding and the pairing breaks.
+			if (mask_acquired)
+			{
+				mask_acquired = false;
+				try
+				{
+					mask_swapchain.release();
+				}
+				catch (std::exception & e2)
+				{
+					spdlog::warn("Fiducial mask release failed: {}", e2.what());
+				}
+			}
 			mask_frame = false;
 		}
 
@@ -1220,6 +1246,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		renderdoc_end(*vk_instance);
 #endif
 		swapchain.release();
+		// Paired with the mask acquire above: same guard, adjacent lines.
+		if (mask_frame)
+			mask_swapchain.release();
 
 		// Surface-projected passthrough needs the FB passthrough object
 		// alive even for opaque (non-alpha) server video
@@ -1275,7 +1304,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// on top. The mask overwrites destination alpha without touching
 		// color; passthrough multiplies by it: reality inside the
 		// silhouette, game outside, gradient across the feather band.
-		xr::swapchain & mask_sc = get_swapchain(swapchain_format, fp.mask_extent.width, fp.mask_extent.height, 1, view_count);
+		// Member swapchain acquired above (never the shared pool).
 		std::array<XrCompositionLayerProjectionView, view_count> mask_views;
 		for (uint32_t view = 0; view < view_count; ++view)
 		{
@@ -1283,14 +1312,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
 			        .pose = pose[view],
 			        .fov = fov[view],
-			        .subImage = {
-			                .swapchain = mask_sc,
-			                .imageRect = {
-			                        .offset = {0, 0},
-			                        .extent = fp.mask_extent,
+				.subImage = {
+				                .swapchain = mask_swapchain,
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = fp.mask_extent,
+				                },
+				                .imageArrayIndex = view,
 			                },
-			                .imageArrayIndex = view,
-			        },
 			};
 		}
 		// imageIndex is implicit: the compositor uses the last released
