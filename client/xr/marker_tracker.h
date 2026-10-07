@@ -120,6 +120,11 @@ private:
 	std::string marker_payload; // exact QR payload to match (required)
 	// Unconfigured payloads already reported (capped: diagnostic only)
 	std::set<std::string> unknown_payloads_logged;
+	// Snapshot content diagnostics: count transitions log at info (silence
+	// otherwise means zero markers), unreadable-payload state likewise.
+	// No gating: the first matching payload sights immediately.
+	uint32_t last_marker_count = UINT32_MAX;
+	bool last_unreadable = false;
 	// BOUNDED_2D allowed for the QR capability: the pose source. Without it
 	// marker entities carry no pose on this runtime.
 	bool bounded_pose = false;

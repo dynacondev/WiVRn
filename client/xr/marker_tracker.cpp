@@ -108,6 +108,8 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	unknown_payloads_logged.clear();
 	bounded_warned = false;
 	discovery_running_logged = false;
+	last_marker_count = UINT32_MAX;
+	last_unreadable = false;
 	current = sighting{};
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
@@ -215,9 +217,16 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer)
 {
 	// QR payloads are decoded strings; anything else has no usable identity
-	if (buffer.bufferId == XR_NULL_SPATIAL_BUFFER_ID_EXT or
-	    buffer.bufferType != XR_SPATIAL_BUFFER_TYPE_STRING_EXT)
+	if (buffer.bufferId == XR_NULL_SPATIAL_BUFFER_ID_EXT)
+	{
+		spdlog::debug("marker_tracker: marker has null payload buffer");
 		return std::nullopt;
+	}
+	if (buffer.bufferType != XR_SPATIAL_BUFFER_TYPE_STRING_EXT)
+	{
+		spdlog::debug("marker_tracker: marker payload buffer type {} is not string", (int)buffer.bufferType);
+		return std::nullopt;
+	}
 
 	XrSpatialBufferGetInfoEXT info{
 	        .type = XR_TYPE_SPATIAL_BUFFER_GET_INFO_EXT,
@@ -225,12 +234,18 @@ std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT
 	};
 	uint32_t count = 0;
 	if (XrResult res = xrGetSpatialBufferStringEXT(snapshot, &info, 0, &count, nullptr); res != XR_SUCCESS or count == 0)
+	{
+		spdlog::debug("marker_tracker: payload size query failed");
 		return std::nullopt;
+	}
 
 	// +1 and explicit trim: runtimes differ on whether count includes NUL
 	std::vector<char> text(count + 1, 0);
 	if (XrResult res = xrGetSpatialBufferStringEXT(snapshot, &info, count, &count, text.data()); res != XR_SUCCESS)
+	{
+		spdlog::debug("marker_tracker: payload fetch failed");
 		return std::nullopt;
+	}
 	while (count > 0 and text[count - 1] == 0)
 		--count;
 	return std::string(text.data(), count);
@@ -366,13 +381,22 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		}
 
 		uint32_t count = std::min(marker_list.markerCount, bounds_list.boundCount);
+		if (marker_list.markerCount != last_marker_count)
+		{
+			last_marker_count = marker_list.markerCount;
+			spdlog::info("marker_tracker: discovery snapshot holds {} marker(s)", marker_list.markerCount);
+		}
 		bool found = false;
+		uint32_t unreadable = 0;
 		for (uint32_t i = 0; i < count; ++i)
 		{
 			// QR runtimes report markerId 0: identity is the payload
 			auto payload = read_payload(snapshot, marker_data[i].data);
 			if (not payload)
+			{
+				++unreadable;
 				continue;
+			}
 			if (*payload != marker_payload)
 			{
 				// Diagnostic: capped, so a room full of foreign QR
@@ -401,6 +425,16 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		}
 		if (not found)
 		{
+			// Markers present but none readable: payload path broken, say
+			// so once (reasons at debug). Otherwise the count line above
+			// already told the story.
+			bool unreadable_now = unreadable > 0;
+			if (unreadable_now != last_unreadable)
+			{
+				last_unreadable = unreadable_now;
+				if (unreadable_now)
+					spdlog::info("marker_tracker: markers visible but payload unreadable");
+			}
 			if (current.tracked)
 				spdlog::info("marker_tracker: lost sight of marker {}", marker_id);
 			current.tracked = false;
