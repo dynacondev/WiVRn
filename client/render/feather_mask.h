@@ -18,16 +18,18 @@
 
 #pragma once
 
-// Feathered passthrough window mask: rasterizes the calibrated mesh
-// silhouette (flat white, alpha 1) into a tiny per-eye target. The
-// compositor's bilinear upscale turns the binary raster into the
-// alpha-gradient feather band, so no blur pass is needed: feather width
-// in screen pixels ~= screen width / mask width.
+// Feathered passthrough window mask.
 //
-// Rendered with a dedicated minimal pipeline (no descriptors, MVP via push
-// constants, no depth, no culling so concave self-overlap still unions).
-// Swapchain images only allow COLOR_ATTACHMENT output, which is why this is
-// a raster pass and not a buffer copy.
+// Per frame (both eyes): rasterize the calibrated mesh silhouette binary
+// at full resolution into intermediate A, separable Gaussian blur H into
+// B and V into the submitted swapchain image. The blur decouples feather
+// width from shape resolution: opaque interiors stay pixel-exact while
+// the band is genuinely smooth (robust to the compositor sampling with or
+// without filtering). Fixed 9-tap kernel (sigma 2); feather-px maps to
+// tap spread, recommended range 4-12 (see docs/configuration.md).
+//
+// Swapchain images only allow COLOR_ATTACHMENT output, which is why the
+// silhouette is a raster pass and not a buffer copy.
 
 #include "render/passthrough_mesh.h"
 
@@ -51,17 +53,18 @@ public:
 	// when idle, e.g. on map change, not per frame.
 	void set_soup(const passthrough_mesh::triangle_soup & soup);
 
-	// Record both eye passes into the layers of an acquired swapchain image.
-	// No-op when no mesh is set. The image must be unused (UNDEFINED is
-	// fine); it is left in GENERAL for the compositor. When rasterize is
-	// false the passes only clear (transparent): the full layer stack,
-	// blend chains and swapchain lifecycle stay hot while no cutout is
-	// applied. TEMPORARY diagnostic for isolating plumbing vs content.
+	// Record silhouette + blur chain for both eyes into the layers of an
+	// acquired swapchain image. No-op when no mesh is set. The image must
+	// be unused (UNDEFINED is fine); it is left in GENERAL for the
+	// compositor. When rasterize is false only the clear runs (transparent
+	// mask): the full layer stack stays hot while no cutout is applied.
+	// Spread scales the blur taps (feather-px / 8, clamped by the caller).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
 	            const std::array<glm::mat4, 2> & mvp,
-	            bool rasterize = true);
+	            bool rasterize = true,
+	            float spread = 1.0f);
 
 	bool has_mesh() const
 	{
@@ -88,6 +91,31 @@ private:
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
+
+	// Separable Gaussian blur (fullscreen triangle, sampled input).
+	vk::raii::RenderPass blur_renderpass{nullptr};
+	vk::raii::PipelineLayout blur_layout{nullptr};
+	vk::raii::Pipeline blur_pipeline{nullptr};
+	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
+	vk::raii::DescriptorPool descriptor_pool{nullptr};
+	vk::raii::DescriptorSet descriptor_set{nullptr};
+	vk::raii::Sampler sampler{nullptr};
+
+	// Blur intermediates (full mask resolution, own images: full usage
+	// control, unlike swapchain images). Recreated when the extent changes.
+	struct blur_target
+	{
+		vk::raii::Image image{nullptr};
+		vk::raii::DeviceMemory memory{nullptr};
+		std::vector<vk::raii::ImageView> views;
+		std::vector<vk::raii::Framebuffer> raster_fbs;
+		std::vector<vk::raii::Framebuffer> blur_fbs;
+	};
+	blur_target target_a;
+	blur_target target_b;
+	vk::Extent2D targets_extent{0, 0};
+	void ensure_targets(vk::Extent2D extent);
+	void update_source(vk::ImageView view);
 
 	vk::raii::Buffer vertex_buffer{nullptr};
 	vk::raii::DeviceMemory vertex_memory{nullptr};

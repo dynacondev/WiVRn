@@ -21,6 +21,7 @@
 #include "vk/shader.h"
 
 #include <cstring>
+#include <spdlog/spdlog.h>
 #include <stdexcept>
 
 namespace
@@ -35,6 +36,14 @@ uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t t
 	}
 	throw std::runtime_error("feather_mask: no suitable memory type");
 }
+
+struct blur_push
+{
+	float texel[2];
+	float dir[2];
+	float spread;
+	float pad = 0;
+};
 } // namespace
 
 feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
@@ -164,6 +173,152 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .renderPass = *renderpass,
 	};
 	pipeline = vk::raii::Pipeline(device, nullptr, pipeline_info);
+
+	// Blur render pass: fully overwritten every use (fullscreen triangle),
+	// so no clear and no prior contents needed.
+	vk::AttachmentDescription blur_attachment{
+	        .format = format,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eDontCare,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::AttachmentReference blur_color_ref{
+	        .attachment = 0,
+	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	};
+	vk::SubpassDescription blur_subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &blur_color_ref,
+	};
+	vk::RenderPassCreateInfo blur_rp_info{
+	        .attachmentCount = 1,
+	        .pAttachments = &blur_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &blur_subpass,
+	};
+	blur_renderpass = vk::raii::RenderPass(device, blur_rp_info);
+
+	auto blur_vert = load_shader(device, "blur.vert");
+	auto blur_frag = load_shader(device, "blur.frag");
+	vk::PipelineShaderStageCreateInfo blur_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **blur_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **blur_frag,
+	                .pName = "main",
+	        },
+	};
+
+	vk::PipelineVertexInputStateCreateInfo blur_vertex_input{};
+	vk::PipelineInputAssemblyStateCreateInfo blur_input_assembly{
+	        .topology = vk::PrimitiveTopology::eTriangleList,
+	};
+	vk::PipelineViewportStateCreateInfo blur_viewport_state{
+	        .viewportCount = 1,
+	        .scissorCount = 1,
+	};
+	vk::PipelineRasterizationStateCreateInfo blur_rasterization{
+	        .polygonMode = vk::PolygonMode::eFill,
+	        .cullMode = vk::CullModeFlagBits::eNone,
+	        .frontFace = vk::FrontFace::eCounterClockwise,
+	        .lineWidth = 1,
+	};
+	vk::PipelineMultisampleStateCreateInfo blur_multisample{
+	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+	};
+	vk::PipelineColorBlendAttachmentState blur_blend_attachment{
+	        .blendEnable = VK_FALSE,
+	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+	};
+	vk::PipelineColorBlendStateCreateInfo blur_blend{
+	        .attachmentCount = 1,
+	        .pAttachments = &blur_blend_attachment,
+	};
+	vk::DynamicState blur_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo blur_dynamic{
+	        .dynamicStateCount = 2,
+	        .pDynamicStates = blur_dynamics,
+	};
+
+	vk::DescriptorSetLayoutBinding sampler_binding{
+	        .binding = 0,
+	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .descriptorCount = 1,
+	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	};
+	vk::DescriptorSetLayoutCreateInfo set_layout_info{
+	        .bindingCount = 1,
+	        .pBindings = &sampler_binding,
+	};
+	descriptor_layout = vk::raii::DescriptorSetLayout(device, set_layout_info);
+
+	vk::PushConstantRange blur_push_range{
+	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        .offset = 0,
+	        .size = 24,
+	};
+	vk::PipelineLayoutCreateInfo blur_layout_info{
+	        .setLayoutCount = 1,
+	        .pSetLayouts = &*descriptor_layout,
+	        .pushConstantRangeCount = 1,
+	        .pPushConstantRanges = &blur_push_range,
+	};
+	blur_layout = vk::raii::PipelineLayout(device, blur_layout_info);
+
+	vk::GraphicsPipelineCreateInfo blur_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = blur_stages,
+	        .pVertexInputState = &blur_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_renderpass,
+	};
+	blur_pipeline = vk::raii::Pipeline(device, nullptr, blur_pipeline_info);
+
+	vk::SamplerCreateInfo sampler_info{
+	        .magFilter = vk::Filter::eLinear,
+	        .minFilter = vk::Filter::eLinear,
+	        .mipmapMode = vk::SamplerMipmapMode::eLinear,
+	        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+	        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+	        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+	        .mipLodBias = 0,
+	        .maxAnisotropy = 1,
+	        .compareEnable = VK_FALSE,
+	        .minLod = 0,
+	        .maxLod = 0,
+	};
+	sampler = vk::raii::Sampler(device, sampler_info);
+
+	vk::DescriptorPoolSize pool_size{
+	        .type = vk::DescriptorType::eCombinedImageSampler,
+	        .descriptorCount = 1,
+	};
+	vk::DescriptorPoolCreateInfo pool_info{
+	        .maxSets = 1,
+	        .poolSizeCount = 1,
+	        .pPoolSizes = &pool_size,
+	};
+	descriptor_pool = vk::raii::DescriptorPool(device, pool_info);
+	vk::DescriptorSetAllocateInfo set_alloc_info{
+	        .descriptorPool = *descriptor_pool,
+	        .descriptorSetCount = 1,
+	        .pSetLayouts = &*descriptor_layout,
+	};
+	descriptor_set = std::move(device.allocateDescriptorSets(set_alloc_info)[0]);
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -231,6 +386,81 @@ void feather_mask_renderer::set_soup(const passthrough_mesh::triangle_soup & sou
 	index_count = (uint32_t)soup.indices.size();
 }
 
+void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
+{
+	if (targets_extent.width == extent.width and targets_extent.height == extent.height and
+	    targets_extent.width != 0)
+		return;
+
+	// Rare path (extent change): in-flight frames may still read the old
+	// images, mirroring setup_reprojection_swapchain.
+	device.waitIdle();
+	targets_extent = extent;
+	for (auto * target: {&target_a, &target_b})
+	{
+		vk::ImageCreateInfo image_info{
+		        .imageType = vk::ImageType::e2D,
+		        .format = format,
+		        .extent = {extent.width, extent.height, 1},
+		        .mipLevels = 1,
+		        .arrayLayers = 2,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .tiling = vk::ImageTiling::eOptimal,
+		        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+		        .sharingMode = vk::SharingMode::eExclusive,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		};
+		target->image = vk::raii::Image(device, image_info);
+		auto requirements = target->image.getMemoryRequirements();
+		vk::MemoryAllocateInfo alloc_info{
+		        .allocationSize = requirements.size,
+		        .memoryTypeIndex = find_memory_type(physical_device, requirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+		};
+		target->memory = vk::raii::DeviceMemory(device, alloc_info);
+		target->image.bindMemory(*target->memory, 0);
+		target->views.clear();
+		target->raster_fbs.clear();
+		target->blur_fbs.clear();
+		for (int layer = 0; layer < 2; ++layer)
+		{
+			vk::ImageViewCreateInfo view_info{
+			        .image = *target->image,
+			        .viewType = vk::ImageViewType::e2D,
+			        .format = format,
+			        .subresourceRange = {
+			                .aspectMask = vk::ImageAspectFlagBits::eColor,
+			                .baseMipLevel = 0,
+			                .levelCount = 1,
+			                .baseArrayLayer = (uint32_t)layer,
+			                .layerCount = 1,
+			        },
+			};
+			target->views.emplace_back(device, view_info);
+		}
+		// Named copies: framebuffer create-info stores the pointer, so the
+		// handles must outlive the constructor calls (no &* temporaries).
+		// Raster and blur passes share these framebuffers: identical
+		// attachment spec (format/count/samples), which is all that
+		// render-pass compatibility compares.
+		vk::ImageView raw_views[2] = {*target->views[0], *target->views[1]};
+		for (int layer = 0; layer < 2; ++layer)
+		{
+			vk::FramebufferCreateInfo fb_info{
+			        .renderPass = *renderpass,
+			        .attachmentCount = 1,
+			        .pAttachments = &raw_views[layer],
+			        .width = extent.width,
+			        .height = extent.height,
+			        .layers = 1,
+			};
+			target->raster_fbs.emplace_back(device, fb_info);
+			fb_info.renderPass = *blur_renderpass;
+			target->blur_fbs.emplace_back(device, fb_info);
+		}
+	}
+	spdlog::info("Fiducial mask blur targets: {}x{}", extent.width, extent.height);
+}
+
 void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
 {
 	if (not pending_upload)
@@ -279,16 +509,64 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
 	                    {});
 }
 
+void feather_mask_renderer::update_source(vk::ImageView view)
+{
+	vk::DescriptorImageInfo image_info{
+	        .sampler = *sampler,
+	        .imageView = view,
+	        .imageLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::WriteDescriptorSet write{
+	        .dstSet = *descriptor_set,
+	        .dstBinding = 0,
+	        .descriptorCount = 1,
+	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .pImageInfo = &image_info,
+	};
+	std::array<vk::CopyDescriptorSet, 0> no_copies{};
+	device.updateDescriptorSets(write, no_copies);
+}
+
 void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    vk::Image image,
                                    vk::Extent2D extent,
                                    const std::array<glm::mat4, 2> & mvp,
-                                   bool rasterize)
+                                   bool rasterize,
+                                   float spread)
 {
-	if (index_count == 0)
-		return;
+	auto set_full_viewport = [&](vk::Extent2D e) {
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)e.width,
+		                        .height = (float)e.height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = e});
+	};
 
-	flush_upload(cmd);
+	// Same-queue read-after-write between passes (all images GENERAL).
+	auto make_readable = [&](vk::Image img) {
+		vk::ImageMemoryBarrier barrier{
+		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+		        .oldLayout = vk::ImageLayout::eGeneral,
+		        .newLayout = vk::ImageLayout::eGeneral,
+		        .image = img,
+		        .subresourceRange = {
+		                .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                .levelCount = 1,
+		                .layerCount = 2,
+		        },
+		};
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    vk::PipelineStageFlagBits::eFragmentShader,
+		                    {},
+		                    {},
+		                    {},
+		                    barrier);
+	};
 
 	auto it = targets.find(image);
 	if (it == targets.end() or it->second.extent.width != extent.width or it->second.extent.height != extent.height)
@@ -364,34 +642,105 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 	vk::ClearValue clear{};
 	clear.color.float32.fill(0);
-	for (int eye = 0; eye < 2; ++eye)
+
+	if (not rasterize)
 	{
-		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = *renderpass,
-		        .framebuffer = *it->second.framebuffers[eye],
-		        .renderArea = {.offset = {0, 0}, .extent = extent},
-		        .clearValueCount = 1,
-		        .pClearValues = &clear,
-		};
-		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		cmd.setViewport(0, vk::Viewport{
-		                        .x = 0,
-		                        .y = 0,
-		                        .width = (float)extent.width,
-		                        .height = (float)extent.height,
-		                        .minDepth = 0,
-		                        .maxDepth = 1,
-		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
-		if (rasterize)
+		// Bypass: clear-only passes, transparent mask, full stack hot.
+		for (int eye = 0; eye < 2; ++eye)
 		{
+			vk::RenderPassBeginInfo begin_info{
+			        .renderPass = *renderpass,
+			        .framebuffer = *it->second.framebuffers[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+			cmd.endRenderPass();
+		}
+	}
+	else
+	{
+		if (index_count == 0)
+			return;
+
+		flush_upload(cmd);
+		ensure_targets(extent);
+
+		// Stage 1: binary silhouette into A (full resolution).
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			vk::RenderPassBeginInfo begin_info{
+			        .renderPass = *renderpass,
+			        .framebuffer = *target_a.raster_fbs[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+			set_full_viewport(extent);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 			cmd.bindVertexBuffers(0, (vk::Buffer)*vertex_buffer, (vk::DeviceSize)0);
 			cmd.bindIndexBuffer(*index_buffer, 0, vk::IndexType::eUint32);
 			cmd.pushConstants<glm::mat4>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, mvp[eye]);
 			cmd.drawIndexed(index_count, 1, 0, 0, 0);
+			cmd.endRenderPass();
 		}
-		cmd.endRenderPass();
+		make_readable(*target_a.image);
+
+		// Stages 2+3: separable Gaussian H into B, V into the swapchain.
+		// One descriptor set, re-pointed per pass; fullscreen triangle
+		// needs no vertex buffers (bound ones are ignored).
+		std::array<vk::DescriptorSet, 1> sets{*descriptor_set};
+		std::array<uint32_t, 0> no_offsets{};
+		blur_push base{
+		        .texel = {1.f / extent.width, 1.f / extent.height},
+		        .spread = spread,
+		};
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			update_source(*target_a.views[eye]);
+			vk::RenderPassBeginInfo begin_h{
+			        .renderPass = *blur_renderpass,
+			        .framebuffer = *target_b.blur_fbs[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
+			set_full_viewport(extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets, no_offsets);
+			blur_push push = base;
+			push.dir[0] = 1;
+			push.dir[1] = 0;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+		}
+		make_readable(*target_b.image);
+
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			update_source(*target_b.views[eye]);
+			vk::RenderPassBeginInfo begin_v{
+			        .renderPass = *blur_renderpass,
+			        .framebuffer = *it->second.framebuffers[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
+			set_full_viewport(extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets, no_offsets);
+			blur_push push = base;
+			push.dir[0] = 0;
+			push.dir[1] = 1;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+		}
 	}
 
 	vk::ImageMemoryBarrier barrier{
