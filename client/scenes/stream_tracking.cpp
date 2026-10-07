@@ -313,18 +313,14 @@ void scenes::stream::tracking()
 	{
 		try
 		{
-			// Rebuild the origin space when the height setting or the
-			// fiducial calibration changed (exact float compare, same as
-			// the old height-only check: recomputed values are bit-stable).
-			float yaw = 0, ox = 0, oz = 0;
-			if (auto calib = tracking_origin_calibration.lock(); calib->active)
-			{
-				yaw = calib->yaw;
-				ox = calib->x;
-				oz = calib->z;
-			}
-			float h = config.get_height_offset();
-			XrPosef desired{{0, std::sin(yaw / 2), 0, std::cos(yaw / 2)}, {ox, -h, oz}};
+		// Rebuild the origin space when the height setting changes (exact
+		// float compare: recomputed values are bit-stable). The origin is
+		// deliberately never shifted by fiducial calibration: the server
+		// renders against the session-start origin, so moving the client
+		// origin would displace the video quad. Virtual-world moves belong
+		// server-side (see ROADMAP.md).
+		float h = config.get_height_offset();
+		XrPosef desired{{0, 0, 0, 1}, {0, -h, 0}};
 			if (memcmp(&desired, &applied_origin, sizeof(XrPosef)) != 0)
 			{
 				applied_origin = desired;

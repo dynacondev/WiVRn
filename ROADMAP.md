@@ -145,36 +145,50 @@ Risks: Horizon OS version skew (known v206 spatial-marker regression report);
 capability absent on older runtimes -> must degrade to Phase-2 static
 placement with a clear status line.
 
-## Phase 4 — One-shot calibrate + world alignment
+## Phase 4 — One-shot calibrate (object placement only)
 
 Scope: wire the button. `meshClientPose = observedMarkerPose *
-markerToMeshOffset`, plus one-shot world recenter for server video.
+markerToMeshOffset`. Deliberately NO world-origin change: shifting the
+client origin moves it out from under the server-rendered video (the game
+is rendered against the session-start origin), displacing the video quad.
+The mesh is placed purely as an object in the stable SLAM frame, which the
+headset holds drift-free. (A marker-as-origin recenter was tried and
+reverted for exactly this reason.)
 
-1. Offset math (client, `stream_tracking.cpp` + new alignment helper):
-   `markerToMeshOffset` built from config `pos/quat/scale` (mesh relative to
-   marker). On button press, if `markerTracked`: set projected geometry
-   instance base pose to `observed * offset`. Store as the persistent mesh
-   anchor; thereafter update its reported transform from SLAM (same space),
+1. Offset math (client): `markerToMeshOffset` built from config
+   `pos/quat/scale` (mesh relative to marker). On button press, if
+   `markerTracked`: set the mesh anchor to `observed * offset`. Store as
+   the persistent mesh anchor; thereafter hold it in the same space,
    ignoring marker loss.
-2. World recenter: generalize `height_offset_space` (today `{0,-h,0}` in
-   `stream_tracking.cpp`, `configuration::get_height_offset`) to a full
-   `XrPosef` origin offset applied to `STAGE`-derived locates before
-   `from_headset::tracking` send (`server/driver/wivrn_session.cpp` already
-   handles `recentered` via `xrt_space_overseer_recenter_local_spaces`; keep
-   that path). Compute yaw+position correction only (preserve height offset
-   semantics), from the same single observation used for the mesh. Manual
-   button re-runs it; no auto re-arm on loss.
-3. UI: Stream GUI `Calibrate / Realign` button (enabled only when tracked),
-   plus last-alignment error/age readout. Persist mesh anchor + world offset
-   for the session; clear on disconnect.
+2. UI: Stream GUI `Calibrate / Realign` button (enabled only when tracked),
+   plus last-alignment error/age readout. Persist mesh anchor for the
+   session; clear on disconnect.
+3. Tracking origin stays height-only (`{0,-h,0}` in `stream_tracking.cpp`):
+   no yaw/XZ from calibration, ever.
 
 Accept: with tag in view press Calibrate -> mesh snaps to tag-relative pose
 and stays world-locked while walking around; cover tag -> mesh stays (SLAM);
-move tag, press again -> re-snaps. Server video content shifts consistently
-with the one-shot recenter (no per-frame swimming).
+move tag, press again -> re-snaps. Server video never shifts (no recenter).
 
 Non-goals in this phase: multi-marker averaging, persistent-across-sessions
 anchors, exposing the marker as a SteamVR tracked device on the server.
+
+## Phase 6 (future) — Server-side virtual-world alignment
+
+Goal: "the simulation renders from where the player virtually moved,"
+without touching the client origin. The existing
+`from_headset::tracking::state_flags::recentered` channel means something
+else ("recenter local spaces to the current physical pose") and must not
+be reused for this.
+
+Sketch: new explicit-offset control packet (yaw + dx + dz, client to
+server, sent on Calibrate alongside the local mesh placement); the server
+composes it into its tracking origin so subsequently rendered game views
+already include the shift, keeping video layers and mesh consistent by
+construction. Open UX questions: who initiates (headset button vs
+dashboard), persistence across sessions, interaction with the existing
+recenter flag and SteamVR lighthouse origin. Design jointly with the
+game-side need; no client origin shift, ever.
 
 ## Phase 5 — Hardening + docs
 

@@ -358,21 +358,15 @@ void scenes::stream::calibrate_to_marker()
 	fp.calibrated_at = now;
 	fp.calibrated_marker = entry->marker_id;
 
-	// World origin: yaw + XZ from the marker (marker-as-origin: afterwards the
-	// marker reports at XZ origin with identity yaw). Y keeps following the
-	// height setting, composed in the tracking loop.
-	const auto & q = sighting.pose.orientation;
-	float yaw = std::atan2(2 * (q.w * q.y + q.x * q.z), 1 - 2 * (q.y * q.y + q.x * q.x));
-	{
-		auto calib = tracking_origin_calibration.lock();
-		calib->active = true;
-		calib->yaw = yaw;
-		calib->x = sighting.pose.position.x;
-		calib->z = sighting.pose.position.z;
-	}
+	// Deliberately no world-origin change: shifting the client origin moves
+	// it out from under the server-rendered video (the game is rendered
+	// against the session-start origin), displacing the video quad. The
+	// mesh is placed purely as an object in the stable SLAM frame, which
+	// the headset holds drift-free. Virtual-world moves belong server-side
+	// (see ROADMAP.md future phase), never as a client origin shift.
 
-	spdlog::info("Calibrated to marker {}: observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), origin yaw {:.1f}deg, sighting {}ms old",
-	             entry->marker_id, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z, glm::degrees(yaw),
+	spdlog::info("Calibrated to marker {}: observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), sighting {}ms old",
+	             entry->marker_id, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z,
 	             (long long)((now - sighting.time) / 1'000'000));
 }
 

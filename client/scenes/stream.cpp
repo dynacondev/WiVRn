@@ -1180,13 +1180,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// by update()). Dedicated member swapchain with explicit
 		// acquire/release pairing (never the shared pool).
 		//
-		// TEMPORARY diagnostic: cutout bypass keeps the entire mask stack
-		// hot (target acquire, clear passes, layer submit, blend chains)
-		// while applying no cutout (transparent mask => full game video),
-		// separating plumbing faults from pose/content faults. Delete this
-		// flag (and the record() rasterize parameter) once the window
-		// geometry is validated.
-		static constexpr bool mask_bypass_cutout = true;
+		// Cutout bypass DISABLED (diagnostic complete): the rasterized
+		// silhouette applies the window. Set true only to re-validate
+		// plumbing with a transparent mask (full game video).
+		static constexpr bool mask_bypass_cutout = false;
 		try
 		{
 			mask_frame = fp.mask_active and fp.mask_renderer and fp.mask_renderer->has_mesh() and view_count == 2;

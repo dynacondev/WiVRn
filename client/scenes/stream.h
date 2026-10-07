@@ -292,23 +292,9 @@ private:
 	// user grant. Process-once; the result feeds the Stats-tab hint.
 	void request_spatial_permissions();
 
-	// World-origin calibration (ROADMAP.md Phase 4). The tracking thread
-	// locates all reported poses against a STAGE reference space built from
-	// this offset; the render thread writes it on calibrate. Y always follows
-	// the configured height offset (composed in the tracking loop); yaw + XZ
-	// come from the last calibration. Convention is marker-as-origin: after
-	// calibrate, the marker sits at reported XZ origin with identity yaw.
-	struct origin_calibration
-	{
-		bool active = false;
-		float yaw = 0; // radians about +Y
-		float x = 0;
-		float z = 0;
-	};
-	thread_safe<origin_calibration> tracking_origin_calibration;
-
-	// Snap the mesh to observedMarkerPose * configOffset and recenter the
-	// tracking origin on the marker. Requires a fresh marker sighting.
+	// Snap the mesh to observedMarkerPose * configOffset. Requires a fresh
+	// marker sighting. Object placement only: the tracking origin is never
+	// touched (see calibrate_to_marker()).
 	void calibrate_to_marker();
 
 	// QR-code tracking (ROADMAP.md Phase 3, Quest runtime capability).
