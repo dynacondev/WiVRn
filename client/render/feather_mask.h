@@ -53,11 +53,15 @@ public:
 
 	// Record both eye passes into the layers of an acquired swapchain image.
 	// No-op when no mesh is set. The image must be unused (UNDEFINED is
-	// fine); it is left in GENERAL for the compositor.
+	// fine); it is left in GENERAL for the compositor. When rasterize is
+	// false the passes only clear (transparent): the full layer stack,
+	// blend chains and swapchain lifecycle stay hot while no cutout is
+	// applied. TEMPORARY diagnostic for isolating plumbing vs content.
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
-	            const std::array<glm::mat4, 2> & mvp);
+	            const std::array<glm::mat4, 2> & mvp,
+	            bool rasterize = true);
 
 	bool has_mesh() const
 	{

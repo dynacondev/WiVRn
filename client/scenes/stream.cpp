@@ -1179,9 +1179,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// mask_active implies the renderer + mesh are ready (invariant kept
 		// by update()). Dedicated member swapchain with explicit
 		// acquire/release pairing (never the shared pool).
+		//
+		// TEMPORARY diagnostic: cutout bypass keeps the entire mask stack
+		// hot (target acquire, clear passes, layer submit, blend chains)
+		// while applying no cutout (transparent mask => full game video),
+		// separating plumbing faults from pose/content faults. Delete this
+		// flag (and the record() rasterize parameter) once the window
+		// geometry is validated.
+		static constexpr bool mask_bypass_cutout = true;
 		try
 		{
 			mask_frame = fp.mask_active and fp.mask_renderer and fp.mask_renderer->has_mesh() and view_count == 2;
+			if (mask_frame and mask_bypass_cutout)
+			{
+				static bool bypass_logged = false;
+				if (not bypass_logged)
+				{
+					bypass_logged = true;
+					spdlog::info("Mask cutout bypassed (diagnostic): submitting transparent mask, full video expected");
+				}
+			}
 			if (mask_frame)
 			{
 				// Dims quantized to 16px: defoveated extents flicker with
@@ -1226,7 +1243,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					fp.mask_wait_warned = false;
 					mask_acquired = true;
 					fp.mask_extent = {mw, mh};
-					fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp);
+					fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout);
 				}
 			}
 		}

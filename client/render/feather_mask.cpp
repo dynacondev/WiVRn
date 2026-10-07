@@ -282,7 +282,8 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
 void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    vk::Image image,
                                    vk::Extent2D extent,
-                                   const std::array<glm::mat4, 2> & mvp)
+                                   const std::array<glm::mat4, 2> & mvp,
+                                   bool rasterize)
 {
 	if (index_count == 0)
 		return;
@@ -382,11 +383,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                        .maxDepth = 1,
 		                });
 		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-		cmd.bindVertexBuffers(0, (vk::Buffer)*vertex_buffer, (vk::DeviceSize)0);
-		cmd.bindIndexBuffer(*index_buffer, 0, vk::IndexType::eUint32);
-		cmd.pushConstants<glm::mat4>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, mvp[eye]);
-		cmd.drawIndexed(index_count, 1, 0, 0, 0);
+		if (rasterize)
+		{
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+			cmd.bindVertexBuffers(0, (vk::Buffer)*vertex_buffer, (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(*index_buffer, 0, vk::IndexType::eUint32);
+			cmd.pushConstants<glm::mat4>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, mvp[eye]);
+			cmd.drawIndexed(index_count, 1, 0, 0, 0);
+		}
 		cmd.endRenderPass();
 	}
 
