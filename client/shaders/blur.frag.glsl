@@ -32,15 +32,20 @@ layout(push_constant) uniform Push
 }
 pc;
 
-// Fixed 9-tap Gaussian, sigma = 2 texels (normalized weights). The tap
-// offsets scale with spread, so feather-px maps to band width without
-// changing the kernel. Only alpha carries information downstream.
-const float W[9] = float[9](0.0276, 0.0663, 0.1238, 0.1802, 0.2042, 0.1802, 0.1238, 0.0663, 0.0276);
-
+// Bilinear-gather 9-tap Gaussian, sigma = 2 texels. Adjacent tap pairs
+// share one linear-filtered fetch at the weighted offset (hardware lerp
+// mixes each pair in exact proportion), so 9 taps cost 5 fetches:
+// center 0.2042, pairs (1,2) at 1.4072 weight 0.3040, pairs (3,4) at
+// 3.2939 weight 0.0939. The tap offsets scale with spread, so feather-px
+// maps to band width without changing the kernel. Only alpha carries
+// information downstream.
 void main()
 {
-	float a = 0.0;
-	for (int i = -4; i <= 4; ++i)
-		a += texture(src, uv + pc.dir * pc.texel * (float(i) * pc.spread)).a * W[i + 4];
+	vec2 t = pc.dir * pc.texel * pc.spread;
+	float a = texture(src, uv).a * 0.2042;
+	a += texture(src, uv + t * 1.4072).a * 0.3040;
+	a += texture(src, uv - t * 1.4072).a * 0.3040;
+	a += texture(src, uv + t * 3.2939).a * 0.0939;
+	a += texture(src, uv - t * 3.2939).a * 0.0939;
 	out_color = vec4(1.0, 1.0, 1.0, a);
 }
