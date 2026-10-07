@@ -69,6 +69,15 @@ public:
 		return (XrCompositionLayerBaseHeader *)&composition_layer;
 	}
 
+	// Forget any chained structs from a previous frame's submit. Our
+	// chains (alpha blend, settings) live in per-frame storage while this
+	// layer lives in the session: a stale next pointer would otherwise
+	// dangle after the frame ends.
+	void reset_chain()
+	{
+		composition_layer.next = nullptr;
+	}
+
 	// True when the runtime supports surface-projected passthrough
 	bool projected_mesh_supported() const
 	{

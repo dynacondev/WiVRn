@@ -1203,6 +1203,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// frame), mirroring setup_reprojection_swapchain.
 					device.waitIdle();
 					mask_swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
+					if (fp.mask_renderer)
+						fp.mask_renderer->reset_targets();
 					spdlog::info("Fiducial mask swapchain: {}x{}", mw, mh);
 				}
 				int mask_index = mask_swapchain.acquire();
@@ -1375,6 +1377,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
 
+		// First frames of each mask activation are traced end to end: a hang
+		// with no further lines localizes to inside end_frame (compositor
+		// on our chains) vs past it (fence wait, now armed with a timeout).
+		static int mask_trace_count = 0;
+		if (not mask_frame)
+			mask_trace_count = 0;
+		bool trace_mask = mask_frame and mask_trace_count < 5;
+		if (trace_mask)
+			spdlog::info("mask frame {}: entering end_frame", mask_trace_count);
 		try
 		{
 			render_end();
@@ -1385,6 +1396,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				spdlog::info("Invalid pose submitted");
 			else
 				throw;
+		}
+		if (trace_mask)
+		{
+			spdlog::info("mask frame {}: end_frame returned", mask_trace_count);
+			++mask_trace_count;
 		}
 	}
 

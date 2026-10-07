@@ -64,6 +64,14 @@ public:
 		return index_count > 0;
 	}
 
+	// Drop cached framebuffers/views (swapchain recreated: old image
+	// handles are dead and driver handle recycling could otherwise alias
+	// a stale framebuffer onto a new image).
+	void reset_targets()
+	{
+		targets.clear();
+	}
+
 private:
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;
@@ -90,8 +98,8 @@ private:
 	vk::DeviceSize staging_size = 0;
 	std::optional<std::pair<vk::DeviceSize, vk::DeviceSize>> pending_upload;
 
-	// Framebuffers + views per swapchain image (images cycle, sizes change
-	// with the feather setting: entries for retired extents are dropped).
+	// Framebuffers + views per swapchain image (images cycle; entries for
+	// retired swapchains are dropped via reset_targets()).
 	struct frame_targets
 	{
 		vk::Extent2D extent;

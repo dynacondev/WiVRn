@@ -316,6 +316,11 @@ void scene::render_start(bool passthrough, XrTime predicted_display_time_)
 
 void scene::add_passthrough_layer()
 {
+	// The session owns its layer struct across frames, but our chained
+	// structs (alpha blend, settings) are per-frame: reset its chain head
+	// first so a stale pointer can never survive into the next submit.
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&session.get_passthrough()))
+		fb->reset_chain();
 	std::visit(
 	        utils::overloaded{
 	                [&](std::monostate &) {
