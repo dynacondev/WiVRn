@@ -112,6 +112,7 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	last_marker_count = UINT32_MAX;
 	last_unreadable = false;
 	buffer_type_logged = false;
+	entries_dumped = false;
 	current = sighting{};
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
@@ -416,6 +417,29 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		}
 
 		uint32_t count = std::min(marker_list.markerCount, bounds_list.boundCount);
+		if (marker_list.markerCount > 0 and not entries_dumped)
+		{
+			entries_dumped = true;
+			for (uint32_t i = 0; i < marker_list.markerCount; ++i)
+			{
+				const auto & md = marker_data[i];
+				if (i < bounds_list.boundCount)
+				{
+					const auto & b = bound_boxes[i];
+					spdlog::info("marker_tracker: entry[{}]: cap={} id={} buf={} buftype={} ext=({:.3f},{:.3f}) pos=({:.2f},{:.2f},{:.2f})",
+					             i, (int)md.capability, md.markerId,
+					             (unsigned long long)md.data.bufferId, (int)md.data.bufferType,
+					             b.extents.width, b.extents.height,
+					             b.center.position.x, b.center.position.y, b.center.position.z);
+				}
+				else
+				{
+					spdlog::info("marker_tracker: entry[{}]: cap={} id={} buf={} buftype={} (no bounds)",
+					             i, (int)md.capability, md.markerId,
+					             (unsigned long long)md.data.bufferId, (int)md.data.bufferType);
+				}
+			}
+		}
 		if (marker_list.markerCount != last_marker_count)
 		{
 			last_marker_count = marker_list.markerCount;

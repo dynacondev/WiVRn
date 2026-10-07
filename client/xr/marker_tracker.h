@@ -126,6 +126,9 @@ private:
 	// No gating: the first matching payload sights immediately.
 	uint32_t last_marker_count = UINT32_MAX;
 	bool last_unreadable = false;
+	// One-shot per-entry dump (capability/id/buffer/extents/pos) on the
+	// first non-empty snapshot per configure: settles husk-vs-real.
+	bool entries_dumped = false;
 	// First-seen payload buffer type, logged once per configure so the
 	// runtime's encoding is a logged fact rather than another blind round.
 	bool buffer_type_logged = false;
