@@ -133,6 +133,7 @@ private:
 	XrTime retry_at = 0;
 	XrTime last_now = 0;
 	bool discovery_failed_once = false;
+	bool discovery_running_logged = false;
 
 	sighting current;
 	std::string status_text = "idle";

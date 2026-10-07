@@ -23,6 +23,20 @@
 #include <algorithm>
 #include <spdlog/spdlog.h>
 
+namespace
+{
+// Discovery/query component sets. Shared by start_discovery() and
+// complete_discovery() so the snapshot can never ask for a component the
+// context doesn't enable (the runtime fails the start for that).
+const XrSpatialComponentTypeEXT marker_only[] = {
+        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
+};
+const XrSpatialComponentTypeEXT marker_and_bounds[] = {
+        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
+        XR_SPATIAL_COMPONENT_TYPE_BOUNDED_2D_EXT,
+};
+} // namespace
+
 bool xr::marker_tracker::supported(instance & inst)
 {
 	return inst.has_extension(XR_EXT_FUTURE_EXTENSION_NAME) and
@@ -93,6 +107,7 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	marker_payload = std::move(payload);
 	unknown_payloads_logged.clear();
 	bounded_warned = false;
+	discovery_running_logged = false;
 	current = sighting{};
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
@@ -246,10 +261,6 @@ void xr::marker_tracker::complete_context()
 
 void xr::marker_tracker::start_discovery()
 {
-	static const XrSpatialComponentTypeEXT components[] = {
-	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
-	        XR_SPATIAL_COMPONENT_TYPE_ANCHOR_EXT,
-	};
 	XrSpatialFilterTrackingStateEXT tracking_filter{
 	        .type = XR_TYPE_SPATIAL_FILTER_TRACKING_STATE_EXT,
 	        .trackingState = XR_SPATIAL_ENTITY_TRACKING_STATE_TRACKING_EXT,
@@ -257,8 +268,8 @@ void xr::marker_tracker::start_discovery()
 	XrSpatialDiscoverySnapshotCreateInfoEXT create_info{
 	        .type = XR_TYPE_SPATIAL_DISCOVERY_SNAPSHOT_CREATE_INFO_EXT,
 	        .next = &tracking_filter,
-	        .componentTypeCount = 2,
-	        .componentTypes = components,
+	        .componentTypeCount = bounded_pose ? 2u : 1u,
+	        .componentTypes = bounded_pose ? marker_and_bounds : marker_only,
 	};
 	if (XrResult res = xrCreateSpatialDiscoverySnapshotAsyncEXT(spatial_context, &create_info, &discovery_future); res != XR_SUCCESS)
 	{
@@ -292,13 +303,12 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 	}
 	spatial_snapshot_handle snapshot(completion.snapshot, xrDestroySpatialSnapshotEXT);
 
-	static const XrSpatialComponentTypeEXT marker_only[] = {
-	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
-	};
-	static const XrSpatialComponentTypeEXT marker_and_bounds[] = {
-	        XR_SPATIAL_COMPONENT_TYPE_MARKER_EXT,
-	        XR_SPATIAL_COMPONENT_TYPE_BOUNDED_2D_EXT,
-	};
+	if (not discovery_running_logged)
+	{
+		discovery_running_logged = true;
+		spdlog::info("marker_tracker: discovery running");
+	}
+
 	XrSpatialComponentDataQueryConditionEXT condition{
 	        .type = XR_TYPE_SPATIAL_COMPONENT_DATA_QUERY_CONDITION_EXT,
 	        .componentTypeCount = bounded_pose ? 2u : 1u,
