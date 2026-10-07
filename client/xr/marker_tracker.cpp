@@ -58,6 +58,7 @@ xr::marker_tracker::marker_tracker(instance & inst_, session & sess_, system & s
         xrCreateSpatialDiscoverySnapshotCompleteEXT(inst_.get_proc<PFN_xrCreateSpatialDiscoverySnapshotCompleteEXT>("xrCreateSpatialDiscoverySnapshotCompleteEXT")),
         xrQuerySpatialComponentDataEXT(inst_.get_proc<PFN_xrQuerySpatialComponentDataEXT>("xrQuerySpatialComponentDataEXT")),
         xrGetSpatialBufferStringEXT(inst_.get_proc<PFN_xrGetSpatialBufferStringEXT>("xrGetSpatialBufferStringEXT")),
+        xrGetSpatialBufferUint8EXT(inst_.get_proc<PFN_xrGetSpatialBufferUint8EXT>("xrGetSpatialBufferUint8EXT")),
         xrDestroySpatialContextEXT(inst_.get_proc<PFN_xrDestroySpatialContextEXT>("xrDestroySpatialContextEXT")),
         xrDestroySpatialSnapshotEXT(inst_.get_proc<PFN_xrDestroySpatialSnapshotEXT>("xrDestroySpatialSnapshotEXT")),
         spatial_context{xrDestroySpatialContextEXT}
@@ -110,6 +111,7 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	discovery_running_logged = false;
 	last_marker_count = UINT32_MAX;
 	last_unreadable = false;
+	buffer_type_logged = false;
 	current = sighting{};
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
@@ -187,9 +189,16 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 	        .type = XR_TYPE_SPATIAL_MARKER_SIZE_EXT,
 	        .markerSideLength = marker_size_m,
 	};
+	// Our fiducial lives on a static rig: tell the runtime to integrate
+	// stationary markers (service reports trackStaticFiducials accordingly).
+	XrSpatialMarkerStaticOptimizationEXT static_opt{
+	        .type = XR_TYPE_SPATIAL_MARKER_STATIC_OPTIMIZATION_EXT,
+	        .next = &size,
+	        .optimizeForStaticMarker = XR_TRUE,
+	};
 	XrSpatialCapabilityConfigurationQrCodeEXT qr_code{
 	        .type = XR_TYPE_SPATIAL_CAPABILITY_CONFIGURATION_QR_CODE_EXT,
-	        .next = &size,
+	        .next = &static_opt,
 	        .capability = XR_SPATIAL_CAPABILITY_MARKER_TRACKING_QR_CODE_EXT,
 	        .enabledComponentCount = (uint32_t)components.size(),
 	        .enabledComponents = components.data(),
@@ -216,15 +225,22 @@ void xr::marker_tracker::configure(int32_t id, float size_m, std::string payload
 
 std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer)
 {
-	// QR payloads are decoded strings; anything else has no usable identity
+	// QR payloads are decoded strings or raw bytes; anything else has no
+	// usable identity. The runtime's choice is logged once per configure.
 	if (buffer.bufferId == XR_NULL_SPATIAL_BUFFER_ID_EXT)
 	{
 		spdlog::debug("marker_tracker: marker has null payload buffer");
 		return std::nullopt;
 	}
-	if (buffer.bufferType != XR_SPATIAL_BUFFER_TYPE_STRING_EXT)
+	if (not buffer_type_logged)
 	{
-		spdlog::debug("marker_tracker: marker payload buffer type {} is not string", (int)buffer.bufferType);
+		buffer_type_logged = true;
+		spdlog::info("marker_tracker: marker payload buffer type {}", (int)buffer.bufferType);
+	}
+	if (buffer.bufferType != XR_SPATIAL_BUFFER_TYPE_STRING_EXT and
+	    buffer.bufferType != XR_SPATIAL_BUFFER_TYPE_UINT8_EXT)
+	{
+		spdlog::debug("marker_tracker: marker payload buffer type {} is not string/uint8", (int)buffer.bufferType);
 		return std::nullopt;
 	}
 
@@ -232,6 +248,25 @@ std::optional<std::string> xr::marker_tracker::read_payload(XrSpatialSnapshotEXT
 	        .type = XR_TYPE_SPATIAL_BUFFER_GET_INFO_EXT,
 	        .bufferId = buffer.bufferId,
 	};
+	if (buffer.bufferType == XR_SPATIAL_BUFFER_TYPE_UINT8_EXT)
+	{
+		uint32_t count = 0;
+		if (XrResult res = xrGetSpatialBufferUint8EXT(snapshot, &info, 0, &count, nullptr); res != XR_SUCCESS or count == 0)
+		{
+			spdlog::debug("marker_tracker: payload size query failed");
+			return std::nullopt;
+		}
+		std::vector<uint8_t> bytes(count + 1, 0);
+		if (XrResult res = xrGetSpatialBufferUint8EXT(snapshot, &info, count, &count, bytes.data()); res != XR_SUCCESS)
+		{
+			spdlog::debug("marker_tracker: payload fetch failed");
+			return std::nullopt;
+		}
+		while (count > 0 and bytes[count - 1] == 0)
+			--count;
+		return std::string(bytes.begin(), bytes.begin() + count);
+	}
+
 	uint32_t count = 0;
 	if (XrResult res = xrGetSpatialBufferStringEXT(snapshot, &info, 0, &count, nullptr); res != XR_SUCCESS or count == 0)
 	{

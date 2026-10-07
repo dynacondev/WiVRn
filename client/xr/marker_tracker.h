@@ -98,6 +98,7 @@ private:
 	PFN_xrCreateSpatialDiscoverySnapshotCompleteEXT xrCreateSpatialDiscoverySnapshotCompleteEXT{};
 	PFN_xrQuerySpatialComponentDataEXT xrQuerySpatialComponentDataEXT{};
 	PFN_xrGetSpatialBufferStringEXT xrGetSpatialBufferStringEXT{};
+	PFN_xrGetSpatialBufferUint8EXT xrGetSpatialBufferUint8EXT{};
 
 	using spatial_context_handle = utils::handle<XrSpatialContextEXT>;
 	using spatial_snapshot_handle = utils::handle<XrSpatialSnapshotEXT>;
@@ -125,6 +126,9 @@ private:
 	// No gating: the first matching payload sights immediately.
 	uint32_t last_marker_count = UINT32_MAX;
 	bool last_unreadable = false;
+	// First-seen payload buffer type, logged once per configure so the
+	// runtime's encoding is a logged fact rather than another blind round.
+	bool buffer_type_logged = false;
 	// BOUNDED_2D allowed for the QR capability: the pose source. Without it
 	// marker entities carry no pose on this runtime.
 	bool bounded_pose = false;
