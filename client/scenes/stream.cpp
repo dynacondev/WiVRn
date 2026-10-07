@@ -1202,7 +1202,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// so shape fidelity no longer depends on tiny targets.
 				// Dims quantized to 64px: defoveated extents flicker with
 				// gaze, and every distinct size would recreate the member.
-				float spread = 1.0f;
+				// Spread 0 is the identity (all taps hit center, weights sum
+				// to 1): feather-px 0 means a true hard edge and doubles
+				// as a chain diagnostic (binary through every pass).
+				float spread = 0.0f;
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
 				if (fp.feather_px > 0)

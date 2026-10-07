@@ -305,20 +305,23 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 1,
+	        .descriptorCount = 2,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
-	        .maxSets = 1,
+	        .maxSets = 2,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
 	};
 	descriptor_pool = vk::raii::DescriptorPool(device, pool_info);
-	vk::DescriptorSetAllocateInfo set_alloc_info{
-	        .descriptorPool = *descriptor_pool,
-	        .descriptorSetCount = 1,
-	        .pSetLayouts = &*descriptor_layout,
-	};
-	descriptor_set = std::move(device.allocateDescriptorSets(set_alloc_info)[0]);
+	for (int i = 0; i < 2; ++i)
+	{
+		vk::DescriptorSetAllocateInfo set_alloc_info{
+		        .descriptorPool = *descriptor_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*descriptor_layout,
+		};
+		descriptor_sets.emplace_back(std::move(device.allocateDescriptorSets(set_alloc_info)[0]));
+	}
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -509,7 +512,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
 	                    {});
 }
 
-void feather_mask_renderer::update_source(vk::ImageView view)
+void feather_mask_renderer::update_source(vk::ImageView view, uint32_t eye)
 {
 	vk::DescriptorImageInfo image_info{
 	        .sampler = *sampler,
@@ -517,7 +520,7 @@ void feather_mask_renderer::update_source(vk::ImageView view)
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	vk::WriteDescriptorSet write{
-	        .dstSet = *descriptor_set,
+	        .dstSet = *descriptor_sets[eye],
 	        .dstBinding = 0,
 	        .descriptorCount = 1,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -689,9 +692,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		make_readable(*target_a.image);
 
 		// Stages 2+3: separable Gaussian H into B, V into the swapchain.
-		// One descriptor set, re-pointed per pass; fullscreen triangle
-		// needs no vertex buffers (bound ones are ignored).
-		std::array<vk::DescriptorSet, 1> sets{*descriptor_set};
+		// One descriptor set per eye (see header): re-pointed per pass.
 		std::array<uint32_t, 0> no_offsets{};
 		blur_push base{
 		        .texel = {1.f / extent.width, 1.f / extent.height},
@@ -699,7 +700,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		for (int eye = 0; eye < 2; ++eye)
 		{
-			update_source(*target_a.views[eye]);
+			update_source(*target_a.views[eye], eye);
 			vk::RenderPassBeginInfo begin_h{
 			        .renderPass = *blur_renderpass,
 			        .framebuffer = *target_b.blur_fbs[eye],
@@ -710,7 +711,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
 			set_full_viewport(extent);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets, no_offsets);
+			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
 			blur_push push = base;
 			push.dir[0] = 1;
 			push.dir[1] = 0;
@@ -722,7 +724,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 		for (int eye = 0; eye < 2; ++eye)
 		{
-			update_source(*target_b.views[eye]);
+			update_source(*target_b.views[eye], eye);
 			vk::RenderPassBeginInfo begin_v{
 			        .renderPass = *blur_renderpass,
 			        .framebuffer = *it->second.framebuffers[eye],
@@ -733,7 +735,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
 			set_full_viewport(extent);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets, no_offsets);
+			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[eye]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
 			blur_push push = base;
 			push.dir[0] = 0;
 			push.dir[1] = 1;
