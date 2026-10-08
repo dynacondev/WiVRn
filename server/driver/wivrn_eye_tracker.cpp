@@ -29,6 +29,9 @@
 #include "util/u_logging.h"
 #include "utils/method.h"
 
+#include "os/os_time.h"
+
+#include <cmath>
 #include <cstdint>
 #include <openxr/openxr.h>
 
@@ -74,11 +77,29 @@ xrt_result_t wivrn_eye_tracker::get_tracked_pose(xrt_input_name name, int64_t at
 {
 	if (name == XRT_INPUT_GENERIC_EYE_GAZE_POSE)
 	{
-		if (auto [min, max] = gaze.get_bounds(); min <= max)
-			at_timestamp_ns = std::clamp(at_timestamp_ns, min, max);
-		auto [production_timestamp, relation] = gaze.get_at(at_timestamp_ns);
-		*out_relation = relation;
-		cnx.add_tracking_request(device_id::EYE_GAZE, at_timestamp_ns, production_timestamp);
+		// EXPERIMENT HACK: Quest 3 has no eye hardware, so synthesize a gaze
+		// panning left/right along screen center: triangle wave, 5s each
+		// direction (10s period), +/-30 deg yaw, zero pitch. Identity pose =
+		// looking straight ahead (-Z); yaw rotates around Y.
+		// Deliberately NOT calling cnx.add_tracking_request() and NOT reading
+		// pose_list `gaze`, so the headset is never polled for EYE_GAZE and
+		// WiVRn's own foveated encoding stays fixed (isolates X-Plane VRS).
+		(void)at_timestamp_ns;
+		int64_t now_ns = os_monotonic_get_ns();
+		double sec = fmod(double(now_ns) / 1e9, 10.0);
+		float tri = sec < 5.0 ? (-1.0f + float(sec) * (2.0f / 5.0f)) : (1.0f - float(sec - 5.0) * (2.0f / 5.0f));
+		constexpr float kAmplitudeRad = 30.0f * 3.14159265358979323846f / 180.0f;
+		float yaw = tri * kAmplitudeRad;
+		float half = yaw * 0.5f;
+		out_relation->relation_flags = (xrt_space_relation_flags)(
+		        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT |
+		        XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT |
+		        XRT_SPACE_RELATION_POSITION_VALID_BIT |
+		        XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		out_relation->pose.orientation = {0.0f, sinf(half), 0.0f, cosf(half)};
+		out_relation->pose.position = {0.0f, 0.0f, 0.0f};
+		out_relation->linear_velocity = {0.0f, 0.0f, 0.0f};
+		out_relation->angular_velocity = {0.0f, 0.0f, 0.0f};
 		return XRT_SUCCESS;
 	}
 

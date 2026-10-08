@@ -197,7 +197,10 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 		}
 	}
 #endif
-	if (get_info().eye_gaze || is_forced_extension("EXT_eye_gaze_interaction"))
+	// EXPERIMENT HACK: always expose a fake eye tracker so X-Plane sees
+	// XR_EXT_eye_gaze_interaction on headsets without eye hardware (e.g. Quest 3).
+	// Revert to `if (get_info().eye_gaze || ...)` after the experiment.
+	if (true)
 	{
 		// The tracker space needs to be attached to the head pose once the space overseer is created
 		static_xdevs[static_xdev_count++] = static_roles.eyes = &eye_tracker.emplace(*this);
