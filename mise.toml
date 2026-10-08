@@ -1,7 +1,7 @@
 # * Backend Priority Order: Core, Aqua, Github, Package Manager (cargo, npm, pipx, conda, ubi)
 
 [env]
-ANDROID_BUILD_TOOLS = "36.0.0"                                  
+ANDROID_BUILD_TOOLS = "36.0.0"
 
 [tools]
 #* Main
@@ -19,6 +19,7 @@ ANDROID_BUILD_TOOLS = "36.0.0"
 "conda:cli11" = "2.7.2"                        # Arch cli11 (header-only, not needed for client-only but required for server/wivrnctl)
 "aqua:KhronosGroup/KTX-Software" = { version = "4.4.2", os = ["linux"] } # Arch ktx-software-bin (ktx CLI for GenerateAssets.cmake); linux-only via mise, macOS needs manual KTX-Software-4.4.2-Darwin-arm64.pkg install from GitHub releases
 opencode = "latest"
+"aqua:BurntSushi/ripgrep" = "latest"
 
 # [plugins] # Used to provide llvm & other tools which must be locally compiled from source
 # "vfox-backend:buildit" = "https://github.com/Quasiflo/buildit#v0.1.0"
