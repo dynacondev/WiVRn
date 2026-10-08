@@ -32,6 +32,7 @@
 #include "android/permissions.h"
 #endif
 
+#include <algorithm>
 #include <cmath>
 #include <glm/gtc/quaternion.hpp>
 #include <memory>
@@ -144,6 +145,18 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			map_key += ';';
 			map_key += std::to_string(e.scale);
 			map_key += ';';
+			// Mode + live tuning ride the same fingerprint: any of them
+			// changing re-seeds the filter/mesh like any other map change.
+			map_key += e.mode;
+			map_key += ';';
+			map_key += e.is_static ? 'S' : 'M';
+			map_key += ';';
+			map_key += std::to_string(e.update_hz) + ',' + std::to_string(e.window_size) + ',' +
+			        std::to_string(e.min_samples) + ',' + std::to_string(e.sigma_k) + ',' +
+			        std::to_string(e.pos_gain) + ',' + std::to_string(e.rot_gain) + ',' +
+			        std::to_string(e.euro_min_cutoff) + ',' + std::to_string(e.euro_beta) + ',' +
+			        std::to_string(e.knee_inner_mm) + ',' + std::to_string(e.knee_outer_mm) + ',' +
+			        std::to_string(e.knee_inner_deg) + ',' + std::to_string(e.knee_outer_deg) + ';';
 			if (not entry and not e.model_hash.empty())
 				entry = e;
 		}
@@ -172,7 +185,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		}
 		if (marker_tracker)
 		{
-			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag);
+			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag, entry->is_static, entry->update_hz);
 			marker_tracker->update(world_space, instance.now(), predicted_display_time);
 		}
 	}
@@ -189,6 +202,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.last_map_key = map_key;
 			fp.calibrated = false;
 			fp.calibrated_tag.clear();
+			fp.filter.reset();
+			fp.continuous = false;
+			fp.novel_ingested = 0;
 			if (fp.ready)
 			{
 				spdlog::info("Fiducial map changed, clearing projected mesh");
@@ -204,7 +220,97 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 
 	// Strict gating: marker tracking above runs unconditionally (needed for
 	// the in-view dot and the Calibrate button), but nothing mesh-related
-	// happens until calibrated.
+	// happens until calibrated. Continuous mode self-seeds that flag on
+	// first sighting (auto-anchor); one-shot waits for the button.
+	if (entry and entry->mode == "continuous" and marker_tracker)
+	{
+		fp.continuous = true;
+		xr::fiducial_filter::tuning t;
+		t.window_size = std::max(2, entry->window_size);
+		t.min_samples = std::clamp(entry->min_samples, 1, t.window_size);
+		t.sigma_k = std::max(0.5f, entry->sigma_k);
+		t.pos_gain = std::max(0.1f, entry->pos_gain);
+		t.rot_gain = std::max(0.1f, entry->rot_gain);
+		t.euro_min_cutoff = std::max(0.05f, entry->euro_min_cutoff);
+		t.euro_beta = std::max(0.f, entry->euro_beta);
+		t.knee_inner_mm = entry->knee_inner_mm;
+		t.knee_outer_mm = std::max(t.knee_inner_mm, entry->knee_outer_mm);
+		t.knee_inner_deg = entry->knee_inner_deg;
+		t.knee_outer_deg = std::max(t.knee_inner_deg, entry->knee_outer_deg);
+		// Tuning rides the map fingerprint above, so a tuning change lands
+		// here with a fresh filter: apply once per map (not per key — the
+		// key's cache flag flips when a download finishes, which must not
+		// wipe a live filter). configure() resets the window.
+		if (map_key != fp.applied_tuning_key)
+		{
+			fp.applied_tuning_key = map_key;
+			fp.filter.configure(t);
+		}
+		if (not fp.calibrated)
+		{
+			// Not seeded yet: the mesh transform below needs a pose, but
+			// nothing is submitted until calibrated, so just keep feeding
+			// the filter (auto-anchor happens on novel sightings below).
+			fp.world_scale = {entry->scale, entry->scale, entry->scale};
+		}
+		auto sighting = marker_tracker->latest();
+		if (sighting.tracked and sighting.novel)
+		{
+			// Same mesh-target math as calibrate_to_marker(), but as a
+			// filter sample instead of a snap: meshTarget =
+			// observedMarker * offset (translation unaffected by scale).
+			glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
+			glm::vec3 marker_pos(sighting.pose.position.x, sighting.pose.position.y, sighting.pose.position.z);
+			glm::quat offset_quat(entry->orientation[3], entry->orientation[0], entry->orientation[1], entry->orientation[2]);
+			glm::vec3 offset_pos(entry->position[0], entry->position[1], entry->position[2]);
+			glm::quat mesh_quat = marker_quat * offset_quat;
+			glm::vec3 mesh_pos = marker_pos + marker_quat * offset_pos;
+			fp.filter.ingest(mesh_pos, mesh_quat, sighting.time);
+			fp.novel_ingested++;
+			fp.last_novel_at = instance.now();
+			if (not fp.calibrated)
+			{
+				// Auto-anchor: the single allowed snap in continuous mode.
+				fp.filter.snap();
+				auto r = fp.filter.rendered();
+				fp.world_pose = {
+				        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
+				        .position = {r.pos.x, r.pos.y, r.pos.z},
+				};
+				fp.world_scale = {entry->scale, entry->scale, entry->scale};
+				fp.calibrated = true;
+				fp.calibrated_at = fp.last_novel_at;
+				fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
+				fp.last_predicted = predicted_display_time;
+				spdlog::info("Continuous: auto-anchored to marker \"{}\"", fp.calibrated_tag);
+			}
+		}
+		if (fp.calibrated and fp.filter.has_target())
+		{
+			// Per-frame proportional follow (large error = large step).
+			// On marker loss no novel samples arrive: advance() coasts on
+			// the current window, i.e. permanent SLAM hold.
+			double dt = fp.last_predicted > 0 ? (predicted_display_time - fp.last_predicted) * 1e-9 : 1.0 / 72.0;
+			fp.last_predicted = predicted_display_time;
+			auto r = fp.filter.advance(std::clamp(dt, 0.0, 0.25));
+			fp.world_pose = {
+			        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
+			        .position = {r.pos.x, r.pos.y, r.pos.z},
+			};
+			fp.world_scale = {entry->scale, entry->scale, entry->scale};
+			if (auto target = fp.filter.resolve())
+			{
+				fp.target_render_err_mm = glm::length(target->pos - r.pos) * 1000.f;
+				float c = std::clamp(std::abs(glm::dot(target->quat, r.quat)), 0.f, 1.f);
+				fp.target_render_err_deg = 2.f * std::acos(c) * 57.29577951308232f;
+			}
+		}
+	}
+	else if (entry)
+	{
+		fp.continuous = entry->mode == "continuous";
+	}
+
 	if (not fp.calibrated)
 		return;
 
@@ -341,6 +447,31 @@ void scenes::stream::calibrate_to_marker()
 		return;
 	}
 
+	if (entry->mode == "continuous")
+	{
+		// Re-seed: the single allowed snap in continuous mode. Clears the
+		// window, ingests the current sighting at full weight, and snaps
+		// the rendered pose to it; follow resumes from there.
+		glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
+		glm::vec3 marker_pos(sighting.pose.position.x, sighting.pose.position.y, sighting.pose.position.z);
+		glm::quat offset_quat(entry->orientation[3], entry->orientation[0], entry->orientation[1], entry->orientation[2]);
+		glm::vec3 offset_pos(entry->position[0], entry->position[1], entry->position[2]);
+		fp.filter.reset();
+		fp.filter.ingest(marker_pos + marker_quat * offset_pos, marker_quat * offset_quat, sighting.time);
+		fp.filter.snap();
+		auto r = fp.filter.rendered();
+		fp.world_pose = {
+		        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
+		        .position = {r.pos.x, r.pos.y, r.pos.z},
+		};
+		fp.world_scale = {entry->scale, entry->scale, entry->scale};
+		fp.calibrated = true;
+		fp.calibrated_at = now;
+		fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
+		spdlog::info("Continuous: re-seeded to marker \"{}\"", fp.calibrated_tag);
+		return;
+	}
+
 	// Mesh anchor: meshClientPose = observedMarkerPose * markerToMeshOffset.
 	// The offset translation is in meters and is not affected by the scale.
 	glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
@@ -382,18 +513,22 @@ void scenes::stream::gui_fiducial_status()
 	if (marker_tracker)
 	{
 		auto sighting = marker_tracker->latest();
+		auto [novel, total] = marker_tracker->update_stats();
+		int dup_pct = total > 0 ? (int)((total - novel) * 100 / total) : 0;
 		ImVec4 dot = sighting.tracked ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
 		ImGui::TextColored(dot, "%s", sighting.tracked ? "[o]" : "[x]");
 		ImGui::SameLine();
 		if (sighting.tracked)
 		{
 			double age_s = (instance.now() - sighting.time) * 1e-9;
-			ImGui::Text("%s %.40s (%.0fcm): %s, %.1fs ago",
+			ImGui::Text("%s %.40s (%.0fcm): %s, %.1fs ago%s%s",
 			            _S("Marker"),
 			            marker_tracker->label().c_str(),
 			            marker_tracker->configured_size() * 100,
 			            _S("tracked"),
-			            age_s);
+			            age_s,
+			            marker_tracker->configured_static() ? "" : " (moving)",
+			            total > 0 ? (" upd " + std::to_string((int)novel) + "/" + std::to_string((int)total) + " " + std::to_string(dup_pct) + "%dup").c_str() : "");
 		}
 		else
 		{
@@ -419,12 +554,24 @@ void scenes::stream::gui_fiducial_status()
 	if (fp.calibrated)
 	{
 		double age_s = (instance.now() - fp.calibrated_at) * 1e-9;
-		ImGui::Text("%s %.40s, %.0fs %s", _S("Aligned to marker"), fp.calibrated_tag.c_str(), age_s, _S("ago"));
+		ImGui::Text("%s %.40s, %.0fs %s%s",
+		            _S("Aligned to marker"),
+		            fp.calibrated_tag.c_str(),
+		            age_s,
+		            _S("ago"),
+		            fp.continuous ? " (continuous)" : "");
+		if (fp.continuous)
+			ImGui::Text("Follow: %zu samples, w=%.2f, err %.1fmm %.2fdeg, %llu novel",
+			            fp.filter.sample_count(),
+			            fp.filter.mean_weight(),
+			            fp.target_render_err_mm,
+			            fp.target_render_err_deg,
+			            (unsigned long long)fp.novel_ingested);
 	}
 
 	bool can_calibrate = marker_tracker && marker_tracker->latest().tracked;
 	ImGui::BeginDisabled(!can_calibrate);
-	if (ImGui::Button(_S("Calibrate to marker")))
+	if (ImGui::Button(_S(fp.continuous ? "Re-seed to marker" : "Calibrate to marker")))
 		calibrate_to_marker();
 	ImGui::EndDisabled();
 	if (not can_calibrate)

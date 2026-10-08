@@ -73,6 +73,30 @@ struct configuration
 		float scale = 1;
 		// Feather width in screen pixels for the passthrough window edges.
 		float feather_px = 24;
+		// Tracking mode: "one-shot" (align once per Calibrate press) or
+		// "continuous" (auto-anchor on sight, then smooth-follow to correct
+		// drift without ever snapping). Unknown values are rejected at parse.
+		std::string mode = "one-shot";
+		// Maps to optimizeForStaticMarker in the QR spatial context.
+		// true = stationary rig (integrate over time); false = moving
+		// reference marker. Toggling recreates the client spatial context
+		// (brief tracking hitch, noted here so it isn't a surprise).
+		bool is_static = true;
+		// Continuous-mode tuning; all optional, all live per map (a change
+		// re-seeds the filter like any other map change). Shared Euro
+		// cutoff/beta cover both position and orientation.
+		float update_hz = 10;
+		int window_size = 12;
+		int min_samples = 4;
+		float sigma_k = 3;
+		float pos_gain = 3;
+		float rot_gain = 3;
+		float euro_min_cutoff = 0.4f;
+		float euro_beta = 0.07f;
+		float knee_inner_mm = 1;
+		float knee_outer_mm = 5;
+		float knee_inner_deg = 0.1f;
+		float knee_outer_deg = 0.5f;
 	};
 	std::vector<fiducial_entry> fiducial_map;
 

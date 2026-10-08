@@ -28,6 +28,7 @@
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
+#include "xr/fiducial_filter.h"
 #include "stream_defoveator.h"
 #include "utils/thread_safe.h"
 #include "wifi_lock.h"
@@ -265,6 +266,20 @@ private:
 		size_t triangle_count = 0;
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
+
+		// Continuous mode ("continuous" map entries): auto-anchors on first
+		// sighting, then robustly averages novel mesh-targets and
+		// proportionally follows every frame (never snaps after the seed).
+		// One-shot entries ignore all of this.
+		bool continuous = false;
+		xr::fiducial_filter filter;
+		std::string applied_tuning_key; // filter tuning source; re-apply on change
+		XrTime last_predicted = 0;
+		// Diagnostics (render thread only).
+		uint64_t novel_ingested = 0;
+		XrTime last_novel_at = 0;
+		float target_render_err_mm = 0;
+		float target_render_err_deg = 0;
 
 		// Feathered mask-blend state. Replaces the binary triangle-mesh
 		// cutout when XR_FB_composition_layer_alpha_blend is available:

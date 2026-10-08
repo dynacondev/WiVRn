@@ -24,6 +24,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace xr
@@ -51,6 +52,12 @@ public:
 		bool tracked = false;
 		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrTime time = 0;
+		// True when this sighting carries a pose not previously reported
+		// (novel detector output). False on repeats: the runtime's QR
+		// detector runs slower than the query rate, so update snapshots
+		// often echo the previous pose. Consumers (continuous filter)
+		// should only ingest novel samples.
+		bool novel = false;
 	};
 
 	// All four extensions must be enabled; check supported() first.
@@ -58,12 +65,16 @@ public:
 	static bool supported(instance &);
 
 	// (Re)configure for a marker; kicks off async context creation.
-	// No-op when already configured for the same size/payload, and
-	// throttled by the failure backoff (no per-frame re-attempt spam).
+	// No-op when already configured for the same size/payload/static/rate,
+	// and throttled by the failure backoff (no per-frame re-attempt spam).
 	// Payload is required: QR runtimes report markerId 0, so identity is
 	// the payload alone. Tag is display-only (UI/logs) and never gates:
 	// a rename updates the label live without restarting tracking.
-	void configure(float marker_size_m, std::string marker_payload, std::string tag);
+	// is_static maps to optimizeForStaticMarker: toggling it recreates the
+	// spatial context (brief tracking hitch). update_hz is the live
+	// update-snapshot rate for the latched entity (discovery stays at 2Hz
+	// for acquisition); clamped to [1, 30].
+	void configure(float marker_size_m, std::string marker_payload, std::string tag, bool is_static = true, float update_hz = 10);
 
 	// Advance the async state machine + throttled discovery.
 	// Render thread only. predicted_time stamps the discovery snapshot.
@@ -90,6 +101,19 @@ public:
 	{
 		return marker_size_m;
 	}
+	bool configured_static() const
+	{
+		return marker_static;
+	}
+	float configured_update_hz() const
+	{
+		return marker_update_hz;
+	}
+	// (novel, total) update-snapshot counts for dup% diagnostics.
+	std::pair<uint64_t, uint64_t> update_stats() const
+	{
+		return {update_queries_novel, update_queries_total};
+	}
 
 private:
 	instance * inst = nullptr;
@@ -103,12 +127,16 @@ private:
 	PFN_xrCreateSpatialContextCompleteEXT xrCreateSpatialContextCompleteEXT{};
 	PFN_xrCreateSpatialDiscoverySnapshotAsyncEXT xrCreateSpatialDiscoverySnapshotAsyncEXT{};
 	PFN_xrCreateSpatialDiscoverySnapshotCompleteEXT xrCreateSpatialDiscoverySnapshotCompleteEXT{};
+	PFN_xrCreateSpatialUpdateSnapshotEXT xrCreateSpatialUpdateSnapshotEXT{};
+	PFN_xrCreateSpatialEntityFromIdEXT xrCreateSpatialEntityFromIdEXT{};
+	PFN_xrDestroySpatialEntityEXT xrDestroySpatialEntityEXT{};
 	PFN_xrQuerySpatialComponentDataEXT xrQuerySpatialComponentDataEXT{};
 	PFN_xrGetSpatialBufferStringEXT xrGetSpatialBufferStringEXT{};
 	PFN_xrGetSpatialBufferUint8EXT xrGetSpatialBufferUint8EXT{};
 
 	using spatial_context_handle = utils::handle<XrSpatialContextEXT>;
 	using spatial_snapshot_handle = utils::handle<XrSpatialSnapshotEXT>;
+	using spatial_entity_handle = utils::handle<XrSpatialEntityEXT>;
 
 	// Deleters are loaded in the constructor (extension procs)
 	PFN_xrDestroySpatialContextEXT xrDestroySpatialContextEXT{};
@@ -127,6 +155,8 @@ private:
 	std::string marker_tag;
 	float marker_size_m = 0;
 	std::string marker_payload; // exact QR payload to match (required)
+	bool marker_static = true;
+	float marker_update_hz = 10;
 	// Unconfigured payloads already reported (capped: diagnostic only)
 	std::set<std::string> unknown_payloads_logged;
 	// Snapshot content diagnostics: count transitions log at info (silence
@@ -150,10 +180,29 @@ private:
 	spatial_context_handle spatial_context;
 
 	XrTime last_discovery_start = 0;
+	XrTime last_update_start = 0;
 	XrTime retry_at = 0;
 	XrTime last_now = 0;
 	bool discovery_failed_once = false;
 	bool discovery_running_logged = false;
+	bool update_unsupported_logged = false;
+
+	// Live entity latched from discovery (update snapshots need handles,
+	// not ids). Recreated when the matching discovery entity id changes;
+	// destroyed on (re)configure.
+	spatial_entity_handle spatial_entity;
+	XrSpatialEntityIdEXT tracked_entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
+
+	// Update-snapshot duplicate accounting: the detector is slower than
+	// the query rate, so most snapshots echo the previous pose. Novel
+	// samples feed the continuous filter; repeats are counted and logged
+	// as a percentage.
+	uint64_t update_queries_total = 0;
+	uint64_t update_queries_novel = 0;
+	int last_dup_pct = -1;
+	XrTime last_dup_log = 0;
+	XrPosef last_reported_pose{{0, 0, 0, 1}, {0, 0, 0}};
+	bool has_reported_pose = false;
 
 	sighting current;
 	std::string status_text = "idle";
@@ -177,5 +226,11 @@ private:
 	void complete_context();
 	void start_discovery();
 	void complete_discovery(XrSpace world_space, XrTime predicted_time);
+	// Synchronous live pose refresh for the latched entity at update_hz.
+	// No re-enumeration, no payload decode: the cheapest fresh pose.
+	void update_snapshot(XrSpace world_space, XrTime now, XrTime predicted_time);
+	void ensure_entity(XrSpatialEntityIdEXT id);
+	void note_sample(const XrPosef & pose, XrTime predicted_time);
+	void log_dup_stats(XrTime now);
 };
 } // namespace xr

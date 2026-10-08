@@ -997,6 +997,25 @@ struct fiducial_map_entry
 	// blend band around the mesh silhouette). Per object; the mask layer
 	// renders at screen/feather resolution. 0 disables feathering.
 	float feather_px = 24;
+	// Tracking mode: "one-shot" (default, align once per Calibrate press)
+	// or "continuous" (auto-anchor on sight, then smooth-follow).
+	std::string mode = "one-shot";
+	// Stationary rig hint (optimizeForStaticMarker). True by default.
+	bool is_static = true;
+	// Continuous-mode live update rate + filter/smoothing tuning.
+	// Shared Euro cutoff/beta cover position and orientation.
+	float update_hz = 10;
+	int window_size = 12;
+	int min_samples = 4;
+	float sigma_k = 3;
+	float pos_gain = 3;
+	float rot_gain = 3;
+	float euro_min_cutoff = 0.4f;
+	float euro_beta = 0.07f;
+	float knee_inner_mm = 1;
+	float knee_outer_mm = 5;
+	float knee_inner_deg = 0.1f;
+	float knee_outer_deg = 0.5f;
 };
 
 struct fiducial_map

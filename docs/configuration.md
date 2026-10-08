@@ -215,6 +215,25 @@ Each entry has:
   The client selects a blur tier automatically (0 hard edge, 1 full-res,
   2/4/8 half/quarter/eighth with exact spread mapping, clamped to 128px),
   so tap density and cost stay flat at any width.
+- `mode`: `"one-shot"` (default) or `"continuous"`. One-shot aligns once
+  per Calibrate press. Continuous auto-anchors on first sighting, then
+  smooth-follows the marker to correct drift without ever snapping: new
+  samples are robustly averaged (median/MAD Cauchy soft-weighting) and the
+  rendered pose exponentially approaches the resolved target every frame
+  (large error = large step). SLAM-holds forever on marker loss.
+- `static`: `true` (default) or `false`. Maps to the runtime's
+  `optimizeForStaticMarker`: keep `true` for a stationary rig, set `false`
+  for a moving reference marker. Toggling recreates the client spatial
+  context (brief tracking hitch).
+- Continuous tuning (all optional, all live per map change; shared Euro
+  cutoff/beta cover position and orientation):
+  `update-hz` (default `10`, live pose queries without full rediscovery),
+  `window-size` (default `12`), `min-samples` (default `4`, warmup),
+  `sigma-k` (default `3`), `pos-gain`/`rot-gain` (default `3`, per-second
+  proportional catch-up), `euro-min-cutoff` (default `0.4`),
+  `euro-beta` (default `0.07`), `knee-inner-mm`/`knee-outer-mm`
+  (defaults `1`/`5`), `knee-inner-deg`/`knee-outer-deg`
+  (defaults `0.1`/`0.5`).
 
 The mesh pose on the headset is
 `meshClientPose = observedMarkerPose * markerToMeshOffset`.

@@ -246,6 +246,38 @@ configuration::configuration()
 				}
 				if (item.contains("feather-px"))
 					e.feather_px = item["feather-px"];
+				if (item.contains("mode"))
+				{
+					e.mode = item["mode"];
+					if (e.mode != "one-shot" and e.mode != "continuous")
+						throw std::runtime_error("invalid fiducial-map mode \"" + e.mode + "\": expected \"one-shot\" or \"continuous\"");
+				}
+				if (item.contains("static"))
+					e.is_static = item["static"];
+				if (item.contains("update-hz"))
+					e.update_hz = item["update-hz"];
+				if (item.contains("window-size"))
+					e.window_size = item["window-size"];
+				if (item.contains("min-samples"))
+					e.min_samples = item["min-samples"];
+				if (item.contains("sigma-k"))
+					e.sigma_k = item["sigma-k"];
+				if (item.contains("pos-gain"))
+					e.pos_gain = item["pos-gain"];
+				if (item.contains("rot-gain"))
+					e.rot_gain = item["rot-gain"];
+				if (item.contains("euro-min-cutoff"))
+					e.euro_min_cutoff = item["euro-min-cutoff"];
+				if (item.contains("euro-beta"))
+					e.euro_beta = item["euro-beta"];
+				if (item.contains("knee-inner-mm"))
+					e.knee_inner_mm = item["knee-inner-mm"];
+				if (item.contains("knee-outer-mm"))
+					e.knee_outer_mm = item["knee-outer-mm"];
+				if (item.contains("knee-inner-deg"))
+					e.knee_inner_deg = item["knee-inner-deg"];
+				if (item.contains("knee-outer-deg"))
+					e.knee_outer_deg = item["knee-outer-deg"];
 				fiducial_map.push_back(std::move(e));
 			}
 		}
