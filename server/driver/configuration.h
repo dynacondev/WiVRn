@@ -89,8 +89,8 @@ struct configuration
 		int window_size = 12;
 		int min_samples = 4;
 		float sigma_k = 3;
-		float pos_gain = 3;
-		float rot_gain = 3;
+		float pos_gain = 24;
+		float rot_gain = 24;
 		float euro_min_cutoff = 0.4f;
 		float euro_beta = 0.07f;
 		float knee_inner_mm = 1;

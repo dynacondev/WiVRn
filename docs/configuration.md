@@ -229,7 +229,7 @@ Each entry has:
   cutoff/beta cover position and orientation):
   `update-hz` (default `10`, live pose queries without full rediscovery),
   `window-size` (default `12`), `min-samples` (default `4`, warmup),
-  `sigma-k` (default `3`), `pos-gain`/`rot-gain` (default `3`, per-second
+  `sigma-k` (default `3`), `pos-gain`/`rot-gain` (default `24`, per-second
   proportional catch-up), `euro-min-cutoff` (default `0.4`),
   `euro-beta` (default `0.07`), `knee-inner-mm`/`knee-outer-mm`
   (defaults `1`/`5`), `knee-inner-deg`/`knee-outer-deg`
