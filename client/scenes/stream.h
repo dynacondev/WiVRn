@@ -44,6 +44,7 @@
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace scenes
@@ -305,8 +306,18 @@ private:
 		std::unordered_map<XrSpatialEntityIdEXT, held_code> held_codes;
 		// Shared white overlay texture (tinted per layer via
 		// colorScaleBias). Explicit acquire/fill/release pairing like the
-		// mask swapchain, never the shared pool.
+		// mask swapchain, never the shared pool. Filled with a CLEAR-only
+		// render pass: xr swapchain images carry no TRANSFER_DST usage,
+		// so clearColorImage is invalid on them (silently dropped).
 		xr::swapchain debug_swapchain;
+		vk::raii::RenderPass debug_pass{nullptr};
+		struct debug_target
+		{
+			vk::Image image{};
+			vk::raii::ImageView view{nullptr};
+			vk::raii::Framebuffer fb{nullptr};
+		};
+		std::vector<debug_target> debug_targets;
 
 		// First-acquisition alpha fade (mask-blend path only: the binary
 		// projected layer type has no opacity control). fade_start stamps

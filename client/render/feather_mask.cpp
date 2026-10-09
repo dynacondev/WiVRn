@@ -682,7 +682,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    bool rasterize,
                                    float feather_px,
                                    float opacity,
-                                   const std::optional<std::array<glm::vec3, 6>> & cutout)
+                                   const std::optional<std::array<glm::vec3, 6>> & cutout,
+                                   const std::array<glm::mat4, 2> & cutout_mvp)
 {
 	auto set_full_viewport = [&](vk::Extent2D e) {
 		cmd.setViewport(0, vk::Viewport{
@@ -1096,7 +1097,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 			cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
 			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-			                               raster_push{.mvp = mvp[eye], .opacity = 0});
+			                               raster_push{.mvp = cutout_mvp[eye], .opacity = 0});
 			cmd.draw(6, 1, 0, 0);
 			cmd.endRenderPass();
 		}

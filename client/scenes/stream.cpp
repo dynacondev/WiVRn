@@ -1212,8 +1212,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
 				                  glm::scale(glm::mat4(1), glm::vec3(fp.world_scale.x, fp.world_scale.y, fp.world_scale.z));
 				std::array<glm::mat4, 2> mvp;
+				std::array<glm::mat4, 2> world_mvp;
 				for (uint32_t view = 0; view < 2; ++view)
-					mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]) * model;
+				{
+					world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+					mvp[view] = world_mvp[view] * model;
+				}
 				// Marker window cutout: raw instant pose of the matched
 				// code (unfiltered, SLAM-held) expanded by the debug
 				// window, punched through the mask so the true code
@@ -1271,7 +1275,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_acquired = true;
 				fp.mask_extent = {mw, mh};
 				fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, fp.feather_px,
-				                         fp.fade_factor(frame_state.predictedDisplayTime), cutout);
+				                         fp.fade_factor(frame_state.predictedDisplayTime), cutout, world_mvp);
 				}
 			}
 		}
@@ -1323,6 +1327,59 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						device.waitIdle();
 						fp.debug_swapchain = xr::swapchain(instance, session, device, swapchain_format, 4, 4);
+						// CLEAR-only pass mirroring the mask raster pass
+						// (UNDEFINED -> GENERAL); per-image framebuffers.
+						vk::AttachmentDescription dbg_attachment{
+						        .format = swapchain_format,
+						        .samples = vk::SampleCountFlagBits::e1,
+						        .loadOp = vk::AttachmentLoadOp::eClear,
+						        .storeOp = vk::AttachmentStoreOp::eStore,
+						        .initialLayout = vk::ImageLayout::eUndefined,
+						        .finalLayout = vk::ImageLayout::eGeneral,
+						};
+						vk::AttachmentReference dbg_ref{
+						        .attachment = 0,
+						        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+						};
+						vk::SubpassDescription dbg_subpass{
+						        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+						        .colorAttachmentCount = 1,
+						        .pColorAttachments = &dbg_ref,
+						};
+						vk::RenderPassCreateInfo dbg_rp_info{
+						        .attachmentCount = 1,
+						        .pAttachments = &dbg_attachment,
+						        .subpassCount = 1,
+						        .pSubpasses = &dbg_subpass,
+						};
+						fp.debug_pass = vk::raii::RenderPass(device, dbg_rp_info);
+						for (vk::Image img: fp.debug_swapchain.images())
+						{
+							vk::raii::ImageView view(device,
+							                        vk::ImageViewCreateInfo{
+							                                .image = img,
+							                                .viewType = vk::ImageViewType::e2D,
+							                                .format = swapchain_format,
+							                                .subresourceRange = {
+							                                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+							                                        .baseMipLevel = 0,
+							                                        .levelCount = 1,
+							                                        .baseArrayLayer = 0,
+							                                        .layerCount = 1,
+							                                },
+							                        });
+							vk::ImageView raw = *view;
+							vk::raii::Framebuffer fb(device,
+							                         vk::FramebufferCreateInfo{
+							                                 .renderPass = *fp.debug_pass,
+							                                 .attachmentCount = 1,
+							                                 .pAttachments = &raw,
+							                                 .width = 4,
+							                                 .height = 4,
+							                                 .layers = 1,
+							                         });
+							fp.debug_targets.push_back({img, std::move(view), std::move(fb)});
+						}
 						spdlog::info("Fiducial debug overlay swapchain: 4x4");
 					}
 					int debug_index = fp.debug_swapchain.acquire();
@@ -1333,36 +1390,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					else
 					{
 						outstanding = true;
-						vk::Image dbg = fp.debug_swapchain.image(debug_index);
-						vk::ImageSubresourceRange range{
-						        .aspectMask = vk::ImageAspectFlagBits::eColor,
-						        .baseMipLevel = 0,
-						        .levelCount = 1,
-						        .baseArrayLayer = 0,
-						        .layerCount = 1,
+						vk::ClearValue white{};
+						white.color.float32.fill(1);
+						vk::RenderPassBeginInfo begin_dbg{
+						        .renderPass = *fp.debug_pass,
+						        .framebuffer = *fp.debug_targets[debug_index].fb,
+						        .renderArea = {.offset = {0, 0}, .extent = {4, 4}},
+						        .clearValueCount = 1,
+						        .pClearValues = &white,
 						};
-						command_buffer.pipelineBarrier(
-						        vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
-						        vk::ImageMemoryBarrier{
-						                .srcAccessMask = {},
-						                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-						                .oldLayout = vk::ImageLayout::eUndefined,
-						                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-						                .image = dbg,
-						                .subresourceRange = range,
-						        });
-						vk::ClearColorValue white(1, 1, 1, 1);
-						command_buffer.clearColorImage(dbg, vk::ImageLayout::eTransferDstOptimal, white, range);
-						command_buffer.pipelineBarrier(
-						        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {},
-						        vk::ImageMemoryBarrier{
-						                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-						                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-						                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-						                .newLayout = vk::ImageLayout::eGeneral,
-						                .image = dbg,
-						                .subresourceRange = range,
-						        });
+						command_buffer.beginRenderPass(begin_dbg, vk::SubpassContents::eInline);
+						command_buffer.endRenderPass();
 						debug_acquired = true;
 						outstanding = false;
 					}
