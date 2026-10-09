@@ -25,7 +25,8 @@
 // B and V into the submitted swapchain image. The blur decouples feather
 // width from shape resolution: opaque interiors stay pixel-exact while
 // the band is genuinely smooth (robust to the compositor sampling with or
-// without filtering). Fixed 9-tap kernel (sigma 2); feather-px maps to
+// without filtering). Fixed 5-tap kernel (sigma 2, tails truncated);
+// feather-px maps to
 // tap spread, recommended range 4-12 (see docs/configuration.md).
 //
 // Swapchain images only allow COLOR_ATTACHMENT output, which is why the
