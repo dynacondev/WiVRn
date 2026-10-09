@@ -30,12 +30,11 @@
 
 namespace
 {
-// Temporary cascade diagnostic: flip to true and rebuild for a viz APK
-// that draws field iso-contours (alpha lines over video; the mask layer
-// blends by alpha only, so RGB painting would be invisible). Smooth
-// concentric lines = healthy cascade. Always false in benchmark and
-// shipping builds.
-constexpr bool sdf_field_viz = true;
+// Temporary cascade diagnostic: set to 1 (iso-contours) or 2 (coverage
+// paint) and rebuild for a viz APK. The mask layer blends by alpha only,
+// so RGB painting would be invisible. Always 0 in benchmark and shipping
+// builds.
+constexpr int sdf_field_viz = 1;
 
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
@@ -67,14 +66,13 @@ struct jfa_push
 };
 
 // Analytic composite push block. Mirrors sdf_composite.frag.glsl Push
-// (28 bytes).
+// (24 bytes).
 struct sdf_composite_push
 {
 	float sdf_dim[2];
 	float feather_px;
 	float opacity;
 	float px_per_texel;
-	float inside_thresh;
 	float viz = 0;
 };
 
@@ -410,7 +408,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 
 	// JFA set: single flood-source sampler. Composite set: flood field
-	// (linear, binding 0) + untouched seed (nearest, binding 1).
+	// (linear, binding 0) + untouched seed (nearest, binding 1) +
+	// coverage-sign (linear, binding 2).
 	vk::DescriptorSetLayoutBinding jfa_binding{
 	        .binding = 0,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -700,6 +699,63 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, int sdf_div)
 			target->fbs.emplace_back(device, fb_info);
 		}
 	}
+	// Coverage-sign texture at half mask resolution in the swapchain
+	// format (existing raster renderpass serves it; framebuffer-compatible
+	// by construction). Same lifetime/key as the SDF targets above.
+	vk::Extent2D cover_alloc{extent.width / 2, extent.height / 2};
+	{
+		vk::ImageCreateInfo cover_info{
+		        .imageType = vk::ImageType::e2D,
+		        .format = format,
+		        .extent = {cover_alloc.width, cover_alloc.height, 1},
+		        .mipLevels = 1,
+		        .arrayLayers = 2,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .tiling = vk::ImageTiling::eOptimal,
+		        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+		        .sharingMode = vk::SharingMode::eExclusive,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		};
+		sdf_cover.image = vk::raii::Image(device, cover_info);
+		auto cover_req = sdf_cover.image.getMemoryRequirements();
+		vk::MemoryAllocateInfo cover_alloc_info{
+		        .allocationSize = cover_req.size,
+		        .memoryTypeIndex = find_memory_type(physical_device, cover_req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+		};
+		sdf_cover.memory = vk::raii::DeviceMemory(device, cover_alloc_info);
+		sdf_cover.image.bindMemory(*sdf_cover.memory, 0);
+		sdf_cover.views.clear();
+		sdf_cover.fbs.clear();
+		for (int layer = 0; layer < 2; ++layer)
+		{
+			vk::ImageViewCreateInfo cover_view_info{
+			        .image = *sdf_cover.image,
+			        .viewType = vk::ImageViewType::e2D,
+			        .format = format,
+			        .subresourceRange = {
+			                .aspectMask = vk::ImageAspectFlagBits::eColor,
+			                .baseMipLevel = 0,
+			                .levelCount = 1,
+			                .baseArrayLayer = (uint32_t)layer,
+			                .layerCount = 1,
+			        },
+			};
+			sdf_cover.views.emplace_back(device, cover_view_info);
+		}
+		vk::ImageView cover_raw[2] = {*sdf_cover.views[0], *sdf_cover.views[1]};
+		for (int layer = 0; layer < 2; ++layer)
+		{
+			vk::FramebufferCreateInfo cover_fb_info{
+			        .renderPass = *renderpass,
+			        .attachmentCount = 1,
+			        .pAttachments = &cover_raw[layer],
+			        .width = cover_alloc.width,
+			        .height = cover_alloc.height,
+			        .layers = 1,
+			};
+			sdf_cover.fbs.emplace_back(device, cover_fb_info);
+		}
+	}
 	spdlog::info("Fiducial mask SDF targets: {}x{} (1/{} of {}x{})", sdf_alloc.width, sdf_alloc.height, sdf_div, extent.width, extent.height);
 }
 
@@ -769,16 +825,16 @@ void feather_mask_renderer::update_flood(uint32_t eye, uint32_t pass, vk::ImageV
 	device.updateDescriptorSets(write, no_copies);
 }
 
-void feather_mask_renderer::update_composite(uint32_t eye, vk::ImageView field, vk::ImageView seed)
+void feather_mask_renderer::update_composite(uint32_t eye, vk::ImageView field, vk::ImageView cover)
 {
 	vk::DescriptorImageInfo field_info{
 	        .sampler = *sampler,
 	        .imageView = field,
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
-	vk::DescriptorImageInfo seed_info{
-	        .sampler = *nearest_sampler,
-	        .imageView = seed,
+	vk::DescriptorImageInfo cover_info{
+	        .sampler = *sampler,
+	        .imageView = cover,
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes{{
@@ -794,7 +850,7 @@ void feather_mask_renderer::update_composite(uint32_t eye, vk::ImageView field, 
 	                .dstBinding = 1,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = &seed_info,
+	                .pImageInfo = &cover_info,
 	        },
 	}};
 	std::array<vk::CopyDescriptorSet, 0> no_copies{};
@@ -966,14 +1022,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 		// SDF path selection (see header): 0 = hard edge raster direct,
 		// else seed + truncated Jump Flood + analytic composite at half
-		// (feather <= 16), quarter (<= 64) or eighth SDF resolution.
+		// (feather <= 8), quarter (<= 64) or eighth SDF resolution.
 		// Values past 128 clamp (documented).
 		float f = feather_px;
 		if (f > 128)
 			f = 128;
 		int sdf_div = 0;
 		if (f > 0)
-			sdf_div = (f > 16) ? ((f > 64) ? 8 : 4) : 2;
+			sdf_div = (f > 8) ? ((f > 64) ? 8 : 4) : 2;
 		if (sdf_div != 0)
 			ensure_targets(extent, sdf_div);
 
@@ -1066,6 +1122,40 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 			make_readable(*sdf_seed.image);
 
+			// Coverage-sign raster at half resolution (flat white): the
+			// composite's linear read softens the 2px grid into the sign
+			// edge, independent of flood resolution.
+			vk::Extent2D cover_extent{extent.width / 2, extent.height / 2};
+			{
+				section_clock cover_clk(&ms_raster);
+				for (int eye = 0; eye < 2; ++eye)
+				{
+					vk::RenderPassBeginInfo begin_cover{
+					        .renderPass = *renderpass,
+					        .framebuffer = *sdf_cover.fbs[eye],
+					        .renderArea = {.offset = {0, 0}, .extent = cover_extent},
+					        .clearValueCount = 1,
+					        .pClearValues = &clear,
+					};
+					cmd.beginRenderPass(begin_cover, vk::SubpassContents::eInline);
+					set_sdf_viewport(cover_extent);
+					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+					for (const auto & d: draws)
+					{
+						auto mit = meshes.find(d.mesh);
+						if (mit == meshes.end() or mit->second.index_count == 0)
+							continue;
+						cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+						cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+						cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+						                               raster_push{.mvp = d.mvp[eye], .opacity = 1});
+						cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+					}
+					cmd.endRenderPass();
+				}
+			}
+			make_readable(*sdf_cover.image);
+
 			// Truncated cascade: seeds need only reach feather-px out
 			// (further pixels composite to 0 regardless), so the first step
 			// is the smallest power of two covering the reach in SDF texels
@@ -1116,7 +1206,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 			for (int eye = 0; eye < 2; ++eye)
 			{
-				update_composite((uint32_t)eye, *flood_last->views[eye], *sdf_seed.views[eye]);
+				update_composite((uint32_t)eye, *flood_last->views[eye], *sdf_cover.views[eye]);
 				vk::RenderPassBeginInfo begin_composite{
 				        .renderPass = *renderpass,
 				        .framebuffer = *it->second.framebuffers[eye],
@@ -1134,8 +1224,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				        .feather_px = f,
 				        .opacity = min_opacity,
 				        .px_per_texel = (float)sdf_div,
-				        .inside_thresh = sdf_outside * 0.5f,
-				        .viz = sdf_field_viz ? 1.f : 0.f,
+				        .viz = (float)sdf_field_viz,
 				};
 				cmd.pushConstants<sdf_composite_push>(*composite_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);

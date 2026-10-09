@@ -29,9 +29,11 @@
 // Gaussian, whose band ran +-F/2).
 //
 // SDF resolution follows the band (distance error ~0.5 SDF texel stays
-// negligible against it): feather <= 16 floods at half mask resolution,
+// negligible against it): feather <= 8 floods at half mask resolution,
 // <= 64 at quarter, above at eighth. feather <= 0 keeps the exact
-// hard-edge direct raster (no field work at all).
+// hard-edge direct raster (no field work at all). The sign edge always
+// resolves from the half-res coverage texture, so coarser floods cost no
+// boundary quality.
 //
 // Swapchain images only allow COLOR_ATTACHMENT output, which is why the
 // seed is a raster pass and not a buffer fill.
@@ -184,6 +186,12 @@ private:
 	vk::raii::Sampler sampler{nullptr};         // linear: flood field reads
 	vk::raii::Sampler nearest_sampler{nullptr}; // nearest: exact seed coords
 	sdf_target sdf_seed, sdf_ping, sdf_pong;
+	// Coverage-sign texture: the silhouette rasterized flat-white at half
+	// mask resolution (swapchain format, so the existing raster renderpass
+	// and pipeline serve it with an opacity-1 push). The composite reads
+	// it linearly for a 2px-grid soft sign edge, decoupling boundary
+	// quality from the (coarser) flood resolution.
+	sdf_target sdf_cover;
 	vk::Extent2D targets_extent{0, 0};
 	int targets_div = 0;
 	// SDF storage format, chosen once in the constructor: RG16F where the
@@ -194,7 +202,7 @@ private:
 	float sdf_outside = 1e10f;
 	void ensure_targets(vk::Extent2D extent, int sdf_div);
 	void update_flood(uint32_t eye, uint32_t pass, vk::ImageView view);
-	void update_composite(uint32_t eye, vk::ImageView field, vk::ImageView seed);
+	void update_composite(uint32_t eye, vk::ImageView field, vk::ImageView cover);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
 	// shared-read (uploads are rare, map-change only); the pending copy

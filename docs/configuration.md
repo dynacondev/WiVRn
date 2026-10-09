@@ -260,7 +260,7 @@ Each `passthrough` entry (behavior object) has:
   (alpha-gradient blend band outside the mesh silhouette, default `24`;
   `0` disables feathering). Mask stacks group by this value so each
   object feathers independently; applied live. The client renders the
-  silhouette into a signed distance field at half (`feather <= 16`),
+  silhouette into a signed distance field at half (`feather <= 8`),
   quarter (`<= 64`) or eighth resolution and composites the band
   analytically in one pass (clamped to 128px), so cost stays nearly flat
   at any width. Interiors

@@ -20,14 +20,15 @@
 
 // Analytic SDF composite (fullscreen triangle from blur.vert): the single
 // full-resolution pass. The flood field (linear-filtered, sub-texel smooth)
-// gives distance to the silhouette; the untouched seed image (nearest)
-// gives inside/outside. Band is outside-only: interiors stay pixel-exact
-// to the rasterized edge, the ramp runs 0 -> feather_px outward.
+// gives distance to the silhouette; the half-res coverage texture
+// (linear-filtered, soft edge) gives inside/outside, decoupling boundary
+// quality from the (coarser) flood resolution. Band is outside-only:
+// interiors stay exact, the ramp runs 0 -> feather_px outward.
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D field;
-layout(set = 0, binding = 1) uniform sampler2D seed;
+layout(set = 0, binding = 1) uniform sampler2D cover;
 
 layout(push_constant) uniform Push
 {
@@ -35,7 +36,6 @@ layout(push_constant) uniform Push
 	float feather_px;
 	float opacity;
 	float px_per_texel;
-	float inside_thresh;
 	float viz;
 }
 pc;
@@ -47,7 +47,7 @@ void main()
 	// Clamp before smoothstep: unreached pixels hold INF seeds, and
 	// strict drivers need not produce clean +inf through length().
 	float raw_px = length(frag - s) * pc.px_per_texel;
-	float inside = texture(seed, uv).x < pc.inside_thresh ? 1.0 : 0.0;
+	float inside = smoothstep(0.35, 0.65, texture(cover, uv).a);
 	if (pc.viz > 0.5)
 	{
 		// Iso-contours every 4px over live video. The mask layer blends
@@ -56,6 +56,14 @@ void main()
 		// healthy cascade, wavy/blocky lines pinpoint errors, and the
 		// reality/video boundary is the sign edge under test. Far field
 		// (past 2x feather) stays video; INF-safe by construction.
+		// Viz mode 2 (viz > 1.5): paint coverage instead, to judge the
+		// sign edge itself.
+		if (pc.viz > 1.5)
+		{
+			float c = texture(cover, uv).a;
+			out_color = vec4(1.0, 1.0, 1.0, c > 0.99 ? 1.0 : (c < 0.01 ? 0.0 : 0.5));
+			return;
+		}
 		float line = fract(raw_px * 0.25) < 0.18 ? 1.0 : 0.0;
 		float a = inside > 0.5 ? 1.0 : (raw_px > pc.feather_px * 2.0 ? 0.0 : line);
 		out_color = vec4(1.0, 1.0, 1.0, a);
