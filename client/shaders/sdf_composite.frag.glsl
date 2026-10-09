@@ -50,10 +50,15 @@ void main()
 	float inside = texture(seed, uv).x < pc.inside_thresh ? 1.0 : 0.0;
 	if (pc.viz > 0.5)
 	{
-		vec3 c = inside > 0.5 ? vec3(0.0, 0.8, 0.0)
-		        : raw_px > pc.feather_px ? vec3(0.8, 0.0, 0.8)
-		        : mix(vec3(0.8, 0.0, 0.0), vec3(0.0, 0.0, 0.8), clamp(raw_px / pc.feather_px, 0.0, 1.0));
-		out_color = vec4(c, 1.0);
+		// Iso-contours every 4px over live video. The mask layer blends
+		// by alpha only (RGB is ignored), so the field is drawn as
+		// opaque contour lines on video: smooth concentric lines =
+		// healthy cascade, wavy/blocky lines pinpoint errors, and the
+		// reality/video boundary is the sign edge under test. Far field
+		// (past 2x feather) stays video; INF-safe by construction.
+		float line = fract(raw_px * 0.25) < 0.18 ? 1.0 : 0.0;
+		float a = inside > 0.5 ? 1.0 : (raw_px > pc.feather_px * 2.0 ? 0.0 : line);
+		out_color = vec4(1.0, 1.0, 1.0, a);
 		return;
 	}
 	float dist_px = min(raw_px, pc.feather_px);

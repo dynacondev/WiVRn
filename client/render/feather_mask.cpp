@@ -31,9 +31,10 @@
 namespace
 {
 // Temporary cascade diagnostic: flip to true and rebuild for a viz APK
-// that paints the distance field instead of the mask (green = inside,
-// red->blue ramp over [0, feather], magenta = unreached/INF). Always
-// false in benchmark and shipping builds.
+// that draws field iso-contours (alpha lines over video; the mask layer
+// blends by alpha only, so RGB painting would be invisible). Smooth
+// concentric lines = healthy cascade. Always false in benchmark and
+// shipping builds.
 constexpr bool sdf_field_viz = true;
 
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
