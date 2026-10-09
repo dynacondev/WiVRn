@@ -336,7 +336,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		{
 			fp.last_map_key = map_key;
 			fp.calibrated = false;
-			fp.fade_start = 0;
 			fp.held_codes.clear();
 			passthrough_objects.clear();
 			fiducial_sightings.clear();
@@ -483,9 +482,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.calibrated = true;
 			fp.world_pose = inst.world_pose;
 			fp.world_scale = inst.world_scale;
-			fp.feather_px = ost.def.feather_px;
-			fp.fade_dur_ms = std::max(0.f, ost.def.fade_in_ms);
-			fp.fade_start = inst.fade_start;
 			fp.status = ost.status;
 			shim_ost = &ost;
 			shimmed = true;
@@ -501,49 +497,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	if (not fp.calibrated)
 		return;
 
-	// Feathered mask-blend path (replaces the binary triangle-mesh cutout
-	// when the alpha-blend extension is present): no runtime mesh upload,
-	// no geometry-instance transform. The soup + raster resources are
-	// (re)built here; raster record and layer submit happen in render().
-	// Render shim: the first live object's soup drives the single renderer
-	// (per-feather groups replace this).
-	if (composition_layer_alpha_blend_supported)
-	{
-		if (shim_ost)
-		{
-			if (fp.mask_hash != shim_ost->soup_hash)
-			{
-				fp.mask_hash = shim_ost->soup_hash;
-				fp.mask_ready = false;
-				fp.mask_active = false;
-				try
-				{
-					fp.mask_soup = shim_ost->soup;
-					if (not fp.mask_renderer)
-						fp.mask_renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
-					fp.mask_renderer->set_soup(fp.mask_soup);
-					fp.mask_ready = fp.mask_renderer->has_mesh();
-					fp.status = "feathered";
-					spdlog::info("Fiducial mask mesh ready: {} triangles, feather {}px",
-					             fp.mask_soup.indices.size() / 3, fp.feather_px);
-				}
-				catch (std::exception & e)
-				{
-					fp.status = std::string("mask error: ") + e.what();
-					spdlog::warn("Fiducial mask mesh failed: {}", e.what());
-				}
-			}
-			fp.mask_active = fp.mask_ready;
-			if (fp.mask_active)
-				return;
-			// Else fall through to the binary mesh path below (mask
-			// unavailable: no soup, no renderer, or no model).
-		}
-		else
-		{
-			fp.mask_active = false;
-		}
-	}
+	// Mask groups record in render() (per-feather stacks); nothing to
+	// upload here. The binary fallback below keeps the first live
+	// instance only: the projected layer type has no per-object layers.
 
 	// Re-upload if the runtime lost the mesh (e.g. passthrough re-created)
 	if (fp.ready and not session.has_projected_passthrough_mesh())

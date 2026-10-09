@@ -36,8 +36,10 @@
 #include <array>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
+#include <map>
 #include <openxr/openxr.h>
 #include <optional>
+#include <string>
 #include "vk/allocation.h"
 #include <unordered_map>
 #include <utility>
@@ -51,37 +53,43 @@ public:
 	                      vk::raii::PhysicalDevice & physical_device,
 	                      vk::Format format);
 
-	// (Re)upload mesh buffers. Synchronous (device idle on replace); call
-	// when idle, e.g. on map change, not per frame.
-	void set_soup(const passthrough_mesh::triangle_soup & soup);
+	// (Re)upload one object's mesh buffers under its key. Synchronous
+	// (device idle on replace); call when idle, e.g. on map change, not
+	// per frame. Empty soup erases the entry.
+	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
+	void remove_mesh(const std::string & key);
 
-	// Record silhouette + blur chain for both eyes into the layers of an
+	// One silhouette draw: which uploaded mesh, per-eye transforms, and
+	// the first-acquisition fade opacity.
+	struct instance_draw
+	{
+		std::string mesh;
+		std::array<glm::mat4, 2> mvp;
+		float opacity = 1;
+	};
+
+	// Record silhouettes + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
 	// be unused (UNDEFINED is fine); it is left in GENERAL for the
 	// compositor. Feather selects the tier (0 = hard edge raster direct,
 	// 1 = full-res blur, 2/4/8 = blur at half/quarter/eighth with exact
 	// spread mapping, clamped to 128px); rasterize=false clears only.
-	// Opacity is the first-acquisition fade (1 = fully present). Cutout is
-	// an optional world-space quad (two triangles, six verts) punched
-	// crisp through the finished mask after all blur passes: the marker
-	// window debug cutout, stamped at full alpha so the hole shows
-	// passthrough (mask 1 = reality). It needs its own view-only MVP (the
-	// mesh soup is mesh-local, so the mesh mvp would place it twice).
-	// Mask path only (the binary projected layer has no alpha control to
-	// punch through).
+	// Cutouts are world-space quads (two triangles each) punched crisp
+	// through the finished mask at full alpha (mask 1 = reality), sharing
+	// one view-only MVP. Mask path only (the binary projected layer has
+	// no alpha control to punch through).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
-	            const std::array<glm::mat4, 2> & mvp,
-	            bool rasterize = true,
-	            float feather_px = 24.0f,
-	            float opacity = 1.0f,
-	            const std::optional<std::array<glm::vec3, 6>> & cutout = std::nullopt,
-	            const std::array<glm::mat4, 2> & cutout_mvp = {});
+	            const std::vector<instance_draw> & draws,
+	            bool rasterize,
+	            float feather_px,
+	            const std::vector<std::array<glm::vec3, 6>> & cutouts,
+	            const std::array<glm::mat4, 2> & cutout_mvp);
 
 	bool has_mesh() const
 	{
-		return index_count > 0;
+		return not meshes.empty();
 	}
 
 	// Drop cached framebuffers/views (swapchain recreated: old image
@@ -108,7 +116,7 @@ private:
 	// LOAD variant of the raster pass for the marker window cutout: same
 	// single-attachment shape (framebuffer-compatible with the above), so
 	// the finished blurred image can be re-begun and stamped with a crisp
-	// zero-alpha quad no blur pass touches.
+	// full-alpha quad no blur pass touches.
 	vk::raii::RenderPass cutout_renderpass{nullptr};
 
 	// Separable Gaussian blur (fullscreen triangle, sampled input).
@@ -151,23 +159,28 @@ private:
 	void ensure_targets(vk::Extent2D extent);
 	void update_source(vk::ImageView view, uint32_t set);
 
-	vk::raii::Buffer vertex_buffer{nullptr};
-	vk::raii::DeviceMemory vertex_memory{nullptr};
-	vk::raii::Buffer index_buffer{nullptr};
-	vk::raii::DeviceMemory index_memory{nullptr};
-	uint32_t index_count = 0;
+	// One uploaded mesh per object in the group. Staging is per mesh and
+	// shared-read (uploads are rare, map-change only); the pending copy
+	// applies at the start of the next record().
+	struct mesh_buffers
+	{
+		vk::raii::Buffer vertex_buffer{nullptr};
+		vk::raii::DeviceMemory vertex_memory{nullptr};
+		vk::raii::Buffer index_buffer{nullptr};
+		vk::raii::DeviceMemory index_memory{nullptr};
+		uint32_t index_count = 0;
+		vk::raii::Buffer staging_buffer{nullptr};
+		vk::raii::DeviceMemory staging_memory{nullptr};
+		vk::DeviceSize staging_size = 0;
+		std::optional<std::pair<vk::DeviceSize, vk::DeviceSize>> pending_upload;
+	};
+	std::map<std::string, mesh_buffers> meshes;
+	void flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh);
 
 	// Marker window-cutout quad (two world-space triangles, rewritten per
 	// record via the persistent VMA mapping). Created lazily on first
 	// cutout use.
 	buffer_allocation cutout_verts;
-
-	// Persistent staging for mesh uploads (resized on demand) + pending
-	// copy applied at the start of the next record().
-	vk::raii::Buffer staging_buffer{nullptr};
-	vk::raii::DeviceMemory staging_memory{nullptr};
-	vk::DeviceSize staging_size = 0;
-	std::optional<std::pair<vk::DeviceSize, vk::DeviceSize>> pending_upload;
 
 	// Framebuffers + views per swapchain image (images cycle; entries for
 	// retired swapchains are dropped via reset_targets()).
@@ -186,6 +199,4 @@ private:
 		}
 	};
 	std::unordered_map<VkImage, frame_targets> targets;
-
-	void flush_upload(vk::raii::CommandBuffer & cmd);
 };

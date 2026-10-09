@@ -856,7 +856,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// below and the layer submit after update().
 	auto & fp = fiducial_passthrough;
 	bool mask_frame = false;
-	bool mask_acquired = false;
+	// Groups acquired this frame (explicit release pairing post-submit).
+	std::vector<fiducial_passthrough_state::mask_group *> acquired_groups;
 	// Fiducial debug overlays (tinted quads at raw sighting poses). The
 	// white texture is acquired/filled here (command buffer still open)
 	// and released after submit, mirroring the mask swapchain pairing.
@@ -1178,10 +1179,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
-		// Feathered mask record: rasterize the calibrated silhouette into a
-		// tiny swapchain; the compositor's upscale is the feather gradient.
-		// mask_active implies the renderer + mesh are ready (invariant kept
-		// by update()). Dedicated member swapchain with explicit
+		// Feathered mask record, one stack per feather group (independent
+		// feathering per object). Groups share a blur chain per feather
+		// value; member objects contribute soups, anchored instances
+		// contribute draws. Dedicated member swapchains with explicit
 		// acquire/release pairing (never the shared pool).
 		//
 		// Cutout bypass DISABLED (diagnostic complete): the rasterized
@@ -1190,39 +1191,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		static constexpr bool mask_bypass_cutout = false;
 		try
 		{
-			mask_frame = fp.mask_active and fp.mask_renderer and fp.mask_renderer->has_mesh() and view_count == 2;
-			if (mask_frame and mask_bypass_cutout)
+			mask_frame = false;
+			if (not composition_layer_alpha_blend_supported)
 			{
-				static bool bypass_logged = false;
-				if (not bypass_logged)
-				{
-					bypass_logged = true;
-					spdlog::info("Mask cutout bypassed (diagnostic): submitting transparent mask, full video expected");
-				}
+				// Binary fallback path owns the display; skip all mask work.
 			}
-			if (mask_frame)
+			else
 			{
-				// Full-resolution mask target (dims quantized to 64px for
-				// swapchain stability); feather-px selects the blur tier
-				// inside record(), applied live with no recalibration.
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
-				glm::quat q(fp.world_pose.orientation.w, fp.world_pose.orientation.x, fp.world_pose.orientation.y, fp.world_pose.orientation.z);
-				glm::vec3 t(fp.world_pose.position.x, fp.world_pose.position.y, fp.world_pose.position.z);
-				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-				                  glm::scale(glm::mat4(1), glm::vec3(fp.world_scale.x, fp.world_scale.y, fp.world_scale.z));
-				std::array<glm::mat4, 2> mvp;
+				// View-only transforms shared by the cutouts.
 				std::array<glm::mat4, 2> world_mvp;
 				for (uint32_t view = 0; view < 2; ++view)
-				{
 					world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
-					mvp[view] = world_mvp[view] * model;
-				}
-				// Marker window cutout: raw instant pose of the matched
+				// Marker window cutouts: raw instant pose of every matched
 				// code (unfiltered, SLAM-held) expanded by the debug
-				// window, punched through the mask so the true code
-				// location stays visible even when the mesh is offset.
-				std::optional<std::array<glm::vec3, 6>> cutout;
+				// window, punched through the masks so true code locations
+				// stay visible even when meshes are offset.
+				std::vector<std::array<glm::vec3, 6>> cutouts;
 				if (fp.debug_overlays and fp.debug_window_mm >= 0)
 				{
 					for (const auto & [id, h]: fp.held_codes)
@@ -1240,62 +1226,155 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						glm::vec3 v1 = c + r * hw - u * hh;
 						glm::vec3 v2 = c + r * hw + u * hh;
 						glm::vec3 v3 = c - r * hw + u * hh;
-						cutout = {v0, v1, v2, v0, v2, v3};
-						break; // single-marker assumption (multi-code later)
+						cutouts.push_back({v0, v1, v2, v0, v2, v3});
 					}
 				}
-				if (not mask_swapchain or mask_swapchain.width() != mw or mask_swapchain.height() != mh)
+				// Claim groups + sync member soups (upload on hash change).
+				std::vector<float> live_feathers;
+				for (auto & [oid, ost]: passthrough_objects)
 				{
-					// Rare path (first frame, feather/config change):
-					// nothing outstanding (previous image released last
-					// frame), mirroring setup_reprojection_swapchain.
-					device.waitIdle();
-					mask_swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
-					if (fp.mask_renderer)
-						fp.mask_renderer->reset_targets();
-					spdlog::info("Fiducial mask swapchain: {}x{}", mw, mh);
-				}
-				int mask_index = mask_swapchain.acquire();
-				if (not mask_swapchain.wait(100'000'000))
-				{
-					// Never park forever on an unavailable image: release
-					// the untouched acquisition to keep pairing and skip
-					// the mask this frame.
-					mask_swapchain.release();
-					mask_frame = false;
-					if (not fp.mask_wait_warned)
+					if (ost.def.type != "3d-passthrough" or not ost.soup_ready)
+						continue;
+					float f = ost.def.feather_px;
+					if (std::ranges::find(live_feathers, f) == live_feathers.end())
+						live_feathers.push_back(f);
+					auto & g = fp.mask_groups[f];
+					g.feather_px = f;
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+					auto mh = g.mesh_hashes.find(oid);
+					if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
 					{
-						fp.mask_wait_warned = true;
-						spdlog::warn("Fiducial mask image wait timed out, skipping");
+						g.renderer->set_mesh(oid, ost.soup);
+						g.mesh_hashes[oid] = ost.soup_hash;
 					}
 				}
-				else
+				// Drop stale groups + stale member meshes.
+				for (auto git = fp.mask_groups.begin(); git != fp.mask_groups.end();)
 				{
-					fp.mask_wait_warned = false;
-					mask_acquired = true;
-				fp.mask_extent = {mw, mh};
-				fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, fp.feather_px,
-				                         fp.fade_factor(frame_state.predictedDisplayTime), cutout, world_mvp);
+					if (std::ranges::find(live_feathers, git->first) == live_feathers.end())
+					{
+						// Rare path: swapchain images may be in flight.
+						device.waitIdle();
+						git = fp.mask_groups.erase(git);
+						continue;
+					}
+					++git;
+					auto & g = git->second;
+					for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
+					{
+						auto oit = passthrough_objects.find(hit->first);
+						if (oit == passthrough_objects.end() or oit->second.def.feather_px != g.feather_px or
+						    not oit->second.soup_ready)
+						{
+							g.renderer->remove_mesh(hit->first);
+							hit = g.mesh_hashes.erase(hit);
+						}
+						else
+							++hit;
+					}
+				}
+				// Record per group: draws from anchored instances of member
+				// objects, opacity from per-instance fade.
+				for (float f: live_feathers)
+				{
+					auto & g = fp.mask_groups[f];
+					std::vector<feather_mask_renderer::instance_draw> draws;
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
+							continue;
+						for (auto & [skey, inst]: ost.instances)
+						{
+							(void)skey;
+							if (not inst.anchored)
+								continue;
+							glm::quat q(inst.world_pose.orientation.w, inst.world_pose.orientation.x,
+							            inst.world_pose.orientation.y, inst.world_pose.orientation.z);
+							glm::vec3 t(inst.world_pose.position.x, inst.world_pose.position.y, inst.world_pose.position.z);
+							glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+							                  glm::scale(glm::mat4(1), glm::vec3(inst.world_scale.x, inst.world_scale.y, inst.world_scale.z));
+							std::array<glm::mat4, 2> mvp;
+							for (uint32_t view = 0; view < 2; ++view)
+								mvp[view] = world_mvp[view] * model;
+							float op = fiducial_passthrough_state::fade_factor(
+							        frame_state.predictedDisplayTime, inst.fade_start,
+							        std::max(0.f, ost.def.fade_in_ms));
+							draws.push_back({oid, mvp, op});
+						}
+					}
+					if (draws.empty())
+					{
+						g.active = false;
+						continue;
+					}
+					if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
+					{
+						// Rare path (first frame, feather/config change):
+						// nothing outstanding (previous images released last
+						// frame), mirroring setup_reprojection_swapchain.
+						device.waitIdle();
+						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
+						g.renderer->reset_targets();
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px)", mw, mh, f);
+					}
+					int mask_index = g.swapchain.acquire();
+					if (not g.swapchain.wait(100'000'000))
+					{
+						// Never park forever on an unavailable image: release
+						// the untouched acquisition to keep pairing and skip
+						// the group this frame.
+						g.swapchain.release();
+						g.active = false;
+						if (not g.wait_warned)
+						{
+							g.wait_warned = true;
+							spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px)", f);
+						}
+					}
+					else
+					{
+						g.wait_warned = false;
+						g.acquired = true;
+						g.extent = {mw, mh};
+						g.renderer->record(
+						        command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
+						        not mask_bypass_cutout, f, cutouts, world_mvp);
+						g.active = true;
+						acquired_groups.push_back(&g);
+						mask_frame = true;
+					}
+				}
+				if (mask_frame and mask_bypass_cutout)
+				{
+					static bool bypass_logged = false;
+					if (not bypass_logged)
+					{
+						bypass_logged = true;
+						spdlog::info("Mask cutout bypassed (diagnostic): submitting transparent mask, full video expected");
+					}
 				}
 			}
 		}
 		catch (std::exception & e)
 		{
 			spdlog::warn("Fiducial mask record failed: {}", e.what());
-			// An acquire already happened: release it here, otherwise the
-			// image stays outstanding and the pairing breaks.
-			if (mask_acquired)
+			// Release everything acquired above, otherwise images stay
+			// outstanding and the pairing breaks.
+			for (auto * g: acquired_groups)
 			{
-				mask_acquired = false;
+				g->acquired = false;
+				g->active = false;
 				try
 				{
-					mask_swapchain.release();
+					g->swapchain.release();
 				}
 				catch (std::exception & e2)
 				{
 					spdlog::warn("Fiducial mask release failed: {}", e2.what());
 				}
 			}
+			acquired_groups.clear();
 			mask_frame = false;
 		}
 
@@ -1456,9 +1535,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		renderdoc_end(*vk_instance);
 #endif
 		swapchain.release();
-		// Paired with the mask acquire above: same guard, adjacent lines.
-		if (mask_frame)
-			mask_swapchain.release();
+		// Paired with the group acquires above: same guard, adjacent lines.
+		for (auto * g: acquired_groups)
+		{
+			g->acquired = false;
+			g->swapchain.release();
+		}
+		acquired_groups.clear();
 		// Paired with the debug overlay acquire above.
 		if (debug_acquired)
 			fp.debug_swapchain.release();
@@ -1512,36 +1595,49 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	if (mask_frame)
 	{
-		// Mask-blend stack, submitted last: video (opaque, above) was
-		// already added, then the feather mask, then fullscreen passthrough
-		// on top. The mask overwrites destination alpha without touching
-		// color; passthrough multiplies by it: reality inside the
-		// silhouette, game outside, gradient across the feather band.
-		// Member swapchain acquired above (never the shared pool).
-		std::array<XrCompositionLayerProjectionView, view_count> mask_views;
-		for (uint32_t view = 0; view < view_count; ++view)
+		// Mask-blend stacks, one per feather group, submitted in feather
+		// order (deterministic): video (opaque, above) was already added,
+		// then each group's mask, then a single fullscreen passthrough on
+		// top. The first mask replaces destination alpha; the rest add
+		// (saturating union); passthrough multiplies by it: reality inside
+		// any silhouette, game outside, gradients across feather bands.
+		// Group swapchains acquired above (never the shared pool).
+		bool first_group = true;
+		for (auto & [f, g]: fp.mask_groups)
 		{
-			mask_views[view] = {
-			        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-			        .pose = pose[view],
-			        .fov = fov[view],
-				.subImage = {
-				                .swapchain = mask_swapchain,
-				                .imageRect = {
-				                        .offset = {0, 0},
-				                        .extent = fp.mask_extent,
-				                },
-				                .imageArrayIndex = view,
-			                },
-			};
+			(void)f;
+			if (not g.active)
+				continue;
+			std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				mask_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = pose[view],
+				        .fov = fov[view],
+					.subImage = {
+					                .swapchain = g.swapchain,
+					                .imageRect = {
+					                        .offset = {0, 0},
+					                        .extent = g.extent,
+					                },
+					                .imageArrayIndex = view,
+					                },
+				};
+			}
+			// imageIndex is implicit: the compositor uses the last released
+			// image, which record() acquired above.
+			add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     mask_views);
+			if (first_group)
+				set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
+				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+			else
+				set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
+				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+			first_group = false;
 		}
-		// imageIndex is implicit: the compositor uses the last released
-		// image, which record() acquired above.
-		add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
-		                     application::space(xr::spaces::world),
-		                     mask_views);
-		set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
-		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		add_passthrough_layer();
 		set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
 		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);

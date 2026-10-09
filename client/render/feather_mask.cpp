@@ -428,14 +428,11 @@ std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_
 	return {std::move(buffer), std::move(memory)};
 }
 
-void feather_mask_renderer::set_soup(const passthrough_mesh::triangle_soup & soup)
+void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
 {
 	if (soup.indices.empty() or soup.vertices.empty())
 	{
-		vertex_buffer.clear();
-		index_buffer.clear();
-		index_count = 0;
-		pending_upload.reset();
+		remove_mesh(key);
 		return;
 	}
 
@@ -443,34 +440,45 @@ void feather_mask_renderer::set_soup(const passthrough_mesh::triangle_soup & sou
 	// old buffers before replacing them.
 	device.waitIdle();
 
+	mesh_buffers & mesh = meshes[key];
 	vk::DeviceSize vertex_bytes = soup.vertices.size() * sizeof(XrVector3f);
 	vk::DeviceSize index_bytes = soup.indices.size() * sizeof(uint32_t);
 	vk::DeviceSize total = vertex_bytes + index_bytes;
 
-	if (staging_size < total)
+	if (mesh.staging_size < total)
 	{
-		std::tie(staging_buffer, staging_memory) = make_buffer(
+		std::tie(mesh.staging_buffer, mesh.staging_memory) = make_buffer(
 		        total,
 		        vk::BufferUsageFlagBits::eTransferSrc,
 		        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-		staging_size = total;
+		mesh.staging_size = total;
 	}
-	void * mapped = staging_memory.mapMemory(0, total);
+	void * mapped = mesh.staging_memory.mapMemory(0, total);
 	std::memcpy(mapped, soup.vertices.data(), vertex_bytes);
 	std::memcpy((char *)mapped + vertex_bytes, soup.indices.data(), index_bytes);
-	staging_memory.unmapMemory();
+	mesh.staging_memory.unmapMemory();
 
-	std::tie(vertex_buffer, vertex_memory) = make_buffer(
+	std::tie(mesh.vertex_buffer, mesh.vertex_memory) = make_buffer(
 	        vertex_bytes,
 	        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
-	std::tie(index_buffer, index_memory) = make_buffer(
+	std::tie(mesh.index_buffer, mesh.index_memory) = make_buffer(
 	        index_bytes,
 	        vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 
-	pending_upload = {vertex_bytes, index_bytes};
-	index_count = (uint32_t)soup.indices.size();
+	mesh.pending_upload = {vertex_bytes, index_bytes};
+	mesh.index_count = (uint32_t)soup.indices.size();
+}
+
+void feather_mask_renderer::remove_mesh(const std::string & key)
+{
+	auto it = meshes.find(key);
+	if (it == meshes.end())
+		return;
+	// Same in-flight hazard as replace.
+	device.waitIdle();
+	meshes.erase(it);
 }
 
 void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
@@ -609,25 +617,25 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 	spdlog::info("Fiducial mask blur targets: {}x{}", extent.width, extent.height);
 }
 
-void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
+void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh)
 {
-	if (not pending_upload)
+	if (not mesh.pending_upload)
 		return;
-	auto [vertex_bytes, index_bytes] = *pending_upload;
-	pending_upload.reset();
+	auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
+	mesh.pending_upload.reset();
 
 	vk::BufferCopy vertex_copy{
 	        .srcOffset = 0,
 	        .dstOffset = 0,
 	        .size = vertex_bytes,
 	};
-	cmd.copyBuffer(*staging_buffer, *vertex_buffer, vertex_copy);
+	cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
 	vk::BufferCopy index_copy{
 	        .srcOffset = vertex_bytes,
 	        .dstOffset = 0,
 	        .size = index_bytes,
 	};
-	cmd.copyBuffer(*staging_buffer, *index_buffer, index_copy);
+	cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
 
 	std::array<vk::BufferMemoryBarrier, 2> barriers = {
 	        vk::BufferMemoryBarrier{
@@ -635,7 +643,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
 	                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
 	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .buffer = *vertex_buffer,
+	                .buffer = *mesh.vertex_buffer,
 	                .offset = 0,
 	                .size = vertex_bytes,
 	        },
@@ -644,7 +652,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd)
 	                .dstAccessMask = vk::AccessFlagBits::eIndexRead,
 	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .buffer = *index_buffer,
+	                .buffer = *mesh.index_buffer,
 	                .offset = 0,
 	                .size = index_bytes,
 	        },
@@ -678,11 +686,10 @@ void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set)
 void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    vk::Image image,
                                    vk::Extent2D extent,
-                                   const std::array<glm::mat4, 2> & mvp,
+                                   const std::vector<instance_draw> & draws,
                                    bool rasterize,
                                    float feather_px,
-                                   float opacity,
-                                   const std::optional<std::array<glm::vec3, 6>> & cutout,
+                                   const std::vector<std::array<glm::vec3, 6>> & cutouts,
                                    const std::array<glm::mat4, 2> & cutout_mvp)
 {
 	auto set_full_viewport = [&](vk::Extent2D e) {
@@ -812,13 +819,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	}
 	else
 	{
-		if (index_count == 0)
+		if (meshes.empty())
 			return;
 
-		flush_upload(cmd);
+		for (auto & [key, mesh]: meshes)
+			flush_upload(cmd, mesh);
 		ensure_targets(extent);
 
-		// Stage 1: binary silhouette into A (full resolution).
+		// Stage 1: binary silhouettes into A (full resolution), one draw
+		// per (mesh, instance, eye). Missing meshes (removed object racing
+		// a queued draw) skip defensively.
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			vk::RenderPassBeginInfo begin_info{
@@ -831,11 +841,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
 			set_full_viewport(extent);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-			cmd.bindVertexBuffers(0, (vk::Buffer)*vertex_buffer, (vk::DeviceSize)0);
-			cmd.bindIndexBuffer(*index_buffer, 0, vk::IndexType::eUint32);
-			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-			                               raster_push{.mvp = mvp[eye], .opacity = opacity});
-			cmd.drawIndexed(index_count, 1, 0, 0, 0);
+			for (const auto & d: draws)
+			{
+				auto mit = meshes.find(d.mesh);
+				if (mit == meshes.end() or mit->second.index_count == 0)
+					continue;
+				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+				                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
+				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+			}
 			cmd.endRenderPass();
 		}
 		make_readable(*target_a.image);
@@ -1062,12 +1078,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		} // tiered
 	}
 
-	// Marker window cutout: crisp post-blur punch. Re-begins the finished
-	// swapchain framebuffers with the LOAD pass and stamps the quad at
-	// FULL alpha (mask 1 = reality window): the hole shows passthrough,
-	// not game. No blur pass touches it, so edges stay pixel-exact.
-	// Debug only; rasterize=false (bypass) skips it with the silhouette.
-	if (cutout and rasterize)
+	// Marker window cutouts: crisp post-blur punch. Re-begins the finished
+	// swapchain framebuffers with the LOAD pass and stamps each quad at
+	// FULL alpha (mask 1 = reality window): holes show passthrough, not
+	// game. No blur pass touches them, so edges stay pixel-exact. Debug
+	// only; rasterize=false (bypass) skips them with the silhouettes.
+	if (not cutouts.empty() and rasterize)
 	{
 		if (not cutout_verts)
 		{
@@ -1084,23 +1100,26 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        "feather_mask cutout",
 			};
 		}
-		std::memcpy(cutout_verts.map(), cutout->data(), sizeof(glm::vec3) * 6);
-		for (int eye = 0; eye < 2; ++eye)
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+		cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
+		for (const auto & quad: cutouts)
 		{
-			vk::RenderPassBeginInfo begin_cut{
-			        .renderPass = *cutout_renderpass,
-			        .framebuffer = *it->second.framebuffers[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = extent},
-			        .clearValueCount = 0,
-			};
-			cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
-			set_full_viewport(extent);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-			cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
-			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-			                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});
-			cmd.draw(6, 1, 0, 0);
-			cmd.endRenderPass();
+			std::memcpy(cutout_verts.map(), quad.data(), sizeof(glm::vec3) * 6);
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				vk::RenderPassBeginInfo begin_cut{
+				        .renderPass = *cutout_renderpass,
+				        .framebuffer = *it->second.framebuffers[eye],
+				        .renderArea = {.offset = {0, 0}, .extent = extent},
+				        .clearValueCount = 0,
+				};
+				cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
+				set_full_viewport(extent);
+				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+				                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});
+				cmd.draw(6, 1, 0, 0);
+				cmd.endRenderPass();
+			}
 		}
 	}
 

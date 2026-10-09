@@ -130,12 +130,6 @@ private:
 
 	xr::swapchain swapchain;
 
-	// Dedicated feather-mask swapchain (NOT from the shared get_swapchain
-	// pool: pooled entries are release-all at render_end, which unpaired a
-	// re-fetched handle and killed the app with CALL_ORDER_INVALID).
-	// Acquired + released explicitly around the raster record each frame.
-	xr::swapchain mask_swapchain;
-
 	std::optional<audio> audio_handle;
 
 	std::optional<xr::hand_tracker> left_hand;
@@ -355,37 +349,42 @@ private:
 		};
 		std::vector<debug_target> debug_targets;
 
-		// First-acquisition alpha fade (mask-blend path only: the binary
-		// projected layer type has no opacity control). fade_start stamps
-		// the seed (auto-anchor / calibrate / re-seed) in predicted-time
-		// base; fade_dur_ms tracks the entry live. 0 duration = instant.
-		XrTime fade_start = 0;
-		float fade_dur_ms = 1000;
-		float fade_factor(XrTime predicted) const
+		// First-acquisition alpha fade, per instance (mask-blend path only:
+		// the binary projected layer type has no opacity control). Each
+		// instance stamps its seed in predicted-time base; duration tracks
+		// its object live. 0 duration = instant.
+		static float fade_factor(XrTime predicted, XrTime start, float dur_ms)
 		{
-			if (fade_dur_ms <= 0 or fade_start == 0)
+			if (dur_ms <= 0 or start == 0)
 				return 1;
 			// Smoothstep ease-in-out (house idiom, cf. the follow-filter
 			// knees): zero slope at both ends, so the window neither pops
 			// in nor slams to full presence like a linear ramp does.
-			double t = std::clamp((predicted - fade_start) * 1e-6 / fade_dur_ms, 0.0, 1.0);
+			double t = std::clamp((predicted - start) * 1e-6 / dur_ms, 0.0, 1.0);
 			return t * t * (3 - 2 * t);
 		}
 
-		// Feathered mask-blend state. Replaces the binary triangle-mesh
-		// cutout when XR_FB_composition_layer_alpha_blend is available:
-		// the calibrated mesh silhouette is rasterized into a tiny shared
-		// mask layer whose upscale is the alpha-gradient feather band.
-		// Feather width comes live from the calibrated map entry
-		// (no recalibration needed to change it).
-		passthrough_mesh::triangle_soup mask_soup;
-		std::string mask_hash; // model hash the soup was built from
-		std::unique_ptr<feather_mask_renderer> mask_renderer;
-		bool mask_ready = false;  // soup uploaded, safe to raster
-		bool mask_active = false; // submitting the mask stack this frame
-		bool mask_wait_warned = false; // image-wait timeout already reported
-		XrExtent2Di mask_extent{0, 0};
-		float feather_px = 24;
+		// Mask stacks grouped by feather-px: objects sharing a feather
+		// value raster into one shared blur chain (independent feathering
+		// per object, one mask layer per group). Render thread only.
+		struct mask_group
+		{
+			float feather_px = 24;
+			std::unique_ptr<feather_mask_renderer> renderer;
+			// Dedicated member swapchain (explicit acquire/release pairing
+			// like the old single mask swapchain, never the shared pool).
+			xr::swapchain swapchain;
+			bool acquired = false;
+			bool wait_warned = false; // image-wait timeout already reported
+			XrExtent2Di extent{0, 0};
+			bool active = false; // submitting this frame
+			// Uploaded object soups by object id (hash compare avoids
+			// re-upload; renderer mirrors).
+			std::map<std::string, std::string> mesh_hashes;
+		};
+		// Exact float equality groups identical parsed values (24 and 24.0
+		// decode bitwise identically).
+		std::map<float, mask_group> mask_groups;
 	};
 	fiducial_passthrough_state fiducial_passthrough;
 
