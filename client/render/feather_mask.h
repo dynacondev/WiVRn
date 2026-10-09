@@ -63,10 +63,9 @@ public:
 	// spread mapping, clamped to 128px); rasterize=false clears only.
 	// Opacity is the first-acquisition fade (1 = fully present). Cutout is
 	// an optional world-space quad (two triangles, six verts) punched
-	// through the silhouette with zero alpha after the mesh draws: the
-	// marker window debug cutout. Pre-blur, so the hole inherits feather
-	// softening. Mask path only (the binary projected layer has no alpha
-	// control to punch through).
+	// crisp through the finished mask after all blur passes: the marker
+	// window debug cutout. Mask path only (the binary projected layer has
+	// no alpha control to punch through).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -101,6 +100,12 @@ private:
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
+
+	// LOAD variant of the raster pass for the marker window cutout: same
+	// single-attachment shape (framebuffer-compatible with the above), so
+	// the finished blurred image can be re-begun and stamped with a crisp
+	// zero-alpha quad no blur pass touches.
+	vk::raii::RenderPass cutout_renderpass{nullptr};
 
 	// Separable Gaussian blur (fullscreen triangle, sampled input).
 	vk::raii::RenderPass blur_renderpass{nullptr};

@@ -184,6 +184,34 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	renderpass = vk::raii::RenderPass(device, renderpass_info);
 
+	// Cutout pass: same shape as the raster pass but LOAD, so the
+	// finished (blurred) swapchain image can be re-begun and stamped.
+	// Framebuffer-compatible with both passes above by construction.
+	vk::AttachmentDescription cutout_attachment{
+	        .format = format,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eLoad,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .initialLayout = vk::ImageLayout::eGeneral,
+	        .finalLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::AttachmentReference cutout_ref{
+	        .attachment = 0,
+	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	};
+	vk::SubpassDescription cutout_subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &cutout_ref,
+	};
+	vk::RenderPassCreateInfo cutout_rp_info{
+	        .attachmentCount = 1,
+	        .pAttachments = &cutout_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &cutout_subpass,
+	};
+	cutout_renderpass = vk::raii::RenderPass(device, cutout_rp_info);
+
 	vk::GraphicsPipelineCreateInfo pipeline_info{
 	        .stageCount = 2,
 	        .pStages = stages,
@@ -807,31 +835,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 			                               raster_push{.mvp = mvp[eye], .opacity = opacity});
 			cmd.drawIndexed(index_count, 1, 0, 0, 0);
-			// Marker window cutout: same world-space quad for both eyes,
-			// zero alpha overwrites the silhouette above (blend is off).
-			if (cutout)
-			{
-				if (not cutout_verts)
-				{
-					cutout_verts = buffer_allocation{
-					        device,
-					        vk::BufferCreateInfo{
-					                .size = sizeof(glm::vec3) * 6,
-					                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
-					        },
-					        VmaAllocationCreateInfo{
-					                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-					                .usage = VMA_MEMORY_USAGE_AUTO,
-					        },
-					        "feather_mask cutout",
-					};
-				}
-				std::memcpy(cutout_verts.map(), cutout->data(), sizeof(glm::vec3) * 6);
-				cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
-				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                               raster_push{.mvp = mvp[eye], .opacity = 0});
-				cmd.draw(6, 1, 0, 0);
-			}
 			cmd.endRenderPass();
 		}
 		make_readable(*target_a.image);
@@ -1056,6 +1059,47 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.endRenderPass();
 			}
 		} // tiered
+	}
+
+	// Marker window cutout: crisp post-blur punch. Re-begins the finished
+	// swapchain framebuffers with the LOAD pass and stamps the quad at
+	// zero alpha — no blur pass touches it, so edges stay pixel-exact.
+	// Debug only; rasterize=false (bypass) skips it with the silhouette.
+	if (cutout and rasterize)
+	{
+		if (not cutout_verts)
+		{
+			cutout_verts = buffer_allocation{
+			        device,
+			        vk::BufferCreateInfo{
+			                .size = sizeof(glm::vec3) * 6,
+			                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+			        },
+			        VmaAllocationCreateInfo{
+			                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+			                .usage = VMA_MEMORY_USAGE_AUTO,
+			        },
+			        "feather_mask cutout",
+			};
+		}
+		std::memcpy(cutout_verts.map(), cutout->data(), sizeof(glm::vec3) * 6);
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			vk::RenderPassBeginInfo begin_cut{
+			        .renderPass = *cutout_renderpass,
+			        .framebuffer = *it->second.framebuffers[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 0,
+			};
+			cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
+			set_full_viewport(extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+			cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
+			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+			                               raster_push{.mvp = mvp[eye], .opacity = 0});
+			cmd.draw(6, 1, 0, 0);
+			cmd.endRenderPass();
+		}
 	}
 
 	vk::ImageMemoryBarrier barrier{
