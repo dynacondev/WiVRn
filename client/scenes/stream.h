@@ -38,9 +38,11 @@
 #include "xr/space.h"
 #include <algorithm>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <shared_mutex>
 #include <thread>
 #include <unordered_map>
@@ -234,10 +236,10 @@ private:
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
 
-	// Fiducial-anchored passthrough meshes (ROADMAP.md Phase 1).
+	// Fiducial tracking + behavior objects (see docs/configuration.md).
 	// Latest map from the server; model files cached under
 	// application::get_config_path() / "fiducial_models" / <hash>.glb.
-	thread_safe<std::vector<to_headset::fiducial_map_entry>> fiducial_entries;
+	thread_safe<to_headset::fiducial_map> fiducial_map;
 	struct fiducial_download
 	{
 		uint32_t chunk_count = 0;
@@ -247,42 +249,74 @@ private:
 	std::unordered_map<std::string, fiducial_download> fiducial_downloads;
 	static std::filesystem::path fiducial_model_path(const std::string & hash);
 
-	// Surface-projected passthrough mesh (ROADMAP.md Phase 2).
-	// Phase 2 placement: the config position/orientation/scale is used
-	// directly as a world-space pose (no marker yet). Phase 4 reinterprets
-	// it as a marker-to-mesh offset.
+	// One runtime tracker per unique marker payload (shared across
+	// fiducials listing it). Synced from the map every frame; stale
+	// trackers are destroyed. Render thread only (all trackers run there).
+	std::map<std::string, xr::marker_tracker> fiducial_trackers;
+	std::string last_tracker_key; // union fingerprint; re-sync + warn on change
+	// Union of configured marker payloads (any fiducial). Green vs red.
+	std::set<std::string> configured_marker_payloads;
+
+	// Solved fiducial frame per (fiducial, entity): observed marker pose
+	// composed with the marker-to-fiducial offset. Single-marker resolve
+	// only; multi-marker averaging is future work (first marker used).
+	// Rebuilt every frame; render thread only.
+	struct fiducial_sighting
+	{
+		std::string fiducial_id;
+		std::string payload;
+		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}};
+		XrExtent2Df extents{0, 0};
+		XrTime time = 0;
+	};
+	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_sighting> fiducial_sightings;
+
+	// One placement per (object, fiducial, entity) sighting: the same QR
+	// seen twice places the object twice; one object over several
+	// fiducials places once per visible pairing (never fused).
+	struct object_instance
+	{
+		bool anchored = false; // auto-aligned on first sighting (only behavior)
+		XrTime anchored_at = 0;
+		XrTime last_seen = 0; // last live sighting; unseen 60s prunes (id recycling)
+		xr::fiducial_filter filter; // tuned from the fiducial (carried through)
+		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrVector3f world_scale{1, 1, 1};
+		XrTime last_predicted = 0;
+		XrTime fade_start = 0;
+		uint64_t samples_ingested = 0;
+		float target_render_err_mm = 0;
+		float target_render_err_deg = 0;
+	};
+	struct passthrough_object_state
+	{
+		to_headset::passthrough_object def; // snapshot from the map
+		// Model geometry shared across instances (grouped renderers
+		// restructure this in favor of per-feather groups next).
+		passthrough_mesh::triangle_soup soup;
+		std::string soup_hash;
+		bool soup_ready = false;
+		size_t vertex_count = 0;
+		size_t triangle_count = 0;
+		std::string status = "waiting for fiducial map";
+		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, object_instance> instances; // key (fiducial, entity)
+	};
+	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
+
+	// Render state for the first live object instance (temporary shim:
+	// per-feather mask groups replace this with per-object rendering).
+	// Driven every frame from the instance states above; render thread only.
 	struct fiducial_passthrough_state
 	{
 		bool attempted = false; // upload tried at least once (no retry spam)
 		bool ready = false;     // mesh live in the runtime
 		bool marker_support_logged = false;
-		bool calibrated = false; // mesh anchor came from calibrate_to_marker()
-		XrTime calibrated_at = 0;
-		// Display label resolved at calibrate time (tag, or payload when
-		// untagged). Never used for matching.
-		std::string calibrated_tag;
-		std::string last_map_key; // map identity; a change invalidates calibration
+		bool calibrated = false; // any instance auto-anchored
+		std::string last_map_key; // map identity; a change wipes instances
 		std::string last_key;   // fingerprint of map + cache, resets attempted
-		std::string model_hash;
 		std::string status = "waiting for fiducial map";
-		size_t vertex_count = 0;
-		size_t triangle_count = 0;
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
-
-		// Continuous mode ("continuous" map entries): auto-anchors on first
-		// sighting, then robustly averages mesh-target samples and
-		// proportionally follows every frame (never snaps after the seed).
-		// One-shot entries ignore all of this.
-		bool continuous = false;
-		xr::fiducial_filter filter;
-		std::string applied_tuning_key; // filter tuning source; re-apply on change
-		XrTime last_predicted = 0;
-		// Diagnostics (render thread only).
-		uint64_t samples_ingested = 0;
-		XrTime last_sample_at = 0;
-		float target_render_err_mm = 0;
-		float target_render_err_deg = 0;
 
 		// Fiducial marker debugging (Passthrough tab, session-scoped,
 		// render thread only). Raw instant poses while visible, frozen
@@ -301,9 +335,11 @@ private:
 			XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
 			XrExtent2Df extents{0, 0};
 			XrTime last_seen = 0;
-			bool matched = false;
+			bool matched = false; // payload in some fiducial's markers
 		};
-		std::unordered_map<XrSpatialEntityIdEXT, held_code> held_codes;
+		// Keyed by (payload, entity): same print seen twice holds twice.
+		// Entity ids may collide across tracker contexts, payloads disambiguate.
+		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, held_code> held_codes;
 		// Shared white overlay texture (tinted per layer via
 		// colorScaleBias). Explicit acquire/fill/release pairing like the
 		// mask swapchain, never the shared pool. Filled with a CLEAR-only
@@ -365,15 +401,10 @@ private:
 	// user grant. Process-once; the result feeds the Stats-tab hint.
 	void request_spatial_permissions();
 
-	// Snap the mesh to observedMarkerPose * configOffset. Requires a fresh
-	// marker sighting. Object placement only: the tracking origin is never
-	// touched (see calibrate_to_marker()).
-	void calibrate_to_marker();
-
-	// QR-code tracking (ROADMAP.md Phase 3, Quest runtime capability).
-	// Driven on the render thread from update_fiducial_passthrough(); empty
-	// until the first fiducial map arrives and the runtime supports it.
-	std::optional<xr::marker_tracker> marker_tracker;
+	// QR-code tracking (Quest runtime capability): one tracker per unique
+	// marker payload, driven on the render thread from
+	// update_fiducial_passthrough(). Instances fan out per sighted entity.
+	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
 
 	stream(std::string server_name, scene & parent_scene);
 

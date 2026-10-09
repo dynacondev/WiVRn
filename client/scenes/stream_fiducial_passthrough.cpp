@@ -86,25 +86,10 @@ void scenes::stream::request_spatial_permissions()
 
 bool scenes::stream::fiducial_passthrough_wanted()
 {
-	// Strict gating: nothing mesh-related happens until the user presses
-	// Calibrate. Pre-calibration behavior is stock upstream, so a grey
+	// Strict gating: nothing mesh-related happens until an instance
+	// auto-anchors. Pre-placement behavior is stock upstream, so a grey
 	// baseline with zero mesh lines in the log exonerates the mesh path.
-	bool wanted = false;
-	if (fiducial_passthrough.calibrated and instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
-	{
-		std::error_code ec;
-		auto entries = fiducial_entries.lock();
-		for (const auto & entry: *entries)
-		{
-			if (entry.model_hash.empty())
-				continue;
-			if (std::filesystem::exists(fiducial_model_path(entry.model_hash), ec))
-			{
-				wanted = true;
-				break;
-			}
-		}
-	}
+	bool wanted = fiducial_passthrough.calibrated and instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME);
 
 	static bool last_wanted = true; // log the initial false once
 	if (wanted != last_wanted)
@@ -115,91 +100,228 @@ bool scenes::stream::fiducial_passthrough_wanted()
 	return wanted;
 }
 
+namespace
+{
+// Filter tuning carried through from the fiducial (resolver + smoothing
+// move are future work; the ops stay at the instance filter for now).
+xr::fiducial_filter::tuning tuning_for(const to_headset::fiducial_entry & f)
+{
+	xr::fiducial_filter::tuning t;
+	t.window_size = std::max(2, f.window_size);
+	t.min_samples = std::clamp(f.min_samples, 1, t.window_size);
+	t.sigma_k = std::max(0.5f, f.sigma_k);
+	t.pos_gain = std::max(0.1f, f.pos_gain);
+	t.rot_gain = std::max(0.1f, f.rot_gain);
+	t.euro_min_cutoff = std::max(0.05f, f.euro_min_cutoff);
+	t.euro_beta = std::max(0.f, f.euro_beta);
+	t.knee_inner_mm = f.knee_inner_mm;
+	t.knee_outer_mm = std::max(t.knee_inner_mm, f.knee_outer_mm);
+	t.knee_inner_deg = f.knee_inner_deg;
+	t.knee_outer_deg = std::max(t.knee_inner_deg, f.knee_outer_deg);
+	return t;
+}
+
+// base * offset (translation unaffected by scale; scale applies later at
+// the object). Offset quaternion stored xyzw.
+XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const std::array<float, 4> & q)
+{
+	glm::quat bq(base.orientation.w, base.orientation.x, base.orientation.y, base.orientation.z);
+	glm::vec3 bp(base.position.x, base.position.y, base.position.z);
+	glm::quat oq(q[3], q[0], q[1], q[2]);
+	glm::vec3 op(p[0], p[1], p[2]);
+	glm::quat rq = bq * oq;
+	glm::vec3 rp = bp + bq * op;
+	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
+}
+} // namespace
+
+void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
+{
+	auto & fp = fiducial_passthrough;
+
+	// Union payload -> {size, static, tag}: first wins, conflicts warn.
+	std::map<std::string, std::tuple<float, bool, std::string>> uni;
+	std::string key;
+	for (const auto & f: map.fiducials)
+	{
+		for (const auto & m: f.markers)
+		{
+			key += m.marker_data;
+			key += ';';
+			key += std::to_string(m.marker_size_m);
+			key += f.is_static ? 'S' : 'M';
+			key += ';';
+			auto [it, fresh] = uni.emplace(m.marker_data, std::make_tuple(m.marker_size_m, f.is_static, f.tag));
+			if (not fresh)
+			{
+				auto & [size, st, tag] = it->second;
+				if (size != m.marker_size_m or st != f.is_static)
+					spdlog::warn("Fiducial tracking: payload \"{}\" configured inconsistently, first wins",
+					             m.marker_data.substr(0, 64));
+				(void)tag;
+			}
+		}
+	}
+	configured_marker_payloads.clear();
+	for (const auto & [payload, _]: uni)
+		configured_marker_payloads.insert(payload);
+
+	if (key != last_tracker_key)
+	{
+		last_tracker_key = key;
+		// Drop trackers for vanished payloads (destroys their contexts).
+		for (auto it = fiducial_trackers.begin(); it != fiducial_trackers.end();)
+		{
+			if (uni.contains(it->first))
+				++it;
+			else
+				it = fiducial_trackers.erase(it);
+		}
+		for (const auto & f: map.fiducials)
+		{
+			if (f.markers.size() > 1)
+				spdlog::warn("Fiducial \"{}\": multi-marker resolve not implemented, using first of {} markers",
+				             f.id, (unsigned)f.markers.size());
+		}
+	}
+
+	if (not xr::marker_tracker::supported(instance))
+	{
+		if (not fp.marker_support_logged)
+		{
+			fp.marker_support_logged = true;
+			spdlog::info("Spatial marker tracking not supported by runtime");
+		}
+		return;
+	}
+	for (auto & [payload, ss]: uni)
+	{
+		auto [it, _] = fiducial_trackers.try_emplace(payload, instance, session, system);
+		auto & [size, is_static, tag] = ss;
+		it->second.configure(size, payload, tag, is_static);
+	}
+}
+
 void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 {
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto & fp = fiducial_passthrough;
+	auto map = fiducial_map.lock();
 
-	// Fingerprints: map_key covers the server map identity (any entry change
-	// invalidates a calibration); the cache flag only re-arms the upload
-	// (a download finishing must NOT wipe a calibration made before it).
+	// Fingerprint: tracking/render identity. Tags excluded (display-only);
+	// feather/fade excluded (live render-only). Any other change wipes
+	// instances; model-cache flips only re-arm uploads (below).
 	std::string map_key;
-	std::optional<to_headset::fiducial_map_entry> entry;
-	bool model_cached = false;
+	for (const auto & f: map->fiducials)
 	{
-		auto entries = fiducial_entries.lock();
-		for (const auto & e: *entries)
+		map_key += 'F';
+		map_key += f.id;
+		map_key += f.is_static ? 'S' : 'M';
+		map_key += ';';
+		map_key += std::to_string(f.window_size) + ',' + std::to_string(f.min_samples) + ',' +
+		        std::to_string(f.sigma_k) + ',' + std::to_string(f.pos_gain) + ',' + std::to_string(f.rot_gain) + ',' +
+		        std::to_string(f.euro_min_cutoff) + ',' + std::to_string(f.euro_beta) + ',' +
+		        std::to_string(f.knee_inner_mm) + ',' + std::to_string(f.knee_outer_mm) + ',' +
+		        std::to_string(f.knee_inner_deg) + ',' + std::to_string(f.knee_outer_deg) + ';';
+		for (const auto & m: f.markers)
 		{
-			map_key += e.model_hash;
+			map_key += m.marker_data;
 			map_key += ';';
-			// Identity is payload + size; the tag is display-only and
-			// deliberately excluded so a rename doesn't wipe calibration.
-			map_key += e.marker_data;
+			map_key += std::to_string(m.marker_size_m);
 			map_key += ';';
-			map_key += std::to_string(e.marker_size_m);
-			map_key += ';';
-			for (float v: e.position)
+			for (float v: m.position)
 				map_key += std::to_string(v) + ',';
 			map_key += ';';
-			for (float v: e.orientation)
+			for (float v: m.orientation)
 				map_key += std::to_string(v) + ',';
 			map_key += ';';
-			map_key += std::to_string(e.scale);
-			map_key += ';';
-			// Mode + live tuning ride the same fingerprint: any of them
-			// changing re-seeds the filter/mesh like any other map change.
-			map_key += e.mode;
-			map_key += ';';
-			map_key += e.is_static ? 'S' : 'M';
-			map_key += ';';
-			map_key += std::to_string(e.window_size) + ',' +
-			        std::to_string(e.min_samples) + ',' + std::to_string(e.sigma_k) + ',' +
-			        std::to_string(e.pos_gain) + ',' + std::to_string(e.rot_gain) + ',' +
-			        std::to_string(e.euro_min_cutoff) + ',' + std::to_string(e.euro_beta) + ',' +
-			        std::to_string(e.knee_inner_mm) + ',' + std::to_string(e.knee_outer_mm) + ',' +
-			        std::to_string(e.knee_inner_deg) + ',' + std::to_string(e.knee_outer_deg) + ';';
-			if (not entry and not e.model_hash.empty())
-				entry = e;
 		}
 	}
-	if (entry)
+	for (const auto & o: map->objects)
 	{
+		map_key += 'O';
+		map_key += o.type;
+		map_key += ';';
+		map_key += o.id;
+		map_key += ';';
+		for (const auto & fid: o.fiducial)
+		{
+			map_key += fid;
+			map_key += ',';
+		}
+		map_key += ';';
+		map_key += o.model_hash;
+		map_key += ';';
+		for (float v: o.position)
+			map_key += std::to_string(v) + ',';
+		map_key += ';';
+		for (float v: o.orientation)
+			map_key += std::to_string(v) + ',';
+		map_key += ';';
+		map_key += std::to_string(o.scale);
+		map_key += ';';
+	}
+	std::string key = map_key;
+	for (const auto & o: map->objects)
+	{
+		if (o.model_hash.empty())
+			continue;
 		std::error_code ec;
-		model_cached = std::filesystem::exists(fiducial_model_path(entry->model_hash), ec);
+		bool cached = std::filesystem::exists(fiducial_model_path(o.model_hash), ec);
+		key += o.model_hash.substr(0, 8);
+		key += cached ? 'C' : 'D';
+		key += ';';
 	}
-	std::string key = map_key + (model_cached ? 'C' : 'D');
 
-	// Marker tracking (Phase 3): same map entry, independent of mesh state
-	if (not entry)
-		marker_tracker.reset();
-	else if (entry->marker_size_m > 0)
+	// Trackers run every frame, independent of objects/meshes (their state
+	// feeds the status UI and the debug overlays pre-placement).
+	sync_fiducial_trackers(*map);
+	XrTime now = instance.now();
+	for (auto & [payload, tr]: fiducial_trackers)
 	{
-		if (not marker_tracker)
+		(void)payload;
+		tr.update(world_space, now, predicted_display_time);
+	}
+
+	// Resolver (single-marker): solved fiducial frame per (fiducial,
+	// entity) = observed * marker offset. Rebuilt every frame.
+	fiducial_sightings.clear();
+	for (const auto & f: map->fiducials)
+	{
+		if (f.markers.empty())
+			continue;
+		const auto & m = f.markers[0];
+		auto tr = fiducial_trackers.find(m.marker_data);
+		if (tr == fiducial_trackers.end())
+			continue;
+		for (const auto & s: tr->second.sightings())
 		{
-			if (xr::marker_tracker::supported(instance))
-				marker_tracker.emplace(instance, session, system);
-			else if (not fp.marker_support_logged)
-			{
-				fp.marker_support_logged = true;
-				spdlog::info("Spatial marker tracking not supported by runtime");
-			}
+			if (s.payload != m.marker_data)
+				continue;
+			fiducial_sightings[{f.id, s.entity_id}] = {
+			        .fiducial_id = f.id,
+			        .payload = s.payload,
+			        .solved = compose_pose(s.pose, m.position, m.orientation),
+			        .extents = s.extents,
+			        .time = s.time,
+			};
 		}
-		if (marker_tracker)
+	}
+
+	// Debug hold-store: every sighted code at its raw instant pose (green
+	// when some fiducial lists the payload, red otherwise); entries freeze
+	// (SLAM hold) when unseen. Runs even before any placement.
+	for (auto & [payload, tr]: fiducial_trackers)
+	{
+		(void)payload;
+		for (const auto & s: tr.sightings())
 		{
-			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag, entry->is_static);
-			marker_tracker->update(world_space, instance.now(), predicted_display_time);
-			// Debug hold-store: every sighted code at its raw instant
-			// pose; entries freeze (SLAM hold) when unseen. Runs even
-			// before calibration so raw positions are always visible.
-			for (const auto & s: marker_tracker->sightings())
-			{
-				auto & h = fp.held_codes[s.entity_id];
-				h.payload = s.payload.substr(0, 64);
-				h.pose = s.pose;
-				h.extents = s.extents;
-				h.last_seen = s.time;
-				h.matched = s.matched;
-			}
+			auto & h = fp.held_codes[{s.payload, s.entity_id}];
+			h.payload = s.payload.substr(0, 64);
+			h.pose = s.pose;
+			h.extents = s.extents;
+			h.last_seen = s.time;
+			h.matched = configured_marker_payloads.contains(s.payload);
 		}
 	}
 
@@ -209,17 +331,20 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.attempted = false;
 		fp.marker_support_logged = false;
 		// Full reset only when the map itself changed: a download finishing
-		// (cache D->C flip) preserves a calibration made before it.
+		// (cache flip) preserves live instances, just re-arms uploads.
 		if (map_key != fp.last_map_key)
 		{
 			fp.last_map_key = map_key;
 			fp.calibrated = false;
-			fp.calibrated_tag.clear();
-			fp.filter.reset();
-			fp.continuous = false;
-			fp.samples_ingested = 0;
 			fp.fade_start = 0;
 			fp.held_codes.clear();
+			passthrough_objects.clear();
+			fiducial_sightings.clear();
+			for (const auto & o: map->objects)
+			{
+				if (o.type != "3d-passthrough")
+					spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", o.id, o.type);
+			}
 			if (fp.ready)
 			{
 				spdlog::info("Fiducial map changed, clearing projected mesh");
@@ -227,111 +352,152 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				fp.ready = false;
 			}
 		}
-		if (not entry)
+		if (map->fiducials.empty() and map->objects.empty())
 			fp.status = "no fiducial map from server";
-		else if (not model_cached)
-			fp.status = "downloading model " + entry->model_hash.substr(0, 8) + "...";
 	}
 
-	// Fade duration is render-only (like feather-px): tracked live, never
-	// part of the calibration fingerprint above.
-	if (entry)
-		fp.fade_dur_ms = std::max(0.f, entry->fade_in_ms);
-
-	// Strict gating: marker tracking above runs unconditionally (needed for
-	// the in-view dot and the Calibrate button), but nothing mesh-related
-	// happens until calibrated. Continuous mode self-seeds that flag on
-	// first sighting (auto-anchor); one-shot waits for the button.
-	if (entry and entry->mode == "continuous" and marker_tracker)
+	// ---- behavior objects: instances per (object, fiducial, entity) ----
+	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
 	{
-		fp.continuous = true;
-		xr::fiducial_filter::tuning t;
-		t.window_size = std::max(2, entry->window_size);
-		t.min_samples = std::clamp(entry->min_samples, 1, t.window_size);
-		t.sigma_k = std::max(0.5f, entry->sigma_k);
-		t.pos_gain = std::max(0.1f, entry->pos_gain);
-		t.rot_gain = std::max(0.1f, entry->rot_gain);
-		t.euro_min_cutoff = std::max(0.05f, entry->euro_min_cutoff);
-		t.euro_beta = std::max(0.f, entry->euro_beta);
-		t.knee_inner_mm = entry->knee_inner_mm;
-		t.knee_outer_mm = std::max(t.knee_inner_mm, entry->knee_outer_mm);
-		t.knee_inner_deg = entry->knee_inner_deg;
-		t.knee_outer_deg = std::max(t.knee_inner_deg, entry->knee_outer_deg);
-		// Tuning rides the map fingerprint above, so a tuning change lands
-		// here with a fresh filter: apply once per map (not per key — the
-		// key's cache flag flips when a download finishes, which must not
-		// wipe a live filter). configure() resets the window.
-		if (map_key != fp.applied_tuning_key)
+		if (std::ranges::any_of(map->objects, [&](const to_headset::passthrough_object & o) { return o.id == oit->first; }))
+			++oit;
+		else
+			oit = passthrough_objects.erase(oit);
+	}
+	for (const auto & def: map->objects)
+	{
+		if (def.type != "3d-passthrough")
+			continue;
+		auto & ost = passthrough_objects[def.id];
+		ost.def = def;
+		// Model geometry upload (shared across this object's instances).
+		if (not def.model_hash.empty())
 		{
-			fp.applied_tuning_key = map_key;
-			fp.filter.configure(t);
-		}
-		if (not fp.calibrated)
-		{
-			// Not seeded yet: the mesh transform below needs a pose, but
-			// nothing is submitted until calibrated, so just keep feeding
-			// the filter (auto-anchor happens on sightings below).
-			fp.world_scale = {entry->scale, entry->scale, entry->scale};
-		}
-		auto sighting = marker_tracker->latest();
-		if (sighting.tracked)
-		{
-			// Same mesh-target math as calibrate_to_marker(), but as a
-			// filter sample instead of a snap: meshTarget =
-			// observedMarker * offset (translation unaffected by scale).
-			glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
-			glm::vec3 marker_pos(sighting.pose.position.x, sighting.pose.position.y, sighting.pose.position.z);
-			glm::quat offset_quat(entry->orientation[3], entry->orientation[0], entry->orientation[1], entry->orientation[2]);
-			glm::vec3 offset_pos(entry->position[0], entry->position[1], entry->position[2]);
-			glm::quat mesh_quat = marker_quat * offset_quat;
-			glm::vec3 mesh_pos = marker_pos + marker_quat * offset_pos;
-			fp.filter.ingest(mesh_pos, mesh_quat, sighting.time);
-			fp.samples_ingested++;
-			fp.last_sample_at = instance.now();
-			if (not fp.calibrated)
+			std::error_code ec;
+			if (std::filesystem::exists(fiducial_model_path(def.model_hash), ec) and ost.soup_hash != def.model_hash)
 			{
-				// Auto-anchor: the single allowed snap in continuous mode.
-				fp.filter.snap();
-				auto r = fp.filter.rendered();
-				fp.world_pose = {
-				        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
-				        .position = {r.pos.x, r.pos.y, r.pos.z},
-				};
-				fp.world_scale = {entry->scale, entry->scale, entry->scale};
-				fp.calibrated = true;
-				fp.calibrated_at = fp.last_sample_at;
-				fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
-				fp.last_predicted = predicted_display_time;
-				fp.fade_start = predicted_display_time;
-				spdlog::info("Continuous: auto-anchored to marker \"{}\"", fp.calibrated_tag);
+				ost.soup_hash = def.model_hash;
+				ost.soup_ready = false;
+				try
+				{
+					ost.soup = passthrough_mesh::flatten_gltf(fiducial_model_path(def.model_hash));
+					ost.soup_ready = true;
+					ost.vertex_count = ost.soup.vertices.size();
+					ost.triangle_count = ost.soup.indices.size() / 3;
+					ost.status = "mesh ready";
+					spdlog::info("Passthrough object \"{}\": mesh ready: {} triangles", def.id, ost.triangle_count);
+				}
+				catch (std::exception & e)
+				{
+					ost.status = std::string("mesh error: ") + e.what();
+					spdlog::warn("Passthrough object \"{}\": mesh failed: {}", def.id, e.what());
+				}
 			}
 		}
-		if (fp.calibrated and fp.filter.has_target())
+		// Instances: every referenced fiducial, every live sighting. Same
+		// QR seen twice places twice; several fiducials place per pairing.
+		for (const auto & fid: def.fiducial)
 		{
-			// Per-frame proportional follow (large error = large step).
-			// On marker loss no fresh samples arrive: advance() coasts on
-			// the current window, i.e. permanent SLAM hold.
-			double dt = fp.last_predicted > 0 ? (predicted_display_time - fp.last_predicted) * 1e-9 : 1.0 / 72.0;
-			fp.last_predicted = predicted_display_time;
-			auto r = fp.filter.advance(std::clamp(dt, 0.0, 0.25));
-			fp.world_pose = {
+			auto fdef = std::ranges::find(map->fiducials, fid, &to_headset::fiducial_entry::id);
+			if (fdef == map->fiducials.end())
+				continue;
+			xr::fiducial_filter::tuning t = tuning_for(*fdef);
+			for (const auto & [skey, fs]: fiducial_sightings)
+			{
+				if (fs.fiducial_id != fid)
+					continue;
+				auto [iit, fresh] = ost.instances.try_emplace(skey);
+				auto & inst = iit->second;
+				if (fresh)
+					inst.filter.configure(t);
+				XrPosef target = compose_pose(fs.solved, def.position, def.orientation);
+				glm::quat tq(target.orientation.w, target.orientation.x, target.orientation.y, target.orientation.z);
+				glm::vec3 tp(target.position.x, target.position.y, target.position.z);
+				inst.filter.ingest(tp, tq, fs.time);
+				inst.samples_ingested++;
+				inst.last_seen = now;
+				if (not inst.anchored)
+				{
+					// Auto-anchor: the single allowed snap (only behavior).
+					inst.filter.snap();
+					auto r = inst.filter.rendered();
+					inst.world_pose = {
+					        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
+					        .position = {r.pos.x, r.pos.y, r.pos.z},
+					};
+					inst.world_scale = {def.scale, def.scale, def.scale};
+					inst.anchored = true;
+					inst.anchored_at = now;
+					inst.last_predicted = predicted_display_time;
+					inst.fade_start = predicted_display_time;
+					spdlog::info("Passthrough object \"{}\" auto-anchored to fiducial \"{}\"", def.id, fid);
+				}
+			}
+		}
+		// Follow every anchored instance; prune ids unseen for 60s (the
+		// runtime recycles long-gone entity ids: without expiry a return
+		// would leave a frozen ghost beside the fresh instance).
+		for (auto iit = ost.instances.begin(); iit != ost.instances.end();)
+		{
+			auto & inst = iit->second;
+			if (now - inst.last_seen > 60'000'000'000LL)
+			{
+				iit = ost.instances.erase(iit);
+				continue;
+			}
+			++iit;
+			if (not inst.anchored or not inst.filter.has_target())
+				continue;
+			double dt = inst.last_predicted > 0 ? (predicted_display_time - inst.last_predicted) * 1e-9 : 1.0 / 72.0;
+			inst.last_predicted = predicted_display_time;
+			auto r = inst.filter.advance(std::clamp(dt, 0.0, 0.25));
+			inst.world_pose = {
 			        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
 			        .position = {r.pos.x, r.pos.y, r.pos.z},
 			};
-			fp.world_scale = {entry->scale, entry->scale, entry->scale};
-			if (auto target = fp.filter.resolve())
+			inst.world_scale = {def.scale, def.scale, def.scale};
+			if (auto target = inst.filter.resolve())
 			{
-				fp.target_render_err_mm = glm::length(target->pos - r.pos) * 1000.f;
+				inst.target_render_err_mm = glm::length(target->pos - r.pos) * 1000.f;
 				float c = std::clamp(std::abs(glm::dot(target->quat, r.quat)), 0.f, 1.f);
-				fp.target_render_err_deg = 2.f * std::acos(c) * 57.29577951308232f;
+				inst.target_render_err_deg = 2.f * std::acos(c) * 57.29577951308232f;
 			}
 		}
 	}
-	else if (entry)
+
+	// ---- render shim: first live instance drives the single render path
+	// (per-feather groups replace this) ----
+	fp.calibrated = false;
+	bool shimmed = false;
+	const passthrough_object_state * shim_ost = nullptr;
+	for (auto & [oid, ost]: passthrough_objects)
 	{
-		fp.continuous = entry->mode == "continuous";
+		(void)oid;
+		if (ost.def.type != "3d-passthrough" or not ost.soup_ready)
+			continue;
+		for (auto & [skey, inst]: ost.instances)
+		{
+			(void)skey;
+			if (not inst.anchored)
+				continue;
+			fp.calibrated = true;
+			fp.world_pose = inst.world_pose;
+			fp.world_scale = inst.world_scale;
+			fp.feather_px = ost.def.feather_px;
+			fp.fade_dur_ms = std::max(0.f, ost.def.fade_in_ms);
+			fp.fade_start = inst.fade_start;
+			fp.status = ost.status;
+			shim_ost = &ost;
+			shimmed = true;
+			break;
+		}
+		if (shimmed)
+			break;
 	}
 
+	// Strict gating: tracking above runs unconditionally (status UI and
+	// debug overlays), but nothing mesh-related submits until an instance
+	// auto-anchors.
 	if (not fp.calibrated)
 		return;
 
@@ -339,28 +505,27 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// when the alpha-blend extension is present): no runtime mesh upload,
 	// no geometry-instance transform. The soup + raster resources are
 	// (re)built here; raster record and layer submit happen in render().
+	// Render shim: the first live object's soup drives the single renderer
+	// (per-feather groups replace this).
 	if (composition_layer_alpha_blend_supported)
 	{
-		if (entry and model_cached)
+		if (shim_ost)
 		{
-			// Live feather value: changing it needs no recalibration.
-			fp.feather_px = entry->feather_px;
-			fp.model_hash = entry->model_hash;
-			if (fp.mask_hash != entry->model_hash)
+			if (fp.mask_hash != shim_ost->soup_hash)
 			{
-				fp.mask_hash = entry->model_hash;
+				fp.mask_hash = shim_ost->soup_hash;
 				fp.mask_ready = false;
 				fp.mask_active = false;
 				try
 				{
-					fp.mask_soup = passthrough_mesh::flatten_gltf(fiducial_model_path(entry->model_hash));
+					fp.mask_soup = shim_ost->soup;
 					if (not fp.mask_renderer)
 						fp.mask_renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
 					fp.mask_renderer->set_soup(fp.mask_soup);
 					fp.mask_ready = fp.mask_renderer->has_mesh();
 					fp.status = "feathered";
 					spdlog::info("Fiducial mask mesh ready: {} triangles, feather {}px",
-					             fp.mask_soup.indices.size() / 3, entry->feather_px);
+					             fp.mask_soup.indices.size() / 3, fp.feather_px);
 				}
 				catch (std::exception & e)
 				{
@@ -395,7 +560,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		return;
 	}
 
-	if (fp.attempted or not entry or not model_cached)
+	if (fp.attempted or not shim_ost)
 		return;
 
 	if (not instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
@@ -408,18 +573,15 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	fp.attempted = true;
 	try
 	{
-		auto soup = passthrough_mesh::flatten_gltf(fiducial_model_path(entry->model_hash));
-
-		// Placement always comes from calibrate_to_marker() (strict gating
-		// above guarantees fp.calibrated here).
-		session.set_projected_passthrough_mesh(soup.vertices, soup.indices, world_space, fp.world_pose, fp.world_scale);
+		// Placement comes from the live instance (strict gating above
+		// guarantees fp.calibrated here). First instance only: the binary
+		// fallback has no per-object layers.
+		session.set_projected_passthrough_mesh(shim_ost->soup.vertices, shim_ost->soup.indices, world_space, fp.world_pose, fp.world_scale);
 
 		fp.ready = true;
-		fp.model_hash = entry->model_hash;
-		fp.vertex_count = soup.vertices.size();
-		fp.triangle_count = soup.indices.size() / 3;
 		fp.status = "projected";
-		spdlog::info("Fiducial passthrough mesh live: {} vertices, {} triangles", fp.vertex_count, fp.triangle_count);
+		spdlog::info("Fiducial passthrough mesh live: {} vertices, {} triangles",
+		             shim_ost->vertex_count, shim_ost->triangle_count);
 
 		session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
 		add_projected_passthrough_layer();
@@ -429,101 +591,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.status = std::string("mesh error: ") + e.what();
 		spdlog::warn("Fiducial passthrough mesh failed: {}", e.what());
 	}
-}
-
-void scenes::stream::calibrate_to_marker()
-{
-	auto & fp = fiducial_passthrough;
-
-	std::optional<to_headset::fiducial_map_entry> entry;
-	{
-		auto entries = fiducial_entries.lock();
-		for (const auto & e: *entries)
-		{
-			if (not e.model_hash.empty())
-			{
-				entry = e;
-				break;
-			}
-		}
-	}
-	if (not entry)
-	{
-		spdlog::warn("Calibrate: no fiducial map entry");
-		return;
-	}
-	if (not marker_tracker)
-	{
-		spdlog::warn("Calibrate: marker tracking unsupported by runtime");
-		return;
-	}
-
-	// Sighting timestamps use predicted display time and can sit slightly in
-	// the future; only reject clearly stale data.
-	XrTime now = instance.now();
-	auto sighting = marker_tracker->latest();
-	if (not sighting.tracked or sighting.time == 0 or (now - sighting.time) > 3'000'000'000)
-	{
-		spdlog::warn("Calibrate: no fresh marker sighting");
-		return;
-	}
-
-	if (entry->mode == "continuous")
-	{
-		// Re-seed: the single allowed snap in continuous mode. Clears the
-		// window, ingests the current sighting at full weight, and snaps
-		// the rendered pose to it; follow resumes from there.
-		glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
-		glm::vec3 marker_pos(sighting.pose.position.x, sighting.pose.position.y, sighting.pose.position.z);
-		glm::quat offset_quat(entry->orientation[3], entry->orientation[0], entry->orientation[1], entry->orientation[2]);
-		glm::vec3 offset_pos(entry->position[0], entry->position[1], entry->position[2]);
-		fp.filter.reset();
-		fp.filter.ingest(marker_pos + marker_quat * offset_pos, marker_quat * offset_quat, sighting.time);
-		fp.filter.snap();
-		auto r = fp.filter.rendered();
-		fp.world_pose = {
-		        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
-		        .position = {r.pos.x, r.pos.y, r.pos.z},
-		};
-		fp.world_scale = {entry->scale, entry->scale, entry->scale};
-		fp.calibrated = true;
-		fp.calibrated_at = now;
-		fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
-		fp.fade_start = now;
-		spdlog::info("Continuous: re-seeded to marker \"{}\"", fp.calibrated_tag);
-		return;
-	}
-
-	// Mesh anchor: meshClientPose = observedMarkerPose * markerToMeshOffset.
-	// The offset translation is in meters and is not affected by the scale.
-	glm::quat marker_quat(sighting.pose.orientation.w, sighting.pose.orientation.x, sighting.pose.orientation.y, sighting.pose.orientation.z);
-	glm::vec3 marker_pos(sighting.pose.position.x, sighting.pose.position.y, sighting.pose.position.z);
-	glm::quat offset_quat(entry->orientation[3], entry->orientation[0], entry->orientation[1], entry->orientation[2]);
-	glm::vec3 offset_pos(entry->position[0], entry->position[1], entry->position[2]);
-	glm::quat mesh_quat = marker_quat * offset_quat;
-	glm::vec3 mesh_pos = marker_pos + marker_quat * offset_pos;
-	fp.world_pose = {
-	        .orientation = {mesh_quat.x, mesh_quat.y, mesh_quat.z, mesh_quat.w},
-	        .position = {mesh_pos.x, mesh_pos.y, mesh_pos.z},
-	};
-	fp.world_scale = {entry->scale, entry->scale, entry->scale};
-	fp.calibrated = true;
-	fp.calibrated_at = now;
-	// Display label: the tag, or the payload when untagged.
-	fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
-	fp.fade_dur_ms = std::max(0.f, entry->fade_in_ms);
-	fp.fade_start = now;
-
-	// Deliberately no world-origin change: shifting the client origin moves
-	// it out from under the server-rendered video (the game is rendered
-	// against the session-start origin), displacing the video quad. The
-	// mesh is placed purely as an object in the stable SLAM frame, which
-	// the headset holds drift-free. Virtual-world moves belong server-side
-	// (see ROADMAP.md future phase), never as a client origin shift.
-
-	spdlog::info("Calibrated to marker \"{}\": observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), sighting {}ms old",
-	             fp.calibrated_tag, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z,
-	             (long long)((now - sighting.time) / 1'000'000));
 }
 
 void scenes::stream::gui_passthrough()
@@ -569,78 +636,86 @@ void scenes::stream::gui_passthrough()
 
 void scenes::stream::gui_fiducial_status()
 {
-	auto & fp = fiducial_passthrough;
-	if (fp.ready)
-		ImGui::Text("%s: %zu tris (%s)", _S("Passthrough mesh"), fp.triangle_count, fp.model_hash.substr(0, 8).c_str());
-	else
-		ImGui::Text("%s: %s", _S("Passthrough mesh"), fp.status.c_str());
+	auto map = fiducial_map.lock();
 
-	if (marker_tracker)
+	if (map->fiducials.empty() and map->objects.empty())
 	{
-		auto sighting = marker_tracker->latest();
-		ImVec4 dot = sighting.tracked ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
-		ImGui::TextColored(dot, "%s", sighting.tracked ? "[o]" : "[x]");
-		ImGui::SameLine();
-		if (sighting.tracked)
+		ImGui::Text("%s", _S("No fiducial map from server"));
+	}
+	for (const auto & f: map->fiducials)
+	{
+		std::string label = f.tag.empty() ? f.id : f.tag;
+		// Live if any current sighting resolves through this fiducial.
+		bool live = false;
+		for (const auto & [key, fs]: fiducial_sightings)
 		{
-			double age_s = (instance.now() - sighting.time) * 1e-9;
-			ImGui::Text("%s %.40s (%.0fcm): %s, %.1fs ago%s",
-			            _S("Marker"),
-			            marker_tracker->label().c_str(),
-			            marker_tracker->configured_size() * 100,
-			            _S("tracked"),
-			            age_s,
-			            marker_tracker->configured_static() ? "" : " (moving)");
+			(void)key;
+			if (fs.fiducial_id == f.id)
+			{
+				live = true;
+				break;
+			}
 		}
-		else
+		ImVec4 dot = live ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
+		ImGui::TextColored(dot, "%s", live ? "[o]" : "[x]");
+		ImGui::SameLine();
+		ImGui::Text("%s %.40s: %s, %zu marker(s)%s",
+		            _S("Fiducial"),
+		            label.c_str(),
+		            live ? _S("tracking") : _S("seeking"),
+		            f.markers.size(),
+		            f.is_static ? "" : " (moving)");
+	}
+	for (const auto & [oid, ost]: passthrough_objects)
+	{
+		(void)oid;
+		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
+		size_t anchored = 0;
+		for (const auto & [key, inst]: ost.instances)
 		{
-			ImGui::Text("%s %.40s: %s",
-			            _S("Marker"),
-			            marker_tracker->label().c_str(),
-			            marker_tracker->status().c_str());
+			(void)key;
+			anchored += inst.anchored;
+		}
+		if (ost.def.type != "3d-passthrough")
+		{
+			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
+			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
+			continue;
+		}
+		if (not ost.soup_ready)
+		{
+			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
+			continue;
+		}
+		ImGui::Text("%s %.40s: %zu tris, %zu %s", _S("Object"), label.c_str(), ost.triangle_count,
+		            anchored, anchored == 1 ? _S("instance") : _S("instances"));
+		size_t shown = 0;
+		for (const auto & [key, inst]: ost.instances)
+		{
+			if (shown >= 8)
+			{
+				ImGui::Text("  ... +%zu", ost.instances.size() - shown);
+				break;
+			}
+			++shown;
+			double age_s = (instance.now() - inst.anchored_at) * 1e-9;
+			ImGui::Text("  %s %.1fs %s, err %.1fmm %.2fdeg, %llu %s",
+			            _S("placed"), age_s, _S("ago"),
+			            (double)inst.target_render_err_mm, (double)inst.target_render_err_deg,
+			            (unsigned long long)inst.samples_ingested, _S("samples"));
+			(void)key;
 		}
 	}
-	else
+	if (fiducial_trackers.empty())
 	{
-		ImGui::Text("%s: %s", _S("Marker"), _S("tracking unavailable"));
+		ImGui::Text("%s: %s", _S("Marker tracking"), _S("unavailable"));
 #ifdef __ANDROID__
-		// The tracker only exists when the runtime exposes the spatial
+		// Trackers only exist when the runtime exposes the spatial
 		// extensions. On Quest that means the manifest permissions (fixed) and
 		// the USE_SCENE runtime grant; extensions enumerate at instance
 		// creation, so a late grant needs an app restart to take effect.
-		if (not scene_permission_granted and not fiducial_entries.lock()->empty())
+		if (not scene_permission_granted and (not map->fiducials.empty() or not map->objects.empty()))
 			ImGui::Text("%s", _S("On Quest, grant the Scene permission, then restart the app"));
 #endif
-	}
-
-	if (fp.calibrated)
-	{
-		double age_s = (instance.now() - fp.calibrated_at) * 1e-9;
-		ImGui::Text("%s %.40s, %.0fs %s%s",
-		            _S("Aligned to marker"),
-		            fp.calibrated_tag.c_str(),
-		            age_s,
-		            _S("ago"),
-		            fp.continuous ? " (continuous)" : "");
-		if (fp.continuous)
-			ImGui::Text("Follow: %zu samples, w=%.2f, err %.1fmm %.2fdeg, %llu ingested",
-			            fp.filter.sample_count(),
-			            fp.filter.mean_weight(),
-			            fp.target_render_err_mm,
-			            fp.target_render_err_deg,
-			            (unsigned long long)fp.samples_ingested);
-		if (float fade = fp.fade_factor(instance.now()); fade < 1)
-			ImGui::Text("Fade-in: %.0f%%", fade * 100);
-	}
-
-	bool can_calibrate = marker_tracker && marker_tracker->latest().tracked;
-	ImGui::BeginDisabled(!can_calibrate);
-	if (ImGui::Button(_S(fp.continuous ? "Re-seed to marker" : "Calibrate to marker")))
-		calibrate_to_marker();
-	ImGui::EndDisabled();
-	if (not can_calibrate)
-	{
-		ImGui::SameLine();
-		ImGui::Text("%s", _S("needs marker in view"));
 	}
 }

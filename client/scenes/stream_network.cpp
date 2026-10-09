@@ -178,22 +178,22 @@ std::filesystem::path scenes::stream::fiducial_model_path(const std::string & ha
 
 void scenes::stream::operator()(to_headset::fiducial_map && map)
 {
-	spdlog::info("Received fiducial map with {} entries", map.entries.size());
-	for (const auto & entry: map.entries)
+	spdlog::info("Received fiducial map with {} fiducials, {} passthrough objects", map.fiducials.size(), map.objects.size());
+	for (const auto & fid: map.fiducials)
 	{
-		// Display label: the tag, or a payload prefix when untagged.
-		std::string label = entry.tag.empty() ? entry.marker_data.substr(0, 64) : entry.tag;
-		if (entry.model_hash.empty())
-			spdlog::info("Fiducial map entry: marker \"{}\" ({:.0f}mm), payload \"{}\", no model",
-			             label, (double)(entry.marker_size_m * 1000),
-			             entry.marker_data.substr(0, 64));
-		else
-			spdlog::info("Fiducial map entry: marker \"{}\" ({:.0f}mm), payload \"{}\", model {} ({} bytes)",
-			             label, (double)(entry.marker_size_m * 1000),
-			             entry.marker_data.substr(0, 64),
-			             entry.model_hash.substr(0, 8), entry.model_size);
+		std::string label = fid.tag.empty() ? fid.id : fid.tag;
+		spdlog::info("Fiducial \"{}\": {} marker(s) ({})", label, fid.markers.size(), fid.is_static ? "static" : "moving");
 	}
-	*fiducial_entries.lock() = std::move(map.entries);
+	for (const auto & obj: map.objects)
+	{
+		std::string label = obj.tag.empty() ? obj.id : obj.tag;
+		if (obj.model_hash.empty())
+			spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
+		else
+			spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes)",
+			             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size);
+	}
+	*fiducial_map.lock() = std::move(map);
 
 	// Request models missing from the local cache
 	std::error_code ec;
@@ -214,19 +214,19 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 	std::vector<std::pair<std::string, uint64_t>> missing;
 	size_t cached = 0;
 	{
-		auto entries = fiducial_entries.lock();
-		for (const auto & entry: *entries)
+		auto map = fiducial_map.lock();
+		for (const auto & obj: map->objects)
 		{
-			if (entry.model_hash.empty() or entry.model_size == 0)
+			if (obj.model_hash.empty() or obj.model_size == 0)
 				continue;
-			if (std::filesystem::exists(fiducial_model_path(entry.model_hash), ec))
+			if (std::filesystem::exists(fiducial_model_path(obj.model_hash), ec))
 			{
 				++cached;
 				continue;
 			}
-			if (fiducial_downloads.contains(entry.model_hash))
+			if (fiducial_downloads.contains(obj.model_hash))
 				continue;
-			missing.emplace_back(entry.model_hash, entry.model_size);
+			missing.emplace_back(obj.model_hash, obj.model_size);
 		}
 	}
 
@@ -259,14 +259,14 @@ void scenes::stream::operator()(to_headset::fiducial_model_chunk && chunk)
 
 	uint64_t expected_size = 0;
 	{
-		auto map = fiducial_entries.lock();
-		auto entry = std::ranges::find(*map, chunk.model_hash, &to_headset::fiducial_map_entry::model_hash);
-		if (entry == map->end() or entry->model_size == 0)
+		auto map = fiducial_map.lock();
+		auto obj = std::ranges::find(map->objects, chunk.model_hash, &to_headset::passthrough_object::model_hash);
+		if (obj == map->objects.end() or obj->model_size == 0)
 		{
 			spdlog::warn("Ignoring fiducial model chunk for unknown hash {}", chunk.model_hash);
 			return;
 		}
-		expected_size = entry->model_size;
+		expected_size = obj->model_size;
 	}
 
 	auto & download = fiducial_downloads[chunk.model_hash];
