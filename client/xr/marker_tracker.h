@@ -25,7 +25,6 @@
 #include <optional>
 #include <set>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace xr
@@ -54,12 +53,6 @@ public:
 		bool tracked = false;
 		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrTime time = 0;
-		// True when this sighting carries a pose not previously reported
-		// (novel detector output). False on repeats: the runtime's QR
-		// detector runs slower than the query rate, so update snapshots
-		// often echo the previous pose. Consumers (continuous filter)
-		// should only ingest novel samples.
-		bool novel = false;
 	};
 
 	// All four extensions must be enabled; check supported() first.
@@ -74,8 +67,8 @@ public:
 	// a rename updates the label live without restarting tracking.
 	// is_static maps to optimizeForStaticMarker: toggling it recreates the
 	// spatial context (brief tracking hitch). Poses for all known codes
-	// refresh every frame via update snapshots (no timers); the detector
-	// is slower, so repeats are flagged novel=false.
+	// refresh every frame via update snapshots (no timers); the runtime
+	// predicts to the requested time, so effectively every tick is fresh.
 	void configure(float marker_size_m, std::string marker_payload, std::string tag, bool is_static = true);
 
 	// Advance the async state machine + throttled discovery.
@@ -118,16 +111,10 @@ public:
 		XrSpatialEntityIdEXT entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
 		XrTime time = 0;
 		bool matched = false;
-		bool novel = false;
 	};
 	const std::vector<code_sighting> & sightings() const
 	{
 		return all_sightings;
-	}
-	// (novel, total) update-snapshot counts for dup% diagnostics.
-	std::pair<uint64_t, uint64_t> update_stats() const
-	{
-		return {update_queries_novel, update_queries_total};
 	}
 
 private:
@@ -210,17 +197,12 @@ private:
 	// every discovery/update; render thread only.
 	std::vector<code_sighting> all_sightings;
 
-	// Update-snapshot duplicate accounting: the detector is slower than
-	// the frame rate, so most snapshots echo the previous pose. Novel
-	// samples feed the continuous filter; repeats are counted and logged
-	// as a percentage. Counted per entity queried.
-	uint64_t update_queries_total = 0;
-	uint64_t update_queries_novel = 0;
-	int last_dup_pct = -1;
-	XrTime last_dup_log = 0;
-	// Last reported pose per entity for echo detection (exact float
-	// compare: the runtime repeats values bit-identically on echo).
-	std::map<XrSpatialEntityIdEXT, XrPosef> last_poses;
+	// Update-snapshot cadence accounting (render thread only): the runtime
+	// predicts poses to the requested time, so effectively every tick is
+	// fresh — no echo/dedup logic. Tick rate logs on a heartbeat.
+	uint64_t update_ticks = 0;
+	XrTime first_tick_at = 0;
+	XrTime last_rate_log = 0;
 
 	sighting current;
 	std::string status_text = "idle";
@@ -245,12 +227,9 @@ private:
 	void start_discovery();
 	void complete_discovery(XrSpace world_space, XrTime predicted_time);
 	// Synchronous live pose refresh for all latched entities, every frame.
-	// No re-enumeration, no timers: novelty is reported per entity via
-	// code_sighting::novel so consumers overlay exactly on new data.
+	// No re-enumeration, no timers.
 	void update_snapshot(XrSpace world_space, XrTime now, XrTime predicted_time);
 	void ensure_entity(XrSpatialEntityIdEXT id);
-	// Echo check for one entity pose; records current pose on novel.
-	bool note_pose(XrSpatialEntityIdEXT id, const XrPosef & pose);
-	void log_dup_stats(XrTime now);
+	void log_rate(XrTime now);
 };
 } // namespace xr

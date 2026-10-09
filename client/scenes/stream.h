@@ -271,7 +271,7 @@ private:
 		XrVector3f world_scale{1, 1, 1};
 
 		// Continuous mode ("continuous" map entries): auto-anchors on first
-		// sighting, then robustly averages novel mesh-targets and
+		// sighting, then robustly averages mesh-target samples and
 		// proportionally follows every frame (never snaps after the seed).
 		// One-shot entries ignore all of this.
 		bool continuous = false;
@@ -279,8 +279,8 @@ private:
 		std::string applied_tuning_key; // filter tuning source; re-apply on change
 		XrTime last_predicted = 0;
 		// Diagnostics (render thread only).
-		uint64_t novel_ingested = 0;
-		XrTime last_novel_at = 0;
+		uint64_t samples_ingested = 0;
+		XrTime last_sample_at = 0;
 		float target_render_err_mm = 0;
 		float target_render_err_deg = 0;
 

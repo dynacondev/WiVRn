@@ -217,7 +217,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.calibrated_tag.clear();
 			fp.filter.reset();
 			fp.continuous = false;
-			fp.novel_ingested = 0;
+			fp.samples_ingested = 0;
 			fp.fade_start = 0;
 			fp.held_codes.clear();
 			if (fp.ready)
@@ -270,11 +270,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		{
 			// Not seeded yet: the mesh transform below needs a pose, but
 			// nothing is submitted until calibrated, so just keep feeding
-			// the filter (auto-anchor happens on novel sightings below).
+			// the filter (auto-anchor happens on sightings below).
 			fp.world_scale = {entry->scale, entry->scale, entry->scale};
 		}
 		auto sighting = marker_tracker->latest();
-		if (sighting.tracked and sighting.novel)
+		if (sighting.tracked)
 		{
 			// Same mesh-target math as calibrate_to_marker(), but as a
 			// filter sample instead of a snap: meshTarget =
@@ -286,8 +286,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			glm::quat mesh_quat = marker_quat * offset_quat;
 			glm::vec3 mesh_pos = marker_pos + marker_quat * offset_pos;
 			fp.filter.ingest(mesh_pos, mesh_quat, sighting.time);
-			fp.novel_ingested++;
-			fp.last_novel_at = instance.now();
+			fp.samples_ingested++;
+			fp.last_sample_at = instance.now();
 			if (not fp.calibrated)
 			{
 				// Auto-anchor: the single allowed snap in continuous mode.
@@ -299,7 +299,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				};
 				fp.world_scale = {entry->scale, entry->scale, entry->scale};
 				fp.calibrated = true;
-				fp.calibrated_at = fp.last_novel_at;
+				fp.calibrated_at = fp.last_sample_at;
 				fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
 				fp.last_predicted = predicted_display_time;
 				fp.fade_start = predicted_display_time;
@@ -309,7 +309,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		if (fp.calibrated and fp.filter.has_target())
 		{
 			// Per-frame proportional follow (large error = large step).
-			// On marker loss no novel samples arrive: advance() coasts on
+			// On marker loss no fresh samples arrive: advance() coasts on
 			// the current window, i.e. permanent SLAM hold.
 			double dt = fp.last_predicted > 0 ? (predicted_display_time - fp.last_predicted) * 1e-9 : 1.0 / 72.0;
 			fp.last_predicted = predicted_display_time;
@@ -578,22 +578,19 @@ void scenes::stream::gui_fiducial_status()
 	if (marker_tracker)
 	{
 		auto sighting = marker_tracker->latest();
-		auto [novel, total] = marker_tracker->update_stats();
-		int dup_pct = total > 0 ? (int)((total - novel) * 100 / total) : 0;
 		ImVec4 dot = sighting.tracked ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
 		ImGui::TextColored(dot, "%s", sighting.tracked ? "[o]" : "[x]");
 		ImGui::SameLine();
 		if (sighting.tracked)
 		{
 			double age_s = (instance.now() - sighting.time) * 1e-9;
-			ImGui::Text("%s %.40s (%.0fcm): %s, %.1fs ago%s%s",
+			ImGui::Text("%s %.40s (%.0fcm): %s, %.1fs ago%s",
 			            _S("Marker"),
 			            marker_tracker->label().c_str(),
 			            marker_tracker->configured_size() * 100,
 			            _S("tracked"),
 			            age_s,
-			            marker_tracker->configured_static() ? "" : " (moving)",
-			            total > 0 ? (" upd " + std::to_string((int)novel) + "/" + std::to_string((int)total) + " " + std::to_string(dup_pct) + "%dup").c_str() : "");
+			            marker_tracker->configured_static() ? "" : " (moving)");
 		}
 		else
 		{
@@ -626,12 +623,12 @@ void scenes::stream::gui_fiducial_status()
 		            _S("ago"),
 		            fp.continuous ? " (continuous)" : "");
 		if (fp.continuous)
-			ImGui::Text("Follow: %zu samples, w=%.2f, err %.1fmm %.2fdeg, %llu novel",
+			ImGui::Text("Follow: %zu samples, w=%.2f, err %.1fmm %.2fdeg, %llu ingested",
 			            fp.filter.sample_count(),
 			            fp.filter.mean_weight(),
 			            fp.target_render_err_mm,
 			            fp.target_render_err_deg,
-			            (unsigned long long)fp.novel_ingested);
+			            (unsigned long long)fp.samples_ingested);
 		if (float fade = fp.fade_factor(instance.now()); fade < 1)
 			ImGui::Text("Fade-in: %.0f%%", fade * 100);
 	}

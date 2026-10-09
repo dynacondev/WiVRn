@@ -45,8 +45,8 @@
 //     carries velocity, opens the cutoff, and gets through — no
 //     stick-slip step like a binary deadband would produce.
 //
-// All state lives on the render thread; ingest() runs at the live update
-// rate (5-10Hz novel samples), advance() runs every frame.
+// All state lives on the render thread; ingest() runs at the live sample
+// rate, advance() runs every frame.
 namespace xr
 {
 
@@ -80,8 +80,7 @@ public:
 	void configure(const tuning & t);
 	void reset();
 
-	// Ingest one mesh-target sample (world space). Duplicates/echoes must
-	// be filtered by the caller (marker_tracker::sighting::novel).
+	// Ingest one mesh-target sample (world space).
 	void ingest(const glm::vec3 & pos, const glm::quat & quat, XrTime t);
 
 	bool has_target() const

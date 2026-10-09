@@ -64,10 +64,11 @@ public:
 	// Opacity is the first-acquisition fade (1 = fully present). Cutout is
 	// an optional world-space quad (two triangles, six verts) punched
 	// crisp through the finished mask after all blur passes: the marker
-	// window debug cutout. It needs its own view-only MVP (the mesh soup
-	// is mesh-local, so the mesh mvp would place it twice). Mask path
-	// only (the binary projected layer has no alpha control to punch
-	// through).
+	// window debug cutout, stamped at full alpha so the hole shows
+	// passthrough (mask 1 = reality). It needs its own view-only MVP (the
+	// mesh soup is mesh-local, so the mesh mvp would place it twice).
+	// Mask path only (the binary projected layer has no alpha control to
+	// punch through).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,

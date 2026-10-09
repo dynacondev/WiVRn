@@ -1064,7 +1064,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 	// Marker window cutout: crisp post-blur punch. Re-begins the finished
 	// swapchain framebuffers with the LOAD pass and stamps the quad at
-	// zero alpha — no blur pass touches it, so edges stay pixel-exact.
+	// FULL alpha (mask 1 = reality window): the hole shows passthrough,
+	// not game. No blur pass touches it, so edges stay pixel-exact.
 	// Debug only; rasterize=false (bypass) skips it with the silhouette.
 	if (cutout and rasterize)
 	{
@@ -1097,7 +1098,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 			cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
 			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-			                               raster_push{.mvp = cutout_mvp[eye], .opacity = 0});
+			                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});
 			cmd.draw(6, 1, 0, 0);
 			cmd.endRenderPass();
 		}
