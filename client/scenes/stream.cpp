@@ -1556,7 +1556,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			spdlog::info("Server video alpha channel: {}", use_alpha ? "on" : "off");
 		}
 		bool want_projected_mesh = fiducial_passthrough_wanted();
-		if (use_alpha or want_projected_mesh)
+		// Start passthrough as soon as a map exists, not at first anchor:
+		// xrPassthroughStartFB mid-session flashes a fullscreen frame at
+		// detection time; warming it up during streaming hides any such
+		// transient. Layer submission stays exactly as gated (enable is
+		// idempotent and cheap to reaffirm).
+		bool have_fiducial_map = false;
+		{
+			auto map = fiducial_map.lock();
+			have_fiducial_map = not map->fiducials.empty() or not map->objects.empty();
+		}
+		if (use_alpha or want_projected_mesh or have_fiducial_map)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
