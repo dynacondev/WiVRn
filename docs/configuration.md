@@ -261,7 +261,7 @@ Each `passthrough` entry (behavior object) has:
   `0` disables feathering). Mask stacks group by this value so each
   object feathers independently; applied live. The client selects a blur
   tier automatically (0 hard edge, 1 half-res with full-res upscale,
-  2/4/8 half/quarter/eighth
+  2/4 quarter, 8 eighth
   with exact spread mapping, clamped to 128px), so tap density and cost
   stay flat at any width.
 - `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds

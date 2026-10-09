@@ -925,7 +925,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			else if (f <= 48)
 			{
 				tier = 2;
-				spread = f / 24.f;
+				// H runs in 4px units, V in 1px: chained sigma 2s*sqrt(17)
+				// matches the old half-H/full-V band (2s*sqrt(5)) at
+				// s = f/44 (within ~5%, narrower-eroding on ties).
+				spread = f / 44.f;
 			}
 			else if (f <= 96)
 			{
@@ -1026,28 +1029,34 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		} // tier == 1
 		else
 		{
-			// Tiered path: silhouettes seed-rasterized at level 1 directly
+			// Tiered path: silhouettes seed-rasterized below full res
 			// (collapsing the old full-res raster + downsample pair: same
-			// draws, half viewport), downsample chain from level 2, blur
-			// at 1/k, upscale submit. down_targets[0].blur_fbs serves the
-			// seed raster: identical attachment spec, which is all that
-			// render-pass compatibility compares (house idiom, cf. A/B).
-			vk::Extent2D de1 = level_extent(extent, 1);
+			// draws, smaller viewport), downsample chain to the blur
+			// level, blur at 1/k, upscale submit. Tier 2 seeds at quarter
+			// (level 2); higher tiers seed at half, so the H working level
+			// is the deeper of the seed level and the tier's natural
+			// level. down_targets[N].blur_fbs serves the seed raster:
+			// identical attachment spec, which is all that render-pass
+			// compatibility compares (house idiom, cf. A/B).
+			int seed_level = (tier == 2) ? 2 : 1;
+			vk::Extent2D de_seed = level_extent(extent, seed_level);
 			{
 				section_clock raster_clk(&ms_raster);
-				raster_silhouettes(down_targets[0].blur_fbs, de1);
+				raster_silhouettes(down_targets[seed_level - 1].blur_fbs, de_seed);
 			}
-			make_readable(*down_targets[0].image);
+			make_readable(*down_targets[seed_level - 1].image);
 			section_clock blur_clk(&ms_blur);
-			// Levels 2..N from the selected tier; sizes shared with ensure
-			// via level_extent() (exact halving required for the box map).
+			// Levels seed_level+1..N from the selected tier; sizes shared
+			// with ensure via level_extent() (exact halving required for
+			// the box map).
 			std::array<uint32_t, 0> no_offsets{};
 			int levels = 0;
 			for (int k = tier; k >= 2; k >>= 1)
 				++levels;
-			std::vector<vk::raii::ImageView> * down_src_views = &down_targets[0].views;
-			vk::Extent2D down_src_extent = de1;
-			for (int l = 2; l <= levels; ++l)
+			int blur_level = std::max(levels, seed_level);
+			std::vector<vk::raii::ImageView> * down_src_views = &down_targets[seed_level - 1].views;
+			vk::Extent2D down_src_extent = de_seed;
+			for (int l = seed_level + 1; l <= levels; ++l)
 			{
 				blur_target & dst = down_targets[l - 1];
 				vk::Extent2D de = level_extent(extent, l);
@@ -1078,11 +1087,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				down_src_extent = de;
 			}
 
-			// H blur at tier res into E, V upscale into swapchain. The V
-			// texel stays 1/tier-size while rendering fullscreen: the
-			// sampler's bilinear upscale is the final step, free.
-			blur_target & eblur = eblur_targets[levels - 1];
-			vk::Extent2D te = level_extent(extent, levels);
+			// H blur at blur_level into E, V upscale into swapchain. The V
+			// texel stays 1/blur-level-size while rendering fullscreen:
+			// the sampler's bilinear upscale is the final step, free.
+			blur_target & eblur = eblur_targets[blur_level - 1];
+			vk::Extent2D te = level_extent(extent, blur_level);
 			blur_push base{
 			        .texel = {1.f / te.width, 1.f / te.height},
 			        .spread = spread,
