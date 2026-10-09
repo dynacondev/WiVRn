@@ -318,8 +318,11 @@ private:
 		{
 			if (fade_dur_ms <= 0 or fade_start == 0)
 				return 1;
-			double t = (predicted - fade_start) * 1e-6 / fade_dur_ms;
-			return std::clamp(t, 0.0, 1.0);
+			// Smoothstep ease-in-out (house idiom, cf. the follow-filter
+			// knees): zero slope at both ends, so the window neither pops
+			// in nor slams to full presence like a linear ramp does.
+			double t = std::clamp((predicted - fade_start) * 1e-6 / fade_dur_ms, 0.0, 1.0);
+			return t * t * (3 - 2 * t);
 		}
 
 		// Feathered mask-blend state. Replaces the binary triangle-mesh
