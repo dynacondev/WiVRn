@@ -1192,9 +1192,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		try
 		{
 			mask_frame = false;
-			if (not composition_layer_alpha_blend_supported)
+			if (not composition_layer_alpha_blend_supported or view_count != 2)
 			{
-				// Binary fallback path owns the display; skip all mask work.
+				// Binary fallback path owns the display (or non-stereo,
+				// which the mask targets don't support); skip all mask work.
 			}
 			else
 			{

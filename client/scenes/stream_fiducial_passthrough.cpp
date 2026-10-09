@@ -206,13 +206,15 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 {
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto & fp = fiducial_passthrough;
-	auto map = fiducial_map.lock();
+	// Snapshot, never held across model file loads below: the network
+	// thread serves chunks through the same lock.
+	to_headset::fiducial_map map = *fiducial_map.lock();
 
 	// Fingerprint: tracking/render identity. Tags excluded (display-only);
 	// feather/fade excluded (live render-only). Any other change wipes
 	// instances; model-cache flips only re-arm uploads (below).
 	std::string map_key;
-	for (const auto & f: map->fiducials)
+	for (const auto & f: map.fiducials)
 	{
 		map_key += 'F';
 		map_key += f.id;
@@ -237,7 +239,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			map_key += ';';
 		}
 	}
-	for (const auto & o: map->objects)
+	for (const auto & o: map.objects)
 	{
 		map_key += 'O';
 		map_key += o.type;
@@ -262,7 +264,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		map_key += ';';
 	}
 	std::string key = map_key;
-	for (const auto & o: map->objects)
+	for (const auto & o: map.objects)
 	{
 		if (o.model_hash.empty())
 			continue;
@@ -275,7 +277,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 
 	// Trackers run every frame, independent of objects/meshes (their state
 	// feeds the status UI and the debug overlays pre-placement).
-	sync_fiducial_trackers(*map);
+	sync_fiducial_trackers(map);
 	XrTime now = instance.now();
 	for (auto & [payload, tr]: fiducial_trackers)
 	{
@@ -286,7 +288,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// Resolver (single-marker): solved fiducial frame per (fiducial,
 	// entity) = observed * marker offset. Rebuilt every frame.
 	fiducial_sightings.clear();
-	for (const auto & f: map->fiducials)
+	for (const auto & f: map.fiducials)
 	{
 		if (f.markers.empty())
 			continue;
@@ -339,7 +341,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.held_codes.clear();
 			passthrough_objects.clear();
 			fiducial_sightings.clear();
-			for (const auto & o: map->objects)
+			for (const auto & o: map.objects)
 			{
 				if (o.type != "3d-passthrough")
 					spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", o.id, o.type);
@@ -351,19 +353,19 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				fp.ready = false;
 			}
 		}
-		if (map->fiducials.empty() and map->objects.empty())
+		if (map.fiducials.empty() and map.objects.empty())
 			fp.status = "no fiducial map from server";
 	}
 
 	// ---- behavior objects: instances per (object, fiducial, entity) ----
 	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
 	{
-		if (std::ranges::any_of(map->objects, [&](const to_headset::passthrough_object & o) { return o.id == oit->first; }))
+		if (std::ranges::any_of(map.objects, [&](const to_headset::passthrough_object & o) { return o.id == oit->first; }))
 			++oit;
 		else
 			oit = passthrough_objects.erase(oit);
 	}
-	for (const auto & def: map->objects)
+	for (const auto & def: map.objects)
 	{
 		if (def.type != "3d-passthrough")
 			continue;
@@ -397,8 +399,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// QR seen twice places twice; several fiducials place per pairing.
 		for (const auto & fid: def.fiducial)
 		{
-			auto fdef = std::ranges::find(map->fiducials, fid, &to_headset::fiducial_entry::id);
-			if (fdef == map->fiducials.end())
+			auto fdef = std::ranges::find(map.fiducials, fid, &to_headset::fiducial_entry::id);
+			if (fdef == map.fiducials.end())
 				continue;
 			xr::fiducial_filter::tuning t = tuning_for(*fdef);
 			for (const auto & [skey, fs]: fiducial_sightings)
