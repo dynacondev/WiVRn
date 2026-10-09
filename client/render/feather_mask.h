@@ -28,10 +28,10 @@
 // rasterized edge; the band never erodes into the model (unlike the old
 // Gaussian, whose band ran +-F/2).
 //
-// SDF resolution halves as the band widens (distance error ~0.5 SDF texel
-// stays negligible against the band): feather <= 32px floods at half mask
-// resolution, above at quarter. feather <= 0 keeps the exact hard-edge
-// direct raster (no field work at all).
+// SDF resolution follows the band (distance error ~0.5 SDF texel stays
+// negligible against it): feather <= 16 floods at half mask resolution,
+// <= 64 at quarter, above at eighth. feather <= 0 keeps the exact
+// hard-edge direct raster (no field work at all).
 //
 // Swapchain images only allow COLOR_ATTACHMENT output, which is why the
 // seed is a raster pass and not a buffer fill.
@@ -150,7 +150,6 @@ private:
 	// (extent/div); the divisor is static per group (keyed by feather-px),
 	// so a config change lands on a fresh renderer. Recreated when the
 	// mask extent changes.
-	static constexpr float sdf_seed_outside = 1e10f; // INF coord: "no seed"
 	struct sdf_target
 	{
 		vk::raii::Image image{nullptr};
@@ -171,11 +170,15 @@ private:
 	vk::raii::DescriptorSetLayout jfa_set_layout{nullptr};
 	vk::raii::DescriptorSetLayout composite_set_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
-	// One set per eye (descriptor updates are host-side writes completing
-	// before submit; distinct sets keep each binding stable): jfa_sets
-	// repoint to the current flood source every iteration, composite_sets
-	// bind (field, seed) per eye. Vectors (not arrays): raii handles have
-	// no default constructor.
+	// One set per (iteration, eye): descriptor updates are host-side
+	// writes completing before submit, so reusing one set across flood
+	// iterations would make every draw read the LAST update (a destroyed
+	// cascade that composites as a hard edge). Distinct sets keep each
+	// binding stable: jfa_sets[eye*8+pass] sources iteration pass,
+	// composite_sets[eye] bind (field, seed). Vectors (not arrays): raii
+	// handles have no default constructor. Worst case is 7 iterations
+	// (128px at div4), so 8/eye has margin.
+	static constexpr uint32_t max_flood_passes = 8;
 	std::vector<vk::raii::DescriptorSet> jfa_sets;
 	std::vector<vk::raii::DescriptorSet> composite_sets;
 	vk::raii::Sampler sampler{nullptr};         // linear: flood field reads
@@ -183,8 +186,14 @@ private:
 	sdf_target sdf_seed, sdf_ping, sdf_pong;
 	vk::Extent2D targets_extent{0, 0};
 	int targets_div = 0;
+	// SDF storage format, chosen once in the constructor: RG16F where the
+	// device renders/filters it (halves flood bandwidth; coords < 2048 are
+	// exact in half), else RG32F. The seed INF and composite inside/outside
+	// threshold follow the choice (sdf_outside / inside_thresh push).
+	vk::Format sdf_format_used = vk::Format::eR32G32Sfloat;
+	float sdf_outside = 1e10f;
 	void ensure_targets(vk::Extent2D extent, int sdf_div);
-	void update_source(vk::ImageView view, uint32_t eye);
+	void update_flood(uint32_t eye, uint32_t pass, vk::ImageView view);
 	void update_composite(uint32_t eye, vk::ImageView field, vk::ImageView seed);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and

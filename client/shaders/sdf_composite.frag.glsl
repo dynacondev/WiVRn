@@ -35,7 +35,8 @@ layout(push_constant) uniform Push
 	float feather_px;
 	float opacity;
 	float px_per_texel;
-	float pad;
+	float inside_thresh;
+	float viz;
 }
 pc;
 
@@ -45,8 +46,17 @@ void main()
 	vec2 s = texture(field, uv).xy;
 	// Clamp before smoothstep: unreached pixels hold INF seeds, and
 	// strict drivers need not produce clean +inf through length().
-	float dist_px = min(length(frag - s) * pc.px_per_texel, pc.feather_px);
-	float inside = texture(seed, uv).x < 5.0e9 ? 1.0 : 0.0;
+	float raw_px = length(frag - s) * pc.px_per_texel;
+	float inside = texture(seed, uv).x < pc.inside_thresh ? 1.0 : 0.0;
+	if (pc.viz > 0.5)
+	{
+		vec3 c = inside > 0.5 ? vec3(0.0, 0.8, 0.0)
+		        : raw_px > pc.feather_px ? vec3(0.8, 0.0, 0.8)
+		        : mix(vec3(0.8, 0.0, 0.0), vec3(0.0, 0.0, 0.8), clamp(raw_px / pc.feather_px, 0.0, 1.0));
+		out_color = vec4(c, 1.0);
+		return;
+	}
+	float dist_px = min(raw_px, pc.feather_px);
 	float band = 1.0 - smoothstep(0.0, pc.feather_px, dist_px);
 	out_color = vec4(1.0, 1.0, 1.0, mix(band, 1.0, inside) * pc.opacity);
 }

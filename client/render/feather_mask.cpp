@@ -30,6 +30,12 @@
 
 namespace
 {
+// Temporary cascade diagnostic: flip to true and rebuild for a viz APK
+// that paints the distance field instead of the mask (green = inside,
+// red->blue ramp over [0, feather], magenta = unreached/INF). Always
+// false in benchmark and shipping builds.
+constexpr bool sdf_field_viz = false;
+
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
 	auto mem = physical_device.getMemoryProperties();
@@ -60,18 +66,16 @@ struct jfa_push
 };
 
 // Analytic composite push block. Mirrors sdf_composite.frag.glsl Push
-// (24 bytes).
+// (28 bytes).
 struct sdf_composite_push
 {
 	float sdf_dim[2];
 	float feather_px;
 	float opacity;
 	float px_per_texel;
-	float pad = 0;
+	float inside_thresh;
+	float viz = 0;
 };
-
-// SDF seed/field storage: float32 RG (coordinates exact, INF-safe).
-constexpr vk::Format sdf_format = vk::Format::eR32G32Sfloat;
 
 // RAII section timer for the record() diagnostics (mask_stage_cpu): adds
 // the scoped wall time in milliseconds to *acc on destruction.
@@ -96,6 +100,19 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
         physical_device(physical_device_),
         format(format_)
 {
+	// SDF storage: RG16F where renderable + linearly filterable (halves
+	// flood bandwidth; coords < 2048 exact in half, INF 60000 < 65504),
+	// else RG32F. Queried once; targets, clear values and the composite
+	// threshold all follow.
+	vk::FormatProperties sdf_props = physical_device.getFormatProperties(vk::Format::eR16G16Sfloat);
+	constexpr auto needed = vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+	if ((sdf_props.optimalTilingFeatures & needed) == needed)
+	{
+		sdf_format_used = vk::Format::eR16G16Sfloat;
+		sdf_outside = 60000.f;
+	}
+	spdlog::info("Fiducial mask SDF storage: {}", vk::to_string(sdf_format_used));
+
 	auto vert = load_shader(device, "mask.vert");
 	auto frag = load_shader(device, "mask.frag");
 
@@ -248,7 +265,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// SDF seed pass: RG32F, CLEARs to INF ("no seed"), stores GENERAL
 	// (the composite samples it back for the inside/outside sign).
 	vk::AttachmentDescription seed_attachment{
-	        .format = sdf_format,
+	        .format = sdf_format_used,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
@@ -275,7 +292,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// SDF flood pass: RG32F, DONT_CARE load (every texel is rewritten by
 	// the fullscreen triangle), stores GENERAL for the next iteration.
 	vk::AttachmentDescription sdf_attachment{
-	        .format = sdf_format,
+	        .format = sdf_format_used,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eDontCare,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
@@ -504,18 +521,19 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	nearest_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
 	nearest_sampler = vk::raii::Sampler(device, nearest_info);
 
-	// 2 JFA sets (1 sampler each) + 2 composite sets (2 samplers each).
+	// 16 JFA sets (8 iterations x eyes) + 2 composite sets (2 samplers
+	// each): 20 descriptors.
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 6,
+	        .descriptorCount = 20,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
-	        .maxSets = 4,
+	        .maxSets = 18,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
 	};
 	descriptor_pool = vk::raii::DescriptorPool(device, pool_info);
-	for (int eye = 0; eye < 2; ++eye)
+	for (uint32_t i = 0; i < 2 * max_flood_passes; ++i)
 	{
 		vk::DescriptorSetAllocateInfo jfa_alloc{
 		        .descriptorPool = *descriptor_pool,
@@ -523,6 +541,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .pSetLayouts = &*jfa_set_layout,
 		};
 		jfa_sets.emplace_back(std::move(device.allocateDescriptorSets(jfa_alloc)[0]));
+	}
+	for (int eye = 0; eye < 2; ++eye)
+	{
 		vk::DescriptorSetAllocateInfo composite_alloc{
 		        .descriptorPool = *descriptor_pool,
 		        .descriptorSetCount = 1,
@@ -623,7 +644,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, int sdf_div)
 	{
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
-		        .format = sdf_format,
+		        .format = sdf_format_used,
 		        .extent = {sdf_alloc.width, sdf_alloc.height, 1},
 		        .mipLevels = 1,
 		        .arrayLayers = 2,
@@ -648,7 +669,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, int sdf_div)
 			vk::ImageViewCreateInfo view_info{
 			        .image = *target->image,
 			        .viewType = vk::ImageViewType::e2D,
-			        .format = sdf_format,
+			        .format = sdf_format_used,
 			        .subresourceRange = {
 			                .aspectMask = vk::ImageAspectFlagBits::eColor,
 			                .baseMipLevel = 0,
@@ -729,7 +750,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	                    {});
 }
 
-void feather_mask_renderer::update_source(vk::ImageView view, uint32_t eye)
+void feather_mask_renderer::update_flood(uint32_t eye, uint32_t pass, vk::ImageView view)
 {
 	vk::DescriptorImageInfo image_info{
 	        .sampler = *nearest_sampler,
@@ -737,7 +758,7 @@ void feather_mask_renderer::update_source(vk::ImageView view, uint32_t eye)
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	vk::WriteDescriptorSet write{
-	        .dstSet = *jfa_sets[eye],
+	        .dstSet = *jfa_sets[eye * max_flood_passes + pass],
 	        .dstBinding = 0,
 	        .descriptorCount = 1,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -944,14 +965,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 		// SDF path selection (see header): 0 = hard edge raster direct,
 		// else seed + truncated Jump Flood + analytic composite at half
-		// (feather <= 32) or quarter SDF resolution. Values past 128
-		// clamp (documented).
+		// (feather <= 16), quarter (<= 64) or eighth SDF resolution.
+		// Values past 128 clamp (documented).
 		float f = feather_px;
 		if (f > 128)
 			f = 128;
 		int sdf_div = 0;
 		if (f > 0)
-			sdf_div = (f > 32) ? 4 : 2;
+			sdf_div = (f > 16) ? ((f > 64) ? 8 : 4) : 2;
 		if (sdf_div != 0)
 			ensure_targets(extent, sdf_div);
 
@@ -1009,7 +1030,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = e});
 			};
 			vk::ClearValue seed_clear{};
-			seed_clear.color.float32.fill(sdf_seed_outside);
+			seed_clear.color.float32.fill(sdf_outside);
 
 			float min_opacity = 1;
 			{
@@ -1060,8 +1081,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				{
 					vk::ImageView src = *sdf_seed.views[eye];
 					sdf_target * dst = &sdf_ping;
+					uint32_t pass = 0;
 					auto flood_pass = [&](int istep) {
-						update_source(src, (uint32_t)eye);
+						update_flood((uint32_t)eye, pass, src);
 						vk::RenderPassBeginInfo begin_flood{
 						        .renderPass = *sdf_renderpass,
 						        .framebuffer = *dst->fbs[eye],
@@ -1070,7 +1092,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 						cmd.beginRenderPass(begin_flood, vk::SubpassContents::eInline);
 						set_sdf_viewport(sdf_extent);
 						cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *jfa_pipeline);
-						std::array<vk::DescriptorSet, 1> flood_sets{*jfa_sets[eye]};
+						std::array<vk::DescriptorSet, 1> flood_sets{*jfa_sets[(uint32_t)eye * max_flood_passes + pass]};
 						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *jfa_layout, 0, flood_sets, no_offsets);
 						jfa_push push{
 						        .texel = {1.f / sdf_extent.width, 1.f / sdf_extent.height},
@@ -1083,6 +1105,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 						flood_last = dst;
 						src = *dst->views[eye];
 						dst = (dst == &sdf_ping) ? &sdf_pong : &sdf_ping;
+						++pass;
 					};
 					for (int s = flood_step; s >= 1; s /= 2)
 						flood_pass(s);
@@ -1110,6 +1133,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				        .feather_px = f,
 				        .opacity = min_opacity,
 				        .px_per_texel = (float)sdf_div,
+				        .inside_thresh = sdf_outside * 0.5f,
+				        .viz = sdf_field_viz ? 1.f : 0.f,
 				};
 				cmd.pushConstants<sdf_composite_push>(*composite_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);
