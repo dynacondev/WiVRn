@@ -710,7 +710,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    float feather_px,
                                    const std::vector<std::array<glm::vec3, 6>> & cutouts,
                                    const std::array<glm::mat4, 2> & cutout_mvp,
-                                   mask_stage_cpu * cpu_stats)
+                                   mask_stage_cpu * cpu_stats,
+                                   vk::Extent2D out_extent)
 {
 	auto t_total0 = std::chrono::steady_clock::now();
 	double ms_raster = 0, ms_blur = 0, ms_punch = 0;
@@ -763,7 +764,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 
 	auto it = targets.find(image);
-	if (it == targets.end() or it->second.extent.width != extent.width or it->second.extent.height != extent.height)
+	// Swapchain-image targets track the submitted (output) size, which is
+	// half for feathered groups; intermediates below track full extent.
+	if (it == targets.end() or it->second.extent.width != out_extent.width or it->second.extent.height != out_extent.height)
 	{
 		if (it != targets.end())
 			targets.erase(it);
@@ -813,8 +816,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			                .renderPass = *renderpass,
 			                .attachmentCount = 1,
 			                .pAttachments = &raw_view_0,
-			                .width = extent.width,
-			                .height = extent.height,
+			                .width = out_extent.width,
+			                .height = out_extent.height,
 			                .layers = 1,
 			        };
 			        return vk::raii::Framebuffer(device, fb_info);
@@ -824,14 +827,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			                .renderPass = *renderpass,
 			                .attachmentCount = 1,
 			                .pAttachments = &raw_view_1,
-			                .width = extent.width,
-			                .height = extent.height,
+			                .width = out_extent.width,
+			                .height = out_extent.height,
 			                .layers = 1,
 			        };
 			        return vk::raii::Framebuffer(device, fb_info);
 		        }(),
 		}};
-		it = targets.emplace(image, frame_targets(extent, std::move(views), std::move(framebuffers))).first;
+		it = targets.emplace(image, frame_targets(out_extent, std::move(views), std::move(framebuffers))).first;
 	}
 
 	vk::ClearValue clear{};
@@ -880,7 +883,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			vk::RenderPassBeginInfo begin_info{
 			        .renderPass = *renderpass,
 			        .framebuffer = *it->second.framebuffers[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .renderArea = {.offset = {0, 0}, .extent = out_extent},
 			        .clearValueCount = 1,
 			        .pClearValues = &clear,
 			};
@@ -964,7 +967,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			section_clock raster_clk(&ms_raster);
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one raster pass per eye, no blur passes.
-			raster_silhouettes(it->second.framebuffers, extent);
+			// (Tier-0 groups submit full, so out matches working here.)
+			raster_silhouettes(it->second.framebuffers, out_extent);
 		}
 		else if (tier == 1)
 		{
@@ -1010,12 +1014,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			vk::RenderPassBeginInfo begin_v{
 			        .renderPass = *blur_renderpass,
 			        .framebuffer = *it->second.framebuffers[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .renderArea = {.offset = {0, 0}, .extent = out_extent},
 			        .clearValueCount = 1,
 			        .pClearValues = &clear,
 			};
 			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
-			set_full_viewport(extent);
+			set_full_viewport(out_extent);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
@@ -1126,12 +1130,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				vk::RenderPassBeginInfo begin_v{
 				        .renderPass = *blur_renderpass,
 				        .framebuffer = *it->second.framebuffers[eye],
-				        .renderArea = {.offset = {0, 0}, .extent = extent},
+				        .renderArea = {.offset = {0, 0}, .extent = out_extent},
 				        .clearValueCount = 1,
 				        .pClearValues = &clear,
 				};
 				cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
-				set_full_viewport(extent);
+				set_full_viewport(out_extent);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
 				std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
@@ -1180,9 +1184,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// construction): fullscreen LOAD/STORE traffic for a small
 				// debug rect would cost a full image round-trip per group.
 				// Any corner behind the camera falls back to fullscreen.
-				vk::Rect2D area{{0, 0}, extent};
+				// Bounds track the submitted (output) size, like the
+				// viewport below: NDC maps consistently at any size.
+				vk::Rect2D area{{0, 0}, out_extent};
 				bool behind = false;
-				float minx = (float)extent.width, miny = (float)extent.height;
+				float minx = (float)out_extent.width, miny = (float)out_extent.height;
 				float maxx = 0, maxy = 0;
 				for (const auto & v: quad)
 				{
@@ -1192,8 +1198,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 						behind = true;
 						break;
 					}
-					float px = (c.x / c.w * 0.5f + 0.5f) * (float)extent.width;
-					float py = (c.y / c.w * 0.5f + 0.5f) * (float)extent.height;
+					float px = (c.x / c.w * 0.5f + 0.5f) * (float)out_extent.width;
+					float py = (c.y / c.w * 0.5f + 0.5f) * (float)out_extent.height;
 					minx = std::min(minx, px);
 					miny = std::min(miny, py);
 					maxx = std::max(maxx, px);
@@ -1201,10 +1207,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}
 				if (not behind)
 				{
-					int32_t x0 = std::clamp<int32_t>((int32_t)std::floor(minx) - 1, 0, (int32_t)extent.width);
-					int32_t y0 = std::clamp<int32_t>((int32_t)std::floor(miny) - 1, 0, (int32_t)extent.height);
-					int32_t x1 = std::clamp<int32_t>((int32_t)std::ceil(maxx) + 1, 0, (int32_t)extent.width);
-					int32_t y1 = std::clamp<int32_t>((int32_t)std::ceil(maxy) + 1, 0, (int32_t)extent.height);
+					int32_t x0 = std::clamp<int32_t>((int32_t)std::floor(minx) - 1, 0, (int32_t)out_extent.width);
+					int32_t y0 = std::clamp<int32_t>((int32_t)std::floor(miny) - 1, 0, (int32_t)out_extent.height);
+					int32_t x1 = std::clamp<int32_t>((int32_t)std::ceil(maxx) + 1, 0, (int32_t)out_extent.width);
+					int32_t y1 = std::clamp<int32_t>((int32_t)std::ceil(maxy) + 1, 0, (int32_t)out_extent.height);
 					if (x1 <= x0 or y1 <= y0)
 						continue;
 					area = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
@@ -1216,7 +1222,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				        .clearValueCount = 0,
 				};
 				cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
-				set_full_viewport(extent);
+				set_full_viewport(out_extent);
 				cmd.setScissor(0, area);
 				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 				                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});

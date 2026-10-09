@@ -576,13 +576,17 @@ private:
 	uint32_t mask_ready_unmetered = 0;
 
 	// ~5s logcat window accumulators (mask perf line). Render thread only.
+	// Minima characterize dip frames (a 2ms total with two live groups =
+	// a skipped group that frame); group-count minima separate skips from
+	// uniformly-fast frames.
 	uint64_t mask_log_frames = 0;
-	double mask_log_sum_gpu = 0, mask_log_max_gpu = 0;
+	double mask_log_sum_gpu = 0, mask_log_max_gpu = 0, mask_log_min_gpu = 0;
 	double mask_log_sum_cpu = 0, mask_log_max_cpu = 0;
 	uint64_t mask_log_unmetered = 0;
+	uint64_t mask_log_min_groups = 0;
 	struct mask_feather_acc
 	{
-		double sum_gpu = 0, max_gpu = 0, sum_cpu = 0;
+		double sum_gpu = 0, max_gpu = 0, min_gpu = 0, sum_cpu = 0;
 		uint64_t frames = 0;
 		int tier = -1;
 		size_t draws = 0;
@@ -590,6 +594,9 @@ private:
 	std::map<float, mask_feather_acc> mask_log_per_feather;
 	XrTime last_mask_perf_log = 0;
 	void log_mask_perf(XrTime now);
+
+	// Last record order, for the permanent slow-slot disambiguation log.
+	std::vector<float> last_live_feathers;
 
 	void accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> & blit_handles, const gpu_timestamps & timestamps);
 	void gui_performance_metrics();

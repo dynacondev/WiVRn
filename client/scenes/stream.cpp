@@ -1219,6 +1219,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
+				// Member mask swapchains run at half resolution: the V
+				// upscale writes half pixels and the compositor expands to
+				// full on submit (bilinear, equivalent filtering to the old
+				// full-res V). Intermediates stay keyed off full mw/mh.
+				int hw = std::max(64, mw / 2);
+				int hh = std::max(64, mh / 2);
 				// View-only transforms shared by the cutouts.
 				std::array<glm::mat4, 2> world_mvp;
 				for (uint32_t view = 0; view < 2; ++view)
@@ -1267,6 +1273,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->set_mesh(oid, ost.soup);
 						g.mesh_hashes[oid] = ost.soup_hash;
 					}
+				}
+				// Permanent record-order log: group costs are positional, so
+				// the per-group loop order below is load-bearing diagnostics.
+				// Logged on change only (config/map edits, anchor flapping).
+				if (live_feathers != last_live_feathers)
+				{
+					last_live_feathers = live_feathers;
+					std::string order;
+					for (float of: live_feathers)
+						order += fmt::format("{:.1f} ", (double)of);
+					spdlog::info("Fiducial mask groups order: {}", order);
 				}
 				// Drop stale groups + stale member meshes. Use-then-advance:
 				// touching git->second after ++git reads past end().
@@ -1328,15 +1345,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.active = false;
 						continue;
 					}
-					if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
+					// Tier-0 groups keep a full-res swapchain (exact hard
+					// edge); feathered groups submit half (V writes half,
+					// compositor upscales). g.extent tracks the submitted
+					// size; record() still works intermediates at full.
+					int gw = (f <= 0) ? mw : hw;
+					int gh = (f <= 0) ? mh : hh;
+					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
 					{
 						// Rare path (first frame, feather/config change):
 						// nothing outstanding (previous images released last
 						// frame), mirroring setup_reprojection_swapchain.
 						device.waitIdle();
-						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
+						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
 						g.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px)", mw, mh, f);
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px)", gw, gh, f);
 					}
 					int mask_index = g.swapchain.acquire();
 					if (not g.swapchain.wait(100'000'000))
@@ -1356,7 +1379,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.wait_warned = false;
 					g.acquired = true;
-					g.extent = {mw, mh};
+					g.extent = {gw, gh};
 					// GPU brackets around the group's blur stack (slots pair
 					// with mask_frame_samples order for next frame's
 					// readback). The catch keeps TOP/BOTTOM paired: a missing
@@ -1370,7 +1393,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.renderer->record(
 						        command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						        not mask_bypass_cutout, f, cutouts, world_mvp, &stage_cpu);
+						        not mask_bypass_cutout, f, cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
 					}
 					catch (...)
 					{

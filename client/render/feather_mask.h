@@ -90,9 +90,11 @@ public:
 	// Record silhouettes + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
 	// be unused (UNDEFINED is fine); it is left in GENERAL for the
-	// compositor. Feather selects the tier (0 = hard edge raster direct,
-	// 1 = full-res blur, 2/4/8 = blur at half/quarter/eighth with exact
-	// spread mapping, clamped to 128px); rasterize=false clears only.
+	// compositor. extent sizes the intermediates (full); out_extent sizes
+	// the submitted image and its passes (half for feathered groups: V
+	// writes half pixels, the compositor upscales on submit; equal for
+	// tier-0). Feather selects the tier as documented; rasterize=false
+	// clears only.
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Mask path only (the binary projected layer has
@@ -105,7 +107,8 @@ public:
 	            float feather_px,
 	            const std::vector<std::array<glm::vec3, 6>> & cutouts,
 	            const std::array<glm::mat4, 2> & cutout_mvp,
-	            mask_stage_cpu * cpu_stats = nullptr);
+	            mask_stage_cpu * cpu_stats,
+	            vk::Extent2D out_extent);
 
 	bool has_mesh() const
 	{

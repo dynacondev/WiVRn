@@ -129,6 +129,10 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		mask_gpu_sum_ms += s.gpu_ms;
 		mask_cpu_sum_ms += s.cpu.total_ms;
 		auto & acc = mask_log_per_feather[s.feather_px];
+		if (acc.frames == 0)
+			acc.min_gpu = s.gpu_ms;
+		else
+			acc.min_gpu = std::min(acc.min_gpu, s.gpu_ms);
 		acc.sum_gpu += s.gpu_ms;
 		acc.max_gpu = std::max(acc.max_gpu, s.gpu_ms);
 		acc.sum_cpu += s.cpu.total_ms;
@@ -144,6 +148,16 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	++mask_log_frames;
 	mask_log_sum_gpu += mask_gpu_sum_ms;
 	mask_log_max_gpu = std::max(mask_log_max_gpu, mask_gpu_sum_ms);
+	if (mask_log_frames == 1)
+	{
+		mask_log_min_gpu = mask_gpu_sum_ms;
+		mask_log_min_groups = mask_ready_samples.size();
+	}
+	else
+	{
+		mask_log_min_gpu = std::min(mask_log_min_gpu, mask_gpu_sum_ms);
+		mask_log_min_groups = std::min(mask_log_min_groups, (uint64_t)mask_ready_samples.size());
+	}
 	mask_log_sum_cpu += mask_cpu_sum_ms;
 	mask_log_max_cpu = std::max(mask_log_max_cpu, mask_cpu_sum_ms);
 	mask_log_unmetered += mask_ready_unmetered;
@@ -211,27 +225,31 @@ void scenes::stream::log_mask_perf(XrTime now)
 	{
 		if (a.frames == 0)
 			continue;
-		detail += fmt::format("[f={:.1f} n={} gpu={:.2f}/{:.2f}ms cpu={:.2f}ms tier={} draws={}] ",
+		detail += fmt::format("[f={:.1f} n={} gpu={:.2f}/{:.2f}/{:.2f}ms cpu={:.2f}ms tier={} draws={}] ",
 		                      f,
 		                      a.frames,
 		                      a.sum_gpu / (double)a.frames,
 		                      a.max_gpu,
+		                      a.min_gpu,
 		                      a.sum_cpu / (double)a.frames,
 		                      a.tier,
 		                      a.draws);
 	}
-	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max, record cpu {:.2f}ms mean / {:.2f} max, unmetered {} {}",
+	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max / {:.2f} min, groups min {}, record cpu {:.2f}ms mean / {:.2f} max, unmetered {} {}",
 	             mask_log_frames,
 	             mask_log_sum_gpu / (double)mask_log_frames,
 	             mask_log_max_gpu,
+	             mask_log_min_gpu,
+	             mask_log_min_groups,
 	             mask_log_sum_cpu / (double)mask_log_frames,
 	             mask_log_max_cpu,
 	             mask_log_unmetered,
 	             detail);
 	mask_log_frames = 0;
-	mask_log_sum_gpu = mask_log_max_gpu = 0;
+	mask_log_sum_gpu = mask_log_max_gpu = mask_log_min_gpu = 0;
 	mask_log_sum_cpu = mask_log_max_cpu = 0;
 	mask_log_unmetered = 0;
+	mask_log_min_groups = 0;
 	mask_log_per_feather.clear();
 }
 
