@@ -506,12 +506,16 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 	// images, mirroring setup_reprojection_swapchain.
 	device.waitIdle();
 	targets_extent = extent;
+	// A/B intermediates at half mask resolution (the mask extent is
+	// 64-quantized upstream, hence evenly divisible); tier-1 raster and
+	// H run small, V upscales to full on submit.
+	vk::Extent2D half_targets = level_extent(extent, 1);
 	for (auto * target: {&target_a, &target_b})
 	{
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
 		        .format = format,
-		        .extent = {extent.width, extent.height, 1},
+		        .extent = {half_targets.width, half_targets.height, 1},
 		        .mipLevels = 1,
 		        .arrayLayers = 2,
 		        .samples = vk::SampleCountFlagBits::e1,
@@ -559,8 +563,8 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			        .renderPass = *renderpass,
 			        .attachmentCount = 1,
 			        .pAttachments = &raw_views[layer],
-			        .width = extent.width,
-			        .height = extent.height,
+			        .width = half_targets.width,
+			        .height = half_targets.height,
 			        .layers = 1,
 			};
 			target->raster_fbs.emplace_back(device, fb_info);
@@ -629,7 +633,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			}
 		}
 	}
-	spdlog::info("Fiducial mask blur targets: {}x{}", extent.width, extent.height);
+	spdlog::info("Fiducial mask blur targets: {}x{} (A/B at half, levels below)", extent.width, extent.height);
 }
 
 void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh)
@@ -896,12 +900,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			flush_upload(cmd, mesh);
 		ensure_targets(extent);
 
-		// Tier from feather-px (see header): 0 hard edge, 1 direct
-		// full-res, 2/4/8 downsampled. Band stays ±F/2 by construction,
-		// so width is continuous across tiers; tap density stays in the
-		// proven regime everywhere. Values past 128 clamp (documented).
+		// Tier from feather-px (see header): 0 hard edge, 1 half-res
+		// blur with full-res upscale, 2/4/8 downsampled. Band stays ±F/2
+		// by construction, so width is continuous across tiers; tap
+		// density stays in the proven regime everywhere. Values past 128
+		// clamp (documented).
 		// Selected before raster: tier 0 goes straight into the swapchain
-		// image, tier 1 via the A intermediate, tiered via a level-1 seed.
+		// image, tier 1 via the half-res A/B intermediates with full-res
+		// upscale, tiered via a level-1 seed.
 		float f = feather_px;
 		int tier = 1;
 		float spread = 1.0f;
@@ -911,8 +917,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		{
 			if (f > 128)
 				f = 128;
+			// Tier-1 blur runs at half resolution (H in half-texels, V in
+			// full): spread f/12 keeps the output band identical to the
+			// old full-res f/8 (chained-sigma match within 5%).
 			if (f <= 16)
-				spread = f / 8.f;
+				spread = f / 12.f;
 			else if (f <= 48)
 			{
 				tier = 2;
@@ -930,15 +939,19 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 		}
 
-		// Stage 1: binary silhouettes into A (full resolution) for the
-		// tier-1 path. Tiered paths seed-rasterize at level 1 directly
-		// (below, collapsing the old full-res raster + downsample pair);
-		// tier 0 has its own direct raster into the swapchain image.
+		// Half-res working extent for the A/B intermediates (the mask
+		// extent is 64-quantized upstream, hence evenly divisible).
+		vk::Extent2D half_extent = level_extent(extent, 1);
+
+		// Stage 1: binary silhouettes into half-res A for the tier-1
+		// path. Tiered paths seed-rasterize at level 1 directly (below,
+		// collapsing the old full-res raster + downsample pair); tier 0
+		// has its own direct raster into the swapchain image.
 		tier_out = tier;
 		if (tier == 1)
 		{
 			section_clock raster_clk(&ms_raster);
-			raster_silhouettes(target_a.raster_fbs, extent);
+			raster_silhouettes(target_a.raster_fbs, half_extent);
 			make_readable(*target_a.image);
 		}
 
@@ -953,13 +966,15 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		else if (tier == 1)
 		{
 			section_clock blur_clk(&ms_blur);
-		// Stages 2+3: separable Gaussian H into B, V into the swapchain.
+		// Stages 2+3: separable Gaussian H into half-res B, V upscale
+		// into the full-res swapchain image (the sampler's bilinear step
+		// is the final upscale, free). Texel tracks the half-res source.
 		// One descriptor set per eye (see header): re-pointed per pass.
 		// (Kept at this indent deliberately: byte-identical to the proven
 		// path; the tier branches above/below own their nesting.)
 		std::array<uint32_t, 0> no_offsets{};
 		blur_push base{
-		        .texel = {1.f / extent.width, 1.f / extent.height},
+		        .texel = {1.f / half_extent.width, 1.f / half_extent.height},
 		        .spread = spread,
 		};
 		for (int eye = 0; eye < 2; ++eye)
@@ -968,12 +983,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			vk::RenderPassBeginInfo begin_h{
 			        .renderPass = *blur_renderpass,
 			        .framebuffer = *target_b.blur_fbs[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .renderArea = {.offset = {0, 0}, .extent = half_extent},
 			        .clearValueCount = 1,
 			        .pClearValues = &clear,
 			};
 			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
-			set_full_viewport(extent);
+			set_full_viewport(half_extent);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);

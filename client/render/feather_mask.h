@@ -21,8 +21,9 @@
 // Feathered passthrough window mask.
 //
 // Per frame (both eyes): rasterize the calibrated mesh silhouette binary
-// at full resolution into intermediate A, separable Gaussian blur H into
-// B and V into the submitted swapchain image. The blur decouples feather
+// at half resolution into intermediate A, separable Gaussian blur H into
+// B and V upscale into the submitted swapchain image (the sampler's
+// bilinear step is the final upscale, free). The blur decouples feather
 // width from shape resolution: opaque interiors stay pixel-exact while
 // the band is genuinely smooth (robust to the compositor sampling with or
 // without filtering). Fixed 5-tap kernel (sigma 2, tails truncated);
