@@ -857,6 +857,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	auto & fp = fiducial_passthrough;
 	bool mask_frame = false;
 	bool mask_acquired = false;
+	// Fiducial debug overlays (tinted quads at raw sighting poses). The
+	// white texture is acquired/filled here (command buffer still open)
+	// and released after submit, mirroring the mask swapchain pairing.
+	bool debug_acquired = false;
 
 	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
@@ -1265,7 +1269,99 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_frame = false;
 		}
 
+		// Debug overlay texture: 4x4 white, tinted per quad via
+		// colorScaleBias at submit (after draw_gui, so overlays sit on
+		// top of everything). Refilled every acquire (trivial cost, no
+		// per-image tracking). Command buffer still open here.
+		if (fp.debug_overlays and (fp.debug_matched or fp.debug_unmatched))
+		{
+			bool any = false;
+			for (const auto & [id, h]: fp.held_codes)
+			{
+				(void)id;
+				if (h.extents.width > 0 and h.extents.height > 0 and
+				    ((h.matched and fp.debug_matched) or (not h.matched and fp.debug_unmatched)))
+				{
+					any = true;
+					break;
+				}
+			}
+			if (any)
+			{
+				// Outstanding tracks the acquire so a mid-fill throw still
+				// releases (never break the acquire/release pairing).
+				bool outstanding = false;
+				try
+				{
+					if (not fp.debug_swapchain)
+					{
+						device.waitIdle();
+						fp.debug_swapchain = xr::swapchain(instance, session, device, swapchain_format, 4, 4);
+						spdlog::info("Fiducial debug overlay swapchain: 4x4");
+					}
+					int debug_index = fp.debug_swapchain.acquire();
+					if (not fp.debug_swapchain.wait(100'000'000))
+					{
+						fp.debug_swapchain.release();
+					}
+					else
+					{
+						outstanding = true;
+						vk::Image dbg = fp.debug_swapchain.image(debug_index);
+						vk::ImageSubresourceRange range{
+						        .aspectMask = vk::ImageAspectFlagBits::eColor,
+						        .baseMipLevel = 0,
+						        .levelCount = 1,
+						        .baseArrayLayer = 0,
+						        .layerCount = 1,
+						};
+						command_buffer.pipelineBarrier(
+						        vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
+						        vk::ImageMemoryBarrier{
+						                .srcAccessMask = {},
+						                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+						                .oldLayout = vk::ImageLayout::eUndefined,
+						                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+						                .image = dbg,
+						                .subresourceRange = range,
+						        });
+						vk::ClearColorValue white(1, 1, 1, 1);
+						command_buffer.clearColorImage(dbg, vk::ImageLayout::eTransferDstOptimal, white, range);
+						command_buffer.pipelineBarrier(
+						        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {},
+						        vk::ImageMemoryBarrier{
+						                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+						                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+						                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+						                .newLayout = vk::ImageLayout::eGeneral,
+						                .image = dbg,
+						                .subresourceRange = range,
+						        });
+						debug_acquired = true;
+						outstanding = false;
+					}
+				}
+				catch (std::exception & e)
+				{
+					spdlog::warn("Fiducial debug overlay acquire failed: {}", e.what());
+					if (outstanding)
+					{
+						outstanding = false;
+						try
+						{
+							fp.debug_swapchain.release();
+						}
+						catch (std::exception & e2)
+						{
+							spdlog::warn("Fiducial debug overlay release failed: {}", e2.what());
+						}
+					}
+				}
+			}
+		}
+
 		command_buffer.end();
+
 		vk::SubmitInfo submit_info;
 		submit_info.setCommandBuffers(*command_buffer);
 
@@ -1299,6 +1395,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Paired with the mask acquire above: same guard, adjacent lines.
 		if (mask_frame)
 			mask_swapchain.release();
+		// Paired with the debug overlay acquire above.
+		if (debug_acquired)
+			fp.debug_swapchain.release();
 
 		// Surface-projected passthrough needs the FB passthrough object
 		// alive even for opaque (non-alpha) server video
@@ -1391,6 +1490,38 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
 
 		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+
+		// Fiducial debug overlays last: raw sighting quads (green matched,
+		// red unmatched, SLAM-held) on top of video, mask and passthrough.
+		// White texture from above, tint + opacity via colorScaleBias.
+		if (debug_acquired)
+		{
+			for (const auto & [id, h]: fp.held_codes)
+			{
+				(void)id;
+				if (h.matched and not fp.debug_matched)
+					continue;
+				if (not h.matched and not fp.debug_unmatched)
+					continue;
+				if (h.extents.width <= 0 or h.extents.height <= 0)
+					continue;
+				float a = std::clamp(fp.debug_opacity, 0.f, 1.f);
+				float r = h.matched ? 0.f : 1.f;
+				float g = h.matched ? 1.f : 0.f;
+				add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+				               application::space(xr::spaces::world),
+				               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
+				               XrSwapchainSubImage{
+				                       .swapchain = fp.debug_swapchain,
+				                       .imageRect = {{0, 0}, {4, 4}},
+				                       .imageArrayIndex = 0,
+				               },
+				               h.pose,
+				               XrExtent2Df{h.extents.width, h.extents.height});
+				if (composition_layer_color_scale_bias_supported)
+					set_color_scale_bias({r * a, g * a, 0.f, a}, {});
+			}
+		}
 
 		// First frames of each mask activation are traced end to end: a hang
 		// with no further lines localizes to inside end_frame (compositor

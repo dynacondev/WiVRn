@@ -188,6 +188,18 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		{
 			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag, entry->is_static);
 			marker_tracker->update(world_space, instance.now(), predicted_display_time);
+			// Debug hold-store: every sighted code at its raw instant
+			// pose; entries freeze (SLAM hold) when unseen. Runs even
+			// before calibration so raw positions are always visible.
+			for (const auto & s: marker_tracker->sightings())
+			{
+				auto & h = fp.held_codes[s.entity_id];
+				h.payload = s.payload.substr(0, 64);
+				h.pose = s.pose;
+				h.extents = s.extents;
+				h.last_seen = s.time;
+				h.matched = s.matched;
+			}
 		}
 	}
 
@@ -207,6 +219,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.continuous = false;
 			fp.novel_ingested = 0;
 			fp.fade_start = 0;
+			fp.held_codes.clear();
 			if (fp.ready)
 			{
 				spdlog::info("Fiducial map changed, clearing projected mesh");
@@ -517,6 +530,39 @@ void scenes::stream::gui_passthrough()
 {
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR-anchored passthrough meshes, marker tracking and alignment."));
 	gui_fiducial_status();
+
+	auto & fp = fiducial_passthrough;
+	ImGui::SeparatorText(_S("Fiducial marker debugging"));
+	ImGui::Checkbox(_S("Marker debug overlays"), &fp.debug_overlays);
+	ImGui::BeginDisabled(not fp.debug_overlays);
+	ImGui::Checkbox(_S("Matched markers (green)"), &fp.debug_matched);
+	ImGui::Checkbox(_S("Unmatched codes (red)"), &fp.debug_unmatched);
+	float pct = fp.debug_opacity * 100;
+	if (ImGui::SliderFloat(_S("Debug overlay opacity"), &pct, 0, 100, "%.0f%%"))
+		fp.debug_opacity = std::clamp(pct / 100, 0.f, 1.f);
+	ImGui::BeginDisabled(true);
+	ImGui::Text("%s", _S("Multi-code corrected position (orange) — coming later"));
+	ImGui::EndDisabled();
+	if (not fp.held_codes.empty())
+	{
+		ImGui::Text("%s (%zu):", _S("Codes in view"), fp.held_codes.size());
+		ImGui::BeginChild("debug_codes", {0, 140});
+		for (const auto & [id, h]: fp.held_codes)
+		{
+			(void)id;
+			ImVec4 dot = h.matched ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
+			double age_s = (instance.now() - h.last_seen) * 1e-9;
+			ImGui::TextColored(dot, "%s", h.matched ? "[o]" : "[x]");
+			ImGui::SameLine();
+			ImGui::Text("%.40s (%.0fx%.0fmm, %.1fs ago)",
+			            h.payload.c_str(),
+			            (double)(h.extents.width * 1000),
+			            (double)(h.extents.height * 1000),
+			            age_s);
+		}
+		ImGui::EndChild();
+	}
+	ImGui::EndDisabled();
 }
 
 void scenes::stream::gui_fiducial_status()

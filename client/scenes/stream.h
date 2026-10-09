@@ -283,6 +283,27 @@ private:
 		float target_render_err_mm = 0;
 		float target_render_err_deg = 0;
 
+		// Fiducial marker debugging (Passthrough tab, session-scoped,
+		// render thread only). Raw instant poses while visible, frozen
+		// SLAM hold when lost; overlays submit even before calibration.
+		bool debug_overlays = false; // master toggle
+		bool debug_matched = true;   // green: configured payload
+		bool debug_unmatched = true; // red: anything else sighted
+		float debug_opacity = 0.5f;  // overlay alpha, 0..1
+		struct held_code
+		{
+			std::string payload; // truncated to 64 chars (QR data is unbounded)
+			XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+			XrExtent2Df extents{0, 0};
+			XrTime last_seen = 0;
+			bool matched = false;
+		};
+		std::unordered_map<XrSpatialEntityIdEXT, held_code> held_codes;
+		// Shared white overlay texture (tinted per layer via
+		// colorScaleBias). Explicit acquire/fill/release pairing like the
+		// mask swapchain, never the shared pool.
+		xr::swapchain debug_swapchain;
+
 		// First-acquisition alpha fade (mask-blend path only: the binary
 		// projected layer type has no opacity control). fade_start stamps
 		// the seed (auto-anchor / calibrate / re-seed) in predicted-time
