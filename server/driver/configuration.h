@@ -85,7 +85,6 @@ struct configuration
 		// Continuous-mode tuning; all optional, all live per map (a change
 		// re-seeds the filter like any other map change). Shared Euro
 		// cutoff/beta cover both position and orientation.
-		float update_hz = 10;
 		int window_size = 12;
 		int min_samples = 4;
 		float sigma_k = 3;

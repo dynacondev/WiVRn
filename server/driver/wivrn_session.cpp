@@ -1013,7 +1013,6 @@ void wivrn_session::send_fiducial_map()
 		        .feather_px = entry.feather_px,
 		        .mode = entry.mode,
 		        .is_static = entry.is_static,
-		        .update_hz = entry.update_hz,
 		        .window_size = entry.window_size,
 		        .min_samples = entry.min_samples,
 		        .sigma_k = entry.sigma_k,

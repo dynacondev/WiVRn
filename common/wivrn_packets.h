@@ -1003,8 +1003,8 @@ struct fiducial_map_entry
 	// Stationary rig hint (optimizeForStaticMarker). True by default.
 	bool is_static = true;
 	// Continuous-mode live update rate + filter/smoothing tuning.
-	// Shared Euro cutoff/beta cover position and orientation.
-	float update_hz = 10;
+	// Poses refresh every frame (no timers); the filter ingests novel
+	// samples only. Shared Euro cutoff/beta cover position and orientation.
 	int window_size = 12;
 	int min_samples = 4;
 	float sigma_k = 3;

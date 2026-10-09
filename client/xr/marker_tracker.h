@@ -20,6 +20,7 @@
 
 #include "utils/handle.h"
 #include <cstdint>
+#include <map>
 #include <openxr/openxr.h>
 #include <optional>
 #include <set>
@@ -42,8 +43,9 @@ class system;
 // marker entities on this runtime).
 //
 // Driven from the render thread (one update() per frame): async context
-// creation, then throttled discovery snapshots whose MARKER + BOUNDED_2D
-// components yield the marker pose in the given base space.
+// creation, throttled discovery snapshots for acquisition, then a
+// synchronous update snapshot every frame for all latched entities whose
+// MARKER + BOUNDED_2D components yield poses in the given base space.
 class marker_tracker
 {
 public:
@@ -65,16 +67,16 @@ public:
 	static bool supported(instance &);
 
 	// (Re)configure for a marker; kicks off async context creation.
-	// No-op when already configured for the same size/payload/static/rate,
-	// and throttled by the failure backoff (no per-frame re-attempt spam).
+	// No-op when already configured for the same size/payload/static, and
+	// throttled by the failure backoff (no per-frame re-attempt spam).
 	// Payload is required: QR runtimes report markerId 0, so identity is
 	// the payload alone. Tag is display-only (UI/logs) and never gates:
 	// a rename updates the label live without restarting tracking.
 	// is_static maps to optimizeForStaticMarker: toggling it recreates the
-	// spatial context (brief tracking hitch). update_hz is the live
-	// update-snapshot rate for the latched entity (discovery stays at 2Hz
-	// for acquisition); clamped to [1, 30].
-	void configure(float marker_size_m, std::string marker_payload, std::string tag, bool is_static = true, float update_hz = 10);
+	// spatial context (brief tracking hitch). Poses for all known codes
+	// refresh every frame via update snapshots (no timers); the detector
+	// is slower, so repeats are flagged novel=false.
+	void configure(float marker_size_m, std::string marker_payload, std::string tag, bool is_static = true);
 
 	// Advance the async state machine + throttled discovery.
 	// Render thread only. predicted_time stamps the discovery snapshot.
@@ -105,9 +107,22 @@ public:
 	{
 		return marker_static;
 	}
-	float configured_update_hz() const
+	// Every code sighted by the latest snapshot pass (matched entry and
+	// unmatched alike), refreshed every frame. Consumers hold their own
+	// SLAM state from this; entries vanish when unseen (no hold here).
+	struct code_sighting
 	{
-		return marker_update_hz;
+		std::string payload;
+		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrExtent2Df extents{0, 0};
+		XrSpatialEntityIdEXT entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
+		XrTime time = 0;
+		bool matched = false;
+		bool novel = false;
+	};
+	const std::vector<code_sighting> & sightings() const
+	{
+		return all_sightings;
 	}
 	// (novel, total) update-snapshot counts for dup% diagnostics.
 	std::pair<uint64_t, uint64_t> update_stats() const
@@ -156,7 +171,6 @@ private:
 	float marker_size_m = 0;
 	std::string marker_payload; // exact QR payload to match (required)
 	bool marker_static = true;
-	float marker_update_hz = 10;
 	// Unconfigured payloads already reported (capped: diagnostic only)
 	std::set<std::string> unknown_payloads_logged;
 	// Snapshot content diagnostics: count transitions log at info (silence
@@ -180,29 +194,33 @@ private:
 	spatial_context_handle spatial_context;
 
 	XrTime last_discovery_start = 0;
-	XrTime last_update_start = 0;
 	XrTime retry_at = 0;
 	XrTime last_now = 0;
 	bool discovery_failed_once = false;
 	bool discovery_running_logged = false;
 	bool update_unsupported_logged = false;
 
-	// Live entity latched from discovery (update snapshots need handles,
-	// not ids). Recreated when the matching discovery entity id changes;
-	// destroyed on (re)configure.
-	spatial_entity_handle spatial_entity;
-	XrSpatialEntityIdEXT tracked_entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
+	// Live entities latched from discovery (update snapshots need handles,
+	// not ids), one per sighted code so unmatched codes refresh at the
+	// same frame cadence. Recreated on discovery matches; cleared when the
+	// runtime reports an id invalid. Discovery re-latches within a beat.
+	std::map<XrSpatialEntityIdEXT, spatial_entity_handle> spatial_entities;
+
+	// All codes from the latest snapshot pass (see sightings()). Rebuilt
+	// every discovery/update; render thread only.
+	std::vector<code_sighting> all_sightings;
 
 	// Update-snapshot duplicate accounting: the detector is slower than
-	// the query rate, so most snapshots echo the previous pose. Novel
+	// the frame rate, so most snapshots echo the previous pose. Novel
 	// samples feed the continuous filter; repeats are counted and logged
-	// as a percentage.
+	// as a percentage. Counted per entity queried.
 	uint64_t update_queries_total = 0;
 	uint64_t update_queries_novel = 0;
 	int last_dup_pct = -1;
 	XrTime last_dup_log = 0;
-	XrPosef last_reported_pose{{0, 0, 0, 1}, {0, 0, 0}};
-	bool has_reported_pose = false;
+	// Last reported pose per entity for echo detection (exact float
+	// compare: the runtime repeats values bit-identically on echo).
+	std::map<XrSpatialEntityIdEXT, XrPosef> last_poses;
 
 	sighting current;
 	std::string status_text = "idle";
@@ -226,11 +244,13 @@ private:
 	void complete_context();
 	void start_discovery();
 	void complete_discovery(XrSpace world_space, XrTime predicted_time);
-	// Synchronous live pose refresh for the latched entity at update_hz.
-	// No re-enumeration, no payload decode: the cheapest fresh pose.
+	// Synchronous live pose refresh for all latched entities, every frame.
+	// No re-enumeration, no timers: novelty is reported per entity via
+	// code_sighting::novel so consumers overlay exactly on new data.
 	void update_snapshot(XrSpace world_space, XrTime now, XrTime predicted_time);
 	void ensure_entity(XrSpatialEntityIdEXT id);
-	void note_sample(const XrPosef & pose, XrTime predicted_time);
+	// Echo check for one entity pose; records current pose on novel.
+	bool note_pose(XrSpatialEntityIdEXT id, const XrPosef & pose);
 	void log_dup_stats(XrTime now);
 };
 } // namespace xr

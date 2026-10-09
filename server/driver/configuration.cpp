@@ -283,8 +283,6 @@ configuration::configuration()
 				}
 				if (item.contains("static"))
 					e.is_static = item["static"];
-				if (item.contains("update-hz"))
-					e.update_hz = item["update-hz"];
 				if (item.contains("window-size"))
 					e.window_size = item["window-size"];
 				if (item.contains("min-samples"))

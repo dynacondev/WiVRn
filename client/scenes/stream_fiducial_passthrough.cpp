@@ -152,7 +152,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			map_key += ';';
 			map_key += e.is_static ? 'S' : 'M';
 			map_key += ';';
-			map_key += std::to_string(e.update_hz) + ',' + std::to_string(e.window_size) + ',' +
+			map_key += std::to_string(e.window_size) + ',' +
 			        std::to_string(e.min_samples) + ',' + std::to_string(e.sigma_k) + ',' +
 			        std::to_string(e.pos_gain) + ',' + std::to_string(e.rot_gain) + ',' +
 			        std::to_string(e.euro_min_cutoff) + ',' + std::to_string(e.euro_beta) + ',' +
@@ -186,7 +186,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		}
 		if (marker_tracker)
 		{
-			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag, entry->is_static, entry->update_hz);
+			marker_tracker->configure(entry->marker_size_m, entry->marker_data, entry->tag, entry->is_static);
 			marker_tracker->update(world_space, instance.now(), predicted_display_time);
 		}
 	}

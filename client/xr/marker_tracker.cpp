@@ -64,8 +64,7 @@ xr::marker_tracker::marker_tracker(instance & inst_, session & sess_, system & s
         xrGetSpatialBufferUint8EXT(inst_.get_proc<PFN_xrGetSpatialBufferUint8EXT>("xrGetSpatialBufferUint8EXT")),
         xrDestroySpatialContextEXT(inst_.get_proc<PFN_xrDestroySpatialContextEXT>("xrDestroySpatialContextEXT")),
         xrDestroySpatialSnapshotEXT(inst_.get_proc<PFN_xrDestroySpatialSnapshotEXT>("xrDestroySpatialSnapshotEXT")),
-        spatial_context{xrDestroySpatialContextEXT},
-        spatial_entity{xrDestroySpatialEntityEXT}
+        spatial_context{xrDestroySpatialContextEXT}
 {
 }
 
@@ -96,14 +95,13 @@ bool xr::marker_tracker::poll_ready(XrFutureEXT future, bool & ready)
 	return true;
 }
 
-void xr::marker_tracker::configure(float size_m, std::string payload, std::string tag, bool is_static, float update_hz)
+void xr::marker_tracker::configure(float size_m, std::string payload, std::string tag, bool is_static)
 {
 	// The tag is display-only: store it before the no-op check so a
 	// rename updates the UI label without restarting tracking.
 	marker_tag = std::move(tag);
-	update_hz = std::clamp(update_hz, 1.f, 30.f);
 	if (size_m == marker_size_m and payload == marker_payload and is_static == marker_static and
-	    update_hz == marker_update_hz and current_state != state::failed and current_state != state::idle)
+	    current_state != state::failed and current_state != state::idle)
 		return;
 
 	// Failure backoff: configure() is called every frame, attempts only on
@@ -114,7 +112,6 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	marker_size_m = size_m;
 	marker_payload = std::move(payload);
 	marker_static = is_static;
-	marker_update_hz = update_hz;
 	unknown_payloads_logged.clear();
 	bounded_warned = false;
 	discovery_running_logged = false;
@@ -127,15 +124,14 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	context_future = XR_NULL_FUTURE_EXT;
 	discovery_future = XR_NULL_FUTURE_EXT;
 	spatial_context = spatial_context_handle{xrDestroySpatialContextEXT};
-	// Entity handles die with their context; the next discovery match
-	// re-latches. Stats reset per configure for a clean dup%.
-	spatial_entity = spatial_entity_handle{xrDestroySpatialEntityEXT};
-	tracked_entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
-	last_update_start = 0;
+	// Entity handles die with their context; discovery re-latches within
+	// a beat. Stats reset per configure for a clean dup%.
+	spatial_entities.clear();
+	all_sightings.clear();
+	last_poses.clear();
 	update_queries_total = 0;
 	update_queries_novel = 0;
 	last_dup_pct = -1;
-	has_reported_pose = false;
 	current_state = state::idle;
 	status_text = "checking capabilities";
 
@@ -144,9 +140,9 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 		fail("fiducial map entry has no QR payload (marker-data)");
 		return;
 	}
-	spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\" ({}, {:.0f}Hz updates)",
+	spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\" ({})",
 	             label(), (double)(size_m * 1000), marker_payload.substr(0, 64),
-	             marker_static ? "static" : "moving", (double)marker_update_hz);
+	             marker_static ? "static" : "moving");
 
 	if (marker_size_m <= 0)
 	{
@@ -484,6 +480,10 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		}
 		bool found = false;
 		uint32_t unreadable = 0;
+		// All readable codes are reported (matched and otherwise): the
+		// debug overlays show every code in view, and every entity id is
+		// latched so the per-frame update path refreshes them all.
+		all_sightings.clear();
 		for (uint32_t i = 0; i < count; ++i)
 		{
 			// QR runtimes report markerId 0: identity is the payload
@@ -493,7 +493,8 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 				++unreadable;
 				continue;
 			}
-			if (*payload != marker_payload)
+			bool matched = *payload == marker_payload;
+			if (not matched)
 			{
 				// Diagnostic: capped, so a room full of foreign QR
 				// codes shows what strings exist without spamming
@@ -501,8 +502,24 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 				    unknown_payloads_logged.insert(*payload).second)
 					spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
 					             payload->substr(0, 64));
-				continue;
 			}
+			XrSpatialEntityIdEXT eid = i < result.entityIdCountOutput ? entity_ids[i] : XR_NULL_SPATIAL_ENTITY_ID_EXT;
+			ensure_entity(eid);
+			if (eid != XR_NULL_SPATIAL_ENTITY_ID_EXT)
+				last_poses[eid] = bound_boxes[i].center;
+			all_sightings.push_back(code_sighting{
+			        .payload = *payload,
+			        .pose = bound_boxes[i].center,
+			        .extents = bound_boxes[i].extents,
+			        .entity_id = eid,
+			        .time = predicted_time,
+			        .matched = matched,
+			        // Discovery is acquisition: always novel so consumers
+			        // seed even if the pose later echoes.
+			        .novel = true,
+			});
+			if (not matched)
+				continue;
 			if (not current.tracked)
 			{
 				const auto & c = bound_boxes[i].center;
@@ -512,20 +529,12 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 				             c.orientation.x, c.orientation.y, c.orientation.z, c.orientation.w,
 				             e.width, e.height);
 			}
-			// Discovery is acquisition: latch the entity for the cheap
-			// synchronous update path, always report novel so the
-			// continuous filter seeds even if the pose echoes.
-			if (i < result.entityIdCountOutput)
-				ensure_entity(entity_ids[i]);
 			current.tracked = true;
 			current.pose = bound_boxes[i].center;
 			current.time = predicted_time;
 			current.novel = true;
-			last_reported_pose = current.pose;
-			has_reported_pose = true;
 			status_text = "tracking marker";
 			found = true;
-			break;
 		}
 		if (not found)
 		{
@@ -553,7 +562,7 @@ void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
 {
 	if (id == XR_NULL_SPATIAL_ENTITY_ID_EXT)
 		return;
-	if (tracked_entity_id == id and spatial_entity)
+	if (spatial_entities.contains(id))
 		return;
 	XrSpatialEntityFromIdCreateInfoEXT from_id{
 	        .type = XR_TYPE_SPATIAL_ENTITY_FROM_ID_CREATE_INFO_EXT,
@@ -565,33 +574,26 @@ void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
 		spdlog::debug("marker_tracker: cannot create entity from id: {}", (int)res);
 		return;
 	}
-	spatial_entity = spatial_entity_handle(entity, xrDestroySpatialEntityEXT);
-	tracked_entity_id = id;
+	spatial_entities.emplace(id, spatial_entity_handle(entity, xrDestroySpatialEntityEXT));
 }
 
-void xr::marker_tracker::note_sample(const XrPosef & pose, XrTime predicted_time)
+bool xr::marker_tracker::note_pose(XrSpatialEntityIdEXT id, const XrPosef & pose)
 {
 	// Detector-echo check: the runtime repeats the identical pose when the
 	// CV pipeline has nothing new. Exact float compare is intentional:
 	// these values come back bit-identical on echo.
-	bool same = has_reported_pose and
-	    pose.position.x == last_reported_pose.position.x and
-	    pose.position.y == last_reported_pose.position.y and
-	    pose.position.z == last_reported_pose.position.z and
-	    pose.orientation.x == last_reported_pose.orientation.x and
-	    pose.orientation.y == last_reported_pose.orientation.y and
-	    pose.orientation.z == last_reported_pose.orientation.z and
-	    pose.orientation.w == last_reported_pose.orientation.w;
-	current.tracked = true;
-	current.pose = pose;
-	current.time = predicted_time;
-	current.novel = not same;
+	auto it = last_poses.find(id);
+	bool same = it != last_poses.end() and
+	    pose.position.x == it->second.position.x and
+	    pose.position.y == it->second.position.y and
+	    pose.position.z == it->second.position.z and
+	    pose.orientation.x == it->second.orientation.x and
+	    pose.orientation.y == it->second.orientation.y and
+	    pose.orientation.z == it->second.orientation.z and
+	    pose.orientation.w == it->second.orientation.w;
 	if (not same)
-	{
-		last_reported_pose = pose;
-		has_reported_pose = true;
-	}
-	status_text = "tracking marker";
+		last_poses[id] = pose;
+	return not same;
 }
 
 void xr::marker_tracker::log_dup_stats(XrTime now)
@@ -611,7 +613,7 @@ void xr::marker_tracker::log_dup_stats(XrTime now)
 
 void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime predicted_time)
 {
-	if (not spatial_entity)
+	if (spatial_entities.empty())
 		return;
 	if (not xrCreateSpatialUpdateSnapshotEXT)
 	{
@@ -623,11 +625,14 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		return;
 	}
 	const XrSpatialComponentTypeEXT * types = bounded_pose ? marker_and_bounds : marker_only;
-	XrSpatialEntityEXT entity = spatial_entity;
+	std::vector<XrSpatialEntityEXT> entities;
+	entities.reserve(spatial_entities.size());
+	for (const auto & [id, handle]: spatial_entities)
+		entities.push_back(handle);
 	XrSpatialUpdateSnapshotCreateInfoEXT create_info{
 	        .type = XR_TYPE_SPATIAL_UPDATE_SNAPSHOT_CREATE_INFO_EXT,
-	        .entityCount = 1,
-	        .entities = &entity,
+	        .entityCount = (uint32_t)entities.size(),
+	        .entities = entities.data(),
 	        .componentTypeCount = bounded_pose ? 2u : 1u,
 	        .componentTypes = types,
 	        .baseSpace = world_space,
@@ -638,10 +643,10 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 	{
 		if (res == XR_ERROR_SPATIAL_ENTITY_ID_INVALID_EXT)
 		{
-			// Entity expired (runtime recycled ids): drop the handle so
-			// the next discovery match re-latches.
-			spatial_entity = spatial_entity_handle{xrDestroySpatialEntityEXT};
-			tracked_entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
+			// An id expired (runtime recycled ids): drop everything so
+			// the next discovery pass re-latches what is still around.
+			spatial_entities.clear();
+			last_poses.clear();
 		}
 		else
 			spdlog::debug("marker_tracker: update snapshot failed: {}", (int)res);
@@ -654,15 +659,16 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 	        .componentTypeCount = bounded_pose ? 2u : 1u,
 	        .componentTypes = types,
 	};
-	// Single entity: reuse the discovery scratch (index 0).
-	if (entity_ids.empty())
+	// The runtime must not return unlisted entities, so sizing scratch to
+	// the request guarantees fit; grow once if a previous pass left it
+	// smaller.
+	size_t need = entities.size();
+	if (entity_ids.size() < need)
 	{
-		entity_ids.assign(8, UINT64_MAX);
-		entity_states.resize(8);
-		marker_data.resize(8);
-		bound_boxes.resize(8);
-		for (auto & m: marker_data)
-			m.markerId = 0xFFFFFFFFu;
+		entity_ids.assign(need, UINT64_MAX);
+		entity_states.resize(need);
+		marker_data.resize(need);
+		bound_boxes.resize(need);
 	}
 	for (auto & m: marker_data)
 		m.markerId = 0xFFFFFFFFu;
@@ -690,41 +696,78 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		spdlog::debug("marker_tracker: update query failed: {}", (int)res);
 		return;
 	}
-	update_queries_total++;
-	if (result.entityIdCountOutput == 0 or
-	    (result.entityStateCountOutput > 0 and entity_states[0] != XR_SPATIAL_ENTITY_TRACKING_STATE_TRACKING_EXT))
-	{
-		current.tracked = false;
-		current.novel = false;
-		status_text = "marker not in view";
-		log_dup_stats(now);
-		return;
-	}
-	auto payload = read_payload(snapshot, marker_data[0].data);
-	if (not payload or *payload != marker_payload)
-	{
-		// Entity id now yields something else: re-acquire via discovery.
-		spatial_entity = spatial_entity_handle{xrDestroySpatialEntityEXT};
-		tracked_entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
-		current.tracked = false;
-		current.novel = false;
-		status_text = "marker not in view";
-		log_dup_stats(now);
-		return;
-	}
 	if (not bounded_pose)
 	{
 		current.tracked = false;
 		current.novel = false;
 		status_text = "marker has no pose component";
-		log_dup_stats(now);
 		return;
 	}
-	if (not current.tracked)
-		spdlog::info("marker_tracker: marker \"{}\" re-sighted via update path", label());
-	note_sample(bound_boxes[0].center, predicted_time);
-	if (current.novel)
-		update_queries_novel++;
+	// Rebuild sightings from this tick; ids the runtime no longer returns
+	// are stale (dropped, discovery re-latches survivors).
+	std::set<XrSpatialEntityIdEXT> seen;
+	all_sightings.clear();
+	bool matched_tick = false;
+	uint32_t out = std::min({result.entityIdCountOutput, (uint32_t)marker_data.size(), (uint32_t)bound_boxes.size()});
+	for (uint32_t i = 0; i < out; ++i)
+	{
+		XrSpatialEntityIdEXT eid = entity_ids[i];
+		seen.insert(eid);
+		if (i >= result.entityStateCountOutput or entity_states[i] != XR_SPATIAL_ENTITY_TRACKING_STATE_TRACKING_EXT)
+			continue;
+		auto payload = read_payload(snapshot, marker_data[i].data);
+		if (not payload)
+			continue;
+		bool matched = *payload == marker_payload;
+		if (not matched)
+		{
+			if (unknown_payloads_logged.size() < 8 and
+			    unknown_payloads_logged.insert(*payload).second)
+				spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
+				             payload->substr(0, 64));
+		}
+		bool novel = note_pose(eid, bound_boxes[i].center);
+		update_queries_total++;
+		if (novel)
+			update_queries_novel++;
+		all_sightings.push_back(code_sighting{
+		        .payload = *payload,
+		        .pose = bound_boxes[i].center,
+		        .extents = bound_boxes[i].extents,
+		        .entity_id = eid,
+		        .time = predicted_time,
+		        .matched = matched,
+		        .novel = novel,
+		});
+		if (not matched)
+			continue;
+		if (not current.tracked)
+			spdlog::info("marker_tracker: marker \"{}\" re-sighted via update path", label());
+		current.tracked = true;
+		current.pose = bound_boxes[i].center;
+		current.time = predicted_time;
+		current.novel = novel;
+		status_text = "tracking marker";
+		matched_tick = true;
+	}
+	for (auto it = spatial_entities.begin(); it != spatial_entities.end();)
+	{
+		if (seen.contains(it->first))
+			++it;
+		else
+		{
+			last_poses.erase(it->first);
+			it = spatial_entities.erase(it);
+		}
+	}
+	if (not matched_tick)
+	{
+		if (current.tracked)
+			spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
+		current.tracked = false;
+		current.novel = false;
+		status_text = "marker not in view";
+	}
 	log_dup_stats(now);
 }
 
@@ -739,13 +782,13 @@ void xr::marker_tracker::update(XrSpace world_space, XrTime now, XrTime predicte
 		case state::failed:
 			// Auto-retry with backoff: transient runtime hiccups recover.
 			// configure() itself honors retry_at, so this only re-arms idle.
-		if (not marker_payload.empty() and now >= retry_at)
-		{
-			retry_at = now + retry_delay_ns;
-			current_state = state::idle;
-			configure(marker_size_m, marker_payload, marker_tag, marker_static, marker_update_hz);
-		}
-		return;
+			if (not marker_payload.empty() and now >= retry_at)
+			{
+				retry_at = now + retry_delay_ns;
+				current_state = state::idle;
+				configure(marker_size_m, marker_payload, marker_tag, marker_static);
+			}
+			return;
 
 		case state::creating_context: {
 			if (now < retry_at)
@@ -762,23 +805,23 @@ void xr::marker_tracker::update(XrSpace world_space, XrTime now, XrTime predicte
 		}
 
 	case state::ready: {
+		// Live refresh every frame (no timers): the detector is slower
+		// than the frame rate, so most ticks echo and only novel poses
+		// propagate. Runs before the discovery poll below so an
+		// acquisition completing this frame has the final word (its
+		// novel flag seeds consumers; the echo would clobber it).
+		if (not spatial_entities.empty())
+			update_snapshot(world_space, now, predicted_time);
 		if (discovery_future != XR_NULL_FUTURE_EXT)
 		{
 			bool ready = false;
 			if (poll_ready(discovery_future, ready) and ready)
 				complete_discovery(world_space, predicted_time);
-			return;
+			// The update path above is independent of the in-flight
+			// discovery: latched entities refresh even while a new
+			// discovery is outstanding.
 		}
-		// Live path first (cheap synchronous refresh of the latched
-		// entity, no re-enumeration), discovery underneath for
-		// acquisition and re-acquire. Both are time-gated; either,
-		// both, or neither may fire on a given frame.
-		XrDuration update_period_ns = (XrDuration)(1e9 / std::clamp(marker_update_hz, 1.f, 30.f));
-		if (spatial_entity and now - last_update_start >= update_period_ns)
-		{
-			last_update_start = now;
-			update_snapshot(world_space, now, predicted_time);
-		}
+		// Discovery stays throttled: acquisition and re-acquire only.
 		if (now - last_discovery_start >= discovery_period_ns)
 		{
 			last_discovery_start = now;
