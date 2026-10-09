@@ -1414,7 +1414,7 @@ void begin_sidebar(float top_bar_h, float tab_width, int footer_items)
 	ImGui::SetCursorPos({0, top_bar_h});
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {16, 16});
 	ImGui::BeginChild("Tabs", {tab_width, ImGui::GetWindowSize().y - top_bar_h}, ImGuiChildFlags_AlwaysUseWindowPadding);
-	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 4});
+	ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0, 2});
 
 	// nav list scrolls in a child that fills the rest, footer stays pinned in footer_items rows
 	const float row_h = ImGui::GetFrameHeight() * metrics::control_height + ImGui::GetStyle().ItemSpacing.y;

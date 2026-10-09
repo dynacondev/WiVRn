@@ -766,6 +766,9 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	const float top_bar_h = wivrn::ui::metrics::top_bar_height;
 	const float content_margin = wivrn::ui::metrics::content_margin;
 	const ImVec2 margin_around_window{50, 50};
+	// Tabbed windows (stats/settings/applications) run a touch taller so
+	// the sidebar holds all sections (incl. Passthrough) without scrolling.
+	const ImVec2 tabs_margin{80, 20};
 
 	ImGuiStyle & style = ImGui::GetStyle();
 	imgui_ctx->new_frame(predicted_display_time);
@@ -811,8 +814,8 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		case stream_tab::stats:
 		case stream_tab::settings:
 		case stream_tab::applications:
-			ImGui::SetNextWindowPos(margin_around_window);
-			ImGui::SetNextWindowSize(viewport_size - margin_around_window * 2);
+			ImGui::SetNextWindowPos(tabs_margin);
+			ImGui::SetNextWindowSize(viewport_size - tabs_margin * 2);
 			display_tabs = true;
 			break;
 		case stream_tab::application_launcher:
@@ -1021,6 +1024,13 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			if (wivrn::ui::nav_item(ICON_FA_COMPUTER, _S("Statistics"), gui_status == stream_tab::stats))
 				next_gui_status = stream_tab::stats;
 
+			wivrn::ui::nav_section(_cS("tab group", "PASSTHROUGH"));
+			if (wivrn::ui::nav_item(ICON_FA_EYE, _cS("tab label", "Passthrough"), gui_status == stream_tab::settings and current_settings_page == settings_page::passthrough))
+			{
+				current_settings_page = settings_page::passthrough;
+				next_gui_status = stream_tab::settings;
+			}
+
 			wivrn::ui::nav_section(_cS("tab group", "SETTINGS"));
 			auto settings_item = [&](const char * icon, const std::string & label, settings_page page) {
 				if (wivrn::ui::nav_item(icon, label, gui_status == stream_tab::settings and current_settings_page == page))
@@ -1037,13 +1047,6 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			settings_item(ICON_FA_LOCATION_CROSSHAIRS, _cS("tab label", "Tracking"), settings_page::tracking);
 			settings_item(ICON_FA_GEARS, _cS("tab label", "System"), settings_page::system);
 			settings_item(ICON_FA_PALETTE, _cS("tab label", "Theme"), settings_page::theme);
-
-			wivrn::ui::nav_section(_cS("tab group", "PASSTHROUGH"));
-			if (wivrn::ui::nav_item(ICON_FA_EYE, _cS("tab label", "Passthrough"), gui_status == stream_tab::settings and current_settings_page == settings_page::passthrough))
-			{
-				current_settings_page = settings_page::passthrough;
-				next_gui_status = stream_tab::settings;
-			}
 
 			// pinned to the bottom
 			wivrn::ui::sidebar_footer();
