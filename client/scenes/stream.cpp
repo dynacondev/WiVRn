@@ -1683,6 +1683,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (composition_layer_color_scale_bias_supported)
 					set_color_scale_bias({r * a, g * a, 0.f, a}, {});
 			}
+			// Heartbeat inventory: which debug quads are actually submitted
+			// (poses distinguish marker quads from a stuck/ghost one).
+			static XrTime last_dbg_log = 0;
+			XrTime dbg_now = instance.now();
+			if (dbg_now - last_dbg_log > 5'000'000'000LL)
+			{
+				last_dbg_log = dbg_now;
+				size_t n = 0;
+				for (const auto & [id, h]: fp.held_codes)
+				{
+					(void)id;
+					if (h.matched and not fp.debug_matched)
+						continue;
+					if (not h.matched and not fp.debug_unmatched)
+						continue;
+					if (h.extents.width <= 0 or h.extents.height <= 0)
+						continue;
+					++n;
+					spdlog::info("Fiducial debug quad: {} {:.0f} x {:.0f}mm at ({:.2f},{:.2f},{:.2f}){}",
+					             h.payload.substr(0, 32), (double)(h.extents.width * 1000),
+					             (double)(h.extents.height * 1000), (double)h.pose.position.x,
+					             (double)h.pose.position.y, (double)h.pose.position.z,
+					             h.matched ? " (matched)" : " (unmatched)");
+				}
+				spdlog::info("Fiducial debug quads: {} submitted", n);
+			}
 		}
 
 		// First frames of each mask activation are traced end to end: a hang

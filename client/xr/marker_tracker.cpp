@@ -571,12 +571,15 @@ void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
 
 void xr::marker_tracker::log_rate(XrTime now)
 {
-	if (update_ticks == 0)
+	if (update_ticks == 0 or first_tick_at == 0)
 		return;
-	if (now - last_rate_log < 5'000'000'000)
+	// Skip the first second: the base is too short for a sane rate.
+	if (now - first_tick_at < 1'000'000'000LL)
+		return;
+	if (now - last_rate_log < 5'000'000'000LL)
 		return;
 	last_rate_log = now;
-	double rate_hz = update_ticks * 1e9 / std::max<XrDuration>(1, now - first_tick_at);
+	double rate_hz = update_ticks * 1e9 / (double)(now - first_tick_at);
 	spdlog::info("marker_tracker: update snapshots running ({} ticks, {:.1f}/s)", update_ticks, rate_hz);
 }
 

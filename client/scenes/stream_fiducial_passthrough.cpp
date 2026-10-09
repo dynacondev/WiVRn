@@ -502,6 +502,19 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// Mask groups record in render() (per-feather stacks); nothing to
 	// upload here. The binary fallback below keeps the first live
 	// instance only: the projected layer type has no per-object layers.
+	// It yields whenever any mask group is submitting this frame (record
+	// ran earlier this frame, so group flags are current): submitting the
+	// projected layer alongside the mask stack disturbs composition.
+	bool mask_live = false;
+	for (auto & [f, g]: fp.mask_groups)
+	{
+		(void)f;
+		if (g.active)
+		{
+			mask_live = true;
+			break;
+		}
+	}
 
 	// Re-upload if the runtime lost the mesh (e.g. passthrough re-created)
 	if (fp.ready and not session.has_projected_passthrough_mesh())
@@ -511,14 +524,14 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.status = "runtime mesh lost, re-uploading";
 	}
 
-	if (fp.ready)
+	if (fp.ready and not mask_live)
 	{
 		session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
 		add_projected_passthrough_layer();
 		return;
 	}
 
-	if (fp.attempted or not shim_ost)
+	if (fp.attempted or not shim_ost or mask_live)
 		return;
 
 	if (not instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))

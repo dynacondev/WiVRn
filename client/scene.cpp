@@ -485,6 +485,8 @@ void scene::render_end()
 
 	// Log the submitted composition on change: layer order/count issues read
 	// as wrong output with no error, so this is the diagnostic of record.
+	// Quad poses/sizes ride along: same-count swaps (e.g. tooltip flicker
+	// vs a stuck debug overlay) are otherwise invisible here.
 	{
 		std::string signature = std::to_string(openxr_layers.size()) + ":";
 		for (auto * base: openxr_layers)
@@ -514,6 +516,12 @@ void scene::render_end()
 		{
 			last_signature = signature;
 			spdlog::info("Submitting layers [{}]", signature);
+			for (auto & l: layers)
+			{
+				if (auto * q = std::get_if<XrCompositionLayerQuad>(&l.composition_layer))
+					spdlog::info("  quad {:.2f}x{:.2f}m at ({:.2f},{:.2f},{:.2f})", q->size.width,
+					             q->size.height, q->pose.position.x, q->pose.position.y, q->pose.position.z);
+			}
 		}
 	}
 
