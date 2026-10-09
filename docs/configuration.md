@@ -226,6 +226,15 @@ Each `fiducials` entry has:
     (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
     single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
 
+> [!NOTE]
+> A QR payload is a single identity: printing the *same* payload twice
+> does not create two trackables. The runtime reports one jumping track
+> for identical prints, so one payload anchoring two places is not
+> supported. For multi-location coverage, print distinct payloads (one
+> per location) and link a single object to all of their fiducials —
+> the supported direction is many objects to one code, never one code
+> to many places.
+
 Each `passthrough` entry (behavior object) has:
 
 - `type`: behavior type. `"3d-passthrough"` renders the model as a
@@ -236,7 +245,9 @@ Each `passthrough` entry (behavior object) has:
   label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required; dangling
   references are dropped with a warning, and an object left with none is
-  skipped)
+  skipped). Relationships fan out: many objects may reference one
+  fiducial, and one object may reference several fiducials (one live
+  instance per visible pairing, never fused).
 - `model-path`: path to a `.glb`/`.gltf` file on the server (optional,
   models larger than 64MB are skipped)
 - `position`: `[x, y, z]` fiducial-to-object offset in meters
