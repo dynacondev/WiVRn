@@ -826,40 +826,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			flush_upload(cmd, mesh);
 		ensure_targets(extent);
 
-		// Stage 1: binary silhouettes into A (full resolution), one draw
-		// per (mesh, instance, eye). Missing meshes (removed object racing
-		// a queued draw) skip defensively.
-		for (int eye = 0; eye < 2; ++eye)
-		{
-			vk::RenderPassBeginInfo begin_info{
-			        .renderPass = *renderpass,
-			        .framebuffer = *target_a.raster_fbs[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = extent},
-			        .clearValueCount = 1,
-			        .pClearValues = &clear,
-			};
-			cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-			set_full_viewport(extent);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-			for (const auto & d: draws)
-			{
-				auto mit = meshes.find(d.mesh);
-				if (mit == meshes.end() or mit->second.index_count == 0)
-					continue;
-				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
-				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-			}
-			cmd.endRenderPass();
-		}
-		make_readable(*target_a.image);
-
 		// Tier from feather-px (see header): 0 hard edge, 1 direct
 		// full-res, 2/4/8 downsampled. Band stays ±F/2 by construction,
 		// so width is continuous across tiers; tap density stays in the
 		// proven regime everywhere. Values past 128 clamp (documented).
+		// Selected before Stage 1: tier 0 rasterizes straight into the
+		// swapchain image and never touches the A intermediate.
 		float f = feather_px;
 		int tier = 1;
 		float spread = 1.0f;
@@ -888,35 +860,71 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 		}
 
+		// Stage 1: binary silhouettes into A (full resolution), one draw
+		// per (mesh, instance, eye). Missing meshes (removed object racing
+		// a queued draw) skip defensively. Tier 0 skips A entirely (its
+		// raster below targets the swapchain image directly).
+		if (tier != 0)
+		{
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				vk::RenderPassBeginInfo begin_info{
+				        .renderPass = *renderpass,
+				        .framebuffer = *target_a.raster_fbs[eye],
+				        .renderArea = {.offset = {0, 0}, .extent = extent},
+				        .clearValueCount = 1,
+				        .pClearValues = &clear,
+				};
+				cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+				set_full_viewport(extent);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+				for (const auto & d: draws)
+				{
+					auto mit = meshes.find(d.mesh);
+					if (mit == meshes.end() or mit->second.index_count == 0)
+						continue;
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+					cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+					                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
+					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+				}
+				cmd.endRenderPass();
+			}
+			make_readable(*target_a.image);
+		}
+
 		std::array<uint32_t, 0> no_offsets{};
 		if (tier == 0)
 		{
-			// Hard edge: single identity copy A -> swapchain (spread 0:
-			// all taps hit center, weights sum to 1). No blur passes.
-			blur_push base{
-			        .texel = {1.f / extent.width, 1.f / extent.height},
-			        .spread = 0,
-			};
+			// Hard edge: rasterize silhouettes straight into the swapchain
+			// image (same pipeline, pushes and clear as Stage 1). This
+			// replaces the old identity copy A -> swapchain, which burned
+			// a fullscreen 5-fetch pass for zero effect (spread 0 hits
+			// center with weights summing to 1). No blur passes.
 			for (int eye = 0; eye < 2; ++eye)
 			{
-				update_source(*target_a.views[eye], 2 + eye);
-				vk::RenderPassBeginInfo begin_v0{
-				        .renderPass = *blur_renderpass,
+				vk::RenderPassBeginInfo begin_0{
+				        .renderPass = *renderpass,
 				        .framebuffer = *it->second.framebuffers[eye],
 				        .renderArea = {.offset = {0, 0}, .extent = extent},
 				        .clearValueCount = 1,
 				        .pClearValues = &clear,
 				};
-				cmd.beginRenderPass(begin_v0, vk::SubpassContents::eInline);
+				cmd.beginRenderPass(begin_0, vk::SubpassContents::eInline);
 				set_full_viewport(extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_v0{*descriptor_sets[2 + eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v0, no_offsets);
-				blur_push push = base;
-				push.dir[0] = 0;
-				push.dir[1] = 1;
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
-				cmd.draw(3, 1, 0, 0);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+				for (const auto & d: draws)
+				{
+					auto mit = meshes.find(d.mesh);
+					if (mit == meshes.end() or mit->second.index_count == 0)
+						continue;
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+					cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+					                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
+					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+				}
 				cmd.endRenderPass();
 			}
 		}
@@ -1107,14 +1115,49 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			std::memcpy(cutout_verts.map(), quad.data(), sizeof(glm::vec3) * 6);
 			for (int eye = 0; eye < 2; ++eye)
 			{
+				// Tighten to the quad's pixel bounds (same NDC mapping the
+				// viewport itself uses, so alignment is exact by
+				// construction): fullscreen LOAD/STORE traffic for a small
+				// debug rect would cost a full image round-trip per group.
+				// Any corner behind the camera falls back to fullscreen.
+				vk::Rect2D area{{0, 0}, extent};
+				bool behind = false;
+				float minx = (float)extent.width, miny = (float)extent.height;
+				float maxx = 0, maxy = 0;
+				for (const auto & v: quad)
+				{
+					glm::vec4 c = cutout_mvp[eye] * glm::vec4(v, 1);
+					if (c.w <= 0)
+					{
+						behind = true;
+						break;
+					}
+					float px = (c.x / c.w * 0.5f + 0.5f) * (float)extent.width;
+					float py = (c.y / c.w * 0.5f + 0.5f) * (float)extent.height;
+					minx = std::min(minx, px);
+					miny = std::min(miny, py);
+					maxx = std::max(maxx, px);
+					maxy = std::max(maxy, py);
+				}
+				if (not behind)
+				{
+					int32_t x0 = std::clamp<int32_t>((int32_t)std::floor(minx) - 1, 0, (int32_t)extent.width);
+					int32_t y0 = std::clamp<int32_t>((int32_t)std::floor(miny) - 1, 0, (int32_t)extent.height);
+					int32_t x1 = std::clamp<int32_t>((int32_t)std::ceil(maxx) + 1, 0, (int32_t)extent.width);
+					int32_t y1 = std::clamp<int32_t>((int32_t)std::ceil(maxy) + 1, 0, (int32_t)extent.height);
+					if (x1 <= x0 or y1 <= y0)
+						continue;
+					area = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+				}
 				vk::RenderPassBeginInfo begin_cut{
 				        .renderPass = *cutout_renderpass,
 				        .framebuffer = *it->second.framebuffers[eye],
-				        .renderArea = {.offset = {0, 0}, .extent = extent},
+				        .renderArea = area,
 				        .clearValueCount = 0,
 				};
 				cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
 				set_full_viewport(extent);
+				cmd.setScissor(0, area);
 				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 				                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});
 				cmd.draw(6, 1, 0, 0);
