@@ -18,34 +18,46 @@
 
 #version 450
 
+// One Jump Flood step (fullscreen triangle from blur.vert): adopt the
+// nearest seed among the 8 neighbors at +-step texels. Distances compare
+// in float32 (squared); storage is float32 RG so coordinates are exact.
+// INF seeds (1e10) square to 1e20, representable, never selected while any
+// real seed is reachable.
 layout(location = 0) in vec2 uv;
-layout(location = 0) out vec4 out_color;
+layout(location = 0) out vec2 out_seed;
 
 layout(set = 0, binding = 0) uniform sampler2D src;
 
 layout(push_constant) uniform Push
 {
 	vec2 texel;
-	vec2 dir;
-	float spread;
+	float step;
 	float pad;
 }
 pc;
 
-// Bilinear-gather 9-tap Gaussian, sigma = 2 texels. Adjacent tap pairs
-// share one linear-filtered fetch at the weighted offset (hardware lerp
-// mixes each pair in exact proportion), so 9 taps cost 5 fetches:
-// center 0.2042, pairs (1,2) at 1.4072 weight 0.3040, pairs (3,4) at
-// 3.2939 weight 0.0939. The tap offsets scale with spread, so feather-px
-// maps to band width without changing the kernel. Only alpha carries
-// information downstream.
 void main()
 {
-	vec2 t = pc.dir * pc.texel * pc.spread;
-	float a = texture(src, uv).a * 0.2042;
-	a += texture(src, uv + t * 1.4072).a * 0.3040;
-	a += texture(src, uv - t * 1.4072).a * 0.3040;
-	a += texture(src, uv + t * 3.2939).a * 0.0939;
-	a += texture(src, uv - t * 3.2939).a * 0.0939;
-	out_color = vec4(1.0, 1.0, 1.0, a);
+	vec2 frag = gl_FragCoord.xy;
+	vec2 best = texture(src, uv).xy;
+	vec2 d0 = frag - best;
+	float best_d = dot(d0, d0);
+	vec2 off = pc.step * pc.texel;
+	for (int j = -1; j <= 1; ++j)
+	{
+		for (int i = -1; i <= 1; ++i)
+		{
+			if (i == 0 && j == 0)
+				continue;
+			vec2 cand = texture(src, uv + vec2(i, j) * off).xy;
+			vec2 d = frag - cand;
+			float dd = dot(d, d);
+			if (dd < best_d)
+			{
+				best_d = dd;
+				best = cand;
+			}
+		}
+	}
+	out_seed = best;
 }

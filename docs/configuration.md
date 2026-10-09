@@ -257,12 +257,15 @@ Each `passthrough` entry (behavior object) has:
 - `scale`: uniform object scale, number or single-element array
   (default `1`, objects only, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
-  (alpha-gradient blend band around the mesh silhouette, default `24`;
+  (alpha-gradient blend band outside the mesh silhouette, default `24`;
   `0` disables feathering). Mask stacks group by this value so each
-  object feathers independently; applied live. The client selects a blur
-  tier automatically (0 hard edge, 1 full-res, 2/4/8 half/quarter/eighth
-  with exact spread mapping, clamped to 128px), so tap density and cost
-  stay flat at any width.
+  object feathers independently; applied live. The client renders the
+  silhouette into a signed distance field at half (`feather <= 32`) or
+  quarter resolution and composites the band analytically in one pass
+  (clamped to 128px), so cost stays nearly flat at any width. Interiors
+  stay pixel-exact to the silhouette; the band runs outward only and
+  never erodes into the model. Per-instance fade opacity collapses to
+  the group minimum during the fade.
 - `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds
   (default `1000`; `0` = appears instantly). Render-only; applied live.
   During the fade the passthrough window ramps from fully transparent
