@@ -131,8 +131,10 @@ static void log_effective_config_once(const nlohmann::json & merged)
 		keys += it.key();
 	}
 	U_LOG_I("Effective configuration keys: %s", keys.empty() ? "(none)" : keys.c_str());
-	if (auto it = merged.find("fiducial-map"); it != merged.end())
-		U_LOG_I("Effective fiducial-map: %s", it->dump().c_str());
+	if (auto it = merged.find("fiducials"); it != merged.end())
+		U_LOG_I("Effective fiducials: %s", it->dump().c_str());
+	if (auto it = merged.find("passthrough"); it != merged.end())
+		U_LOG_I("Effective passthrough objects: %s", it->dump().c_str());
 }
 
 nlohmann::json configuration::read_configuration()
@@ -242,45 +244,28 @@ configuration::configuration()
 			}
 		}
 
-		if (auto it = json.find("fiducial-map"); it != json.end())
+		// Orientation helper: [rx, ry, rz] degrees (fixed-frame X, then Y,
+		// then Z, see euler_deg_to_quat()) to xyzw quaternion.
+		auto parse_orientation = [](const nlohmann::json & o, const char * what) {
+			if (not o.is_array() or o.size() != 3)
+				throw std::runtime_error(std::string("invalid ") + what + " orientation: expected [rx, ry, rz] degrees");
+			return euler_deg_to_quat(o[0], o[1], o[2]);
+		};
+
+		if (auto it = json.find("fiducials"); it != json.end())
 		{
 			for (const auto & item: *it)
 			{
 				fiducial_entry e;
+				if (item.contains("id"))
+					e.id = item["id"];
+				if (e.id.empty())
+				{
+					U_LOG_W("fiducial entry without id, skipping");
+					continue;
+				}
 				if (item.contains("tag"))
 					e.tag = item["tag"];
-				if (item.contains("marker-size-m"))
-					e.marker_size_m = item["marker-size-m"];
-				if (item.contains("marker-data"))
-					e.marker_data = item["marker-data"];
-				if (item.contains("model-path"))
-					e.model_path = item["model-path"];
-				if (item.contains("position"))
-					e.position = item["position"];
-				if (item.contains("orientation"))
-				{
-					// Degrees [rx, ry, rz]: fixed-frame rotations about X,
-					// then Y, then Z (see euler_deg_to_quat()).
-					const auto & o = item["orientation"];
-					if (not o.is_array() or o.size() != 3)
-						throw std::runtime_error("invalid fiducial-map orientation: expected [rx, ry, rz] degrees");
-					e.orientation = euler_deg_to_quat(o[0], o[1], o[2]);
-				}
-				if (item.contains("scale"))
-				{
-					if (item["scale"].is_number())
-						e.scale = item["scale"];
-					else if (item["scale"].is_array() and item["scale"].size() > 0)
-						e.scale = item["scale"].at(0);
-				}
-				if (item.contains("feather-px"))
-					e.feather_px = item["feather-px"];
-				if (item.contains("mode"))
-				{
-					e.mode = item["mode"];
-					if (e.mode != "one-shot" and e.mode != "continuous")
-						throw std::runtime_error("invalid fiducial-map mode \"" + e.mode + "\": expected \"one-shot\" or \"continuous\"");
-				}
 				if (item.contains("static"))
 					e.is_static = item["static"];
 				if (item.contains("window-size"))
@@ -305,9 +290,109 @@ configuration::configuration()
 					e.knee_inner_deg = item["knee-inner-deg"];
 				if (item.contains("knee-outer-deg"))
 					e.knee_outer_deg = item["knee-outer-deg"];
+				if (item.contains("markers"))
+				{
+					for (const auto & m: item["markers"])
+					{
+						fiducial_marker mk;
+						if (m.contains("marker-data"))
+							mk.marker_data = m["marker-data"];
+						if (mk.marker_data.empty())
+						{
+							U_LOG_W("fiducial \"%s\": marker without marker-data, skipping marker", e.id.c_str());
+							continue;
+						}
+						if (m.contains("marker-size-m"))
+							mk.marker_size_m = m["marker-size-m"];
+						if (m.contains("position"))
+							mk.position = m["position"];
+						if (m.contains("orientation"))
+							mk.orientation = parse_orientation(m["orientation"], "fiducial marker");
+						e.markers.push_back(std::move(mk));
+					}
+				}
+				if (e.markers.empty())
+				{
+					U_LOG_W("fiducial \"%s\": no markers, skipping", e.id.c_str());
+					continue;
+				}
+				if (std::ranges::any_of(fiducials, [&](const fiducial_entry & f) { return f.id == e.id; }))
+				{
+					U_LOG_W("duplicate fiducial id \"%s\", skipping", e.id.c_str());
+					continue;
+				}
+				fiducials.push_back(std::move(e));
+			}
+		}
+
+		if (auto it = json.find("passthrough"); it != json.end())
+		{
+			for (const auto & item: *it)
+			{
+				passthrough_object o;
+				if (item.contains("type"))
+					o.type = item["type"];
+				if (o.type != "3d-passthrough")
+				{
+					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
+					        item.value("id", o.type).c_str(), o.type.c_str());
+					continue;
+				}
+				if (item.contains("id"))
+					o.id = item["id"];
+				if (o.id.empty())
+				{
+					U_LOG_W("passthrough object without id, skipping");
+					continue;
+				}
+				if (item.contains("tag"))
+					o.tag = item["tag"];
+				if (item.contains("fiducial"))
+				{
+					const auto & f = item["fiducial"];
+					if (f.is_string())
+						o.fiducial.push_back(f);
+					else
+						for (const auto & i: f)
+							o.fiducial.push_back(i);
+				}
+				// Drop dangling references (typos shouldn't nuke the map).
+				o.fiducial.erase(
+				        std::remove_if(o.fiducial.begin(), o.fiducial.end(), [&](const std::string & id) {
+					        bool known = std::ranges::any_of(fiducials, [&](const fiducial_entry & e) { return e.id == id; });
+					        if (not known)
+						        U_LOG_W("passthrough object \"%s\": unknown fiducial \"%s\", dropping reference", o.id.c_str(), id.c_str());
+					        return not known;
+				        }),
+				        o.fiducial.end());
+				if (o.fiducial.empty())
+				{
+					U_LOG_W("passthrough object \"%s\": no valid fiducials, skipping", o.id.c_str());
+					continue;
+				}
+				if (item.contains("model-path"))
+					o.model_path = item["model-path"];
+				if (item.contains("position"))
+					o.position = item["position"];
+				if (item.contains("orientation"))
+					o.orientation = parse_orientation(item["orientation"], "passthrough object");
+				if (item.contains("scale"))
+				{
+					if (item["scale"].is_number())
+						o.scale = item["scale"];
+					else if (item["scale"].is_array() and item["scale"].size() > 0)
+						o.scale = item["scale"].at(0);
+				}
+				if (item.contains("feather-px"))
+					o.feather_px = item["feather-px"];
 				if (item.contains("fade-in-ms"))
-					e.fade_in_ms = item["fade-in-ms"];
-				fiducial_map.push_back(std::move(e));
+					o.fade_in_ms = item["fade-in-ms"];
+				if (std::ranges::any_of(passthrough_objects, [&](const passthrough_object & p) { return p.id == o.id; }))
+				{
+					U_LOG_W("duplicate passthrough object id \"%s\", skipping", o.id.c_str());
+					continue;
+				}
+				passthrough_objects.push_back(std::move(o));
 			}
 		}
 

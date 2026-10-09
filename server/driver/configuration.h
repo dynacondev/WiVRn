@@ -56,35 +56,33 @@ struct configuration
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;
 
-	// Fiducial-anchored passthrough meshes (Quest only, see ROADMAP.md).
-	// Maps a QR-code marker (by exact payload string) to a glB model +
-	// marker-to-mesh offset.
-	struct fiducial_entry
+	// Fiducial tracking markers (Quest only, see ROADMAP.md). Each
+	// fiducial resolves its markers to one 6DoF frame; behavior objects
+	// in passthrough[] reference fiducials by id and place instances per
+	// sighted marker entity.
+	struct fiducial_marker
 	{
-		// Display-only label for the headset status UI (correlates the
-		// GUI row with this config entry). Never used for matching.
-		std::string tag;
-		float marker_size_m = 0;
 		// Exact decoded payload identifying the marker (required).
 		std::string marker_data;
-		std::string model_path;
+		float marker_size_m = 0;
+		// Marker-to-fiducial offset: fiducialPose = observedMarkerPose
+		// * offset. Position in meters, orientation as xyzw quaternion
+		// (parsed from [rx, ry, rz] degrees).
 		std::array<float, 3> position = {0, 0, 0};
 		std::array<float, 4> orientation = {0, 0, 0, 1};
-		float scale = 1;
-		// Feather width in screen pixels for the passthrough window edges.
-		float feather_px = 24;
-		// Tracking mode: "one-shot" (align once per Calibrate press) or
-		// "continuous" (auto-anchor on sight, then smooth-follow to correct
-		// drift without ever snapping). Unknown values are rejected at parse.
-		std::string mode = "one-shot";
-		// Maps to optimizeForStaticMarker in the QR spatial context.
-		// true = stationary rig (integrate over time); false = moving
-		// reference marker. Toggling recreates the client spatial context
-		// (brief tracking hitch, noted here so it isn't a surprise).
+	};
+	struct fiducial_entry
+	{
+		// Stable link key referenced by passthrough objects (required,
+		// must be unique).
+		std::string id;
+		// Display-only label for the headset status UI. Never used for
+		// matching or linkage.
+		std::string tag;
 		bool is_static = true;
-		// Continuous-mode tuning; all optional, all live per map (a change
-		// re-seeds the filter like any other map change). Shared Euro
-		// cutoff/beta cover both position and orientation.
+		// Resolver/smoothing tuning. The multi-marker resolve and the
+		// smoothing move are future work; values are carried through to
+		// the per-instance filters unchanged for now.
 		int window_size = 12;
 		int min_samples = 4;
 		float sigma_k = 3;
@@ -96,11 +94,39 @@ struct configuration
 		float knee_outer_mm = 5;
 		float knee_inner_deg = 0.1f;
 		float knee_outer_deg = 0.5f;
-		// Alpha fade-in at first acquisition, milliseconds (0 = instant).
-		// Render-only: applied live, never invalidates calibration.
+		std::vector<fiducial_marker> markers;
+	};
+	// Behavior objects placed from solved fiducial frames. Instances fan
+	// out per sighted marker entity: the same QR seen twice places the
+	// object twice; one object may reference several fiducials (one
+	// instance per visible pairing, never fused).
+	struct passthrough_object
+	{
+		// Behavior type. "3d-passthrough" renders the model as a
+		// surface-projected passthrough cutout. Unknown types are
+		// skipped with a warning (forward-compat for
+		// 3d-passthrough-reversed, 3d-boundary(-reversed), 3d-depth).
+		std::string type = "3d-passthrough";
+		std::string id;
+		std::string tag;
+		// Referenced fiducial ids (dangling refs skip the object).
+		std::vector<std::string> fiducial;
+		std::string model_path;
+		// Fiducial-to-object offset: objectPose = solvedFiducialPose *
+		// offset. Uniform scale applies last, objects only.
+		std::array<float, 3> position = {0, 0, 0};
+		std::array<float, 4> orientation = {0, 0, 0, 1};
+		float scale = 1;
+		// Passthrough window feather width in screen pixels (render-only,
+		// applied live). Mask stacks group by this value so each object
+		// feathers independently.
+		float feather_px = 24;
+		// Alpha fade-in at first acquisition, milliseconds (0 = instant,
+		// render-only, applied live).
 		float fade_in_ms = 1000;
 	};
-	std::vector<fiducial_entry> fiducial_map;
+	std::vector<fiducial_entry> fiducials;
+	std::vector<passthrough_object> passthrough_objects;
 
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;

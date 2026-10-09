@@ -45,10 +45,11 @@ Current baseline (why this is new):
 Scope: define the mapping and get bytes to the headset. No rendering yet.
 
 1. Server config (`docs/configuration.md`, server config loader):
-   `fiducial_map: [{marker_id, marker_size_m, marker_data, model_path,
-   position[3], orientation[3] (degrees rx/ry/rz), scale[3] or float}]`. Pose + scale
-   only, per prior agreement. `marker_data` is the exact QR payload string.
-   Paths resolved server-side, blobs read at session start.
+   `fiducials: [{id, markers: [{marker_data, marker_size_m, position[3],
+   orientation[3] degrees}]}]` plus `passthrough: [{type, id, fiducial: [ids],
+   model_path, position[3], orientation[3] degrees, scale, feather-px,
+   fade-in-ms}]`. `marker_data` is the exact QR payload string. Paths
+   resolved server-side, blobs read at session start.
 2. Protocol (`common/wivrn_packets.h`, `common/protocol_version.h`):
    new `to_headset::fiducial_map{entries}` + `to_headset::model_blob{hash,
    bytes}` (glB). Bump/check `protocol_revision` handling so mismatched
@@ -107,7 +108,7 @@ compositing can be tested standalone.
 
 MVP test (must pass before Phase 3):
 
-- Quest 3, WiVRn server with 1-entry `fiducial_map` + small glB (<10MB).
+- Quest 3, WiVRn server with 1-fiducial + 1-object config + small glB (<10MB).
 - Connect, Stream GUI shows model loaded (hash/bytes).
 - Look around: passthrough visible only through the mesh silhouette, stable
   from multiple angles, occluding server video (overlay). No app-shaded mesh
@@ -206,11 +207,18 @@ Example config fragment (Phase 1):
 
 ```json
 {
-	"fiducial_map": [
+	"fiducials": [
 		{
-			"marker_id": 42,
-			"marker_size_m": 0.08,
-			"model_path": "/usr/share/wivrn/meshes/widget.glb",
+			"id": "press",
+			"markers": [{"marker-data": "wivrn:11", "marker-size-m": 0.08}]
+		}
+	],
+	"passthrough": [
+		{
+			"type": "3d-passthrough",
+			"id": "press-window",
+			"fiducial": ["press"],
+			"model-path": "/usr/share/wivrn/meshes/widget.glb",
 			"position": [0, 0.05, 0.1],
 			"orientation": [0, 0, 0],
 			"scale": 1.0
@@ -219,5 +227,6 @@ Example config fragment (Phase 1):
 }
 ```
 
-`position/orientation/scale` is the marker-to-mesh offset applied per
-`meshClientPose = observedMarkerPose * markerToMeshOffset`.
+`position/orientation/scale` compose per
+`fiducialPose = observedMarkerPose * markerToFiducialOffset` then
+`objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

@@ -971,40 +971,34 @@ struct running_applications
 	std::vector<application> applications;
 };
 
-// Fiducial-anchored passthrough mesh (Quest only, see ROADMAP.md Phase 1).
-// The server is authoritative for the mapping; models are pushed on demand
-// and cached client-side by content hash.
-struct fiducial_map_entry
+// Fiducial tracking markers + behavior objects (Quest only, see
+// ROADMAP.md). The server is authoritative for both maps; models are
+// pushed on demand and cached client-side by content hash. Objects
+// reference fiducials by id; instances fan out per sighted marker entity.
+struct fiducial_marker
 {
-	// Display-only label for the headset status UI (correlates the GUI
-	// row with the server config entry). Never used for matching.
-	std::string tag;
-	// Physical marker size in meters (needed for pose scale)
-	float marker_size_m;
 	// Exact decoded payload string identifying this marker (QR codes: the
 	// runtime reports markerId 0, so matching is by payload). Required.
 	std::string marker_data;
-	// Hex content hash of the glB model, empty when no model is configured
-	std::string model_hash;
-	// Full model size in bytes (client pre-allocates reassembly buffer)
-	uint64_t model_size;
-	// Marker-to-mesh offset: meshClientPose = observedMarkerPose * offset.
-	// Position in meters, orientation as xyzw quaternion, uniform scale.
+	// Physical marker size in meters (needed for pose scale)
+	float marker_size_m;
+	// Marker-to-fiducial offset: fiducialPose = observedMarkerPose *
+	// offset. Position in meters, orientation as xyzw quaternion.
 	std::array<float, 3> position;
 	std::array<float, 4> orientation;
-	float scale;
-	// Passthrough window feather width in screen pixels (alpha-gradient
-	// blend band around the mesh silhouette). Per object; the mask layer
-	// renders at screen/feather resolution. 0 disables feathering.
-	float feather_px = 24;
-	// Tracking mode: "one-shot" (default, align once per Calibrate press)
-	// or "continuous" (auto-anchor on sight, then smooth-follow).
-	std::string mode = "one-shot";
-	// Stationary rig hint (optimizeForStaticMarker). True by default.
+};
+
+struct fiducial_entry
+{
+	// Stable link key referenced by passthrough objects (required).
+	std::string id;
+	// Display-only label for the headset status UI. Never used for
+	// matching or linkage.
+	std::string tag;
+	// Maps to optimizeForStaticMarker in the QR spatial context.
 	bool is_static = true;
-	// Continuous-mode live update rate + filter/smoothing tuning.
-	// Poses refresh every frame (no timers); the filter ingests novel
-	// samples only. Shared Euro cutoff/beta cover position and orientation.
+	// Resolver/smoothing tuning (resolver + smoothing move are future
+	// work; values ride along to the per-instance filters unchanged).
 	int window_size = 12;
 	int min_samples = 4;
 	float sigma_k = 3;
@@ -1016,14 +1010,41 @@ struct fiducial_map_entry
 	float knee_outer_mm = 5;
 	float knee_inner_deg = 0.1f;
 	float knee_outer_deg = 0.5f;
+	std::vector<fiducial_marker> markers;
+};
+
+struct passthrough_object
+{
+	// Behavior type. "3d-passthrough" renders the model as a
+	// surface-projected passthrough cutout; unknown types are skipped
+	// client-side (forward-compat).
+	std::string type = "3d-passthrough";
+	std::string id;
+	std::string tag;
+	// Referenced fiducial ids (one instance per visible pairing).
+	std::vector<std::string> fiducial;
+	// Hex content hash of the glB model, empty when no model is configured
+	std::string model_hash;
+	// Full model size in bytes (client pre-allocates reassembly buffer)
+	uint64_t model_size;
+	// Fiducial-to-object offset: objectPose = solvedFiducialPose *
+	// offset. Position in meters, orientation as xyzw quaternion, uniform
+	// scale applied last (objects only).
+	std::array<float, 3> position;
+	std::array<float, 4> orientation;
+	float scale;
+	// Passthrough window feather width in screen pixels (alpha-gradient
+	// blend band around the mesh silhouette). Mask stacks group by this
+	// value so each object feathers independently. 0 disables feathering.
+	float feather_px = 24;
 	// Alpha fade-in at first acquisition, milliseconds (0 = instant).
-	// Render-only: applied live, never invalidates calibration.
 	float fade_in_ms = 1000;
 };
 
 struct fiducial_map
 {
-	std::vector<fiducial_map_entry> entries;
+	std::vector<fiducial_entry> fiducials;
+	std::vector<passthrough_object> objects;
 };
 
 struct fiducial_model_chunk

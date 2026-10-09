@@ -993,25 +993,20 @@ std::optional<std::vector<std::byte>> read_model_file(const std::string & path)
 void wivrn_session::send_fiducial_map()
 {
 	configuration config;
-	if (config.fiducial_map.empty())
+	if (config.fiducials.empty() and config.passthrough_objects.empty())
 	{
 		U_LOG_I("Fiducial map: no entries configured");
 		return;
 	}
 
-	U_LOG_I("Fiducial map: sending %u entries", (unsigned)config.fiducial_map.size());
+	U_LOG_I("Fiducial map: sending %u fiducials, %u passthrough objects",
+	        (unsigned)config.fiducials.size(), (unsigned)config.passthrough_objects.size());
 	to_headset::fiducial_map msg;
-	for (const auto & entry: config.fiducial_map)
+	for (const auto & entry: config.fiducials)
 	{
-		to_headset::fiducial_map_entry e{
+		to_headset::fiducial_entry e{
+		        .id = entry.id,
 		        .tag = entry.tag,
-		        .marker_size_m = entry.marker_size_m,
-		        .marker_data = entry.marker_data,
-		        .position = entry.position,
-		        .orientation = entry.orientation,
-		        .scale = entry.scale,
-		        .feather_px = entry.feather_px,
-		        .mode = entry.mode,
 		        .is_static = entry.is_static,
 		        .window_size = entry.window_size,
 		        .min_samples = entry.min_samples,
@@ -1024,35 +1019,57 @@ void wivrn_session::send_fiducial_map()
 		        .knee_outer_mm = entry.knee_outer_mm,
 		        .knee_inner_deg = entry.knee_inner_deg,
 		        .knee_outer_deg = entry.knee_outer_deg,
+		};
+		for (const auto & m: entry.markers)
+			e.markers.push_back(to_headset::fiducial_marker{
+			        .marker_data = m.marker_data,
+			        .marker_size_m = m.marker_size_m,
+			        .position = m.position,
+			        .orientation = m.orientation,
+			});
+		const char * label = entry.tag.empty() ? entry.id.c_str() : entry.tag.c_str();
+		U_LOG_I("Fiducial \"%s\" (%s): %u markers", label, entry.is_static ? "static" : "moving", (unsigned)e.markers.size());
+		msg.fiducials.push_back(std::move(e));
+	}
+	for (const auto & entry: config.passthrough_objects)
+	{
+		to_headset::passthrough_object o{
+		        .type = entry.type,
+		        .id = entry.id,
+		        .tag = entry.tag,
+		        .fiducial = entry.fiducial,
+		        .position = entry.position,
+		        .orientation = entry.orientation,
+		        .scale = entry.scale,
+		        .feather_px = entry.feather_px,
 		        .fade_in_ms = entry.fade_in_ms,
 		};
 
-		// Display label: the tag, or the payload when untagged.
-		const char * label = entry.tag.empty() ? entry.marker_data.c_str() : entry.tag.c_str();
+		// Display label: the tag, or the id when untagged.
+		const char * label = entry.tag.empty() ? entry.id.c_str() : entry.tag.c_str();
 		if (not entry.model_path.empty())
 		{
 			if (auto data = read_model_file(entry.model_path))
 			{
-				e.model_hash = hash_hex(fnv1a64(*data));
-				e.model_size = data->size();
-			U_LOG_I("Fiducial map: marker \"%s\" (%.0fmm), payload \"%s\", model %s (%llu bytes) from %s",
-			        label, (double)(entry.marker_size_m * 1000),
-				        entry.marker_data.c_str(),
-				        e.model_hash.c_str(), (unsigned long long)e.model_size,
+				o.model_hash = hash_hex(fnv1a64(*data));
+				o.model_size = data->size();
+				U_LOG_I("Passthrough object \"%s\" (%s): model %s (%llu bytes) from %s",
+				        label, o.type.c_str(),
+				        o.model_hash.c_str(), (unsigned long long)o.model_size,
 				        entry.model_path.c_str());
 			}
 			else
 			{
-				U_LOG_W("Fiducial map: cannot serve model %s, entry will have no model", entry.model_path.c_str());
+				U_LOG_W("Passthrough object \"%s\": cannot serve model %s, entry will have no model",
+				        label, entry.model_path.c_str());
 			}
 		}
 		else
 		{
-			U_LOG_I("Fiducial map: marker \"%s\" (%.0fmm), no model configured",
-			        label, (double)(entry.marker_size_m * 1000));
+			U_LOG_I("Passthrough object \"%s\" (%s): no model configured", label, o.type.c_str());
 		}
 
-		msg.entries.push_back(std::move(e));
+		msg.objects.push_back(std::move(o));
 	}
 
 	send_control(std::move(msg));
@@ -1062,7 +1079,7 @@ void wivrn_session::operator()(from_headset::fiducial_model_request && request)
 {
 	U_LOG_I("Fiducial model requested: %s", request.model_hash.c_str());
 	configuration config;
-	for (const auto & entry: config.fiducial_map)
+	for (const auto & entry: config.passthrough_objects)
 	{
 		if (entry.model_path.empty())
 			continue;

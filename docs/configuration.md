@@ -183,79 +183,113 @@ Default value: unset
 
 If set, overrides the name displayed in the server list.
 
-## `fiducial-map`
+## `fiducials` and `passthrough`
 Default value: unset (feature disabled)
 
-Maps fiducials to glTF/GLB models for Quest passthrough mesh anchoring (see
-`ROADMAP.md`). The Quest runtime tracks **QR codes** (its AprilTag capability
-is not exposed to third-party apps), so each entry identifies its marker by
-the exact decoded QR payload string. The server reads each model file, sends
-the mapping plus content hashes to the headset on connect, and serves model
-bytes on demand. The headset caches models by hash, so files are transferred
-once.
+Quest fiducial tracking + behavior objects (see `ROADMAP.md`). Tracking
+(`fiducials`) is separate from behavior (`passthrough` objects that
+reference fiducials by id): the same QR printed twice places the object
+twice (one instance per sighted marker), and one object may reference
+several fiducials (one instance per visible pairing, never fused).
 
-Each entry has:
+The Quest runtime tracks **QR codes** (its AprilTag capability
+is not exposed to third-party apps), so each marker is identified by
+the exact decoded QR payload string. The server sends both maps plus
+model content hashes to the headset on connect, and serves model
+bytes on demand. The headset caches models by hash, so files are
+transferred once.
 
-- `tag`: display-only label shown in the headset status UI, so the GUI
-  row correlates with this config entry (optional; matching is by
-  `marker-data` alone, and renaming never invalidates a calibration)
-- `marker-data`: exact QR payload string to match, byte-for-byte (required)
-- `marker-size-m`: physical marker size in meters (required for pose scale;
-  measure the printed QR's outer edge)
-- `model-path`: path to a `.glb`/`.gltf` file on the server (optional, models
-  larger than 64MB are skipped)
-- `position`: `[x, y, z]` marker-to-mesh offset in meters (default `[0,0,0]`)
-- `orientation`: `[rx, ry, rz]` marker-to-mesh rotation in degrees
-  (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
-  single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
-- `scale`: uniform marker-to-mesh scale, number or single-element array
-  (default `1`)
-- `feather-px`: passthrough window feather width in screen pixels
-  (alpha-gradient blend band around the mesh silhouette, default `24`;
-  `0` disables feathering). Per object; applied live, no recalibration.
-  The client selects a blur tier automatically (0 hard edge, 1 full-res,
-  2/4/8 half/quarter/eighth with exact spread mapping, clamped to 128px),
-  so tap density and cost stay flat at any width.
-- `mode`: `"one-shot"` (default) or `"continuous"`. One-shot aligns once
-  per Calibrate press. Continuous auto-anchors on first sighting, then
-  smooth-follows the marker to correct drift without ever snapping: new
-  samples are robustly averaged (median/MAD Cauchy soft-weighting) and the
-  rendered pose exponentially approaches the resolved target every frame
-  (large error = large step). SLAM-holds forever on marker loss.
+Each `fiducials` entry has:
+
+- `id`: stable link key referenced by passthrough objects (required,
+  must be unique)
+- `tag`: display-only label shown in the headset status UI (optional;
+  renaming never affects tracking or linkage)
 - `static`: `true` (default) or `false`. Maps to the runtime's
   `optimizeForStaticMarker`: keep `true` for a stationary rig, set `false`
   for a moving reference marker. Toggling recreates the client spatial
   context (brief tracking hitch).
-- Continuous tuning (all optional, all live per map change; shared Euro
-  cutoff/beta cover position and orientation). Poses refresh every frame
-  (no timers); the filter ingests novel samples only:
-  `window-size` (default `12`), `min-samples` (default `4`),
-  `sigma-k` (default `3`), `pos-gain`/`rot-gain` (default `24`, per-second
-  proportional catch-up), `euro-min-cutoff` (default `0.4`),
-  `euro-beta` (default `0.07`),   `knee-inner-mm`/`knee-outer-mm`
-  (defaults `1`/`5`), `knee-inner-deg`/`knee-outer-deg`
-  (defaults `0.1`/`0.5`).
-- `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds
-  (default `1000`; `0` = appears instantly). Render-only; applied live,
-  never invalidates calibration. During the fade the passthrough window
-  ramps from fully transparent (game video) to fully present.
+- Resolver/smoothing tuning (all optional; shared Euro cutoff/beta cover
+  position and orientation): `window-size` (default `12`),
+  `min-samples` (default `4`), `sigma-k` (default `3`),
+  `pos-gain`/`rot-gain` (default `24`, per-second proportional catch-up),
+  `euro-min-cutoff` (default `0.4`), `euro-beta` (default `0.07`),
+  `knee-inner-mm`/`knee-outer-mm` (defaults `1`/`5`),
+  `knee-inner-deg`/`knee-outer-deg` (defaults `0.1`/`0.5`).
+- `markers`: list of markers resolving to the one fiducial frame, each with:
+  - `marker-data`: exact QR payload string to match, byte-for-byte (required)
+  - `marker-size-m`: physical marker size in meters (required for pose
+    scale; measure the printed QR's outer edge)
+  - `position`: `[x, y, z]` marker-to-fiducial offset in meters
+    (default `[0,0,0]`)
+  - `orientation`: `[rx, ry, rz]` marker-to-fiducial rotation in degrees
+    (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
+    single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
 
-The mesh pose on the headset is
-`meshClientPose = observedMarkerPose * markerToMeshOffset`.
+Each `passthrough` entry (behavior object) has:
+
+- `type`: behavior type. `"3d-passthrough"` renders the model as a
+  surface-projected passthrough cutout. Unknown types are skipped with a
+  warning (forward-compat for `3d-passthrough-reversed`, `3d-boundary`,
+  `3d-boundary-reversed`, `3d-depth`).
+- `id`: stable identifier (required, must be unique); `tag`: display-only
+  label (optional)
+- `fiducial`: referenced fiducial id, or list of ids (required; dangling
+  references are dropped with a warning, and an object left with none is
+  skipped)
+- `model-path`: path to a `.glb`/`.gltf` file on the server (optional,
+  models larger than 64MB are skipped)
+- `position`: `[x, y, z]` fiducial-to-object offset in meters
+  (default `[0,0,0]`)
+- `orientation`: `[rx, ry, rz]` fiducial-to-object rotation in degrees
+  (default `[0,0,0]`, same fixed-frame convention as above)
+- `scale`: uniform object scale, number or single-element array
+  (default `1`, objects only, applied last)
+- `feather-px`: passthrough window feather width in screen pixels
+  (alpha-gradient blend band around the mesh silhouette, default `24`;
+  `0` disables feathering). Mask stacks group by this value so each
+  object feathers independently; applied live. The client selects a blur
+  tier automatically (0 hard edge, 1 full-res, 2/4/8 half/quarter/eighth
+  with exact spread mapping, clamped to 128px), so tap density and cost
+  stay flat at any width.
+- `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds
+  (default `1000`; `0` = appears instantly). Render-only; applied live.
+  During the fade the passthrough window ramps from fully transparent
+  (game video) to fully present.
+
+Poses compose as
+`fiducialPose = observedMarkerPose * markerToFiducialOffset` then
+`objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
+Objects auto-align on first sighting of a referenced marker, then
+smooth-follow without ever snapping, and SLAM-hold forever on marker loss.
 
 Print the QR encoding exactly the `marker-data` string, e.g.
 `qrencode -o marker11.png -s 10 "wivrn:11"`. Matching is exact and
-case-sensitive; any other QR code in view is ignored (the headset logs its
-payload to help you copy it verbatim into the config).
+case-sensitive; any other QR code in view is reported in the headset
+Passthrough tab (red) to help you copy it verbatim into the config.
 
 ### Example
 ```json
 {
-	"fiducial-map": [
+	"fiducials": [
 		{
-			"tag": "window",
-			"marker-data": "wivrn:11",
-			"marker-size-m": 0.08,
+			"id": "press",
+			"tag": "Press rig",
+			"static": true,
+			"markers": [
+				{
+					"marker-data": "wivrn:11",
+					"marker-size-m": 0.08
+				}
+			]
+		}
+	],
+	"passthrough": [
+		{
+			"type": "3d-passthrough",
+			"id": "press-window",
+			"tag": "Press window",
+			"fiducial": ["press"],
 			"model-path": "/usr/share/wivrn/meshes/widget.glb",
 			"position": [0, 0.05, 0.1],
 			"orientation": [0, 0, 0],
