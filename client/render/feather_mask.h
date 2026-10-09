@@ -20,23 +20,16 @@
 
 // Feathered passthrough window mask.
 //
-// Per frame (both eyes): rasterize the calibrated mesh silhouette as SDF
-// seeds at reduced resolution, run a truncated Jump Flood cascade (only as
-// far as the feather reaches), then composite analytically in a single
-// full-resolution pass: alpha is 1 inside the silhouette, smoothstepped
-// 1 -> 0 over feather-px outside it. Interiors stay pixel-exact to the
-// rasterized edge; the band never erodes into the model (unlike the old
-// Gaussian, whose band ran +-F/2).
-//
-// SDF resolution follows the band (distance error ~0.5 SDF texel stays
-// negligible against it): feather <= 8 floods at half mask resolution,
-// <= 64 at quarter, above at eighth. feather <= 0 keeps the exact
-// hard-edge direct raster (no field work at all). The sign edge always
-// resolves from the half-res coverage texture, so coarser floods cost no
-// boundary quality.
+// Per frame (both eyes): rasterize the calibrated mesh silhouette binary
+// at full resolution into intermediate A, separable Gaussian blur H into
+// B and V into the submitted swapchain image. The blur decouples feather
+// width from shape resolution: opaque interiors stay pixel-exact while
+// the band is genuinely smooth (robust to the compositor sampling with or
+// without filtering). Fixed 9-tap kernel (sigma 2); feather-px maps to
+// tap spread, recommended range 4-12 (see docs/configuration.md).
 //
 // Swapchain images only allow COLOR_ATTACHMENT output, which is why the
-// seed is a raster pass and not a buffer fill.
+// silhouette is a raster pass and not a buffer copy.
 
 #include "render/passthrough_mesh.h"
 
@@ -84,27 +77,24 @@ public:
 	// interest); CPU sections here identify the host-hot stage.
 	struct mask_stage_cpu
 	{
-		double raster_ms = 0; // SDF seed raster (or tier-0 direct raster)
-		double blur_ms = 0;   // Jump Flood cascade (all iterations)
+		double raster_ms = 0; // Stage 1 silhouettes (or tier-0 direct raster)
+		double blur_ms = 0;   // blur H+V (tier 1) or downsample+H+V (tiered)
 		double punch_ms = 0;  // marker-window cutout punch
 		double total_ms = 0;  // whole record() body, incl. target setup
-		int tier = -1;        // 0 = hard edge, else SDF downsample divisor
+		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
 		size_t draws = 0;     // silhouette drawIndexed calls (both eyes)
 	};
 
-	// Record silhouettes + SDF chain for both eyes into the layers of an
+	// Record silhouettes + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
 	// be unused (UNDEFINED is fine); it is left in GENERAL for the
-	// compositor. Feather selects the path (0 = hard edge raster direct,
-	// >0 = SDF at half/quarter resolution, clamped to 128px);
-	// rasterize=false clears only.
+	// compositor. Feather selects the tier (0 = hard edge raster direct,
+	// 1 = full-res blur, 2/4/8 = blur at half/quarter/eighth with exact
+	// spread mapping, clamped to 128px); rasterize=false clears only.
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Mask path only (the binary projected layer has
 	// no alpha control to punch through).
-	// Per-instance fade opacity collapses to the group minimum: the field
-	// carries distance only, so the composite applies one uniform opacity
-	// (identical to per-draw while a group holds a single instance).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -147,62 +137,45 @@ private:
 	// full-alpha quad no blur pass touches.
 	vk::raii::RenderPass cutout_renderpass{nullptr};
 
-	// SDF seed + Jump Flood workspaces (own RG32F images: full usage
-	// control, unlike swapchain images). Sized to this group's SDF divisor
-	// (extent/div); the divisor is static per group (keyed by feather-px),
-	// so a config change lands on a fresh renderer. Recreated when the
-	// mask extent changes.
-	struct sdf_target
+	// Separable Gaussian blur (fullscreen triangle, sampled input).
+	vk::raii::RenderPass blur_renderpass{nullptr};
+	vk::raii::PipelineLayout blur_layout{nullptr};
+	vk::raii::Pipeline blur_pipeline{nullptr};
+	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
+	// reads the push block's src_texel prefix).
+	vk::raii::Pipeline downsample_pipeline{nullptr};
+	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
+	vk::raii::DescriptorPool descriptor_pool{nullptr};
+	// One set per (pass, eye): descriptor updates are host-side writes
+	// that complete before submit, so every draw would otherwise read the
+	// LAST update (all passes sampling the final image, i.e. unwritten
+	// data). Distinct sets make each binding stable across the frame.
+	// Index: 0,1 = blur-H eyes 0,1; 2,3 = blur-V eyes 0,1; 4..9 =
+	// downsample levels 1..3 x eyes 0,1.
+	std::vector<vk::raii::DescriptorSet> descriptor_sets;
+	vk::raii::Sampler sampler{nullptr};
+
+	// Blur intermediates (full mask resolution, own images: full usage
+	// control, unlike swapchain images). Recreated when the extent changes.
+	struct blur_target
 	{
 		vk::raii::Image image{nullptr};
 		vk::raii::DeviceMemory memory{nullptr};
 		std::vector<vk::raii::ImageView> views;
-		std::vector<vk::raii::Framebuffer> fbs;
+		std::vector<vk::raii::Framebuffer> raster_fbs;
+		std::vector<vk::raii::Framebuffer> blur_fbs;
 	};
-	// Seed render pass: CLEARs to INF, stores GENERAL (read back by the
-	// composite for the inside/outside sign).
-	vk::raii::RenderPass seed_renderpass{nullptr};
-	vk::raii::Pipeline seed_pipeline{nullptr}; // mask.vert + seed.frag
-	// Flood render pass: DONT_CARE load (every texel rewritten), GENERAL.
-	vk::raii::RenderPass sdf_renderpass{nullptr};
-	vk::raii::Pipeline jfa_pipeline{nullptr}; // blur.vert + jfa.frag
-	vk::raii::Pipeline composite_pipeline{nullptr}; // blur.vert + sdf_composite.frag
-	vk::raii::PipelineLayout jfa_layout{nullptr};
-	vk::raii::PipelineLayout composite_layout{nullptr};
-	vk::raii::DescriptorSetLayout jfa_set_layout{nullptr};
-	vk::raii::DescriptorSetLayout composite_set_layout{nullptr};
-	vk::raii::DescriptorPool descriptor_pool{nullptr};
-	// One set per (iteration, eye): descriptor updates are host-side
-	// writes completing before submit, so reusing one set across flood
-	// iterations would make every draw read the LAST update (a destroyed
-	// cascade that composites as a hard edge). Distinct sets keep each
-	// binding stable: jfa_sets[eye*8+pass] sources iteration pass,
-	// composite_sets[eye] bind (field, seed). Vectors (not arrays): raii
-	// handles have no default constructor. Worst case is 7 iterations
-	// (128px at div4), so 8/eye has margin.
-	static constexpr uint32_t max_flood_passes = 8;
-	std::vector<vk::raii::DescriptorSet> jfa_sets;
-	std::vector<vk::raii::DescriptorSet> composite_sets;
-	vk::raii::Sampler sampler{nullptr};         // linear: flood field reads
-	vk::raii::Sampler nearest_sampler{nullptr}; // nearest: exact seed coords
-	sdf_target sdf_seed, sdf_ping, sdf_pong;
-	// Coverage-sign texture: the silhouette rasterized flat-white at half
-	// mask resolution (swapchain format, so the existing raster renderpass
-	// and pipeline serve it with an opacity-1 push). The composite reads
-	// it linearly for a 2px-grid soft sign edge, decoupling boundary
-	// quality from the (coarser) flood resolution.
-	sdf_target sdf_cover;
+	blur_target target_a;
+	blur_target target_b;
+	// Downsample chain (D) and tier blur workspaces (E) at half, quarter
+	// and eighth mask resolution (index 0..2). Tier k blurs at 1/k size
+	// with the same fixed kernel, so tap density (and cost) stays flat
+	// while feather-px grows; the band stays continuous by exact mapping.
+	blur_target down_targets[3];
+	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	int targets_div = 0;
-	// SDF storage format, chosen once in the constructor: RG16F where the
-	// device renders/filters it (halves flood bandwidth; coords < 2048 are
-	// exact in half), else RG32F. The seed INF and composite inside/outside
-	// threshold follow the choice (sdf_outside / inside_thresh push).
-	vk::Format sdf_format_used = vk::Format::eR32G32Sfloat;
-	float sdf_outside = 1e10f;
-	void ensure_targets(vk::Extent2D extent, int sdf_div);
-	void update_flood(uint32_t eye, uint32_t pass, vk::ImageView view);
-	void update_composite(uint32_t eye, vk::ImageView field, vk::ImageView cover);
+	void ensure_targets(vk::Extent2D extent);
+	void update_source(vk::ImageView view, uint32_t set);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
 	// shared-read (uploads are rare, map-change only); the pending copy

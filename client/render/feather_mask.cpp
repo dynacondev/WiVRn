@@ -21,21 +21,13 @@
 #include "vk/shader.h"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
-#include <cmath>
 #include <cstring>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 
 namespace
 {
-// Temporary cascade diagnostic: set to 1 (iso-contours) or 2 (coverage
-// paint) and rebuild for a viz APK. The mask layer blends by alpha only,
-// so RGB painting would be invisible. Always 0 in benchmark and shipping
-// builds.
-constexpr int sdf_field_viz = 1;
-
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
 	auto mem = physical_device.getMemoryProperties();
@@ -47,33 +39,21 @@ uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t t
 	throw std::runtime_error("feather_mask: no suitable memory type");
 }
 
-// Silhouette raster push block. Mirrors mask.vert PushConstants (mvp)
-// plus opacity: mask.frag (tier 0) writes it as mask alpha, seed.frag
-// ignores it (seeds are binary), and the SDF composite takes the group
-// minimum as its uniform opacity.
+struct blur_push
+{
+	float texel[2];
+	float dir[2];
+	float spread;
+	float pad = 0;
+};
+
+// Silhouette raster push block. Mirrors mask.vert/frag.glsl PushConstants:
+// mvp plus the first-acquisition fade opacity. The blur chain is linear in
+// alpha, so one raster-alpha scale fades interior and feather band alike.
 struct raster_push
 {
 	glm::mat4 mvp;
 	float opacity = 1;
-};
-
-// Jump Flood push block. Mirrors jfa.frag.glsl Push (16 bytes).
-struct jfa_push
-{
-	float texel[2];
-	float step;
-	float pad = 0;
-};
-
-// Analytic composite push block. Mirrors sdf_composite.frag.glsl Push
-// (24 bytes).
-struct sdf_composite_push
-{
-	float sdf_dim[2];
-	float feather_px;
-	float opacity;
-	float px_per_texel;
-	float viz = 0;
 };
 
 // RAII section timer for the record() diagnostics (mask_stage_cpu): adds
@@ -90,6 +70,20 @@ struct section_clock
 	}
 };
 
+// Downsample level extent (level 1 = half): exact halving, so the 2x2 box
+// mapping stays exact. Shared with ensure_targets: sizes must match.
+// The mask extent is 64-quantized upstream, hence divisible throughout.
+vk::Extent2D level_extent(vk::Extent2D full, int level)
+{
+	uint32_t w = full.width;
+	uint32_t h = full.height;
+	for (int i = 0; i < level; ++i)
+	{
+		w = std::max(8u, w / 2);
+		h = std::max(8u, h / 2);
+	}
+	return {w, h};
+}
 } // namespace
 
 feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
@@ -99,19 +93,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
         physical_device(physical_device_),
         format(format_)
 {
-	// SDF storage: RG16F where renderable + linearly filterable (halves
-	// flood bandwidth; coords < 2048 exact in half, INF 60000 < 65504),
-	// else RG32F. Queried once; targets, clear values and the composite
-	// threshold all follow.
-	vk::FormatProperties sdf_props = physical_device.getFormatProperties(vk::Format::eR16G16Sfloat);
-	constexpr auto needed = vk::FormatFeatureFlagBits::eColorAttachment | vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
-	if ((sdf_props.optimalTilingFeatures & needed) == needed)
-	{
-		sdf_format_used = vk::Format::eR16G16Sfloat;
-		sdf_outside = 60000.f;
-	}
-	spdlog::info("Fiducial mask SDF storage: {}", vk::to_string(sdf_format_used));
-
 	auto vert = load_shader(device, "mask.vert");
 	auto frag = load_shader(device, "mask.frag");
 
@@ -261,244 +242,150 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	pipeline = vk::raii::Pipeline(device, nullptr, pipeline_info);
 
-	// SDF seed pass: RG32F, CLEARs to INF ("no seed"), stores GENERAL
-	// (the composite samples it back for the inside/outside sign).
-	vk::AttachmentDescription seed_attachment{
-	        .format = sdf_format_used,
-	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eClear,
-	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
-	};
-	vk::AttachmentReference seed_color_ref{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::SubpassDescription seed_subpass{
-	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &seed_color_ref,
-	};
-	vk::RenderPassCreateInfo seed_rp_info{
-	        .attachmentCount = 1,
-	        .pAttachments = &seed_attachment,
-	        .subpassCount = 1,
-	        .pSubpasses = &seed_subpass,
-	};
-	seed_renderpass = vk::raii::RenderPass(device, seed_rp_info);
-
-	// SDF flood pass: RG32F, DONT_CARE load (every texel is rewritten by
-	// the fullscreen triangle), stores GENERAL for the next iteration.
-	vk::AttachmentDescription sdf_attachment{
-	        .format = sdf_format_used,
+	// Blur render pass: fully overwritten every use (fullscreen triangle),
+	// so no clear and no prior contents needed.
+	vk::AttachmentDescription blur_attachment{
+	        .format = format,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eDontCare,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	        .finalLayout = vk::ImageLayout::eGeneral,
 	};
-	vk::AttachmentReference sdf_color_ref{
+	vk::AttachmentReference blur_color_ref{
 	        .attachment = 0,
 	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
-	vk::SubpassDescription sdf_subpass{
+	vk::SubpassDescription blur_subpass{
 	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
 	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &sdf_color_ref,
+	        .pColorAttachments = &blur_color_ref,
 	};
-	vk::RenderPassCreateInfo sdf_rp_info{
+	vk::RenderPassCreateInfo blur_rp_info{
 	        .attachmentCount = 1,
-	        .pAttachments = &sdf_attachment,
+	        .pAttachments = &blur_attachment,
 	        .subpassCount = 1,
-	        .pSubpasses = &sdf_subpass,
+	        .pSubpasses = &blur_subpass,
 	};
-	sdf_renderpass = vk::raii::RenderPass(device, sdf_rp_info);
+	blur_renderpass = vk::raii::RenderPass(device, blur_rp_info);
 
-	// Seed pipeline: same mesh vertex input as the raster pass (mask.vert
-	// transforms by pc.mvp), seed.frag emits fragcoords. Shares the raster
-	// pipeline layout (push block identical; the fragment stage just
-	// ignores opacity).
-	auto seed_frag = load_shader(device, "seed.frag");
-	vk::PipelineShaderStageCreateInfo seed_stages[2] = {
+	auto blur_vert = load_shader(device, "blur.vert");
+	auto blur_frag = load_shader(device, "blur.frag");
+	vk::PipelineShaderStageCreateInfo blur_stages[2] = {
 	        {
 	                .stage = vk::ShaderStageFlagBits::eVertex,
-	                .module = **vert,
+	                .module = **blur_vert,
 	                .pName = "main",
 	        },
 	        {
 	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **seed_frag,
-	                .pName = "main",
-	        },
-	};
-	vk::GraphicsPipelineCreateInfo seed_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = seed_stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *pipeline_layout,
-	        .renderPass = *seed_renderpass,
-	};
-	seed_pipeline = vk::raii::Pipeline(device, nullptr, seed_pipeline_info);
-
-	auto fullscreen_vert = load_shader(device, "blur.vert");
-	auto jfa_frag = load_shader(device, "jfa.frag");
-	auto composite_frag = load_shader(device, "sdf_composite.frag");
-	vk::PipelineShaderStageCreateInfo jfa_stages[2] = {
-	        {
-	                .stage = vk::ShaderStageFlagBits::eVertex,
-	                .module = **fullscreen_vert,
-	                .pName = "main",
-	        },
-	        {
-	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **jfa_frag,
-	                .pName = "main",
-	        },
-	};
-	vk::PipelineShaderStageCreateInfo composite_stages[2] = {
-	        {
-	                .stage = vk::ShaderStageFlagBits::eVertex,
-	                .module = **fullscreen_vert,
-	                .pName = "main",
-	        },
-	        {
-	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **composite_frag,
+	                .module = **blur_frag,
 	                .pName = "main",
 	        },
 	};
 
-	vk::PipelineVertexInputStateCreateInfo fs_vertex_input{};
-	vk::PipelineInputAssemblyStateCreateInfo fs_input_assembly{
+	vk::PipelineVertexInputStateCreateInfo blur_vertex_input{};
+	vk::PipelineInputAssemblyStateCreateInfo blur_input_assembly{
 	        .topology = vk::PrimitiveTopology::eTriangleList,
 	};
-	vk::PipelineViewportStateCreateInfo fs_viewport_state{
+	vk::PipelineViewportStateCreateInfo blur_viewport_state{
 	        .viewportCount = 1,
 	        .scissorCount = 1,
 	};
-	vk::PipelineRasterizationStateCreateInfo fs_rasterization{
+	vk::PipelineRasterizationStateCreateInfo blur_rasterization{
 	        .polygonMode = vk::PolygonMode::eFill,
 	        .cullMode = vk::CullModeFlagBits::eNone,
 	        .frontFace = vk::FrontFace::eCounterClockwise,
 	        .lineWidth = 1,
 	};
-	vk::PipelineMultisampleStateCreateInfo fs_multisample{
+	vk::PipelineMultisampleStateCreateInfo blur_multisample{
 	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
 	};
-	vk::PipelineColorBlendAttachmentState fs_blend_attachment{
+	vk::PipelineColorBlendAttachmentState blur_blend_attachment{
 	        .blendEnable = VK_FALSE,
 	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
 	                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
 	};
-	vk::PipelineColorBlendStateCreateInfo fs_blend{
+	vk::PipelineColorBlendStateCreateInfo blur_blend{
 	        .attachmentCount = 1,
-	        .pAttachments = &fs_blend_attachment,
+	        .pAttachments = &blur_blend_attachment,
 	};
-	vk::DynamicState fs_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
-	vk::PipelineDynamicStateCreateInfo fs_dynamic{
+	vk::DynamicState blur_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo blur_dynamic{
 	        .dynamicStateCount = 2,
-	        .pDynamicStates = fs_dynamics,
+	        .pDynamicStates = blur_dynamics,
 	};
 
-	// JFA set: single flood-source sampler. Composite set: flood field
-	// (linear, binding 0) + untouched seed (nearest, binding 1) +
-	// coverage-sign (linear, binding 2).
-	vk::DescriptorSetLayoutBinding jfa_binding{
+	vk::DescriptorSetLayoutBinding sampler_binding{
 	        .binding = 0,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	        .descriptorCount = 1,
 	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
 	};
-	vk::DescriptorSetLayoutCreateInfo jfa_set_layout_info{
+	vk::DescriptorSetLayoutCreateInfo set_layout_info{
 	        .bindingCount = 1,
-	        .pBindings = &jfa_binding,
+	        .pBindings = &sampler_binding,
 	};
-	jfa_set_layout = vk::raii::DescriptorSetLayout(device, jfa_set_layout_info);
+	descriptor_layout = vk::raii::DescriptorSetLayout(device, set_layout_info);
 
-	vk::DescriptorSetLayoutBinding composite_bindings[2] = {
-	        {
-	                .binding = 0,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 1,
-	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	        },
-	        {
-	                .binding = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 1,
-	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	        },
-	};
-	vk::DescriptorSetLayoutCreateInfo composite_set_layout_info{
-	        .bindingCount = 2,
-	        .pBindings = composite_bindings,
-	};
-	composite_set_layout = vk::raii::DescriptorSetLayout(device, composite_set_layout_info);
-
-	vk::PushConstantRange jfa_push_range{
+	vk::PushConstantRange blur_push_range{
 	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
 	        .offset = 0,
-	        .size = sizeof(jfa_push),
+	        .size = 24,
 	};
-	vk::PipelineLayoutCreateInfo jfa_layout_info{
+	vk::PipelineLayoutCreateInfo blur_layout_info{
 	        .setLayoutCount = 1,
-	        .pSetLayouts = &*jfa_set_layout,
+	        .pSetLayouts = &*descriptor_layout,
 	        .pushConstantRangeCount = 1,
-	        .pPushConstantRanges = &jfa_push_range,
+	        .pPushConstantRanges = &blur_push_range,
 	};
-	jfa_layout = vk::raii::PipelineLayout(device, jfa_layout_info);
+	blur_layout = vk::raii::PipelineLayout(device, blur_layout_info);
 
-	vk::PushConstantRange composite_push_range{
-	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	        .offset = 0,
-	        .size = sizeof(sdf_composite_push),
-	};
-	vk::PipelineLayoutCreateInfo composite_layout_info{
-	        .setLayoutCount = 1,
-	        .pSetLayouts = &*composite_set_layout,
-	        .pushConstantRangeCount = 1,
-	        .pPushConstantRanges = &composite_push_range,
-	};
-	composite_layout = vk::raii::PipelineLayout(device, composite_layout_info);
-
-	vk::GraphicsPipelineCreateInfo jfa_pipeline_info{
+	vk::GraphicsPipelineCreateInfo blur_pipeline_info{
 	        .stageCount = 2,
-	        .pStages = jfa_stages,
-	        .pVertexInputState = &fs_vertex_input,
-	        .pInputAssemblyState = &fs_input_assembly,
-	        .pViewportState = &fs_viewport_state,
-	        .pRasterizationState = &fs_rasterization,
-	        .pMultisampleState = &fs_multisample,
-	        .pColorBlendState = &fs_blend,
-	        .pDynamicState = &fs_dynamic,
-	        .layout = *jfa_layout,
-	        .renderPass = *sdf_renderpass,
+	        .pStages = blur_stages,
+	        .pVertexInputState = &blur_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_renderpass,
 	};
-	jfa_pipeline = vk::raii::Pipeline(device, nullptr, jfa_pipeline_info);
+	blur_pipeline = vk::raii::Pipeline(device, nullptr, blur_pipeline_info);
 
-	// Composite targets the swapchain image: same CLEAR render pass as the
-	// silhouette raster (framebuffer-compatible by construction).
-	vk::GraphicsPipelineCreateInfo composite_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = composite_stages,
-	        .pVertexInputState = &fs_vertex_input,
-	        .pInputAssemblyState = &fs_input_assembly,
-	        .pViewportState = &fs_viewport_state,
-	        .pRasterizationState = &fs_rasterization,
-	        .pMultisampleState = &fs_multisample,
-	        .pColorBlendState = &fs_blend,
-	        .pDynamicState = &fs_dynamic,
-	        .layout = *composite_layout,
-	        .renderPass = *renderpass,
+	// Box-downsample pipeline: same fullscreen vertex shader, same layout
+	// (reads only the push prefix) and render pass as the blur passes.
+	auto downsample_frag = load_shader(device, "downsample.frag");
+	vk::PipelineShaderStageCreateInfo downsample_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **blur_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **downsample_frag,
+	                .pName = "main",
+	        },
 	};
-	composite_pipeline = vk::raii::Pipeline(device, nullptr, composite_pipeline_info);
+	vk::PipelineVertexInputStateCreateInfo downsample_vertex_input{};
+	vk::GraphicsPipelineCreateInfo downsample_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = downsample_stages,
+	        .pVertexInputState = &downsample_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_renderpass,
+	};
+	downsample_pipeline = vk::raii::Pipeline(device, nullptr, downsample_pipeline_info);
 
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
@@ -515,41 +402,24 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	sampler = vk::raii::Sampler(device, sampler_info);
 
-	vk::SamplerCreateInfo nearest_info = sampler_info;
-	nearest_info.magFilter = vk::Filter::eNearest;
-	nearest_info.minFilter = vk::Filter::eNearest;
-	nearest_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
-	nearest_sampler = vk::raii::Sampler(device, nearest_info);
-
-	// 16 JFA sets (8 iterations x eyes) + 2 composite sets (2 samplers
-	// each): 20 descriptors.
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 20,
+	        .descriptorCount = 10,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
-	        .maxSets = 18,
+	        .maxSets = 10,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
 	};
 	descriptor_pool = vk::raii::DescriptorPool(device, pool_info);
-	for (uint32_t i = 0; i < 2 * max_flood_passes; ++i)
+	for (int i = 0; i < 10; ++i)
 	{
-		vk::DescriptorSetAllocateInfo jfa_alloc{
+		vk::DescriptorSetAllocateInfo set_alloc_info{
 		        .descriptorPool = *descriptor_pool,
 		        .descriptorSetCount = 1,
-		        .pSetLayouts = &*jfa_set_layout,
+		        .pSetLayouts = &*descriptor_layout,
 		};
-		jfa_sets.emplace_back(std::move(device.allocateDescriptorSets(jfa_alloc)[0]));
-	}
-	for (int eye = 0; eye < 2; ++eye)
-	{
-		vk::DescriptorSetAllocateInfo composite_alloc{
-		        .descriptorPool = *descriptor_pool,
-		        .descriptorSetCount = 1,
-		        .pSetLayouts = &*composite_set_layout,
-		};
-		composite_sets.emplace_back(std::move(device.allocateDescriptorSets(composite_alloc)[0]));
+		descriptor_sets.emplace_back(std::move(device.allocateDescriptorSets(set_alloc_info)[0]));
 	}
 }
 
@@ -626,26 +496,22 @@ void feather_mask_renderer::remove_mesh(const std::string & key)
 	meshes.erase(it);
 }
 
-void feather_mask_renderer::ensure_targets(vk::Extent2D extent, int sdf_div)
+void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 {
 	if (targets_extent.width == extent.width and targets_extent.height == extent.height and
-	    targets_extent.width != 0 and targets_div == sdf_div)
+	    targets_extent.width != 0)
 		return;
 
-	// Rare path (extent or divisor change): in-flight frames may still read
-	// the old images, mirroring setup_reprojection_swapchain.
+	// Rare path (extent change): in-flight frames may still read the old
+	// images, mirroring setup_reprojection_swapchain.
 	device.waitIdle();
 	targets_extent = extent;
-	targets_div = sdf_div;
-	// This group's SDF resolution (the mask extent is 64-quantized
-	// upstream, hence evenly divisible by 2 and 4 throughout).
-	vk::Extent2D sdf_alloc{extent.width / (uint32_t)sdf_div, extent.height / (uint32_t)sdf_div};
-	for (auto * target: std::array<sdf_target *, 3>{&sdf_seed, &sdf_ping, &sdf_pong})
+	for (auto * target: {&target_a, &target_b})
 	{
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
-		        .format = sdf_format_used,
-		        .extent = {sdf_alloc.width, sdf_alloc.height, 1},
+		        .format = format,
+		        .extent = {extent.width, extent.height, 1},
 		        .mipLevels = 1,
 		        .arrayLayers = 2,
 		        .samples = vk::SampleCountFlagBits::e1,
@@ -663,13 +529,14 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, int sdf_div)
 		target->memory = vk::raii::DeviceMemory(device, alloc_info);
 		target->image.bindMemory(*target->memory, 0);
 		target->views.clear();
-		target->fbs.clear();
+		target->raster_fbs.clear();
+		target->blur_fbs.clear();
 		for (int layer = 0; layer < 2; ++layer)
 		{
 			vk::ImageViewCreateInfo view_info{
 			        .image = *target->image,
 			        .viewType = vk::ImageViewType::e2D,
-			        .format = sdf_format_used,
+			        .format = format,
 			        .subresourceRange = {
 			                .aspectMask = vk::ImageAspectFlagBits::eColor,
 			                .baseMipLevel = 0,
@@ -682,81 +549,87 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, int sdf_div)
 		}
 		// Named copies: framebuffer create-info stores the pointer, so the
 		// handles must outlive the constructor calls (no &* temporaries).
-		// Seed and flood passes share these framebuffers: identical
+		// Raster and blur passes share these framebuffers: identical
 		// attachment spec (format/count/samples), which is all that
 		// render-pass compatibility compares.
 		vk::ImageView raw_views[2] = {*target->views[0], *target->views[1]};
 		for (int layer = 0; layer < 2; ++layer)
 		{
 			vk::FramebufferCreateInfo fb_info{
-			        .renderPass = *seed_renderpass,
-			        .attachmentCount = 1,
-			        .pAttachments = &raw_views[layer],
-			        .width = sdf_alloc.width,
-			        .height = sdf_alloc.height,
-			        .layers = 1,
-			};
-			target->fbs.emplace_back(device, fb_info);
-		}
-	}
-	// Coverage-sign texture at half mask resolution in the swapchain
-	// format (existing raster renderpass serves it; framebuffer-compatible
-	// by construction). Same lifetime/key as the SDF targets above.
-	vk::Extent2D cover_alloc{extent.width / 2, extent.height / 2};
-	{
-		vk::ImageCreateInfo cover_info{
-		        .imageType = vk::ImageType::e2D,
-		        .format = format,
-		        .extent = {cover_alloc.width, cover_alloc.height, 1},
-		        .mipLevels = 1,
-		        .arrayLayers = 2,
-		        .samples = vk::SampleCountFlagBits::e1,
-		        .tiling = vk::ImageTiling::eOptimal,
-		        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
-		        .sharingMode = vk::SharingMode::eExclusive,
-		        .initialLayout = vk::ImageLayout::eUndefined,
-		};
-		sdf_cover.image = vk::raii::Image(device, cover_info);
-		auto cover_req = sdf_cover.image.getMemoryRequirements();
-		vk::MemoryAllocateInfo cover_alloc_info{
-		        .allocationSize = cover_req.size,
-		        .memoryTypeIndex = find_memory_type(physical_device, cover_req.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
-		};
-		sdf_cover.memory = vk::raii::DeviceMemory(device, cover_alloc_info);
-		sdf_cover.image.bindMemory(*sdf_cover.memory, 0);
-		sdf_cover.views.clear();
-		sdf_cover.fbs.clear();
-		for (int layer = 0; layer < 2; ++layer)
-		{
-			vk::ImageViewCreateInfo cover_view_info{
-			        .image = *sdf_cover.image,
-			        .viewType = vk::ImageViewType::e2D,
-			        .format = format,
-			        .subresourceRange = {
-			                .aspectMask = vk::ImageAspectFlagBits::eColor,
-			                .baseMipLevel = 0,
-			                .levelCount = 1,
-			                .baseArrayLayer = (uint32_t)layer,
-			                .layerCount = 1,
-			        },
-			};
-			sdf_cover.views.emplace_back(device, cover_view_info);
-		}
-		vk::ImageView cover_raw[2] = {*sdf_cover.views[0], *sdf_cover.views[1]};
-		for (int layer = 0; layer < 2; ++layer)
-		{
-			vk::FramebufferCreateInfo cover_fb_info{
 			        .renderPass = *renderpass,
 			        .attachmentCount = 1,
-			        .pAttachments = &cover_raw[layer],
-			        .width = cover_alloc.width,
-			        .height = cover_alloc.height,
+			        .pAttachments = &raw_views[layer],
+			        .width = extent.width,
+			        .height = extent.height,
 			        .layers = 1,
 			};
-			sdf_cover.fbs.emplace_back(device, cover_fb_info);
+			target->raster_fbs.emplace_back(device, fb_info);
+			fb_info.renderPass = *blur_renderpass;
+			target->blur_fbs.emplace_back(device, fb_info);
 		}
 	}
-	spdlog::info("Fiducial mask SDF targets: {}x{} (1/{} of {}x{})", sdf_alloc.width, sdf_alloc.height, sdf_div, extent.width, extent.height);
+	// Downsample/blur levels at half, quarter and eighth mask resolution
+	// (exact halving: the mask extent is 64-quantized upstream). One set of
+	// framebuffers each (blur render pass throughout); A/B above keep both.
+	for (int li = 0; li < 3; ++li)
+	{
+		vk::Extent2D le = level_extent(extent, li + 1);
+		for (auto * target: {&down_targets[li], &eblur_targets[li]})
+		{
+			vk::ImageCreateInfo image_info{
+			        .imageType = vk::ImageType::e2D,
+			        .format = format,
+			        .extent = {le.width, le.height, 1},
+			        .mipLevels = 1,
+			        .arrayLayers = 2,
+			        .samples = vk::SampleCountFlagBits::e1,
+			        .tiling = vk::ImageTiling::eOptimal,
+			        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+			        .sharingMode = vk::SharingMode::eExclusive,
+			        .initialLayout = vk::ImageLayout::eUndefined,
+			};
+			target->image = vk::raii::Image(device, image_info);
+			auto requirements = target->image.getMemoryRequirements();
+			vk::MemoryAllocateInfo alloc_info{
+			        .allocationSize = requirements.size,
+			        .memoryTypeIndex = find_memory_type(physical_device, requirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+			};
+			target->memory = vk::raii::DeviceMemory(device, alloc_info);
+			target->image.bindMemory(*target->memory, 0);
+			target->views.clear();
+			target->blur_fbs.clear();
+			for (int layer = 0; layer < 2; ++layer)
+			{
+				vk::ImageViewCreateInfo view_info{
+				        .image = *target->image,
+				        .viewType = vk::ImageViewType::e2D,
+				        .format = format,
+				        .subresourceRange = {
+				                .aspectMask = vk::ImageAspectFlagBits::eColor,
+				                .baseMipLevel = 0,
+				                .levelCount = 1,
+				                .baseArrayLayer = (uint32_t)layer,
+				                .layerCount = 1,
+				        },
+				};
+				target->views.emplace_back(device, view_info);
+			}
+			vk::ImageView raw_views[2] = {*target->views[0], *target->views[1]};
+			for (int layer = 0; layer < 2; ++layer)
+			{
+			vk::FramebufferCreateInfo fb_info{
+			        .renderPass = *blur_renderpass,
+			        .attachmentCount = 1,
+			        .pAttachments = &raw_views[layer],
+			        .width = le.width,
+			        .height = le.height,
+			        .layers = 1,
+			};
+			target->blur_fbs.emplace_back(device, fb_info);
+			}
+		}
+	}
+	spdlog::info("Fiducial mask blur targets: {}x{}", extent.width, extent.height);
 }
 
 void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh)
@@ -807,15 +680,15 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	                    {});
 }
 
-void feather_mask_renderer::update_flood(uint32_t eye, uint32_t pass, vk::ImageView view)
+void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set)
 {
 	vk::DescriptorImageInfo image_info{
-	        .sampler = *nearest_sampler,
+	        .sampler = *sampler,
 	        .imageView = view,
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	vk::WriteDescriptorSet write{
-	        .dstSet = *jfa_sets[eye * max_flood_passes + pass],
+	        .dstSet = *descriptor_sets[set],
 	        .dstBinding = 0,
 	        .descriptorCount = 1,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -823,38 +696,6 @@ void feather_mask_renderer::update_flood(uint32_t eye, uint32_t pass, vk::ImageV
 	};
 	std::array<vk::CopyDescriptorSet, 0> no_copies{};
 	device.updateDescriptorSets(write, no_copies);
-}
-
-void feather_mask_renderer::update_composite(uint32_t eye, vk::ImageView field, vk::ImageView cover)
-{
-	vk::DescriptorImageInfo field_info{
-	        .sampler = *sampler,
-	        .imageView = field,
-	        .imageLayout = vk::ImageLayout::eGeneral,
-	};
-	vk::DescriptorImageInfo cover_info{
-	        .sampler = *sampler,
-	        .imageView = cover,
-	        .imageLayout = vk::ImageLayout::eGeneral,
-	};
-	std::array<vk::WriteDescriptorSet, 2> writes{{
-	        {
-	                .dstSet = *composite_sets[eye],
-	                .dstBinding = 0,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = &field_info,
-	        },
-	        {
-	                .dstSet = *composite_sets[eye],
-	                .dstBinding = 1,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = &cover_info,
-	        },
-	}};
-	std::array<vk::CopyDescriptorSet, 0> no_copies{};
-	device.updateDescriptorSets(writes, no_copies);
 }
 
 void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
@@ -1019,28 +860,88 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 		for (auto & [key, mesh]: meshes)
 			flush_upload(cmd, mesh);
+		ensure_targets(extent);
 
-		// SDF path selection (see header): 0 = hard edge raster direct,
-		// else seed + truncated Jump Flood + analytic composite at half
-		// (feather <= 8), quarter (<= 64) or eighth SDF resolution.
-		// Values past 128 clamp (documented).
+		// Tier from feather-px (see header): 0 hard edge, 1 direct
+		// full-res, 2/4/8 downsampled. Band stays ±F/2 by construction,
+		// so width is continuous across tiers; tap density stays in the
+		// proven regime everywhere. Values past 128 clamp (documented).
+		// Selected before Stage 1: tier 0 rasterizes straight into the
+		// swapchain image and never touches the A intermediate.
 		float f = feather_px;
-		if (f > 128)
-			f = 128;
-		int sdf_div = 0;
-		if (f > 0)
-			sdf_div = (f > 8) ? ((f > 64) ? 8 : 4) : 2;
-		if (sdf_div != 0)
-			ensure_targets(extent, sdf_div);
+		int tier = 1;
+		float spread = 1.0f;
+		if (f <= 0)
+			tier = 0;
+		else
+		{
+			if (f > 128)
+				f = 128;
+			if (f <= 16)
+				spread = f / 8.f;
+			else if (f <= 48)
+			{
+				tier = 2;
+				spread = f / 24.f;
+			}
+			else if (f <= 96)
+			{
+				tier = 4;
+				spread = f / 48.f;
+			}
+			else
+			{
+				tier = 8;
+				spread = f / 96.f;
+			}
+		}
 
-		tier_out = sdf_div;
+		// Stage 1: binary silhouettes into A (full resolution), one draw
+		// per (mesh, instance, eye). Missing meshes (removed object racing
+		// a queued draw) skip defensively. Tier 0 skips A entirely (its
+		// raster below targets the swapchain image directly).
+		tier_out = tier;
+		if (tier != 0)
+		{
+			section_clock raster_clk(&ms_raster);
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				vk::RenderPassBeginInfo begin_info{
+				        .renderPass = *renderpass,
+				        .framebuffer = *target_a.raster_fbs[eye],
+				        .renderArea = {.offset = {0, 0}, .extent = extent},
+				        .clearValueCount = 1,
+				        .pClearValues = &clear,
+				};
+				cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+				set_full_viewport(extent);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+				for (const auto & d: draws)
+				{
+					auto mit = meshes.find(d.mesh);
+					if (mit == meshes.end() or mit->second.index_count == 0)
+						continue;
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+					cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+					                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
+					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+					++n_draws;
+				}
+				cmd.endRenderPass();
+			}
+			make_readable(*target_a.image);
+		}
 
-		if (sdf_div == 0)
+		std::array<uint32_t, 0> no_offsets{};
+		if (tier == 0)
 		{
 			section_clock raster_clk(&ms_raster);
 			// Hard edge: rasterize silhouettes straight into the swapchain
-			// image (same pipeline, pushes and clear as the seed pass).
-			// Exact, one raster pass per eye, no field work.
+			// image (same pipeline, pushes and clear as Stage 1). This
+			// replaces the old identity copy A -> swapchain, which burned
+			// a fullscreen 5-fetch pass for zero effect (spread 0 hits
+			// center with weights summing to 1). No blur passes.
 			for (int eye = 0; eye < 2; ++eye)
 			{
 				vk::RenderPassBeginInfo begin_0{
@@ -1068,175 +969,170 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.endRenderPass();
 			}
 		}
+		else if (tier == 1)
+		{
+			section_clock blur_clk(&ms_blur);
+		// Stages 2+3: separable Gaussian H into B, V into the swapchain.
+		// One descriptor set per eye (see header): re-pointed per pass.
+		// (Kept at this indent deliberately: byte-identical to the proven
+		// path; the tier branches above/below own their nesting.)
+		std::array<uint32_t, 0> no_offsets{};
+		blur_push base{
+		        .texel = {1.f / extent.width, 1.f / extent.height},
+		        .spread = spread,
+		};
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			update_source(*target_a.views[eye], eye);
+			vk::RenderPassBeginInfo begin_h{
+			        .renderPass = *blur_renderpass,
+			        .framebuffer = *target_b.blur_fbs[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
+			set_full_viewport(extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
+			blur_push push = base;
+			push.dir[0] = 1;
+			push.dir[1] = 0;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+		}
+		make_readable(*target_b.image);
+
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			update_source(*target_b.views[eye], 2 + eye);
+			vk::RenderPassBeginInfo begin_v{
+			        .renderPass = *blur_renderpass,
+			        .framebuffer = *it->second.framebuffers[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
+			set_full_viewport(extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
+			blur_push push = base;
+			push.dir[0] = 0;
+			push.dir[1] = 1;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+		}
+		} // tier == 1
 		else
 		{
-			// SDF feather path: binary seeds at reduced resolution, a Jump
-			// Flood cascade truncated to the feather reach, and one analytic
-			// composite into the swapchain image. Group fade opacity
-			// collapses to the minimum: the field carries distance only.
-			vk::Extent2D sdf_extent{extent.width / (uint32_t)sdf_div, extent.height / (uint32_t)sdf_div};
-			auto set_sdf_viewport = [&](vk::Extent2D e) {
-				cmd.setViewport(0, vk::Viewport{
-				                        .x = 0,
-				                        .y = 0,
-				                        .width = (float)e.width,
-				                        .height = (float)e.height,
-				                        .minDepth = 0,
-				                        .maxDepth = 1,
-				                });
-				cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = e});
-			};
-			vk::ClearValue seed_clear{};
-			seed_clear.color.float32.fill(sdf_outside);
-
-			float min_opacity = 1;
+			section_clock blur_clk(&ms_blur);
+			// Tiered path: downsample chain, blur at 1/k, upscale submit.
+			// Levels 1..N from the selected tier; sizes shared with ensure
+			// via level_extent() (exact halving required for the box map).
+			std::array<uint32_t, 0> no_offsets{};
+			int levels = 0;
+			for (int k = tier; k >= 2; k >>= 1)
+				++levels;
+			std::vector<vk::raii::ImageView> * down_src_views = &target_a.views;
+			vk::Extent2D down_src_extent = extent;
+			for (int l = 1; l <= levels; ++l)
 			{
-				section_clock seed_clk(&ms_raster);
+				blur_target & dst = down_targets[l - 1];
+				vk::Extent2D de = level_extent(extent, l);
 				for (int eye = 0; eye < 2; ++eye)
 				{
-					vk::RenderPassBeginInfo begin_seed{
-					        .renderPass = *seed_renderpass,
-					        .framebuffer = *sdf_seed.fbs[eye],
-					        .renderArea = {.offset = {0, 0}, .extent = sdf_extent},
-					        .clearValueCount = 1,
-					        .pClearValues = &seed_clear,
-					};
-					cmd.beginRenderPass(begin_seed, vk::SubpassContents::eInline);
-					set_sdf_viewport(sdf_extent);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *seed_pipeline);
-					for (const auto & d: draws)
-					{
-						auto mit = meshes.find(d.mesh);
-						if (mit == meshes.end() or mit->second.index_count == 0)
-							continue;
-						cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-						cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-						cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-						                               raster_push{.mvp = d.mvp[eye], .opacity = 1});
-						cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-						++n_draws;
-						min_opacity = std::min(min_opacity, d.opacity);
-					}
-					cmd.endRenderPass();
-				}
-			}
-			make_readable(*sdf_seed.image);
-
-			// Coverage-sign raster at half resolution (flat white): the
-			// composite's linear read softens the 2px grid into the sign
-			// edge, independent of flood resolution.
-			vk::Extent2D cover_extent{extent.width / 2, extent.height / 2};
-			{
-				section_clock cover_clk(&ms_raster);
-				for (int eye = 0; eye < 2; ++eye)
-				{
-					vk::RenderPassBeginInfo begin_cover{
-					        .renderPass = *renderpass,
-					        .framebuffer = *sdf_cover.fbs[eye],
-					        .renderArea = {.offset = {0, 0}, .extent = cover_extent},
+					update_source(*(*down_src_views)[eye], 4 + (l - 1) * 2 + eye);
+					vk::RenderPassBeginInfo begin_down{
+					        .renderPass = *blur_renderpass,
+					        .framebuffer = *dst.blur_fbs[eye],
+					        .renderArea = {.offset = {0, 0}, .extent = de},
 					        .clearValueCount = 1,
 					        .pClearValues = &clear,
 					};
-					cmd.beginRenderPass(begin_cover, vk::SubpassContents::eInline);
-					set_sdf_viewport(cover_extent);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-					for (const auto & d: draws)
-					{
-						auto mit = meshes.find(d.mesh);
-						if (mit == meshes.end() or mit->second.index_count == 0)
-							continue;
-						cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-						cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-						cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-						                               raster_push{.mvp = d.mvp[eye], .opacity = 1});
-						cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-					}
+					cmd.beginRenderPass(begin_down, vk::SubpassContents::eInline);
+					set_full_viewport(de);
+					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *downsample_pipeline);
+					std::array<vk::DescriptorSet, 1> sets_d{*descriptor_sets[4 + (l - 1) * 2 + eye]};
+					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_d, no_offsets);
+					blur_push push{};
+					push.texel[0] = 1.f / down_src_extent.width;
+					push.texel[1] = 1.f / down_src_extent.height;
+					cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+					cmd.draw(3, 1, 0, 0);
 					cmd.endRenderPass();
 				}
+				make_readable(*dst.image);
+				down_src_views = &dst.views;
+				down_src_extent = de;
 			}
-			make_readable(*sdf_cover.image);
 
-			// Truncated cascade: seeds need only reach feather-px out
-			// (further pixels composite to 0 regardless), so the first step
-			// is the smallest power of two covering the reach in SDF texels
-			// (floored at 4), then halve to 1, plus one extra step-1
-			// refinement (JFA+1 against vertex errors).
-			int flood_step = 4;
-			while (flood_step < (int)std::ceil(f / (float)sdf_div))
-				flood_step *= 2;
-			sdf_target * flood_last = &sdf_ping;
-			std::array<uint32_t, 0> no_offsets{};
+			// H blur at tier res into E, V upscale into swapchain. The V
+			// texel stays 1/tier-size while rendering fullscreen: the
+			// sampler's bilinear upscale is the final step, free.
+			blur_target & eblur = eblur_targets[levels - 1];
+			vk::Extent2D te = level_extent(extent, levels);
+			blur_push base{
+			        .texel = {1.f / te.width, 1.f / te.height},
+			        .spread = spread,
+			};
+			for (int eye = 0; eye < 2; ++eye)
 			{
-				section_clock flood_clk(&ms_blur);
-				for (int eye = 0; eye < 2; ++eye)
-				{
-					vk::ImageView src = *sdf_seed.views[eye];
-					sdf_target * dst = &sdf_ping;
-					uint32_t pass = 0;
-					auto flood_pass = [&](int istep) {
-						update_flood((uint32_t)eye, pass, src);
-						vk::RenderPassBeginInfo begin_flood{
-						        .renderPass = *sdf_renderpass,
-						        .framebuffer = *dst->fbs[eye],
-						        .renderArea = {.offset = {0, 0}, .extent = sdf_extent},
-						};
-						cmd.beginRenderPass(begin_flood, vk::SubpassContents::eInline);
-						set_sdf_viewport(sdf_extent);
-						cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *jfa_pipeline);
-						std::array<vk::DescriptorSet, 1> flood_sets{*jfa_sets[(uint32_t)eye * max_flood_passes + pass]};
-						cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *jfa_layout, 0, flood_sets, no_offsets);
-						jfa_push push{
-						        .texel = {1.f / sdf_extent.width, 1.f / sdf_extent.height},
-						        .step = (float)istep,
-						};
-						cmd.pushConstants<jfa_push>(*jfa_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
-						cmd.draw(3, 1, 0, 0);
-						cmd.endRenderPass();
-						make_readable(*dst->image);
-						flood_last = dst;
-						src = *dst->views[eye];
-						dst = (dst == &sdf_ping) ? &sdf_pong : &sdf_ping;
-						++pass;
-					};
-					for (int s = flood_step; s >= 1; s /= 2)
-						flood_pass(s);
-					flood_pass(1);
-				}
+				update_source(*(*down_src_views)[eye], eye);
+				vk::RenderPassBeginInfo begin_h{
+				        .renderPass = *blur_renderpass,
+				        .framebuffer = *eblur.blur_fbs[eye],
+				        .renderArea = {.offset = {0, 0}, .extent = te},
+				        .clearValueCount = 1,
+				        .pClearValues = &clear,
+				};
+				cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
+				set_full_viewport(te);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+				std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
+				blur_push push = base;
+				push.dir[0] = 1;
+				push.dir[1] = 0;
+				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
 			}
+			make_readable(*eblur.image);
 
 			for (int eye = 0; eye < 2; ++eye)
 			{
-				update_composite((uint32_t)eye, *flood_last->views[eye], *sdf_cover.views[eye]);
-				vk::RenderPassBeginInfo begin_composite{
-				        .renderPass = *renderpass,
+				update_source(*eblur.views[eye], 2 + eye);
+				vk::RenderPassBeginInfo begin_v{
+				        .renderPass = *blur_renderpass,
 				        .framebuffer = *it->second.framebuffers[eye],
 				        .renderArea = {.offset = {0, 0}, .extent = extent},
 				        .clearValueCount = 1,
 				        .pClearValues = &clear,
 				};
-				cmd.beginRenderPass(begin_composite, vk::SubpassContents::eInline);
+				cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
 				set_full_viewport(extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *composite_pipeline);
-				std::array<vk::DescriptorSet, 1> composite_set{*composite_sets[eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *composite_layout, 0, composite_set, no_offsets);
-				sdf_composite_push push{
-				        .sdf_dim = {(float)sdf_extent.width, (float)sdf_extent.height},
-				        .feather_px = f,
-				        .opacity = min_opacity,
-				        .px_per_texel = (float)sdf_div,
-				        .viz = (float)sdf_field_viz,
-				};
-				cmd.pushConstants<sdf_composite_push>(*composite_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+				std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
+				blur_push push = base;
+				push.dir[0] = 0;
+				push.dir[1] = 1;
+				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}
-		}
+		} // tiered
 	}
 
-	// Marker window cutouts: crisp post-composite punch. Re-begins the finished
+	// Marker window cutouts: crisp post-blur punch. Re-begins the finished
 	// swapchain framebuffers with the LOAD pass and stamps each quad at
 	// FULL alpha (mask 1 = reality window): holes show passthrough, not
-	// game. No SDF pass touches them, so edges stay pixel-exact. Debug
+	// game. No blur pass touches them, so edges stay pixel-exact. Debug
 	// only; rasterize=false (bypass) skips them with the silhouettes.
 	if (not cutouts.empty() and rasterize)
 	{
