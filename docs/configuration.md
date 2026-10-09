@@ -205,8 +205,9 @@ Each entry has:
 - `model-path`: path to a `.glb`/`.gltf` file on the server (optional, models
   larger than 64MB are skipped)
 - `position`: `[x, y, z]` marker-to-mesh offset in meters (default `[0,0,0]`)
-- `orientation`: `[x, y, z, w]` marker-to-mesh rotation quaternion (default
-  `[0,0,0,1]`)
+- `orientation`: `[rx, ry, rz]` marker-to-mesh rotation in degrees
+  (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
+  single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
 - `scale`: uniform marker-to-mesh scale, number or single-element array
   (default `1`)
 - `feather-px`: passthrough window feather width in screen pixels
@@ -253,7 +254,7 @@ payload to help you copy it verbatim into the config).
 			"marker-size-m": 0.08,
 			"model-path": "/usr/share/wivrn/meshes/widget.glb",
 			"position": [0, 0.05, 0.1],
-			"orientation": [0, 0, 0, 1],
+			"orientation": [0, 0, 0],
 			"scale": 1.0,
 			"feather-px": 24
 		}

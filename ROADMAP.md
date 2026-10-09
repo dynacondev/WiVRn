@@ -46,7 +46,7 @@ Scope: define the mapping and get bytes to the headset. No rendering yet.
 
 1. Server config (`docs/configuration.md`, server config loader):
    `fiducial_map: [{marker_id, marker_size_m, marker_data, model_path,
-   position[3], orientation[4 xyzw], scale[3] or float}]`. Pose + scale
+   position[3], orientation[3] (degrees rx/ry/rz), scale[3] or float}]`. Pose + scale
    only, per prior agreement. `marker_data` is the exact QR payload string.
    Paths resolved server-side, blobs read at session start.
 2. Protocol (`common/wivrn_packets.h`, `common/protocol_version.h`):
@@ -212,7 +212,7 @@ Example config fragment (Phase 1):
 			"marker_size_m": 0.08,
 			"model_path": "/usr/share/wivrn/meshes/widget.glb",
 			"position": [0, 0.05, 0.1],
-			"orientation": [0, 0, 0, 1],
+			"orientation": [0, 0, 0],
 			"scale": 1.0
 		}
 	]

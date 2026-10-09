@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -46,6 +47,27 @@ static auto resolve_path(std::filesystem::path path)
 		return path;
 
 	return canonical;
+}
+
+// [rx, ry, rz] degrees to xyzw quaternion. Fixed-frame rotations about X,
+// then Y, then Z (q = qz * qy * qx), so single-axis values do the obvious
+// thing and combined angles compose in a documented order.
+static std::array<float, 4> euler_deg_to_quat(float rx_deg, float ry_deg, float rz_deg)
+{
+	constexpr float deg = (float)M_PI / 180.f;
+	float cx = std::cos(rx_deg * deg * 0.5f), sx = std::sin(rx_deg * deg * 0.5f);
+	float cy = std::cos(ry_deg * deg * 0.5f), sy = std::sin(ry_deg * deg * 0.5f);
+	float cz = std::cos(rz_deg * deg * 0.5f), sz = std::sin(rz_deg * deg * 0.5f);
+	auto mul = [](std::array<float, 4> a, std::array<float, 4> b) {
+		return std::array<float, 4>{
+		        a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+		        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+		        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+		        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2],
+		};
+	};
+	std::array<float, 4> qx{sx, 0, 0, cx}, qy{0, sy, 0, cy}, qz{0, 0, sz, cz};
+	return mul(mul(qz, qy), qx);
 }
 
 static std::filesystem::path config_file;
@@ -236,7 +258,14 @@ configuration::configuration()
 				if (item.contains("position"))
 					e.position = item["position"];
 				if (item.contains("orientation"))
-					e.orientation = item["orientation"];
+				{
+					// Degrees [rx, ry, rz]: fixed-frame rotations about X,
+					// then Y, then Z (see euler_deg_to_quat()).
+					const auto & o = item["orientation"];
+					if (not o.is_array() or o.size() != 3)
+						throw std::runtime_error("invalid fiducial-map orientation: expected [rx, ry, rz] degrees");
+					e.orientation = euler_deg_to_quat(o[0], o[1], o[2]);
+				}
 				if (item.contains("scale"))
 				{
 					if (item["scale"].is_number())
