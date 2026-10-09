@@ -223,7 +223,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// Fade duration is render-only (like feather-px): tracked live, never
 	// part of the calibration fingerprint above.
 	if (entry)
-		fp.fade_dur_s = std::max(0.f, entry->fade_in_s);
+		fp.fade_dur_ms = std::max(0.f, entry->fade_in_ms);
 
 	// Strict gating: marker tracking above runs unconditionally (needed for
 	// the in-view dot and the Calibrate button), but nothing mesh-related
@@ -498,7 +498,7 @@ void scenes::stream::calibrate_to_marker()
 	fp.calibrated_at = now;
 	// Display label: the tag, or the payload when untagged.
 	fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
-	fp.fade_dur_s = std::max(0.f, entry->fade_in_s);
+	fp.fade_dur_ms = std::max(0.f, entry->fade_in_ms);
 	fp.fade_start = now;
 
 	// Deliberately no world-origin change: shifting the client origin moves

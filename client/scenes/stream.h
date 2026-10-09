@@ -286,14 +286,14 @@ private:
 		// First-acquisition alpha fade (mask-blend path only: the binary
 		// projected layer type has no opacity control). fade_start stamps
 		// the seed (auto-anchor / calibrate / re-seed) in predicted-time
-		// base; fade_dur_s tracks the entry live. 0 duration = instant.
+		// base; fade_dur_ms tracks the entry live. 0 duration = instant.
 		XrTime fade_start = 0;
-		float fade_dur_s = 0;
+		float fade_dur_ms = 1000;
 		float fade_factor(XrTime predicted) const
 		{
-			if (fade_dur_s <= 0 or fade_start == 0)
+			if (fade_dur_ms <= 0 or fade_start == 0)
 				return 1;
-			double t = (predicted - fade_start) * 1e-9 / fade_dur_s;
+			double t = (predicted - fade_start) * 1e-6 / fade_dur_ms;
 			return std::clamp(t, 0.0, 1.0);
 		}
 

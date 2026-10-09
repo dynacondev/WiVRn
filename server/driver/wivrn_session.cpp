@@ -1025,7 +1025,7 @@ void wivrn_session::send_fiducial_map()
 		        .knee_outer_mm = entry.knee_outer_mm,
 		        .knee_inner_deg = entry.knee_inner_deg,
 		        .knee_outer_deg = entry.knee_outer_deg,
-		        .fade_in_s = entry.fade_in_s,
+		        .fade_in_ms = entry.fade_in_ms,
 		};
 
 		// Display label: the tag, or the payload when untagged.

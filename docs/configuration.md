@@ -235,10 +235,10 @@ Each entry has:
   `euro-beta` (default `0.07`),   `knee-inner-mm`/`knee-outer-mm`
   (defaults `1`/`5`), `knee-inner-deg`/`knee-outer-deg`
   (defaults `0.1`/`0.5`).
-- `fade-in-s`: alpha fade-in at first acquisition, in seconds (default `0`
-  = appears instantly). Render-only; applied live, never invalidates
-  calibration. During the fade the passthrough window ramps from fully
-  transparent (game video) to fully present.
+- `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds
+  (default `1000`; `0` = appears instantly). Render-only; applied live,
+  never invalidates calibration. During the fade the passthrough window
+  ramps from fully transparent (game video) to fully present.
 
 The mesh pose on the headset is
 `meshClientPose = observedMarkerPose * markerToMeshOffset`.

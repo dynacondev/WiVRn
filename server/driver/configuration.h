@@ -97,9 +97,9 @@ struct configuration
 		float knee_outer_mm = 5;
 		float knee_inner_deg = 0.1f;
 		float knee_outer_deg = 0.5f;
-		// Alpha fade-in at first acquisition, seconds (0 = instant).
+		// Alpha fade-in at first acquisition, milliseconds (0 = instant).
 		// Render-only: applied live, never invalidates calibration.
-		float fade_in_s = 0;
+		float fade_in_ms = 1000;
 	};
 	std::vector<fiducial_entry> fiducial_map;
 
