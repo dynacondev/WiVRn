@@ -500,67 +500,57 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		return;
 
 	// Mask groups record in render() (per-feather stacks); nothing to
-	// upload here. The binary fallback below keeps the first live
-	// instance only: the projected layer type has no per-object layers.
-	// It yields whenever any mask group is submitting this frame (record
-	// ran earlier this frame, so group flags are current): submitting the
-	// projected layer alongside the mask stack disturbs composition.
-	bool mask_live = false;
-	for (auto & [f, g]: fp.mask_groups)
+	// upload here. The binary fallback below runs solely where the mask
+	// path is unavailable (no alpha-blend ext): the projected layer type
+	// has no per-object layers, and its first-frame presentation flashes
+	// fullscreen, so it stays out of the mask stack's way entirely.
+	if (not composition_layer_alpha_blend_supported)
 	{
-		(void)f;
-		if (g.active)
+		// Re-upload if the runtime lost the mesh (e.g. passthrough re-created)
+		if (fp.ready and not session.has_projected_passthrough_mesh())
 		{
-			mask_live = true;
-			break;
+			fp.ready = false;
+			fp.attempted = false;
+			fp.status = "runtime mesh lost, re-uploading";
 		}
-	}
 
-	// Re-upload if the runtime lost the mesh (e.g. passthrough re-created)
-	if (fp.ready and not session.has_projected_passthrough_mesh())
-	{
-		fp.ready = false;
-		fp.attempted = false;
-		fp.status = "runtime mesh lost, re-uploading";
-	}
+		if (fp.ready)
+		{
+			session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
+			add_projected_passthrough_layer();
+			return;
+		}
 
-	if (fp.ready and not mask_live)
-	{
-		session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
-		add_projected_passthrough_layer();
-		return;
-	}
+		if (fp.attempted or not shim_ost)
+			return;
 
-	if (fp.attempted or not shim_ost or mask_live)
-		return;
+		if (not instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
+		{
+			fp.attempted = true;
+			fp.status = "XR_FB_triangle_mesh not supported by runtime";
+			return;
+		}
 
-	if (not instance.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
-	{
 		fp.attempted = true;
-		fp.status = "XR_FB_triangle_mesh not supported by runtime";
-		return;
-	}
+		try
+		{
+			// Placement comes from the live instance (strict gating above
+			// guarantees fp.calibrated here).
+			session.set_projected_passthrough_mesh(shim_ost->soup.vertices, shim_ost->soup.indices, world_space, fp.world_pose, fp.world_scale);
 
-	fp.attempted = true;
-	try
-	{
-		// Placement comes from the live instance (strict gating above
-		// guarantees fp.calibrated here). First instance only: the binary
-		// fallback has no per-object layers.
-		session.set_projected_passthrough_mesh(shim_ost->soup.vertices, shim_ost->soup.indices, world_space, fp.world_pose, fp.world_scale);
+			fp.ready = true;
+			fp.status = "projected";
+			spdlog::info("Fiducial passthrough mesh live: {} vertices, {} triangles",
+			             shim_ost->vertex_count, shim_ost->triangle_count);
 
-		fp.ready = true;
-		fp.status = "projected";
-		spdlog::info("Fiducial passthrough mesh live: {} vertices, {} triangles",
-		             shim_ost->vertex_count, shim_ost->triangle_count);
-
-		session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
-		add_projected_passthrough_layer();
-	}
-	catch (std::exception & e)
-	{
-		fp.status = std::string("mesh error: ") + e.what();
-		spdlog::warn("Fiducial passthrough mesh failed: {}", e.what());
+			session.update_projected_passthrough_transform(world_space, predicted_display_time, fp.world_pose, fp.world_scale);
+			add_projected_passthrough_layer();
+		}
+		catch (std::exception & e)
+		{
+			fp.status = std::string("mesh error: ") + e.what();
+			spdlog::warn("Fiducial passthrough mesh failed: {}", e.what());
+		}
 	}
 }
 
