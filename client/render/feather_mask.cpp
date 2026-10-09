@@ -21,6 +21,7 @@
 #include "vk/shader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
@@ -53,6 +54,20 @@ struct raster_push
 {
 	glm::mat4 mvp;
 	float opacity = 1;
+};
+
+// RAII section timer for the record() diagnostics (mask_stage_cpu): adds
+// the scoped wall time in milliseconds to *acc on destruction.
+struct section_clock
+{
+	std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+	double * acc;
+	explicit section_clock(double * a) :
+	        acc(a) {}
+	~section_clock()
+	{
+		*acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+	}
 };
 
 // Downsample level extent (level 1 = half): exact halving, so the 2x2 box
@@ -690,8 +705,25 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    bool rasterize,
                                    float feather_px,
                                    const std::vector<std::array<glm::vec3, 6>> & cutouts,
-                                   const std::array<glm::mat4, 2> & cutout_mvp)
+                                   const std::array<glm::mat4, 2> & cutout_mvp,
+                                   mask_stage_cpu * cpu_stats)
 {
+	auto t_total0 = std::chrono::steady_clock::now();
+	double ms_raster = 0, ms_blur = 0, ms_punch = 0;
+	size_t n_draws = 0;
+	int tier_out = -1;
+	auto fill_stats = [&] {
+		if (cpu_stats)
+		{
+			cpu_stats->raster_ms = ms_raster;
+			cpu_stats->blur_ms = ms_blur;
+			cpu_stats->punch_ms = ms_punch;
+			cpu_stats->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total0).count();
+			cpu_stats->tier = tier_out;
+			cpu_stats->draws = n_draws;
+		}
+	};
+
 	auto set_full_viewport = [&](vk::Extent2D e) {
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
@@ -706,7 +738,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 	// Same-queue read-after-write between passes (all images GENERAL).
 	auto make_readable = [&](vk::Image img) {
-		vk::ImageMemoryBarrier barrier{
+	vk::ImageMemoryBarrier barrier{
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 		        .oldLayout = vk::ImageLayout::eGeneral,
@@ -803,6 +835,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 	if (not rasterize)
 	{
+		section_clock raster_clk(&ms_raster);
 		// Bypass: clear-only passes, transparent mask, full stack hot.
 		for (int eye = 0; eye < 2; ++eye)
 		{
@@ -820,7 +853,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	else
 	{
 		if (meshes.empty())
+		{
+			fill_stats();
 			return;
+		}
 
 		for (auto & [key, mesh]: meshes)
 			flush_upload(cmd, mesh);
@@ -864,8 +900,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// per (mesh, instance, eye). Missing meshes (removed object racing
 		// a queued draw) skip defensively. Tier 0 skips A entirely (its
 		// raster below targets the swapchain image directly).
+		tier_out = tier;
 		if (tier != 0)
 		{
+			section_clock raster_clk(&ms_raster);
 			for (int eye = 0; eye < 2; ++eye)
 			{
 				vk::RenderPassBeginInfo begin_info{
@@ -888,6 +926,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 					                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
 					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+					++n_draws;
 				}
 				cmd.endRenderPass();
 			}
@@ -897,6 +936,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		std::array<uint32_t, 0> no_offsets{};
 		if (tier == 0)
 		{
+			section_clock raster_clk(&ms_raster);
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image (same pipeline, pushes and clear as Stage 1). This
 			// replaces the old identity copy A -> swapchain, which burned
@@ -924,12 +964,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 					                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
 					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+					++n_draws;
 				}
 				cmd.endRenderPass();
 			}
 		}
 		else if (tier == 1)
 		{
+			section_clock blur_clk(&ms_blur);
 		// Stages 2+3: separable Gaussian H into B, V into the swapchain.
 		// One descriptor set per eye (see header): re-pointed per pass.
 		// (Kept at this indent deliberately: byte-identical to the proven
@@ -988,6 +1030,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		} // tier == 1
 		else
 		{
+			section_clock blur_clk(&ms_blur);
 			// Tiered path: downsample chain, blur at 1/k, upscale submit.
 			// Levels 1..N from the selected tier; sizes shared with ensure
 			// via level_extent() (exact halving required for the box map).
@@ -1110,6 +1153,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		}
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 		cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
+		section_clock punch_clk(&ms_punch);
 		for (const auto & quad: cutouts)
 		{
 			std::memcpy(cutout_verts.map(), quad.data(), sizeof(glm::vec3) * 6);
@@ -1165,6 +1209,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 		}
 	}
+
+	// All mask passes recorded (barrier below is submit bookkeeping, not
+	// mask work): stamp the diagnostics before leaving.
+	fill_stats();
 
 	vk::ImageMemoryBarrier barrier{
 	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,

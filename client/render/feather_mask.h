@@ -68,6 +68,23 @@ public:
 		float opacity = 1;
 	};
 
+	// Per-record host-side cost breakdown (steady_clock, milliseconds).
+	// Filled when record() gets a non-null out-pointer; all zeros on
+	// early-out paths. Permanent diagnostics: the stream scene sums these
+	// per frame into the Statistics plots and a periodic logcat line.
+	// GPU cost per group comes from timestamp brackets the caller writes
+	// around record() (one group = one blur stack = the GPU unit of
+	// interest); CPU sections here identify the host-hot stage.
+	struct mask_stage_cpu
+	{
+		double raster_ms = 0; // Stage 1 silhouettes (or tier-0 direct raster)
+		double blur_ms = 0;   // blur H+V (tier 1) or downsample+H+V (tiered)
+		double punch_ms = 0;  // marker-window cutout punch
+		double total_ms = 0;  // whole record() body, incl. target setup
+		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
+		size_t draws = 0;     // silhouette drawIndexed calls (both eyes)
+	};
+
 	// Record silhouettes + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
 	// be unused (UNDEFINED is fine); it is left in GENERAL for the
@@ -85,7 +102,8 @@ public:
 	            bool rasterize,
 	            float feather_px,
 	            const std::vector<std::array<glm::vec3, 6>> & cutouts,
-	            const std::array<glm::mat4, 2> & cutout_mvp);
+	            const std::array<glm::mat4, 2> & cutout_mvp,
+	            mask_stage_cpu * cpu_stats = nullptr);
 
 	bool has_mesh() const
 	{

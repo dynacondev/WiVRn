@@ -120,6 +120,37 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	global_metrics[metrics_offset].bandwidth_rx = bandwidth_rx * 8;
 	global_metrics[metrics_offset].bandwidth_tx = bandwidth_tx * 8;
 
+	// Mask perf: ready samples pair previous frame's record() CPU stats
+	// with the timestamp brackets read back above. Seconds for the plots,
+	// milliseconds for the logcat window.
+	double mask_gpu_sum_ms = 0, mask_cpu_sum_ms = 0;
+	for (auto & s: mask_ready_samples)
+	{
+		mask_gpu_sum_ms += s.gpu_ms;
+		mask_cpu_sum_ms += s.cpu.total_ms;
+		auto & acc = mask_log_per_feather[s.feather_px];
+		acc.sum_gpu += s.gpu_ms;
+		acc.max_gpu = std::max(acc.max_gpu, s.gpu_ms);
+		acc.sum_cpu += s.cpu.total_ms;
+		acc.frames += 1;
+		acc.tier = s.cpu.tier;
+		acc.draws = s.cpu.draws;
+	}
+	global_metrics[metrics_offset].mask_gpu_time = (float)(mask_gpu_sum_ms * 1e-3);
+	global_metrics[metrics_offset].mask_cpu_time = (float)(mask_cpu_sum_ms * 1e-3);
+	global_metrics[metrics_offset].mask_groups = (float)mask_ready_samples.size();
+	compact_mask_gpu_time = 0.99f * compact_mask_gpu_time + 0.01f * (float)(mask_gpu_sum_ms * 1e-3);
+	compact_mask_cpu_time = 0.99f * compact_mask_cpu_time + 0.01f * (float)(mask_cpu_sum_ms * 1e-3);
+	++mask_log_frames;
+	mask_log_sum_gpu += mask_gpu_sum_ms;
+	mask_log_max_gpu = std::max(mask_log_max_gpu, mask_gpu_sum_ms);
+	mask_log_sum_cpu += mask_cpu_sum_ms;
+	mask_log_max_cpu = std::max(mask_log_max_cpu, mask_cpu_sum_ms);
+	mask_log_unmetered += mask_ready_unmetered;
+	mask_ready_samples.clear();
+	mask_ready_unmetered = 0;
+	log_mask_perf(predicted_display_time);
+
 	std::vector<shard_accumulator::blit_handle *> active_handles;
 	active_handles.reserve(blit_handles.size());
 	for (const auto & h: blit_handles)
@@ -165,18 +196,58 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	metrics_offset = (metrics_offset + 1) % global_metrics.size();
 }
 
-void scenes::stream::gui_performance_metrics()
+void scenes::stream::log_mask_perf(XrTime now)
 {
-	const ImGuiStyle & style = ImGui::GetStyle();
+	if (mask_log_frames == 0)
+		return;
+	// ~5s cadence, marker_tracker::log_rate idiom. The first window after
+	// a config change includes swapchain-create/upload frames: ignore the
+	// first line per run, read the steady ones.
+	if (last_mask_perf_log != 0 and now - last_mask_perf_log < 5'000'000'000LL)
+		return;
+	last_mask_perf_log = now;
+	std::string detail;
+	for (auto & [f, a]: mask_log_per_feather)
+	{
+		if (a.frames == 0)
+			continue;
+		detail += fmt::format("[f={:.1f} n={} gpu={:.2f}/{:.2f}ms cpu={:.2f}ms tier={} draws={}] ",
+		                      f,
+		                      a.frames,
+		                      a.sum_gpu / (double)a.frames,
+		                      a.max_gpu,
+		                      a.sum_cpu / (double)a.frames,
+		                      a.tier,
+		                      a.draws);
+	}
+	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max, record cpu {:.2f}ms mean / {:.2f} max, unmetered {} {}",
+	             mask_log_frames,
+	             mask_log_sum_gpu / (double)mask_log_frames,
+	             mask_log_max_gpu,
+	             mask_log_sum_cpu / (double)mask_log_frames,
+	             mask_log_max_cpu,
+	             mask_log_unmetered,
+	             detail);
+	mask_log_frames = 0;
+	mask_log_sum_gpu = mask_log_max_gpu = 0;
+	mask_log_sum_cpu = mask_log_max_cpu = 0;
+	mask_log_unmetered = 0;
+	mask_log_per_feather.clear();
+}
+
+void scenes::stream::gui_performance_metrics()
+{	const ImGuiStyle & style = ImGui::GetStyle();
 	const wivrn::ui::theme & t = wivrn::ui::current();
 
 	ImVec2 window_size = ImGui::GetWindowSize() - ImVec2(2, 2) * style.WindowPadding;
 
 	const std::array plots = {
 	        // clang-format off
-	        plot(_("CPU time"), {{"",          &global_metric::cpu_time}},     "s"),
+	        plot(_("CPU time"), {{"",          &global_metric::cpu_time},
+	                                {_("Mask record"), &global_metric::mask_cpu_time}},     "s"),
 
-	        plot(_("GPU time"), {{_("Defoveate"), &global_metric::gpu_time}},  "s"),
+	        plot(_("GPU time"), {{_("Defoveate"), &global_metric::gpu_time},
+	                             {_("Mask"),      &global_metric::mask_gpu_time}},  "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),
@@ -379,6 +450,8 @@ void scenes::stream::gui_compact_view()
 		f(_S("Upload"), 8 * compact_bandwidth_tx * 1e-6, "Mbit/s");
 		f(_S("CPU time"), compact_cpu_time * 1000, "ms");
 		f(_S("GPU time"), compact_gpu_time * 1000, "ms");
+		f(_S("Mask GPU"), compact_mask_gpu_time * 1000, "ms");
+		f(_S("Mask record CPU"), compact_mask_cpu_time * 1000, "ms");
 		f(_S("Motion to photon latency"),
 		  tracking_control.lock()->motions_to_photons / 1'000'000.f,
 		  "ms");

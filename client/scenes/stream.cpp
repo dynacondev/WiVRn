@@ -908,12 +908,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	current_blit_handles.fill(nullptr);
 
 	gpu_timestamps timestamps;
+	// Previous frame's mask samples still sit in mask_frame_samples (this
+	// frame's record() calls haven't run yet): attach their GPU times now,
+	// then hand them to accumulate_metrics via mask_ready_*. Only the
+	// written stamp prefix is requested: an eWait read over never-written
+	// queries would hang.
+	uint32_t mask_metered = std::min<uint32_t>((uint32_t)mask_frame_samples.size(), max_metered_mask_groups);
 	if (query_pool_filled)
 	{
+		uint32_t stamp_count = (uint32_t)mask_group_slot_first + 2 * mask_metered;
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
-		        size_gpu_timestamps,
-		        size_gpu_timestamps * sizeof(uint64_t),
+		        stamp_count,
+		        stamp_count * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 
@@ -922,8 +929,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			boost::pfr::for_each_field(timestamps, [n = 1, &timestamps2](float & t) mutable {
 				t = (timestamps2[n++] - timestamps2[0]) * application::get_physical_device_properties().limits.timestampPeriod / 1e9;
 			});
+			double period_ms = application::get_physical_device_properties().limits.timestampPeriod * 1e-6;
+			for (uint32_t i = 0; i < mask_metered; ++i)
+			{
+				uint64_t begin = timestamps2[mask_group_slot_first + 2 * i];
+				uint64_t end = timestamps2[mask_group_slot_first + 2 * i + 1];
+				mask_frame_samples[i].gpu_ms = (double)(end - begin) * period_ms;
+			}
 		}
 	}
+	mask_ready_samples = std::move(mask_frame_samples);
+	mask_frame_samples.clear();
+	mask_ready_unmetered = mask_frame_unmetered;
+	mask_frame_unmetered = 0;
 
 	session.begin_frame();
 
@@ -1337,12 +1355,36 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					else
 					{
 						g.wait_warned = false;
-						g.acquired = true;
-						g.extent = {mw, mh};
+					g.acquired = true;
+					g.extent = {mw, mh};
+					// GPU brackets around the group's blur stack (slots pair
+					// with mask_frame_samples order for next frame's
+					// readback). The catch keeps TOP/BOTTOM paired: a missing
+					// BOTTOM_OF_PIPE would hang the eWait readback.
+					uint32_t stamp = (uint32_t)mask_frame_samples.size();
+					bool metered = stamp < max_metered_mask_groups;
+					if (metered)
+						command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, mask_group_slot_first + 2 * stamp);
+					feather_mask_renderer::mask_stage_cpu stage_cpu;
+					try
+					{
 						g.renderer->record(
 						        command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						        not mask_bypass_cutout, f, cutouts, world_mvp);
-						g.active = true;
+						        not mask_bypass_cutout, f, cutouts, world_mvp, &stage_cpu);
+					}
+					catch (...)
+					{
+						if (metered)
+							command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
+						mask_frame_samples.push_back({f, 0, stage_cpu});
+						throw;
+					}
+					if (metered)
+						command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
+					else
+						++mask_frame_unmetered;
+					mask_frame_samples.push_back({f, 0, stage_cpu});
+					g.active = true;
 						acquired_groups.push_back(&g);
 						mask_frame = true;
 					}

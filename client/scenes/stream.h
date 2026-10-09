@@ -498,12 +498,23 @@ private:
 		float gpu_time = 0;
 	};
 
+	// Mask perf brackets: slots 0,1 stay the whole-frame pair; metered
+	// group i uses 2+2i (TOP_OF_PIPE at record entry) and 3+2i
+	// (BOTTOM_OF_PIPE at record exit). Groups beyond the cap still record
+	// (CPU stats included) but share no stamp slots; they count as
+	// unmetered in the log line.
+	static const inline uint32_t max_metered_mask_groups = 4;
+	static const inline int mask_group_slot_first = 2;
+
 	struct global_metric
 	{
 		float gpu_time;
 		float cpu_time = 0;
 		float bandwidth_rx = 0;
 		float bandwidth_tx = 0;
+		float mask_gpu_time = 0; // summed over metered groups
+		float mask_cpu_time = 0; // summed record() total over all groups
+		float mask_groups = 0;   // groups recorded this frame
 	};
 
 	struct plot
@@ -518,7 +529,7 @@ private:
 		const char * unit;
 	};
 
-	static const inline int size_gpu_timestamps = 1 + sizeof(gpu_timestamps) / sizeof(float);
+	static const inline int size_gpu_timestamps = mask_group_slot_first + 2 * max_metered_mask_groups;
 
 	struct decoder_metric
 	{
@@ -547,6 +558,38 @@ private:
 	float compact_bandwidth_tx = 0;
 	float compact_cpu_time = 0;
 	float compact_gpu_time = 0;
+	float compact_mask_gpu_time = 0;
+	float compact_mask_cpu_time = 0;
+
+	// Per-frame mask samples: filled around each record() (CPU stats
+	// immediate, GPU attached at next frame's timestamp readback), then
+	// moved to mask_ready_* for accumulate_metrics. Render thread only.
+	struct mask_group_sample
+	{
+		float feather_px = 0;
+		double gpu_ms = 0;
+		feather_mask_renderer::mask_stage_cpu cpu;
+	};
+	std::vector<mask_group_sample> mask_frame_samples;
+	std::vector<mask_group_sample> mask_ready_samples;
+	uint32_t mask_frame_unmetered = 0;
+	uint32_t mask_ready_unmetered = 0;
+
+	// ~5s logcat window accumulators (mask perf line). Render thread only.
+	uint64_t mask_log_frames = 0;
+	double mask_log_sum_gpu = 0, mask_log_max_gpu = 0;
+	double mask_log_sum_cpu = 0, mask_log_max_cpu = 0;
+	uint64_t mask_log_unmetered = 0;
+	struct mask_feather_acc
+	{
+		double sum_gpu = 0, max_gpu = 0, sum_cpu = 0;
+		uint64_t frames = 0;
+		int tier = -1;
+		size_t draws = 0;
+	};
+	std::map<float, mask_feather_acc> mask_log_per_feather;
+	XrTime last_mask_perf_log = 0;
+	void log_mask_perf(XrTime now);
 
 	void accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> & blit_handles, const gpu_timestamps & timestamps);
 	void gui_performance_metrics();
