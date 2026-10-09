@@ -1250,7 +1250,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.mesh_hashes[oid] = ost.soup_hash;
 					}
 				}
-				// Drop stale groups + stale member meshes.
+				// Drop stale groups + stale member meshes. Use-then-advance:
+				// touching git->second after ++git reads past end().
 				for (auto git = fp.mask_groups.begin(); git != fp.mask_groups.end();)
 				{
 					if (std::ranges::find(live_feathers, git->first) == live_feathers.end())
@@ -1260,7 +1261,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						git = fp.mask_groups.erase(git);
 						continue;
 					}
-					++git;
 					auto & g = git->second;
 					for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
 					{
@@ -1274,6 +1274,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						else
 							++hit;
 					}
+					++git;
 				}
 				// Record per group: draws from anchored instances of member
 				// objects, opacity from per-instance fade.
