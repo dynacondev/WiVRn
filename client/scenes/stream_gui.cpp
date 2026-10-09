@@ -454,6 +454,9 @@ void scenes::stream::gui_settings(float)
 		case settings_page::theme:
 			wivrn::gui::settings_theme(ctx);
 			break;
+		case settings_page::passthrough:
+			gui_passthrough();
+			break;
 	}
 }
 
@@ -872,7 +875,6 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			ImGui::BeginChild("Main", ImVec2(ImGui::GetWindowSize().x - ImGui::GetCursorPosX() - content_margin, 0));
 			ImGui::SetCursorPosY(20);
 			wivrn::ui::page_header(_S("Statistics"), _S("Live streaming performance."));
-			gui_fiducial_status();
 			ImGui::BeginChild("plots", {0, 0});
 			gui_performance_metrics();
 			ImGui::EndChild();
@@ -1035,6 +1037,13 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			settings_item(ICON_FA_LOCATION_CROSSHAIRS, _cS("tab label", "Tracking"), settings_page::tracking);
 			settings_item(ICON_FA_GEARS, _cS("tab label", "System"), settings_page::system);
 			settings_item(ICON_FA_PALETTE, _cS("tab label", "Theme"), settings_page::theme);
+
+			wivrn::ui::nav_section(_cS("tab group", "PASSTHROUGH"));
+			if (wivrn::ui::nav_item(ICON_FA_EYE, _cS("tab label", "Passthrough"), gui_status == stream_tab::settings and current_settings_page == settings_page::passthrough))
+			{
+				current_settings_page = settings_page::passthrough;
+				next_gui_status = stream_tab::settings;
+			}
 
 			// pinned to the bottom
 			wivrn::ui::sidebar_footer();

@@ -26,6 +26,7 @@
 
 #include "application.h"
 #include "render/passthrough_mesh.h"
+#include "render/ui_widgets.h"
 #include "utils/i18n.h"
 
 #ifdef __ANDROID__
@@ -500,6 +501,12 @@ void scenes::stream::calibrate_to_marker()
 	spdlog::info("Calibrated to marker \"{}\": observed at ({:.2f}, {:.2f}, {:.2f}), mesh at ({:.2f}, {:.2f}, {:.2f}), sighting {}ms old",
 	             fp.calibrated_tag, marker_pos.x, marker_pos.y, marker_pos.z, mesh_pos.x, mesh_pos.y, mesh_pos.z,
 	             (long long)((now - sighting.time) / 1'000'000));
+}
+
+void scenes::stream::gui_passthrough()
+{
+	wivrn::ui::page_header(_S("Passthrough"), _S("QR-anchored passthrough meshes, marker tracking and alignment."));
+	gui_fiducial_status();
 }
 
 void scenes::stream::gui_fiducial_status()

@@ -166,6 +166,7 @@ private:
 		tracking,
 		theme,
 		system,
+		passthrough,
 	};
 	settings_page current_settings_page = settings_page::video;
 
@@ -303,6 +304,7 @@ private:
 	bool fiducial_passthrough_wanted();
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	void gui_fiducial_status();
+	void gui_passthrough();
 
 	// Eager USE_SCENE runtime-permission request (Android): manifest presence
 	// makes the spatial extensions enumerable, but tracking data needs the
