@@ -34,7 +34,7 @@ namespace
 // that paints the distance field instead of the mask (green = inside,
 // red->blue ramp over [0, feather], magenta = unreached/INF). Always
 // false in benchmark and shipping builds.
-constexpr bool sdf_field_viz = false;
+constexpr bool sdf_field_viz = true;
 
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
