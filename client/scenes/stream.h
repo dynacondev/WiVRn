@@ -290,6 +290,10 @@ private:
 		bool debug_matched = true;   // green: configured payload
 		bool debug_unmatched = true; // red: anything else sighted
 		float debug_opacity = 0.5f;  // overlay alpha, 0..1
+		// Marker window cutout, mm past the marker edge punched through
+		// the passthrough mask (-1 = disabled). Gated on the master
+		// toggle; mask path only.
+		int debug_window_mm = 50;
 		struct held_code
 		{
 			std::string payload; // truncated to 64 chars (QR data is unbounded)

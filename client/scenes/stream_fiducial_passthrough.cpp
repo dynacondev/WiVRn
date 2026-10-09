@@ -540,6 +540,8 @@ void scenes::stream::gui_passthrough()
 	float pct = fp.debug_opacity * 100;
 	if (ImGui::SliderFloat(_S("Debug overlay opacity"), &pct, 0, 100, "%.0f%%"))
 		fp.debug_opacity = std::clamp(pct / 100, 0.f, 1.f);
+	if (ImGui::SliderInt(_S("Marker window cutout"), &fp.debug_window_mm, -1, 512, fp.debug_window_mm < 0 ? "Disabled" : "%d mm"))
+		fp.debug_window_mm = std::clamp(fp.debug_window_mm, -1, 512);
 	ImGui::BeginDisabled(true);
 	ImGui::Text("%s", _S("Multi-code corrected position (orange) — coming later"));
 	ImGui::EndDisabled();

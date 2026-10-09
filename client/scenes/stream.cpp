@@ -1214,6 +1214,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				std::array<glm::mat4, 2> mvp;
 				for (uint32_t view = 0; view < 2; ++view)
 					mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]) * model;
+				// Marker window cutout: raw instant pose of the matched
+				// code (unfiltered, SLAM-held) expanded by the debug
+				// window, punched through the mask so the true code
+				// location stays visible even when the mesh is offset.
+				std::optional<std::array<glm::vec3, 6>> cutout;
+				if (fp.debug_overlays and fp.debug_window_mm >= 0)
+				{
+					for (const auto & [id, h]: fp.held_codes)
+					{
+						(void)id;
+						if (not h.matched or h.extents.width <= 0 or h.extents.height <= 0)
+							continue;
+						glm::quat mq(h.pose.orientation.w, h.pose.orientation.x, h.pose.orientation.y, h.pose.orientation.z);
+						glm::vec3 c(h.pose.position.x, h.pose.position.y, h.pose.position.z);
+						glm::vec3 r = mq * glm::vec3(1, 0, 0);
+						glm::vec3 u = mq * glm::vec3(0, 1, 0);
+						float hw = h.extents.width * 0.5f + fp.debug_window_mm / 1000.f;
+						float hh = h.extents.height * 0.5f + fp.debug_window_mm / 1000.f;
+						glm::vec3 v0 = c - r * hw - u * hh;
+						glm::vec3 v1 = c + r * hw - u * hh;
+						glm::vec3 v2 = c + r * hw + u * hh;
+						glm::vec3 v3 = c - r * hw + u * hh;
+						cutout = {v0, v1, v2, v0, v2, v3};
+						break; // single-marker assumption (multi-code later)
+					}
+				}
 				if (not mask_swapchain or mask_swapchain.width() != mw or mask_swapchain.height() != mh)
 				{
 					// Rare path (first frame, feather/config change):
@@ -1245,7 +1271,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_acquired = true;
 				fp.mask_extent = {mw, mh};
 				fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, fp.feather_px,
-				                         fp.fade_factor(frame_state.predictedDisplayTime));
+				                         fp.fade_factor(frame_state.predictedDisplayTime), cutout);
 				}
 			}
 		}

@@ -35,8 +35,10 @@
 
 #include <array>
 #include <glm/mat4x4.hpp>
+#include <glm/vec3.hpp>
 #include <openxr/openxr.h>
 #include <optional>
+#include "vk/allocation.h"
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -59,14 +61,20 @@ public:
 	// compositor. Feather selects the tier (0 = hard edge raster direct,
 	// 1 = full-res blur, 2/4/8 = blur at half/quarter/eighth with exact
 	// spread mapping, clamped to 128px); rasterize=false clears only.
-	// Opacity is the first-acquisition fade (1 = fully present).
+	// Opacity is the first-acquisition fade (1 = fully present). Cutout is
+	// an optional world-space quad (two triangles, six verts) punched
+	// through the silhouette with zero alpha after the mesh draws: the
+	// marker window debug cutout. Pre-blur, so the hole inherits feather
+	// softening. Mask path only (the binary projected layer has no alpha
+	// control to punch through).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
 	            const std::array<glm::mat4, 2> & mvp,
 	            bool rasterize = true,
 	            float feather_px = 24.0f,
-	            float opacity = 1.0f);
+	            float opacity = 1.0f,
+	            const std::optional<std::array<glm::vec3, 6>> & cutout = std::nullopt);
 
 	bool has_mesh() const
 	{
@@ -139,6 +147,11 @@ private:
 	vk::raii::Buffer index_buffer{nullptr};
 	vk::raii::DeviceMemory index_memory{nullptr};
 	uint32_t index_count = 0;
+
+	// Marker window-cutout quad (two world-space triangles, rewritten per
+	// record via the persistent VMA mapping). Created lazily on first
+	// cutout use.
+	buffer_allocation cutout_verts;
 
 	// Persistent staging for mesh uploads (resized on demand) + pending
 	// copy applied at the start of the next record().

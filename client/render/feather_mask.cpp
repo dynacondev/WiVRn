@@ -653,7 +653,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    const std::array<glm::mat4, 2> & mvp,
                                    bool rasterize,
                                    float feather_px,
-                                   float opacity)
+                                   float opacity,
+                                   const std::optional<std::array<glm::vec3, 6>> & cutout)
 {
 	auto set_full_viewport = [&](vk::Extent2D e) {
 		cmd.setViewport(0, vk::Viewport{
@@ -806,6 +807,31 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 			                               raster_push{.mvp = mvp[eye], .opacity = opacity});
 			cmd.drawIndexed(index_count, 1, 0, 0, 0);
+			// Marker window cutout: same world-space quad for both eyes,
+			// zero alpha overwrites the silhouette above (blend is off).
+			if (cutout)
+			{
+				if (not cutout_verts)
+				{
+					cutout_verts = buffer_allocation{
+					        device,
+					        vk::BufferCreateInfo{
+					                .size = sizeof(glm::vec3) * 6,
+					                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+					        },
+					        VmaAllocationCreateInfo{
+					                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+					                .usage = VMA_MEMORY_USAGE_AUTO,
+					        },
+					        "feather_mask cutout",
+					};
+				}
+				std::memcpy(cutout_verts.map(), cutout->data(), sizeof(glm::vec3) * 6);
+				cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
+				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+				                               raster_push{.mvp = mvp[eye], .opacity = 0});
+				cmd.draw(6, 1, 0, 0);
+			}
 			cmd.endRenderPass();
 		}
 		make_readable(*target_a.image);
