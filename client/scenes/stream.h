@@ -36,6 +36,7 @@
 #include "wivrn_packets.h"
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
+#include <algorithm>
 #include <filesystem>
 #include <mutex>
 #include <optional>
@@ -281,6 +282,20 @@ private:
 		XrTime last_novel_at = 0;
 		float target_render_err_mm = 0;
 		float target_render_err_deg = 0;
+
+		// First-acquisition alpha fade (mask-blend path only: the binary
+		// projected layer type has no opacity control). fade_start stamps
+		// the seed (auto-anchor / calibrate / re-seed) in predicted-time
+		// base; fade_dur_s tracks the entry live. 0 duration = instant.
+		XrTime fade_start = 0;
+		float fade_dur_s = 0;
+		float fade_factor(XrTime predicted) const
+		{
+			if (fade_dur_s <= 0 or fade_start == 0)
+				return 1;
+			double t = (predicted - fade_start) * 1e-9 / fade_dur_s;
+			return std::clamp(t, 0.0, 1.0);
+		}
 
 		// Feathered mask-blend state. Replaces the binary triangle-mesh
 		// cutout when XR_FB_composition_layer_alpha_blend is available:

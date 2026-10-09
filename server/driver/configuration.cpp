@@ -307,6 +307,8 @@ configuration::configuration()
 					e.knee_inner_deg = item["knee-inner-deg"];
 				if (item.contains("knee-outer-deg"))
 					e.knee_outer_deg = item["knee-outer-deg"];
+				if (item.contains("fade-in-s"))
+					e.fade_in_s = item["fade-in-s"];
 				fiducial_map.push_back(std::move(e));
 			}
 		}

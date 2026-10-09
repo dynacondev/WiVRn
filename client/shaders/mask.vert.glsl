@@ -23,6 +23,10 @@ layout(location = 0) in vec3 pos;
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
+	// First-acquisition fade: global silhouette opacity, ramps 0 -> 1.
+	// Read by the fragment stage; the blur chain is linear in alpha so
+	// the whole window (interior and feather band) fades uniformly.
+	float opacity;
 }
 pc;
 

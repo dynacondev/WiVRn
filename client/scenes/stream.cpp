@@ -1239,8 +1239,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					fp.mask_wait_warned = false;
 					mask_acquired = true;
-					fp.mask_extent = {mw, mh};
-					fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, fp.feather_px);
+				fp.mask_extent = {mw, mh};
+				fp.mask_renderer->record(command_buffer, mask_swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, mvp, not mask_bypass_cutout, fp.feather_px,
+				                         fp.fade_factor(frame_state.predictedDisplayTime));
 				}
 			}
 		}

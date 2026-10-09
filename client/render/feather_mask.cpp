@@ -46,6 +46,15 @@ struct blur_push
 	float pad = 0;
 };
 
+// Silhouette raster push block. Mirrors mask.vert/frag.glsl PushConstants:
+// mvp plus the first-acquisition fade opacity. The blur chain is linear in
+// alpha, so one raster-alpha scale fades interior and feather band alike.
+struct raster_push
+{
+	glm::mat4 mvp;
+	float opacity = 1;
+};
+
 // Downsample level extent (level 1 = half): exact halving, so the 2x2 box
 // mapping stays exact. Shared with ensure_targets: sizes must match.
 // The mask extent is 64-quantized upstream, hence divisible throughout.
@@ -140,9 +149,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 
 	vk::PushConstantRange push_range{
-	        .stageFlags = vk::ShaderStageFlagBits::eVertex,
+	        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
 	        .offset = 0,
-	        .size = sizeof(glm::mat4),
+	        .size = sizeof(raster_push),
 	};
 	vk::PipelineLayoutCreateInfo layout_info{
 	        .pushConstantRangeCount = 1,
@@ -643,7 +652,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    vk::Extent2D extent,
                                    const std::array<glm::mat4, 2> & mvp,
                                    bool rasterize,
-                                   float feather_px)
+                                   float feather_px,
+                                   float opacity)
 {
 	auto set_full_viewport = [&](vk::Extent2D e) {
 		cmd.setViewport(0, vk::Viewport{
@@ -793,7 +803,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 			cmd.bindVertexBuffers(0, (vk::Buffer)*vertex_buffer, (vk::DeviceSize)0);
 			cmd.bindIndexBuffer(*index_buffer, 0, vk::IndexType::eUint32);
-			cmd.pushConstants<glm::mat4>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, mvp[eye]);
+			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+			                               raster_push{.mvp = mvp[eye], .opacity = opacity});
 			cmd.drawIndexed(index_count, 1, 0, 0, 0);
 			cmd.endRenderPass();
 		}

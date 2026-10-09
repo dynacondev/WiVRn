@@ -232,9 +232,13 @@ Each entry has:
   `window-size` (default `12`), `min-samples` (default `4`, warmup),
   `sigma-k` (default `3`), `pos-gain`/`rot-gain` (default `24`, per-second
   proportional catch-up), `euro-min-cutoff` (default `0.4`),
-  `euro-beta` (default `0.07`), `knee-inner-mm`/`knee-outer-mm`
+  `euro-beta` (default `0.07`),   `knee-inner-mm`/`knee-outer-mm`
   (defaults `1`/`5`), `knee-inner-deg`/`knee-outer-deg`
   (defaults `0.1`/`0.5`).
+- `fade-in-s`: alpha fade-in at first acquisition, in seconds (default `0`
+  = appears instantly). Render-only; applied live, never invalidates
+  calibration. During the fade the passthrough window ramps from fully
+  transparent (game video) to fully present.
 
 The mesh pose on the headset is
 `meshClientPose = observedMarkerPose * markerToMeshOffset`.

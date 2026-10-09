@@ -59,12 +59,14 @@ public:
 	// compositor. Feather selects the tier (0 = hard edge raster direct,
 	// 1 = full-res blur, 2/4/8 = blur at half/quarter/eighth with exact
 	// spread mapping, clamped to 128px); rasterize=false clears only.
+	// Opacity is the first-acquisition fade (1 = fully present).
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
 	            const std::array<glm::mat4, 2> & mvp,
 	            bool rasterize = true,
-	            float feather_px = 24.0f);
+	            float feather_px = 24.0f,
+	            float opacity = 1.0f);
 
 	bool has_mesh() const
 	{

@@ -206,6 +206,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.filter.reset();
 			fp.continuous = false;
 			fp.novel_ingested = 0;
+			fp.fade_start = 0;
 			if (fp.ready)
 			{
 				spdlog::info("Fiducial map changed, clearing projected mesh");
@@ -218,6 +219,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		else if (not model_cached)
 			fp.status = "downloading model " + entry->model_hash.substr(0, 8) + "...";
 	}
+
+	// Fade duration is render-only (like feather-px): tracked live, never
+	// part of the calibration fingerprint above.
+	if (entry)
+		fp.fade_dur_s = std::max(0.f, entry->fade_in_s);
 
 	// Strict gating: marker tracking above runs unconditionally (needed for
 	// the in-view dot and the Calibrate button), but nothing mesh-related
@@ -283,6 +289,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				fp.calibrated_at = fp.last_novel_at;
 				fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
 				fp.last_predicted = predicted_display_time;
+				fp.fade_start = predicted_display_time;
 				spdlog::info("Continuous: auto-anchored to marker \"{}\"", fp.calibrated_tag);
 			}
 		}
@@ -469,6 +476,7 @@ void scenes::stream::calibrate_to_marker()
 		fp.calibrated = true;
 		fp.calibrated_at = now;
 		fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
+		fp.fade_start = now;
 		spdlog::info("Continuous: re-seeded to marker \"{}\"", fp.calibrated_tag);
 		return;
 	}
@@ -490,6 +498,8 @@ void scenes::stream::calibrate_to_marker()
 	fp.calibrated_at = now;
 	// Display label: the tag, or the payload when untagged.
 	fp.calibrated_tag = entry->tag.empty() ? entry->marker_data : entry->tag;
+	fp.fade_dur_s = std::max(0.f, entry->fade_in_s);
+	fp.fade_start = now;
 
 	// Deliberately no world-origin change: shifting the client origin moves
 	// it out from under the server-rendered video (the game is rendered
@@ -574,6 +584,8 @@ void scenes::stream::gui_fiducial_status()
 			            fp.target_render_err_mm,
 			            fp.target_render_err_deg,
 			            (unsigned long long)fp.novel_ingested);
+		if (float fade = fp.fade_factor(instance.now()); fade < 1)
+			ImGui::Text("Fade-in: %.0f%%", fade * 100);
 	}
 
 	bool can_calibrate = marker_tracker && marker_tracker->latest().tracked;
