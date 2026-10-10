@@ -27,17 +27,25 @@
 #include <vulkan/vulkan_raii.hpp>
 
 #include "vk/allocation.h"
+#include "xr/swapchain.h"
 
 // World-space debug line renderer: 1px line segments (position + RGBA)
-// drawn over the eye images with a per-eye MVP. Replaces the old tinted
-// compositor quads (one layer per quad blew maxLayerCount): all debug
-// geometry submits zero composition layers. Lines have no faces, so no
-// facing math and no backface doubling. Blending is in the pipeline, so
-// no FB extensions are needed either.
+// composited as ONE transparent projection layer (standard alpha blend,
+// no FB extensions needed). One layer always: no per-quad layers, so
+// maxLayerCount can never overflow no matter the tag count. Lines have
+// no faces, so no facing math and no backface doubling. Blending is in
+// the pipeline.
 //
-// Lifetime mirrors the video swapchain (rebuilt with it): per-(image,
-// eye) framebuffers over the swapchain images, one host-visible vertex
-// buffer grown on demand. Render thread only.
+// Own swapchain, CLEAR every frame (UNDEFINED initial: no layout history
+// is ever assumed — the eye-image LOAD variant of this class died on
+// exactly that assumption). Per-(image, eye) framebuffers, one
+// host-visible vertex buffer grown on demand. Render thread only.
+namespace xr
+{
+class instance;
+class session;
+} // namespace xr
+
 class debug_lines_renderer
 {
 public:
@@ -47,12 +55,24 @@ public:
 		float color[4];
 	};
 
-	debug_lines_renderer(vk::raii::Device & device, vk::Format format, std::vector<vk::Image> images,
-	                     vk::Extent2D extent);
+	explicit debug_lines_renderer(vk::raii::Device & device);
 
-	// Record segments (vertex PAIRS) into both eye layers of images[index].
-	// No-op (no barrier, no passes) when verts is empty. extents size the
-	// per-eye viewports (the submitted layer rects); mvp maps world to NDC.
+	// (Re)create swapchain + targets + pipelines for format/size.
+	// waitIdle inside on rebuild; no-op when unchanged.
+	void ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h);
+
+	bool ready() const
+	{
+		return (bool)swapchain_;
+	}
+
+	// Acquire + wait (100ms); -1 on timeout (pairing-safe: the untouched
+	// acquisition is released inside, skip the frame).
+	int acquire();
+
+	// Record segments (vertex PAIRS) into both eye layers of the acquired
+	// image. No-op when verts is empty. extents size the per-eye
+	// viewports (the submitted layer rects); mvp maps world to NDC.
 	// blended=false selects the blend-off pipeline (TEMP diagnostic: skips
 	// the alpha path to isolate blending faults).
 	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
@@ -63,7 +83,7 @@ public:
 	                 const vertex * verts, size_t vert_count);
 
 	// TEMP diagnostic twin: triangle list through the same renderpass /
-	// framebuffers / barrier / vertex buffer, unblended. Tri-visible vs
+	// framebuffers / vertex buffer, unblended. Tri-visible vs
 	// lines-invisible bisects primitive-topology faults from shared-infra
 	// faults. Revert with the line-visibility verdict.
 
@@ -72,7 +92,19 @@ public:
 	// memcpys clobber earlier draws' data (same buffer, draw at submit).
 	void begin_frame();
 
+	// Release the acquired image (after submit, before endFrame — the
+	// compositor takes the last released image).
+	void release();
+
+	xr::swapchain & swapchain()
+	{
+		return swapchain_;
+	}
+
 private:
+	void init_pipelines(vk::Format format);
+	void init_targets();
+
 	vk::raii::Device * device = nullptr;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
@@ -81,6 +113,10 @@ private:
 	vk::raii::Pipeline pipeline_unblended{nullptr}; // TEMP diagnostic: blend-off variant
 	vk::raii::Pipeline pipeline_tri{nullptr}; // TEMP diagnostic: triangle twin (topology bisect)
 
+	xr::swapchain swapchain_;
+	vk::Format format_ = vk::Format::eUndefined;
+	vk::Extent2D extent_{0, 0};
+
 	struct target
 	{
 		vk::raii::ImageView view{nullptr};
@@ -88,10 +124,7 @@ private:
 	};
 	// [image][eye], parallel to the swapchain image list.
 	std::vector<std::array<target, 2>> targets;
-	std::vector<vk::Image> images;
-	vk::Extent2D extent{0, 0};
 
 	buffer_allocation staging;
-	size_t staging_verts = 0;
 	size_t staging_used = 0; // verts consumed this frame (reset by begin_frame)
 };
