@@ -75,6 +75,10 @@ public:
 	{
 		return images_;
 	}
+	size_t image_count() const
+	{
+		return images_.size();
+	}
 	vk::Image image(size_t i) const
 	{
 		return images_[i];

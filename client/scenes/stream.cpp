@@ -869,6 +869,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// TODO: stop/restart video stream
 		session.begin_frame();
 		session.end_frame(frame_state.predictedDisplayTime, {});
+		// Idle gap, not a deadline miss: the cadence check re-arms
+		// silently when set instead of counting (spike forensics).
+		early_out_since_render = true;
 		return;
 	}
 
@@ -907,7 +910,40 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
 
-	gpu_timestamps timestamps;
+	++frame_seq;
+	mask_frame_seq = frame_seq;
+	// Rendered-frame cadence (early-outs above never reach here): gaps
+	// over 1.5 periods are vsyncs that produced no submission, i.e. a
+	// missed deadline upstream or a parked frame. A refresh-rate switch
+	// resets the reference instead of counting (period itself moved).
+	mask_frame_misses = 0;
+	if (early_out_since_render)
+	{
+		// Gap spans idle frames (decoders empty at connect, shutdown):
+		// re-arm silently, count nothing.
+		early_out_since_render = false;
+	}
+	else if (last_rendered_predicted != 0 and frame_state.predictedDisplayPeriod > 0)
+	{
+		if (frame_state.predictedDisplayPeriod != last_cadence_period and last_cadence_period != 0)
+		{
+			// Refresh rate changed: re-arm silently.
+		}
+		else if (frame_state.predictedDisplayTime - last_rendered_predicted >
+		         frame_state.predictedDisplayPeriod + frame_state.predictedDisplayPeriod / 2)
+		{
+			// Rounded: a 1.75-period gap skipped one vsync, not zero.
+			mask_frame_misses = (uint64_t)((frame_state.predictedDisplayTime - last_rendered_predicted +
+			                                frame_state.predictedDisplayPeriod / 2) /
+			                               frame_state.predictedDisplayPeriod) -
+			                    1;
+			vsync_misses += mask_frame_misses;
+		}
+	}
+	last_rendered_predicted = frame_state.predictedDisplayTime;
+	last_cadence_period = frame_state.predictedDisplayPeriod;
+
+	gpu_timestamps timestamps{};
 	// Previous frame's mask samples still sit in mask_frame_samples (this
 	// frame's record() calls haven't run yet): attach their GPU times now,
 	// then hand them to accumulate_metrics via mask_ready_*. Only the
@@ -936,12 +972,51 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				uint64_t end = timestamps2[mask_group_slot_first + 2 * i + 1];
 				mask_frame_samples[i].gpu_ms = (double)(end - begin) * period_ms;
 			}
+			// Video-region split stamp lives at a fixed address past the
+			// metered prefix (unlike the metered groups): separate bounded
+			// read, same eWait safety (written every submit). The
+			// defoveate delta reuses slot 1, so only one extra stamp.
+			auto [res_vr, vr_stamps] = query_pool.getResults<uint64_t>(
+			        video_split_first,
+			        1,
+			        sizeof(uint64_t),
+			        sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+			if (res_vr == vk::Result::eSuccess)
+			{
+				mask_frame_vr_prefix_ms = (double)(vr_stamps[0] - timestamps2[0]) * period_ms;
+				mask_frame_vr_defoveate_ms = (double)(timestamps2[1] - vr_stamps[0]) * period_ms;
+			}
 		}
+		// Bracket epoch: the pool always holds the last submit's stamps,
+		// so the brackets just attached belong to last_submit_seq. A
+		// skipped submit (mid-body throw) breaks that pairing; the dump
+		// then emits a gap line instead of misattributing stale brackets.
+		mask_frame_bracket_seq = last_submit_seq;
 	}
 	mask_ready_samples = std::move(mask_frame_samples);
 	mask_frame_samples.clear();
 	mask_ready_unmetered = mask_frame_unmetered;
 	mask_frame_unmetered = 0;
+	// Forensic doubles ride the same 1-frame stagger: everything moved
+	// here describes the frame whose GPU brackets were just read back.
+	mask_ready_video_wait_ms = mask_frame_video_wait_ms;
+	mask_frame_video_wait_ms = 0;
+	mask_ready_skipped_wait_ms = mask_frame_skipped_wait_ms;
+	mask_frame_skipped_wait_ms = 0;
+	mask_ready_submit_ms = mask_frame_submit_ms;
+	mask_frame_submit_ms = 0;
+	mask_ready_endframe_ms = mask_frame_endframe_ms;
+	mask_frame_endframe_ms = 0;
+	mask_ready_starved = mask_frame_starved;
+	mask_frame_starved = false;
+	mask_ready_misses = mask_frame_misses;
+	mask_frame_misses = 0;
+	mask_ready_seq = mask_frame_seq;
+	mask_ready_bracket_seq = mask_frame_bracket_seq;
+	mask_ready_vr_prefix_ms = mask_frame_vr_prefix_ms;
+	mask_ready_vr_defoveate_ms = mask_frame_vr_defoveate_ms;
+	mask_ready_record_seq = mask_frame_record_seq;
 
 	session.begin_frame();
 
@@ -1086,6 +1161,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
+
+	// Video-region split stamp (spike forensics): everything before this
+	// is blit/barrier setup, everything after (up to slot 1) is defoveate.
+	// Unconditional, like slot 1: the split readback eWaits on it.
+	command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, video_split_first);
+
 	// Allow the headset to time warp if we are redisplaying a frame
 	if ((not application::get_hmd_traits().discard_frame) or
 	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
@@ -1129,7 +1210,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		assert(swapchain);
 		// defoveate the image, apply scale/bias
 		int image_index = swapchain.acquire();
+		XrTime video_wait_t0 = instance.now();
 		swapchain.wait();
+		// Host-side image wait (compositor backpressure lives here,
+		// invisible to GPU brackets and record clocks alike).
+		mask_frame_video_wait_ms = (instance.now() - video_wait_t0) * 1e-6;
 
 		switch (gui_status)
 		{
@@ -1197,16 +1282,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
+
 		// Feathered mask record, one stack per feather group (independent
 		// feathering per object). Groups share a blur chain per feather
 		// value; member objects contribute soups, anchored instances
 		// contribute draws. Dedicated member swapchains with explicit
 		// acquire/release pairing (never the shared pool).
-		//
-		// Cutout bypass DISABLED (diagnostic complete): the rasterized
-		// silhouette applies the window. Set true only to re-validate
-		// plumbing with a transparent mask (full game video).
-		static constexpr bool mask_bypass_cutout = false;
 		try
 		{
 			mask_frame = false;
@@ -1219,12 +1300,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
-				// Member mask swapchains run at half resolution: the V
-				// upscale writes half pixels and the compositor expands to
-				// full on submit (bilinear, equivalent filtering to the old
-				// full-res V). Intermediates stay keyed off full mw/mh.
+				// Member mask swapchains submit below full: the V pass writes
+				// the submitted size and the compositor expands to full on
+				// submit (bilinear, equivalent filtering to the old
+				// full-res V). Tier-0 stays full (exact hard edge), tier-1
+				// submits half, tiered submits quarter (their bands are
+				// wide enough to survive it; working sizes are unchanged).
+				// Intermediates stay keyed off full mw/mh.
 				int hw = std::max(64, mw / 2);
 				int hh = std::max(64, mh / 2);
+				int qw = std::max(64, mw / 4);
+				int qh = std::max(64, mh / 4);
 				// View-only transforms shared by the cutouts.
 				std::array<glm::mat4, 2> world_mvp;
 				for (uint32_t view = 0; view < 2; ++view)
@@ -1316,6 +1402,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				for (float f: live_feathers)
 				{
 					auto & g = fp.mask_groups[f];
+					// Eager setup (map arrival, not first visibility):
+					// member swapchain + intermediates ready before first
+					// draws, so first-visible frames pay record+submit only
+					// (no allocations/stalls mid-game). All change-gated:
+					// steady state is a size compare + extent compare.
+					// Tier-0 groups keep a full-res swapchain (exact hard
+					// edge); tier-1 submits half, tiered submits quarter (V
+					// writes the submitted size, the compositor upscales).
+					// g.extent tracks the submitted size; record() still works
+					// intermediates at full. Sizing shares record()'s tier map
+					// (tier_for_feather): the two must agree.
+					int tier = feather_mask_renderer::tier_for_feather(f);
+					int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
+					int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
+					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
+					{
+						// Rare path (first frame, feather/config change):
+						// nothing outstanding (previous images released last
+						// frame), mirroring setup_reprojection_swapchain.
+						device.waitIdle();
+						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
+						g.renderer->reset_targets();
+						g.images_outstanding = 0;
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
+					}
+					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for
@@ -1390,30 +1502,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.active = false;
 						continue;
 					}
-					// Tier-0 groups keep a full-res swapchain (exact hard
-					// edge); feathered groups submit half (V writes half,
-					// compositor upscales). g.extent tracks the submitted
-					// size; record() still works intermediates at full.
-					int gw = (f <= 0) ? mw : hw;
-					int gh = (f <= 0) ? mh : hh;
-					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
-					{
-						// Rare path (first frame, feather/config change):
-						// nothing outstanding (previous images released last
-						// frame), mirroring setup_reprojection_swapchain.
-						device.waitIdle();
-						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
-						g.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px)", gw, gh, f);
-					}
 					int mask_index = g.swapchain.acquire();
-					if (not g.swapchain.wait(100'000'000))
+					// Paired from acquisition: the group joins the release
+					// list immediately, so wait/record/stamp throws (outer
+					// catch) release its image instead of leaking it (one
+					// leaked image per frame drains the pool in pool-depth
+					// frames, then acquires fail permanently).
+					++g.images_outstanding;
+					acquired_groups.push_back(&g);
+					spdlog::debug("Fiducial mask acquire: feather {}px image {} ({} of {} outstanding)", f, mask_index, g.images_outstanding, g.swapchain.image_count());
+					XrTime group_wait_t0 = instance.now();
+					bool waited = g.swapchain.wait(100'000'000);
+					// Same host-wait bookkeeping as the video swapchain above.
+					double group_wait_ms = (instance.now() - group_wait_t0) * 1e-6;
+					if (not waited)
 					{
 						// Never park forever on an unavailable image: release
 						// the untouched acquisition to keep pairing and skip
 						// the group this frame.
 						g.swapchain.release();
+						--g.images_outstanding;
+						acquired_groups.pop_back();
 						g.active = false;
+						// A 100ms timeout is itself the starvation signal: no
+						// sample is pushed for a skipped group, so bank its
+						// wait separately or the dump goes blind exactly when
+						// backpressure bites.
+						mask_frame_skipped_wait_ms += group_wait_ms;
 						if (not g.wait_warned)
 						{
 							g.wait_warned = true;
@@ -1430,6 +1545,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// readback). The catch keeps TOP/BOTTOM paired: a missing
 					// BOTTOM_OF_PIPE would hang the eWait readback.
 					uint32_t stamp = (uint32_t)mask_frame_samples.size();
+					mask_frame_record_seq = frame_seq;
 					bool metered = stamp < max_metered_mask_groups;
 					if (metered)
 						command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, mask_group_slot_first + 2 * stamp);
@@ -1438,39 +1554,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.renderer->record(
 						        command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						        not mask_bypass_cutout, f, cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
+						        true, f, cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
 					}
 					catch (...)
 					{
 						if (metered)
 							command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
-						mask_frame_samples.push_back({f, 0, stage_cpu});
+						mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
 						throw;
 					}
 					if (metered)
-						command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
+					command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
 					else
 						++mask_frame_unmetered;
-					mask_frame_samples.push_back({f, 0, stage_cpu});
+					mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
 					g.active = true;
-						acquired_groups.push_back(&g);
 						mask_frame = true;
-					}
-				}
-				if (mask_frame and mask_bypass_cutout)
-				{
-					static bool bypass_logged = false;
-					if (not bypass_logged)
-					{
-						bypass_logged = true;
-						spdlog::info("Mask cutout bypassed (diagnostic): submitting transparent mask, full video expected");
 					}
 				}
 			}
 		}
 		catch (std::exception & e)
 		{
-			spdlog::warn("Fiducial mask record failed: {}", e.what());
+			spdlog::warn("Fiducial mask record failed: {} ({} mask images outstanding across groups)", e.what(), acquired_groups.size());
 			// Release everything acquired above, otherwise images stay
 			// outstanding and the pairing breaks.
 			for (auto * g: acquired_groups)
@@ -1480,6 +1586,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				try
 				{
 					g->swapchain.release();
+					--g->images_outstanding;
 				}
 				catch (std::exception & e2)
 				{
@@ -1642,7 +1749,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		submit_info.pNext = &sem_info;
 
 		device.resetFences(*fence);
+		XrTime submit_t0 = instance.now();
 		queue.lock()->submit(submit_info, *fence);
+		// Driver-side submit cost (normally ~0.05ms; spikes here are
+		// driver contention, not GPU execution — the brackets can't see
+		// it, this clock can).
+		mask_frame_submit_ms = (instance.now() - submit_t0) * 1e-6;
+		// Submit epoch for the bracket guard below: the pool now holds
+		// this frame's stamps.
+		last_submit_seq = frame_seq;
 #if WIVRN_FEATURE_RENDERDOC
 		renderdoc_end(*vk_instance);
 #endif
@@ -1652,6 +1767,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			g->acquired = false;
 			g->swapchain.release();
+			--g->images_outstanding;
+			spdlog::debug("Fiducial mask release: feather {}px ({} outstanding)", g->feather_px, g->images_outstanding);
 		}
 		acquired_groups.clear();
 		// Paired with the debug overlay acquire above.
@@ -1881,7 +1998,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			spdlog::info("mask frame {}: entering end_frame", mask_trace_count);
 		try
 		{
+			XrTime endframe_t0 = instance.now();
 			render_end();
+			// Layer fixup + xrEndFrame host cost (compositor round-trip
+			// lives here; a stall here is a late frame with fast brackets).
+			mask_frame_endframe_ms = (instance.now() - endframe_t0) * 1e-6;
 		}
 		catch (std::system_error & e)
 		{

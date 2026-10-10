@@ -621,10 +621,16 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 	targets_extent = extent;
 	// A/B intermediates at half mask resolution (the mask extent is
 	// 64-quantized upstream, hence evenly divisible); tier-1 raster and
-	// H run small, V upscales to full on submit.
+	// H run small, V writes the half-res submitted image (the compositor
+	// upscales to full).
 	vk::Extent2D half_targets = level_extent(extent, 1);
 	for (auto * target: {&target_a, &target_b})
 	{
+		// Views/framebuffers must die before the image they reference
+		// (the image assignment below destroys the old image).
+		target->views.clear();
+		target->raster_fbs.clear();
+		target->blur_fbs.clear();
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
 		        .format = blur_format,
@@ -645,9 +651,6 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 		};
 		target->memory = vk::raii::DeviceMemory(device, alloc_info);
 		target->image.bindMemory(*target->memory, 0);
-		target->views.clear();
-		target->raster_fbs.clear();
-		target->blur_fbs.clear();
 		for (int layer = 0; layer < 2; ++layer)
 		{
 			vk::ImageViewCreateInfo view_info{
@@ -705,6 +708,8 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			        .sharingMode = vk::SharingMode::eExclusive,
 			        .initialLayout = vk::ImageLayout::eUndefined,
 			};
+			target->views.clear();
+			target->blur_fbs.clear();
 			target->image = vk::raii::Image(device, image_info);
 			auto requirements = target->image.getMemoryRequirements();
 			vk::MemoryAllocateInfo alloc_info{
@@ -713,14 +718,12 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			};
 			target->memory = vk::raii::DeviceMemory(device, alloc_info);
 			target->image.bindMemory(*target->memory, 0);
-			target->views.clear();
-			target->blur_fbs.clear();
 			for (int layer = 0; layer < 2; ++layer)
 			{
 				vk::ImageViewCreateInfo view_info{
 				        .image = *target->image,
 				        .viewType = vk::ImageViewType::e2D,
-				        .format = format,
+				        .format = blur_format,
 				        .subresourceRange = {
 				                .aspectMask = vk::ImageAspectFlagBits::eColor,
 				                .baseMipLevel = 0,
@@ -1016,45 +1019,35 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		ensure_targets(extent);
 
 		// Tier from feather-px (see header): 0 hard edge, 1 half-res
-		// blur with full-res upscale, 2/4/8 downsampled. Band stays ±F/2
-		// by construction, so width is continuous across tiers; tap
-		// density stays in the proven regime everywhere. Values past 128
-		// clamp (documented).
+		// blur, 2/4/8 downsampled. Every feathered group submits a
+		// half-res image (V writes half pixels, the compositor
+		// bilinear-upscales to full on submit), so the blur works in
+		// 1/k-size texels (k = 2 tier-1, 4 tier-2/4, 8 tier-8) and the
+		// screen-space band is 2k*sqrt(2)*spread px. Divisor 12*k keeps
+		// the band continuous across tiers (within float rounding) with
+		// tap density flat everywhere. Values past 128 clamp (documented).
 		// Selected before raster: tier 0 goes straight into the swapchain
-		// image, tier 1 via the half-res A/B intermediates with full-res
-		// upscale, tiered via a level-1 seed.
-		float f = feather_px;
-		int tier = 1;
+		// image, tier 1 via the half-res A/B intermediates, tiered via a
+		// level-2 (tier 2) or level-1 (tier 4/8) seed.
+		float f = feather_px > 128.f ? 128.f : feather_px;
+		int tier = tier_for_feather(feather_px);
 		float spread = 1.0f;
-		if (f <= 0)
-			tier = 0;
-		else
+		if (tier == 1)
 		{
-			if (f > 128)
-				f = 128;
-			// Tier-1 blur runs at half resolution (H in half-texels, V in
-			// full): spread f/12 keeps the output band identical to the
-			// old full-res f/8 (chained-sigma match within 5%).
-			if (f <= 16)
-				spread = f / 12.f;
-			else if (f <= 48)
-			{
-				tier = 2;
-				// H runs in 4px units, V in 1px: chained sigma 2s*sqrt(17)
-				// matches the old half-H/full-V band (2s*sqrt(5)) at
-				// s = f/44 (within ~5%, narrower-eroding on ties).
-				spread = f / 44.f;
-			}
-			else if (f <= 96)
-			{
-				tier = 4;
-				spread = f / 48.f;
-			}
-			else
-			{
-				tier = 8;
-				spread = f / 96.f;
-			}
+			// k = 2: band 4*sqrt(2)*spread px.
+			spread = f / 24.f;
+		}
+		else if (tier == 2)
+		{
+			// k = 4: band 8*sqrt(2)*spread px, same slope as tier 1.
+			spread = f / 48.f;
+		}
+		else if (tier == 4)
+			spread = f / 48.f;
+		else if (tier == 8)
+		{
+			// k = 8: band 16*sqrt(2)*spread px, same slope again.
+			spread = f / 96.f;
 		}
 
 		// Half-res working extent for the A/B intermediates (the mask
@@ -1251,12 +1244,37 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// only; rasterize=false (bypass) skips them with the silhouettes.
 	if (not cutouts.empty() and rasterize)
 	{
-		if (not cutout_verts)
+		// Execution barrier: the V upscale (or tier-0 raster) above wrote
+		// the swapchain image as COLOR_ATTACHMENT; the LOAD cutout pass
+		// below reads it. Without this a tile GPU may LOAD stale tiles.
+		vk::ImageMemoryBarrier cut_barrier{
+		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
+		        .oldLayout = vk::ImageLayout::eGeneral,
+		        .newLayout = vk::ImageLayout::eGeneral,
+		        .image = image,
+		        .subresourceRange = {
+		                .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                .levelCount = 1,
+		                .layerCount = 2,
+		        },
+		};
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    {},
+		                    {},
+		                    {},
+		                    cut_barrier);
+		// One vertex buffer for every quad, uploaded once: record() only
+		// records, so per-quad memcpys before submit would leave every
+		// draw reading the last quad. Grown on demand (debug path only).
+		vk::DeviceSize cut_need = sizeof(glm::vec3) * 6 * cutouts.size();
+		if (not cutout_verts or cutout_verts.size() < cut_need)
 		{
 			cutout_verts = buffer_allocation{
 			        device,
 			        vk::BufferCreateInfo{
-			                .size = sizeof(glm::vec3) * 6,
+			                .size = cut_need,
 			                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
 			        },
 			        VmaAllocationCreateInfo{
@@ -1266,12 +1284,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        "feather_mask cutout",
 			};
 		}
+		for (size_t qi = 0; qi < cutouts.size(); ++qi)
+			std::memcpy((char *)cutout_verts.map() + qi * sizeof(glm::vec3) * 6, cutouts[qi].data(), sizeof(glm::vec3) * 6);
+		// House idiom (cf. gpu_buffer): unmap flushes host writes for GPU read.
+		cutout_verts.unmap();
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 		cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
 		section_clock punch_clk(&ms_punch);
-		for (const auto & quad: cutouts)
+		for (size_t qi = 0; qi < cutouts.size(); ++qi)
 		{
-			std::memcpy(cutout_verts.map(), quad.data(), sizeof(glm::vec3) * 6);
+			const auto & quad = cutouts[qi];
 			for (int eye = 0; eye < 2; ++eye)
 			{
 				// Tighten to the quad's pixel bounds (same NDC mapping the
@@ -1321,7 +1343,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.setScissor(0, area);
 				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 				                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});
-				cmd.draw(6, 1, 0, 0);
+				cmd.draw(6, 1, (uint32_t)(qi * 6), 0);
 				cmd.endRenderPass();
 			}
 		}

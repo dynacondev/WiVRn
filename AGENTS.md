@@ -108,17 +108,63 @@ Mixed = 2 groups (f=12+f=24 or 23+24).
   tile round-trip; shader fetches second-order (5-tap saved ~30%
   tier-1, ~0% tier-2). **Swapchain (XR-shared, uncached) traffic
   dominates**; shrinking cached intermediates 4× bought ~15%.
+- **XR acquire order is load-bearing**: member swapchains must be
+  acquired AFTER the video swapchain each frame. Member-before-video
+  wedges member pools within seconds (`CALL_ORDER_INVALID` forever).
+  Submit reorder is therefore unavailable as a lever — record order
+  implies acquire order.
 - Fixes that moved mixed 8.0→0.85ms: half-res member swapchains +
   compositor upscale (~8×); seed-rasterize at level 1 (8→6 passes);
   5-tap kernel (keep sigma-matched spreads); tier-0 raster-direct
   (~0.08ms, leave alone).
+- Later, saturated regime: **quarter-res tiered submit** (tier-0 full,
+  tier-1 half, tier ≥2 quarter; sizing-only via `out_extent`, zero
+  shader changes; saturated mixed 6→~4ms). Constraint: submit scale
+  must resolve the band (~0.24 texels across it); tier-1 at quarter
+  puts f=7's band in 0.4 texels — broken, not soft.
+- **Spread continuity** (divisor 12k: f/24,f/48,f/48,f/96): tier-1's
+  slope was ~2× the 2/4/8 family (~40% pop at f=16→17); band is now
+  √2·f/6 at every tier, exact at all boundaries.
 - Dead ends: SDF/Jump-Flood replacement (reverted, 5.1× solo cost);
   intermediate shrinking; punch scissor (debug-only); descriptor
   aliasing/DVFS/marker-flicker/mesh-size theories ruled out.
+  Single-composite unification saves ~2 passes but not the saturation
+  mechanism (downgraded; per-object feathers rule out quantize —
+  headroom is tiers + variance control). Tier-1 subpass merge
+  (raster+H+V, DONT_CARE intermediates) measured ≈identical twice,
+  deleted: neighborhood taps need sampler reads, transients forbid
+  them, driver resolves through DRAM anyway. Cull hysteresis
+  (linger-3/appear-instant) reverted unvalidated — needs flap-rate
+  data first.
 - Discipline: solo-per-tier + mixed + same-feather matrix, 60s runs,
   fixed res/refresh/markers, overlays off, ignore first log line.
   `tier=` meanings changed across commits — check commit before
   comparing logs. Verify res constancy via `Creating new swapchain` /
   `Fiducial mask swapchain` lines. Record order = `passthrough_objects`
   map order (`mask groups order:` log); per-window minima (`groups min`)
-  separate skipped groups (2ms dips) from spikes.
+  separate skipped groups (2ms dips) from spikes. Matrix now
+  mixed-band (10/26/67) + refresh ladder (72/90/120), overlays noted
+  per run (rate/impact/config confound freely). Spike lines need the
+  `blits + defov == video` identity check; `draws=` is window-max;
+  thresholds in `spike_threshold_ms` / `spike_mask_threshold_ms`.
+
+## Stutter chase (spike forensics — ceiling, not mean)
+
+- Headroom is a **statistics problem**: means (~2-4ms) leave budget at
+  every refresh; tails (6-9ms) + variance do the damage. Felt stutter
+  tracks **mask variance**, not video spikes (AG@120: 86 video-only
+  spikes, mask ~0.07 flat, felt perfect; AF@72 with M1 + flapping
+  didn't). Timewarp covers late video; a late/swimming cutout is felt.
+- **M1**: first recorded slot eats ~2.5-3.5ms under saturation
+  regardless of content; slow slot follows record position.
+- **M2 video-region spikes** (~5.5ms in slots 0→1 = blits+defoveate):
+  blits ≈ 0.00 always, all defoveate; mask brackets normal in the same
+  frames; waits/submit/endframe flat; no cadence break; cold-present,
+  motion-free, starved-0 frames spike too. Surviving model: bursty DRAM
+  contention hitting whichever eye's pass executes through the burst.
+- **Forensics retention** (cheap, permanent alibis): `mask spike:` dump
+  (whole+mask triggers 5.0/4.0ms), `mask gap:` epoch-guard line,
+  `misses/spikes/starved/vr mean/max` counters, video-region split
+  (blits/defov), cadence misses (idle gaps excluded), wait/submit/
+  endframe clocks, CPU stage clocks. Deleted after serving: merged
+  path, per-eye split, bypass switch, hysteresis.

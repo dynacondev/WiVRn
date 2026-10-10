@@ -74,6 +74,26 @@ public:
 		float opacity = 1;
 	};
 
+	// Tier selection from feather-px, shared with the scene (which sizes
+	// member swapchains from it: tier-0 submits full, tier-1 half, tiered
+	// quarter). Single source of truth: record() and the scene must agree,
+	// or sizing (and the merged tier-1 gate on out == half) misfires.
+	static int tier_for_feather(float feather_px)
+	{
+		float f = feather_px;
+		if (f <= 0)
+			return 0;
+		if (f > 128.f)
+			f = 128.f;
+		if (f <= 16)
+			return 1;
+		if (f <= 48)
+			return 2;
+		if (f <= 96)
+			return 4;
+		return 8;
+	}
+
 	// Per-record host-side cost breakdown (steady_clock, milliseconds).
 	// Filled when record() gets a non-null out-pointer; all zeros on
 	// early-out paths. Permanent diagnostics: the stream scene sums these
@@ -126,6 +146,11 @@ public:
 	{
 		targets.clear();
 	}
+
+	// Ensure intermediates for an extent (idempotent, change-gated). Public
+	// so the scene can warm targets at map arrival, before first draws;
+	// record() calls it too (same gate, no double work).
+	void ensure_targets(vk::Extent2D extent);
 
 private:
 	vk::raii::Device & device;
@@ -195,7 +220,6 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	void ensure_targets(vk::Extent2D extent);
 	void update_source(vk::ImageView view, uint32_t set);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
@@ -217,9 +241,9 @@ private:
 	std::map<std::string, mesh_buffers> meshes;
 	void flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh);
 
-	// Marker window-cutout quad (two world-space triangles, rewritten per
-	// record via the persistent VMA mapping). Created lazily on first
-	// cutout use.
+	// Marker window-cutout quads (two world-space triangles each, batched
+	// per record with one upload + firstVertex draws, unmapped to flush).
+	// Grown on demand; created lazily on first cutout use.
 	buffer_allocation cutout_verts;
 
 	// Framebuffers + views per swapchain image (images cycle; entries for
