@@ -36,9 +36,9 @@ pc;
 void main()
 {
 	vec2 t = pc.src_texel;
-	float a = texture(src, uv + vec2(-0.5, -0.5) * t).a;
-	a += texture(src, uv + vec2(0.5, -0.5) * t).a;
-	a += texture(src, uv + vec2(-0.5, 0.5) * t).a;
-	a += texture(src, uv + vec2(0.5, 0.5) * t).a;
-	out_color = vec4(1.0, 1.0, 1.0, a * 0.25);
+	float a = texture(src, uv + vec2(-0.5, -0.5) * t).r;
+	a += texture(src, uv + vec2(0.5, -0.5) * t).r;
+	a += texture(src, uv + vec2(-0.5, 0.5) * t).r;
+	a += texture(src, uv + vec2(0.5, 0.5) * t).r;
+	out_color = vec4(a * 0.25);
 }

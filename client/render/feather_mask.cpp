@@ -70,6 +70,11 @@ struct section_clock
 	}
 };
 
+// Single-channel intermediates (mask alpha only): quarter the bytes of
+// RGBA8 at identical 8-bit precision. Submitted images stay RGBA8 (the
+// blend-factor vocabulary needs an alpha channel).
+constexpr vk::Format blur_format = vk::Format::eR8Unorm;
+
 // Downsample level extent (level 1 = half): exact halving, so the 2x2 box
 // mapping stays exact. Shared with ensure_targets: sizes must match.
 // The mask extent is 64-quantized upstream, hence divisible throughout.
@@ -199,6 +204,33 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	renderpass = vk::raii::RenderPass(device, renderpass_info);
 
+	// R8 variant of the raster pass for the single-channel intermediates
+	// (same CLEAR/STORE shape, R8 attachment).
+	vk::AttachmentDescription raster_r8_attachment{
+	        .format = blur_format,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::AttachmentReference raster_r8_ref{
+	        .attachment = 0,
+	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	};
+	vk::SubpassDescription raster_r8_subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &raster_r8_ref,
+	};
+	vk::RenderPassCreateInfo raster_r8_rp_info{
+	        .attachmentCount = 1,
+	        .pAttachments = &raster_r8_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &raster_r8_subpass,
+	};
+	raster_r8_renderpass = vk::raii::RenderPass(device, raster_r8_rp_info);
+
 	// Cutout pass: same shape as the raster pass but LOAD, so the
 	// finished (blurred) swapchain image can be re-begun and stamped.
 	// Framebuffer-compatible with both passes above by construction.
@@ -242,6 +274,23 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	pipeline = vk::raii::Pipeline(device, nullptr, pipeline_info);
 
+	// R8 raster pipeline: same shaders (mask.frag replicates opacity to
+	// all channels) and layout, R8 render pass.
+	vk::GraphicsPipelineCreateInfo raster_r8_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = stages,
+	        .pVertexInputState = &vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &rasterization,
+	        .pMultisampleState = &multisample,
+	        .pColorBlendState = &blend,
+	        .pDynamicState = &dynamic,
+	        .layout = *pipeline_layout,
+	        .renderPass = *raster_r8_renderpass,
+	};
+	raster_r8_pipeline = vk::raii::Pipeline(device, nullptr, raster_r8_pipeline_info);
+
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
 	// so no clear and no prior contents needed.
 	vk::AttachmentDescription blur_attachment{
@@ -268,6 +317,34 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .pSubpasses = &blur_subpass,
 	};
 	blur_renderpass = vk::raii::RenderPass(device, blur_rp_info);
+
+	// R8 variant of the blur pass for the intermediates (same DONT_CARE
+	// shape). The RGBA8 pass above serves only the V upscale into
+	// swapchain images now.
+	vk::AttachmentDescription blur_r8_attachment{
+	        .format = blur_format,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eDontCare,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::AttachmentReference blur_r8_ref{
+	        .attachment = 0,
+	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	};
+	vk::SubpassDescription blur_r8_subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &blur_r8_ref,
+	};
+	vk::RenderPassCreateInfo blur_r8_rp_info{
+	        .attachmentCount = 1,
+	        .pAttachments = &blur_r8_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &blur_r8_subpass,
+	};
+	blur_r8_renderpass = vk::raii::RenderPass(device, blur_r8_rp_info);
 
 	auto blur_vert = load_shader(device, "blur.vert");
 	auto blur_frag = load_shader(device, "blur.frag");
@@ -356,8 +433,25 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	blur_pipeline = vk::raii::Pipeline(device, nullptr, blur_pipeline_info);
 
+	// R8 blur pipeline: same shaders/layout (format-free), R8 pass. Serves
+	// every blur except the V upscale (which targets RGBA8 swapchains).
+	vk::GraphicsPipelineCreateInfo blur_r8_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = blur_stages,
+	        .pVertexInputState = &blur_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_r8_renderpass,
+	};
+	blur_r8_pipeline = vk::raii::Pipeline(device, nullptr, blur_r8_pipeline_info);
+
 	// Box-downsample pipeline: same fullscreen vertex shader, same layout
-	// (reads only the push prefix) and render pass as the blur passes.
+	// (reads only the push prefix); R8 throughout (intermediates only).
 	auto downsample_frag = load_shader(device, "downsample.frag");
 	vk::PipelineShaderStageCreateInfo downsample_stages[2] = {
 	        {
@@ -383,7 +477,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .pColorBlendState = &blur_blend,
 	        .pDynamicState = &blur_dynamic,
 	        .layout = *blur_layout,
-	        .renderPass = *blur_renderpass,
+	        .renderPass = *blur_r8_renderpass,
 	};
 	downsample_pipeline = vk::raii::Pipeline(device, nullptr, downsample_pipeline_info);
 
@@ -514,7 +608,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 	{
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
-		        .format = format,
+		        .format = blur_format,
 		        .extent = {half_targets.width, half_targets.height, 1},
 		        .mipLevels = 1,
 		        .arrayLayers = 2,
@@ -540,7 +634,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			vk::ImageViewCreateInfo view_info{
 			        .image = *target->image,
 			        .viewType = vk::ImageViewType::e2D,
-			        .format = format,
+			        .format = blur_format,
 			        .subresourceRange = {
 			                .aspectMask = vk::ImageAspectFlagBits::eColor,
 			                .baseMipLevel = 0,
@@ -560,7 +654,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 		for (int layer = 0; layer < 2; ++layer)
 		{
 			vk::FramebufferCreateInfo fb_info{
-			        .renderPass = *renderpass,
+			        .renderPass = *raster_r8_renderpass,
 			        .attachmentCount = 1,
 			        .pAttachments = &raw_views[layer],
 			        .width = half_targets.width,
@@ -568,7 +662,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			        .layers = 1,
 			};
 			target->raster_fbs.emplace_back(device, fb_info);
-			fb_info.renderPass = *blur_renderpass;
+			fb_info.renderPass = *blur_r8_renderpass;
 			target->blur_fbs.emplace_back(device, fb_info);
 		}
 	}
@@ -582,8 +676,8 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 		{
 			vk::ImageCreateInfo image_info{
 			        .imageType = vk::ImageType::e2D,
-			        .format = format,
-			        .extent = {le.width, le.height, 1},
+		        .format = blur_format,
+		        .extent = {le.width, le.height, 1},
 			        .mipLevels = 1,
 			        .arrayLayers = 2,
 			        .samples = vk::SampleCountFlagBits::e1,
@@ -622,7 +716,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			for (int layer = 0; layer < 2; ++layer)
 			{
 			vk::FramebufferCreateInfo fb_info{
-			        .renderPass = *blur_renderpass,
+			        .renderPass = *blur_r8_renderpass,
 			        .attachmentCount = 1,
 			        .pAttachments = &raw_views[layer],
 			        .width = le.width,
@@ -845,11 +939,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// extent. Missing meshes (removed object racing a queued draw) skip
 	// defensively. NDC is resolution-independent, so the same draws serve
 	// full- and tier-res targets with only the viewport changing.
-	auto raster_silhouettes = [&](const auto & fbs, vk::Extent2D e) {
+	auto raster_silhouettes = [&](const auto & fbs, vk::Extent2D e, vk::raii::Pipeline & pipe, vk::raii::RenderPass & rp) {
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			vk::RenderPassBeginInfo begin_info{
-			        .renderPass = *renderpass,
+			        .renderPass = *rp,
 			        .framebuffer = *fbs[eye],
 			        .renderArea = {.offset = {0, 0}, .extent = e},
 			        .clearValueCount = 1,
@@ -857,7 +951,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			};
 			cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
 			set_full_viewport(e);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe);
 			for (const auto & d: draws)
 			{
 				auto mit = meshes.find(d.mesh);
@@ -957,7 +1051,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		if (tier == 1)
 		{
 			section_clock raster_clk(&ms_raster);
-			raster_silhouettes(target_a.raster_fbs, half_extent);
+			raster_silhouettes(target_a.raster_fbs, half_extent, raster_r8_pipeline, raster_r8_renderpass);
 			make_readable(*target_a.image);
 		}
 
@@ -968,7 +1062,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one raster pass per eye, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
-			raster_silhouettes(it->second.framebuffers, out_extent);
+			raster_silhouettes(it->second.framebuffers, out_extent, pipeline, renderpass);
 		}
 		else if (tier == 1)
 		{
@@ -988,7 +1082,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		{
 			update_source(*target_a.views[eye], eye);
 			vk::RenderPassBeginInfo begin_h{
-			        .renderPass = *blur_renderpass,
+			        .renderPass = *blur_r8_renderpass,
 			        .framebuffer = *target_b.blur_fbs[eye],
 			        .renderArea = {.offset = {0, 0}, .extent = half_extent},
 			        .clearValueCount = 1,
@@ -996,7 +1090,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			};
 			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
 			set_full_viewport(half_extent);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
 			blur_push push = base;
@@ -1046,7 +1140,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			vk::Extent2D de_seed = level_extent(extent, seed_level);
 			{
 				section_clock raster_clk(&ms_raster);
-				raster_silhouettes(down_targets[seed_level - 1].blur_fbs, de_seed);
+				raster_silhouettes(down_targets[seed_level - 1].blur_fbs, de_seed, raster_r8_pipeline, raster_r8_renderpass);
 			}
 			make_readable(*down_targets[seed_level - 1].image);
 			section_clock blur_clk(&ms_blur);
@@ -1068,7 +1162,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				{
 					update_source(*(*down_src_views)[eye], 4 + (l - 1) * 2 + eye);
 					vk::RenderPassBeginInfo begin_down{
-					        .renderPass = *blur_renderpass,
+					        .renderPass = *blur_r8_renderpass,
 					        .framebuffer = *dst.blur_fbs[eye],
 					        .renderArea = {.offset = {0, 0}, .extent = de},
 					        .clearValueCount = 1,
@@ -1104,7 +1198,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			{
 				update_source(*(*down_src_views)[eye], eye);
 				vk::RenderPassBeginInfo begin_h{
-				        .renderPass = *blur_renderpass,
+				        .renderPass = *blur_r8_renderpass,
 				        .framebuffer = *eblur.blur_fbs[eye],
 				        .renderArea = {.offset = {0, 0}, .extent = te},
 				        .clearValueCount = 1,
@@ -1112,7 +1206,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				};
 				cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
 				set_full_viewport(te);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline);
 				std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
 				blur_push push = base;

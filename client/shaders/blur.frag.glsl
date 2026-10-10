@@ -40,13 +40,14 @@ pc;
 // renormalizing folds it into the kept taps, narrowing the effective
 // sigma slightly and steepening the far edge by low single digits of
 // alpha. The tap offsets scale with spread, so feather-px maps to band
-// width without changing the kernel. Only alpha carries information
-// downstream.
+// width without changing the kernel. Only the mask channel carries
+// information: .r in, replicated out (serves R8 intermediates and the
+// RGBA8 upscale with one body).
 void main()
 {
 	vec2 t = pc.dir * pc.texel * pc.spread;
-	float a = texture(src, uv).a * 0.2514;
-	a += texture(src, uv + t * 1.4072).a * 0.3743;
-	a += texture(src, uv - t * 1.4072).a * 0.3743;
-	out_color = vec4(1.0, 1.0, 1.0, a);
+	float a = texture(src, uv).r * 0.2514;
+	a += texture(src, uv + t * 1.4072).r * 0.3743;
+	a += texture(src, uv - t * 1.4072).r * 0.3743;
+	out_color = vec4(a);
 }

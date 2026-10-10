@@ -18,10 +18,9 @@
 
 #version 450
 
-// Flat silhouette: color is ignored by the blend factors (mask layer writes
-// alpha only), alpha is opacity inside the mesh. The compositor's bilinear
-// upscale of the tiny mask target turns this binary raster into the feather
-// gradient.
+// Flat silhouette: opacity replicated to all channels, so one body serves
+// single-channel intermediates (.r) and RGBA8 outputs (.a; RGB is ignored
+// downstream by the ZERO color blend factors).
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
@@ -33,5 +32,5 @@ layout(location = 0) out vec4 out_color;
 
 void main()
 {
-	out_color = vec4(1.0, 1.0, 1.0, pc.opacity);
+	out_color = vec4(pc.opacity);
 }

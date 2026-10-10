@@ -136,6 +136,13 @@ private:
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 
+	// R8 variants of the raster path for the single-channel blur
+	// intermediates (same shaders: mask.frag replicates opacity to all
+	// channels, so one body serves R8 (.r) and RGBA8 (.a) targets).
+	// Renderpasses differ by format only; layout is shared (format-free).
+	vk::raii::RenderPass raster_r8_renderpass{nullptr};
+	vk::raii::Pipeline raster_r8_pipeline{nullptr};
+
 	// LOAD variant of the raster pass for the marker window cutout: same
 	// single-attachment shape (framebuffer-compatible with the above), so
 	// the finished blurred image can be re-begun and stamped with a crisp
@@ -143,9 +150,14 @@ private:
 	vk::raii::RenderPass cutout_renderpass{nullptr};
 
 	// Separable Gaussian blur (fullscreen triangle, sampled input).
+	// Two format variants: R8 for the intermediates, RGBA8 for the V
+	// upscale into swapchain images. Same shaders/layouts (format-free);
+	// only renderpass + pipeline objects split.
 	vk::raii::RenderPass blur_renderpass{nullptr};
+	vk::raii::RenderPass blur_r8_renderpass{nullptr};
 	vk::raii::PipelineLayout blur_layout{nullptr};
 	vk::raii::Pipeline blur_pipeline{nullptr};
+	vk::raii::Pipeline blur_r8_pipeline{nullptr};
 	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
 	// reads the push block's src_texel prefix).
 	vk::raii::Pipeline downsample_pipeline{nullptr};
