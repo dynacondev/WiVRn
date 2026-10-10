@@ -220,11 +220,20 @@ Each `fiducials` entry has:
   - `marker-data`: exact QR payload string to match, byte-for-byte (required)
   - `marker-size-m`: physical marker size in meters (required for pose
     scale; measure the printed QR's outer edge)
-  - `position`: `[x, y, z]` marker-to-fiducial offset in meters
-    (default `[0,0,0]`)
-  - `orientation`: `[rx, ry, rz]` marker-to-fiducial rotation in degrees
-    (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
-    single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
+  - `position`: `[x, y, z]` tag center in fiducial meters, in fiducial
+    axes (default `[0,0,0]`). This is what a ruler measures: where the
+    QR sits relative to the model origin, along the model's axes —
+    regardless of the angles below. Correcting a position moves the
+    code's assumed spot along world axes; the model compensates
+    opposite to keep a glued tag glued.
+  - `orientation`: `[rx, ry, rz]` tag orientation relative to fiducial
+    axes, in degrees (default `[0,0,0]`). Fixed-frame rotations about
+    X, then Y, then Z, so single-axis values do the obvious thing
+    (e.g. `[0,90,0]` yaws 90°). Absolute, not incremental: editing it
+    spins the assumed tag pose about the tag center, and the model
+    pivots about the tag — the tag never slides across the model.
+  - The client inverts these once at load (vote = observed × offset⁻¹),
+    so authoring stays in model coordinates throughout.
 
 > [!NOTE]
 > A QR payload is a single identity: printing the *same* payload twice
@@ -271,11 +280,20 @@ Each `passthrough` entry (behavior object) has:
   During the fade the passthrough window ramps from fully transparent
   (game video) to fully present.
 
-Poses compose as
-`fiducialPose = observedMarkerPose * markerToFiducialOffset` then
+Poses compose as `fiducialPose = observedMarkerPose * inverse(markerOffset)` then
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
+Marker offsets are tag-in-board (see above); object offsets are
+object-in-board, so both sections author in model coordinates.
 Objects auto-align on first sighting of a referenced marker, then
 smooth-follow without ever snapping, and SLAM-hold forever on marker loss.
+
+> [!WARNING]
+> Marker offset semantics changed (tag-in-board, inverted at load).
+> Existing configs must invert their marker entries: with identity
+> rotation, negate `position`; in general `new = old⁻¹` (negate the
+> angles for single-axis entries, e.g. `[0,45,0]` → `[0,-45,0]`, and
+> rotate the negated position by the new angles). Verify with a known
+> identity case: it must reproduce the old overlay exactly.
 
 Print the QR encoding exactly the `marker-data` string, e.g.
 `qrencode -o marker11.png -s 10 "wivrn:11"`. Matching is exact and

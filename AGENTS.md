@@ -87,6 +87,10 @@ inert unless set; full flow in `docs/profiling.md`.
   twice is NOT two trackables; for multi-location coverage print
   distinct payloads and link one object to several fiducial ids
   (`docs/configuration.md#fiducials-and-passthrough`).
+- Marker offsets are authored tag-in-board (tag pose in model coords;
+  position edits move along world axes, orientation tweaks pivot about
+  the tag) and inverted once at load — never hand-invert in config.
+  Object offsets are object-in-board, used directly.
 - `common/wivrn_packets.h` + `wivrn_serialization*.h` define the
   wire protocol — keep client/server in sync; no compat layer.
 - Board fusion: `client/xr/board_solver.{h,cpp}` (Eigen 3.4.0 +

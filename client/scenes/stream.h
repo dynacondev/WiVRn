@@ -37,6 +37,7 @@
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -262,8 +263,8 @@ private:
 		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}}; // board hypothesis
 		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}}; // raw tag pose (incidence/overlay)
 		float tag_size_m = 0;
-		float offset_pos[3] = {0, 0, 0}; // marker->board offset (overlay reverse-compute)
-		float offset_quat[4] = {0, 0, 0, 1}; // xyzw
+		std::array<float, 3> offset_pos{0, 0, 0}; // EFFECTIVE marker->board
+		std::array<float, 4> offset_quat{0, 0, 0, 1}; // (authored tag-in-board, inverted at load)
 	};
 	std::vector<fiducial_vote> fiducial_votes;
 

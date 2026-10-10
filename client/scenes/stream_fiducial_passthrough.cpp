@@ -116,21 +116,20 @@ XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const
 	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
 }
 
-// Tag pose reverse-computed from a fused board pose: tag = board *
-// offset^-1 (orange corrected overlay vs the raw green sightings).
-// Computed per frame (K tiny).
-XrPosef board_to_tag(const XrPosef & board, const std::array<float, 3> & p, const std::array<float, 4> & q)
+// Authored marker offsets are tag-in-board: position = tag center in
+// fiducial meters, orientation = tag orientation relative to fiducial
+// axes. Votes need the inverse (board-in-tag). Inverted here, once per
+// sighting (nanoseconds, K tiny) — never hand-invert in config. Unit
+// quaternions: conjugate is the inverse.
+void effective_offset(const std::array<float, 3> & p, const std::array<float, 4> & q,
+                      std::array<float, 3> & op, std::array<float, 4> & oq)
 {
-	glm::quat bq(board.orientation.w, board.orientation.x, board.orientation.y, board.orientation.z);
-	glm::vec3 bp(board.position.x, board.position.y, board.position.z);
-	glm::mat4 fm = glm::translate(glm::mat4(1), bp) * glm::mat4_cast(bq);
-	glm::quat oq(q[3], q[0], q[1], q[2]);
-	glm::vec3 op(p[0], p[1], p[2]);
-	glm::mat4 om = glm::translate(glm::mat4(1), op) * glm::mat4_cast(oq);
-	glm::mat4 tm = fm * glm::inverse(om);
-	glm::quat rq = glm::quat_cast(tm);
-	glm::vec3 rp(tm[3]);
-	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
+	glm::quat r = glm::normalize(glm::quat(q[3], q[0], q[1], q[2]));
+	glm::vec3 t(p[0], p[1], p[2]);
+	glm::quat ri = glm::conjugate(r);
+	glm::vec3 ti = -(ri * t);
+	op = {ti.x, ti.y, ti.z};
+	oq = {ri.x, ri.y, ri.z, ri.w};
 }
 } // namespace
 
@@ -285,8 +284,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	auto t_track1 = std::chrono::steady_clock::now();
 
 	// Resolver: one board hypothesis (vote) per (fiducial, marker,
-	// entity) = observed * marker offset. ALL markers of a fiducial vote
-	// now (was: markers[0] only). Rebuilt every frame.
+	// entity) = observed * effective offset. ALL markers of a fiducial
+	// vote now (was: markers[0] only). Rebuilt every frame.
 	fiducial_votes.clear();
 	for (const auto & f: map.fiducials)
 	{
@@ -295,6 +294,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			auto tr = fiducial_trackers.find(m.marker_data);
 			if (tr == fiducial_trackers.end())
 				continue;
+			std::array<float, 3> ep;
+			std::array<float, 4> eq;
+			effective_offset(m.position, m.orientation, ep, eq);
 			for (const auto & s: tr->second.sightings())
 			{
 				if (s.payload != m.marker_data)
@@ -302,13 +304,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				fiducial_vote v;
 				v.fiducial_id = f.id;
 				v.payload = s.payload;
-				v.solved = compose_pose(s.pose, m.position, m.orientation);
+				v.solved = compose_pose(s.pose, ep, eq);
 				v.observed = s.pose;
 				v.tag_size_m = m.marker_size_m;
-				for (int k = 0; k < 3; ++k)
-					v.offset_pos[k] = m.position[k];
-				for (int k = 0; k < 4; ++k)
-					v.offset_quat[k] = m.orientation[k];
+				v.offset_pos = ep;
+				v.offset_quat = eq;
 				fiducial_votes.push_back(std::move(v));
 			}
 		}
@@ -438,14 +438,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		bp.tags_visible = (int)sol.tags.size();
 		bp.tag_stats = std::move(sol.tags);
 		fp.last_solve_ms = std::max(fp.last_solve_ms, sol.solve_us * 1e-3);
-		// Orange overlay inputs: reverse-compute each voting tag from
-		// the fused board pose.
-		for (const auto & v: bv)
-		{
-			std::array<float, 3> op{v.offset_pos[0], v.offset_pos[1], v.offset_pos[2]};
-			std::array<float, 4> oq{v.offset_quat[0], v.offset_quat[1], v.offset_quat[2], v.offset_quat[3]};
-			fp.corrected_tags[v.payload] = {board_to_tag(sol.board_pose, op, oq), v.tag_size_m, f.id};
-		}
+		// Orange overlay inputs: each tag re-projected from the fused
+		// board pose with its AUTHORED offset (predicted = fused *
+		// authored: the inverse of the vote path, so no extra math).
+		// Green raw vs orange corrected shows disagreement at a glance.
+		for (const auto & m: f.markers)
+			fp.corrected_tags[m.marker_data] = {compose_pose(sol.board_pose, m.position, m.orientation), m.marker_size_m, f.id};
 		// Logging: heartbeat per fiducial + visible-set changes.
 		// `board solve:` is the tuning instrument (more logging better).
 		static XrTime last_solve_log = 0;

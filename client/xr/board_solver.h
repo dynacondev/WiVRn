@@ -43,8 +43,9 @@ struct board_vote
 {
 	std::string payload; // log/GUI identity only, never matched on here
 	XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}}; // world-space tag pose, predicted to display time
-	float offset_pos[3] = {0, 0, 0}; // marker->board offset: vote = observed * offset
-	float offset_quat[4] = {0, 0, 0, 1}; // xyzw
+	float offset_pos[3] = {0, 0, 0}; // EFFECTIVE marker->board offset:
+	float offset_quat[4] = {0, 0, 0, 1}; // xyzw. vote = observed * offset.
+	// Config authors tag-in-board; the resolver inverts once at load.
 	float tag_size_m = 0;
 	float distance_m = 0; // head -> tag center
 	float cos_incidence = 1; // |tag normal . view dir|, 0..1
