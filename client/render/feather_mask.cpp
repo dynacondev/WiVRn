@@ -578,6 +578,25 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
+	// Model-space bounds for the stream-side frustum skip (upload-time
+	// only; per-frame tests transform the 8 corners by the draw MVP).
+	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
+	glm::vec3 hi = lo;
+	for (const auto & v: soup.vertices)
+	{
+		lo = glm::min(lo, glm::vec3(v.x, v.y, v.z));
+		hi = glm::max(hi, glm::vec3(v.x, v.y, v.z));
+	}
+	mesh.aabb_min = lo;
+	mesh.aabb_max = hi;
+}
+
+std::optional<std::pair<glm::vec3, glm::vec3>> feather_mask_renderer::mesh_bounds(const std::string & key) const
+{
+	auto it = meshes.find(key);
+	if (it == meshes.end())
+		return std::nullopt;
+	return std::make_pair(it->second.aabb_min, it->second.aabb_max);
 }
 
 void feather_mask_renderer::remove_mesh(const std::string & key)

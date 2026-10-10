@@ -1317,6 +1317,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					auto & g = fp.mask_groups[f];
 					std::vector<feather_mask_renderer::instance_draw> draws;
+					// Frustum skip: drop draws fully outside both eyes (the
+					// empty-draws path below then skips acquire/record for
+					// fully-culled groups, which cost nothing). Conservative:
+					// any w<=0 corner (behind camera flips projection) keeps
+					// the draw; the NDC box grows by the feather bleed + 1px
+					// so blur contributions survive culling (pixel-exact).
+					float margin_x = (f * 0.5f + 1.f) / ((float)mw * 0.5f);
+					float margin_y = (f * 0.5f + 1.f) / ((float)mh * 0.5f);
+					auto draw_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
+						auto bounds = g.renderer->mesh_bounds(mesh);
+						if (not bounds)
+							return true;
+						for (uint32_t view = 0; view < 2; ++view)
+						{
+							for (int corner = 0; corner < 8; ++corner)
+							{
+								glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
+								            (corner & 2) ? bounds->second.y : bounds->first.y,
+								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+								glm::vec4 c = draw_mvp[view] * q;
+								if (c.w <= 0)
+									return true;
+								if (glm::abs(c.x) <= c.w * (1.f + margin_x) and
+								    glm::abs(c.y) <= c.w * (1.f + margin_y) and c.z >= 0 and c.z <= c.w)
+									return true;
+							}
+						}
+						return false;
+					};
 					for (auto & [oid, ost]: passthrough_objects)
 					{
 						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
@@ -1337,6 +1366,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							float op = fiducial_passthrough_state::fade_factor(
 							        frame_state.predictedDisplayTime, inst.fade_start,
 							        std::max(0.f, ost.def.fade_in_ms));
+							if (not draw_visible(oid, mvp))
+								continue;
 							draws.push_back({oid, mvp, op});
 						}
 					}

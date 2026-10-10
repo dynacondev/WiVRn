@@ -60,6 +60,10 @@ public:
 	// per frame. Empty soup erases the entry.
 	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
 	void remove_mesh(const std::string & key);
+	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
+	// draw). Computed once at upload; the draws filter in stream.cpp
+	// consults it before acquire, so fully-culled groups cost nothing.
+	std::optional<std::pair<glm::vec3, glm::vec3>> mesh_bounds(const std::string & key) const;
 
 	// One silhouette draw: which uploaded mesh, per-eye transforms, and
 	// the first-acquisition fade opacity.
@@ -208,6 +212,7 @@ private:
 		vk::raii::DeviceMemory staging_memory{nullptr};
 		vk::DeviceSize staging_size = 0;
 		std::optional<std::pair<vk::DeviceSize, vk::DeviceSize>> pending_upload;
+		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
 	std::map<std::string, mesh_buffers> meshes;
 	void flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh);
