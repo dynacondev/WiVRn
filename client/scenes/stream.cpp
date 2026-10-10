@@ -1293,6 +1293,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	fp.dbg_boxes = 0;
 	if (gizmo_lines and fp.debug_overlays)
 	{
+		gizmo_lines->begin_frame();
 		using vtx = debug_lines_renderer::vertex;
 		std::vector<vtx> segs;
 		segs.reserve(256);

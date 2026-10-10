@@ -23,6 +23,8 @@
 #include <cstddef>
 #include <cstring>
 
+#include <spdlog/spdlog.h>
+
 namespace
 {
 struct push
@@ -132,20 +134,22 @@ debug_lines_renderer::debug_lines_renderer(vk::raii::Device & device, vk::Format
 	};
 	pipeline_layout = vk::raii::PipelineLayout(device, layout_info);
 
-	// LOAD/STORE on GENERAL: the eye image already holds video (defoveate
-	// left it COLOR_ATTACHMENT_OPTIMAL; both are valid color-attachment
-	// layouts, the barrier below orders the passes).
+	// LOAD/STORE: the eye image already holds video. initial GENERAL
+	// matches what acquire actually delivers (the compositor retires
+	// submitted images there; nothing restores OPTIMAL); final OPTIMAL
+	// keeps the submit contract identical to all previous builds.
+	// (TEMP experiment: was OPTIMAL/OPTIMAL, invisible.)
 	vk::AttachmentDescription attachment{
 	        .format = format,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eLoad,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	        .initialLayout = vk::ImageLayout::eGeneral,
 	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference color_ref{
 	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	        .layout = vk::ImageLayout::eGeneral,
 	};
 	vk::SubpassDescription subpass{
 	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
@@ -226,6 +230,11 @@ debug_lines_renderer::debug_lines_renderer(vk::raii::Device & device, vk::Format
 	}
 }
 
+void debug_lines_renderer::begin_frame()
+{
+	staging_used = 0;
+}
+
 void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
                                   const std::array<vk::Extent2D, 2> & extents,
                                   const std::array<glm::mat4, 2> & mvp, const vertex * verts, size_t vert_count,
@@ -234,13 +243,26 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
 		return;
 
-	size_t need = vert_count * sizeof(vertex);
-	if (not staging or staging.info().size < need)
+	// Append-only within a frame (one upload serves all records; draws
+	// reference their own ranges). Fixed generous cap: frame usage is
+	// hundreds of verts; growing mid-frame would orphan earlier draws.
+	static constexpr size_t kStagingCapVerts = 4096;
+	if (staging_used + vert_count > kStagingCapVerts)
+	{
+		static bool warned = false;
+		if (not warned)
+		{
+			warned = true;
+			spdlog::warn("debug_lines: frame vertex overflow, dropping");
+		}
+		return;
+	}
+	if (not staging or staging.info().size < kStagingCapVerts * sizeof(vertex))
 	{
 		staging = buffer_allocation(
 		        *device,
 		        vk::BufferCreateInfo{
-		                .size = need,
+		                .size = kStagingCapVerts * sizeof(vertex),
 		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
 		        },
 		        VmaAllocationCreateInfo{
@@ -249,8 +271,10 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        },
 		        "debug lines");
 	}
-	std::memcpy(staging.map(), verts, need);
+	uint32_t first_vertex = (uint32_t)staging_used;
+	std::memcpy((char *)staging.map() + first_vertex * sizeof(vertex), verts, vert_count * sizeof(vertex));
 	staging.unmap();
+	staging_used += vert_count;
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, blended ? *pipeline : *pipeline_unblended);
 	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
@@ -270,8 +294,8 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		                            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead |
 		                                             vk::AccessFlagBits::eColorAttachmentWrite,
-		                            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-		                            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                            .oldLayout = vk::ImageLayout::eGeneral,
+		                            .newLayout = vk::ImageLayout::eGeneral,
 		                            .image = images[image_index],
 		                            .subresourceRange = {
 		                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -297,7 +321,7 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        .clearValueCount = 0,
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		cmd.draw((uint32_t)vert_count, 1, 0, 0);
+		cmd.draw((uint32_t)vert_count, 1, first_vertex, 0);
 		cmd.endRenderPass();
 	}
 }
@@ -310,13 +334,26 @@ void debug_lines_renderer::record_tris(vk::raii::CommandBuffer & cmd, size_t ima
 	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
 		return;
 
-	size_t need = vert_count * sizeof(vertex);
-	if (not staging or staging.info().size < need)
+	// Append-only within a frame (one upload serves all records; draws
+	// reference their own ranges). Fixed generous cap: frame usage is
+	// hundreds of verts; growing mid-frame would orphan earlier draws.
+	static constexpr size_t kStagingCapVerts = 4096;
+	if (staging_used + vert_count > kStagingCapVerts)
+	{
+		static bool warned = false;
+		if (not warned)
+		{
+			warned = true;
+			spdlog::warn("debug_lines: frame vertex overflow, dropping");
+		}
+		return;
+	}
+	if (not staging or staging.info().size < kStagingCapVerts * sizeof(vertex))
 	{
 		staging = buffer_allocation(
 		        *device,
 		        vk::BufferCreateInfo{
-		                .size = need,
+		                .size = kStagingCapVerts * sizeof(vertex),
 		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
 		        },
 		        VmaAllocationCreateInfo{
@@ -325,8 +362,10 @@ void debug_lines_renderer::record_tris(vk::raii::CommandBuffer & cmd, size_t ima
 		        },
 		        "debug lines");
 	}
-	std::memcpy(staging.map(), verts, need);
+	uint32_t first_vertex = (uint32_t)staging_used;
+	std::memcpy((char *)staging.map() + first_vertex * sizeof(vertex), verts, vert_count * sizeof(vertex));
 	staging.unmap();
+	staging_used += vert_count;
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_tri);
 	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
@@ -343,8 +382,8 @@ void debug_lines_renderer::record_tris(vk::raii::CommandBuffer & cmd, size_t ima
 		                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		                            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead |
 		                                             vk::AccessFlagBits::eColorAttachmentWrite,
-		                            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-		                            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                            .oldLayout = vk::ImageLayout::eGeneral,
+		                            .newLayout = vk::ImageLayout::eGeneral,
 		                            .image = images[image_index],
 		                            .subresourceRange = {
 		                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -370,7 +409,7 @@ void debug_lines_renderer::record_tris(vk::raii::CommandBuffer & cmd, size_t ima
 		        .clearValueCount = 0,
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		cmd.draw((uint32_t)vert_count, 1, 0, 0);
+		cmd.draw((uint32_t)vert_count, 1, first_vertex, 0);
 		cmd.endRenderPass();
 	}
 }

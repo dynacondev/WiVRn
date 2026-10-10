@@ -67,6 +67,11 @@ public:
 	// lines-invisible bisects primitive-topology faults from shared-infra
 	// faults. Revert with the line-visibility verdict.
 
+	// Reset the append cursor (once per frame, before records). All
+	// records in a frame share one upload; without the cursor, later
+	// memcpys clobber earlier draws' data (same buffer, draw at submit).
+	void begin_frame();
+
 private:
 	vk::raii::Device * device = nullptr;
 
@@ -88,4 +93,5 @@ private:
 
 	buffer_allocation staging;
 	size_t staging_verts = 0;
+	size_t staging_used = 0; // verts consumed this frame (reset by begin_frame)
 };
