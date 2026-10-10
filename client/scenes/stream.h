@@ -385,7 +385,9 @@ private:
 			XrTime last_seen = 0;
 			bool matched = false; // payload in some fiducial's markers
 		};
-		// Keyed by (payload, entity): same print seen twice holds twice.
+		// Keyed by (payload, entity); collapsed to one entry per payload
+		// at hold-store time (newest wins): the runtime recycles entity
+		// ids, and one payload is one identity, so ghosts never linger.
 		// Entity ids may collide across tracker contexts, payloads disambiguate.
 		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, held_code> held_codes;
 

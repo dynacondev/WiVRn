@@ -330,6 +330,30 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			h.matched = configured_marker_payloads.contains(s.payload);
 		}
 	}
+	// Collapse duplicate tracks: one payload is one identity, but the
+	// runtime recycles entity ids (discovery re-latch vs update path),
+	// which ghosts a frozen duplicate beside the live track — duplicate
+	// list rows and double quads. Keep newest seen; tie-break by smaller
+	// entity id so concurrent tracks pick a stable survivor (no flicker).
+	for (auto it = fp.held_codes.begin(); it != fp.held_codes.end();)
+	{
+		bool superseded = false;
+		for (auto jt = fp.held_codes.begin(); jt != fp.held_codes.end(); ++jt)
+		{
+			if (jt == it or jt->first.first != it->first.first)
+				continue;
+			if (jt->second.last_seen > it->second.last_seen or
+			    (jt->second.last_seen == it->second.last_seen and jt->first.second < it->first.second))
+			{
+				superseded = true;
+				break;
+			}
+		}
+		if (superseded)
+			it = fp.held_codes.erase(it);
+		else
+			++it;
+	}
 	auto t_sync1 = std::chrono::steady_clock::now();
 	fp.last_tracker_ms = std::chrono::duration<double, std::milli>(t_track1 - t_track0).count();
 	fp.last_sync_ms = std::chrono::duration<double, std::milli>(t_sync1 - t_sync0).count() - fp.last_tracker_ms;
