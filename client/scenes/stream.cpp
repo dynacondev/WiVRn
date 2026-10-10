@@ -1384,6 +1384,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 		fp.dbg_segments = segs.size() / 2;
+		fp.dbg_have_ndc = false;
 		if (not segs.empty())
 		{
 			std::array<vk::Extent2D, 2> eye_ext;
@@ -1394,6 +1395,45 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				eye_mvp[view] = world_mvp[view];
 			}
 			gizmo_lines->record(command_buffer, (size_t)image_index, eye_ext, eye_mvp, segs.data(), segs.size());
+			// TEMP diagnostic readout: first vert through the eye-0 MVP on
+			// CPU. NDC inside [-1,1] exonerates the mapping chain.
+			glm::vec4 clip = eye_mvp[0] * glm::vec4(segs[0].pos[0], segs[0].pos[1], segs[0].pos[2], 1.f);
+			if (clip.w > 1e-9f)
+			{
+				fp.dbg_ndc[0] = clip.x / clip.w;
+				fp.dbg_ndc[1] = clip.y / clip.w;
+				fp.dbg_ndc[2] = clip.w;
+				fp.dbg_have_ndc = true;
+			}
+			fp.dbg_view_w = eye_ext[0].width;
+			fp.dbg_view_h = eye_ext[0].height;
+			fp.dbg_img = (uint32_t)image_index;
+		}
+		// TEMP diagnostic draw: unmissable identity-MVP white diagonal +
+		// cross through the BLEND-OFF pipeline. Visible => pipeline,
+		// framebuffers, barrier and viewport all work (mapping + blend
+		// bypassed). Invisible => infra fault. Revert with the flag.
+		static constexpr bool kDbgIdentityDiag = true;
+		if (kDbgIdentityDiag and gizmo_lines)
+		{
+			using vtx = debug_lines_renderer::vertex;
+			const vtx diag[] = {
+			        {{-0.9f, -0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{0.9f, 0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{-0.9f, 0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{0.9f, 0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{0.f, -0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{0.f, 0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			};
+			std::array<vk::Extent2D, 2> eye_ext;
+			std::array<glm::mat4, 2> eye_mvp;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+				eye_mvp[view] = glm::mat4(1);
+			}
+			gizmo_lines->record(command_buffer, (size_t)image_index, eye_ext, eye_mvp, diag,
+			                    sizeof(diag) / sizeof(diag[0]), false);
 		}
 	}
 
@@ -1909,7 +1949,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (fp.debug_overlays and dbg_now - last_dbg_log > 5000000000LL)
 		{
 			last_dbg_log = dbg_now;
-			spdlog::info("Fiducial debug lines: {} boxes, {} segments", fp.dbg_boxes, fp.dbg_segments);
+			// TEMP diagnostic readout (see record site): NDC inside [-1,1]
+			// exonerates the mapping chain; view/img identify the target.
+			if (fp.dbg_have_ndc)
+				spdlog::info("Fiducial debug lines: {} boxes, {} segments, ndc ({:.2f},{:.2f}) w {:.1f} view {}x{} img {}",
+				             fp.dbg_boxes, fp.dbg_segments, (double)fp.dbg_ndc[0], (double)fp.dbg_ndc[1],
+				             (double)fp.dbg_ndc[2], fp.dbg_view_w, fp.dbg_view_h, fp.dbg_img);
+			else
+				spdlog::info("Fiducial debug lines: {} boxes, {} segments (no ndc)", fp.dbg_boxes,
+				             fp.dbg_segments);
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;
@@ -2135,6 +2183,7 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// Debug line overlays share the video swapchain lifetime (framebuffers
 	// per image); rebuilt here so stale VkImages never linger.
 	gizmo_lines.emplace(device, swapchain.format(), swapchain.images(), extent);
+	spdlog::info("Debug lines: {} eye images", swapchain.images().size());
 }
 
 scene::meta & scenes::stream::get_meta_scene()

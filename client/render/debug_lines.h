@@ -53,9 +53,11 @@ public:
 	// Record segments (vertex PAIRS) into both eye layers of images[index].
 	// No-op (no barrier, no passes) when verts is empty. extents size the
 	// per-eye viewports (the submitted layer rects); mvp maps world to NDC.
+	// blended=false selects the blend-off pipeline (TEMP diagnostic: skips
+	// the alpha path to isolate blending faults).
 	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents, const std::array<glm::mat4, 2> & mvp,
-	            const vertex * verts, size_t vert_count);
+	            const vertex * verts, size_t vert_count, bool blended = true);
 
 private:
 	vk::raii::Device * device = nullptr;
@@ -63,6 +65,7 @@ private:
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
+	vk::raii::Pipeline pipeline_unblended{nullptr}; // TEMP diagnostic: blend-off variant
 
 	struct target
 	{

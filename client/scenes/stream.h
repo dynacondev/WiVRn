@@ -342,6 +342,11 @@ private:
 		double last_solve_ms = 0; // board fusion cost (max over fiducials)
 		double last_horizon_ms = 0; // predicted - now: how far poses are extrapolated
 		size_t dbg_segments = 0, dbg_boxes = 0; // last recorded debug-line counts (heartbeat)
+		// TEMP diagnostic mapping readout (heartbeat): first-vert NDC +
+		// viewport + target indices. NDC inside [-1,1] exonerates mapping.
+		float dbg_ndc[3] = {0, 0, 0};
+		uint32_t dbg_view_w = 0, dbg_view_h = 0, dbg_img = 0;
+		bool dbg_have_ndc = false;
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
 

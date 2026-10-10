@@ -175,6 +175,18 @@ debug_lines_renderer::debug_lines_renderer(vk::raii::Device & device, vk::Format
 	};
 	pipeline = vk::raii::Pipeline(device, nullptr, pipeline_info);
 
+	// TEMP diagnostic twin: identical except blending off (isolates blend
+	// faults from pipeline/framebuffer/barrier faults).
+	vk::PipelineColorBlendAttachmentState blend_off_attachment = blend_attachment;
+	blend_off_attachment.blendEnable = VK_FALSE;
+	vk::PipelineColorBlendStateCreateInfo blend_off{
+	        .attachmentCount = 1,
+	        .pAttachments = &blend_off_attachment,
+	};
+	vk::GraphicsPipelineCreateInfo pipeline_off_info = pipeline_info;
+	pipeline_off_info.pColorBlendState = &blend_off;
+	pipeline_unblended = vk::raii::Pipeline(device, nullptr, pipeline_off_info);
+
 	// Per-(image, eye) framebuffers (one layer each, like the defoveator).
 	for (vk::Image image: images)
 	{
@@ -208,7 +220,8 @@ debug_lines_renderer::debug_lines_renderer(vk::raii::Device & device, vk::Format
 
 void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
                                   const std::array<vk::Extent2D, 2> & extents,
-                                  const std::array<glm::mat4, 2> & mvp, const vertex * verts, size_t vert_count)
+                                  const std::array<glm::mat4, 2> & mvp, const vertex * verts, size_t vert_count,
+                                  bool blended)
 {
 	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
 		return;
@@ -231,7 +244,7 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	std::memcpy(staging.map(), verts, need);
 	staging.unmap();
 
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, blended ? *pipeline : *pipeline_unblended);
 	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
 
 	for (uint32_t eye = 0; eye < 2; ++eye)
