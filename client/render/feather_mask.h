@@ -74,6 +74,26 @@ public:
 		float opacity = 1;
 	};
 
+	// Tier selection from feather-px, shared with the scene (which sizes
+	// member swapchains from it: tier-0 submits full, tier-1 half, tiered
+	// quarter). Single source of truth: record() and the scene must agree,
+	// or sizing (and the merged tier-1 gate on out == half) misfires.
+	static int tier_for_feather(float feather_px)
+	{
+		float f = feather_px;
+		if (f <= 0)
+			return 0;
+		if (f > 128.f)
+			f = 128.f;
+		if (f <= 16)
+			return 1;
+		if (f <= 48)
+			return 2;
+		if (f <= 96)
+			return 4;
+		return 8;
+	}
+
 	// Per-record host-side cost breakdown (steady_clock, milliseconds).
 	// Filled when record() gets a non-null out-pointer; all zeros on
 	// early-out paths. Permanent diagnostics: the stream scene sums these

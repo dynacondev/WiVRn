@@ -1184,35 +1184,25 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// Selected before raster: tier 0 goes straight into the swapchain
 		// image, tier 1 via the half-res A/B intermediates, tiered via a
 		// level-2 (tier 2) or level-1 (tier 4/8) seed.
-		float f = feather_px;
-		int tier = 1;
+		float f = feather_px > 128.f ? 128.f : feather_px;
+		int tier = tier_for_feather(feather_px);
 		float spread = 1.0f;
-		if (f <= 0)
-			tier = 0;
-		else
+		if (tier == 1)
 		{
-			if (f > 128)
-				f = 128;
 			// k = 2: band 4*sqrt(2)*spread px.
-			if (f <= 16)
-				spread = f / 24.f;
-			else if (f <= 48)
-			{
-				tier = 2;
-				// k = 4: band 8*sqrt(2)*spread px, same slope as tier 1.
-				spread = f / 48.f;
-			}
-			else if (f <= 96)
-			{
-				tier = 4;
-				spread = f / 48.f;
-			}
-			else
-			{
-				tier = 8;
-				// k = 8: band 16*sqrt(2)*spread px, same slope again.
-				spread = f / 96.f;
-			}
+			spread = f / 24.f;
+		}
+		else if (tier == 2)
+		{
+			// k = 4: band 8*sqrt(2)*spread px, same slope as tier 1.
+			spread = f / 48.f;
+		}
+		else if (tier == 4)
+			spread = f / 48.f;
+		else if (tier == 8)
+		{
+			// k = 8: band 16*sqrt(2)*spread px, same slope again.
+			spread = f / 96.f;
 		}
 
 		// Half-res working extent for the A/B intermediates (the mask
