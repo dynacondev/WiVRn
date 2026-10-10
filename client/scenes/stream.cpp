@@ -1221,12 +1221,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
-				// Member mask swapchains run at half resolution: the V
-				// upscale writes half pixels and the compositor expands to
-				// full on submit (bilinear, equivalent filtering to the old
-				// full-res V). Intermediates stay keyed off full mw/mh.
+				// Member mask swapchains submit below full: the V pass writes
+				// the submitted size and the compositor expands to full on
+				// submit (bilinear, equivalent filtering to the old
+				// full-res V). Tier-0 stays full (exact hard edge), tier-1
+				// submits half, tiered submits quarter (their bands are
+				// wide enough to survive it; working sizes are unchanged).
+				// Intermediates stay keyed off full mw/mh.
 				int hw = std::max(64, mw / 2);
 				int hh = std::max(64, mh / 2);
+				int qw = std::max(64, mw / 4);
+				int qh = std::max(64, mh / 4);
 				// View-only transforms shared by the cutouts.
 				std::array<glm::mat4, 2> world_mvp;
 				for (uint32_t view = 0; view < 2; ++view)
@@ -1324,11 +1329,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// (no allocations/stalls mid-game). All change-gated:
 					// steady state is a size compare + extent compare.
 					// Tier-0 groups keep a full-res swapchain (exact hard
-					// edge); feathered groups submit half (V writes half,
-					// compositor upscales). g.extent tracks the submitted
-					// size; record() still works intermediates at full.
-					int gw = (f <= 0) ? mw : hw;
-					int gh = (f <= 0) ? mh : hh;
+					// edge); tier-1 submits half, tiered submits quarter (V
+					// writes the submitted size, the compositor upscales).
+					// g.extent tracks the submitted size; record() still works
+					// intermediates at full. Sizing shares record()'s tier map
+					// (tier_for_feather): the two must agree.
+					int tier = feather_mask_renderer::tier_for_feather(f);
+					int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
+					int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
 					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
 					{
 						// Rare path (first frame, feather/config change):

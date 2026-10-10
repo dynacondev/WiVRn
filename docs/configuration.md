@@ -262,9 +262,10 @@ Each `passthrough` entry (behavior object) has:
   object feathers independently; applied live. The client selects a blur
    tier automatically (0 hard edge, 1 half-res, 2/4 quarter, 8 eighth
    with exact spread mapping, clamped to 128px), so tap density and cost
-  stay flat at any width. Feathered groups submit half-resolution mask
-  images (the V upscale writes half pixels; the compositor expands to
-  full); tier-0 stays full.
+   stay flat at any width. Submitted mask size follows the tier:
+   tier-0 stays full (exact hard edge), tier-1 submits half-resolution,
+   tiered submits quarter-resolution (the V pass writes the submitted
+   size; the compositor expands to full).
 - `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds
   (default `1000`; `0` = appears instantly). Render-only; applied live.
   During the fade the passthrough window ramps from fully transparent
