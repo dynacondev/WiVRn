@@ -581,11 +581,35 @@ private:
 		float feather_px = 0;
 		double gpu_ms = 0;
 		feather_mask_renderer::mask_stage_cpu cpu;
+		// xrWaitSwapchainImage duration for this group's acquire (host
+		// wait, invisible to both GPU brackets and record() CPU clocks:
+		// compositor backpressure shows here, nowhere else).
+		double wait_ms = 0;
 	};
 	std::vector<mask_group_sample> mask_frame_samples;
 	std::vector<mask_group_sample> mask_ready_samples;
 	uint32_t mask_frame_unmetered = 0;
 	uint32_t mask_ready_unmetered = 0;
+
+	// Spike-forensic frame doubles: CPU-side timings for the frame whose
+	// GPU brackets sit in mask_frame_samples, moved together at readback
+	// (same 1-frame stagger, so the spike dump attributes one frame).
+	// Render thread only.
+	double mask_frame_video_wait_ms = 0, mask_ready_video_wait_ms = 0;
+	double mask_frame_skipped_wait_ms = 0, mask_ready_skipped_wait_ms = 0;
+	double mask_frame_submit_ms = 0, mask_ready_submit_ms = 0;
+	double mask_frame_endframe_ms = 0, mask_ready_endframe_ms = 0;
+	bool mask_frame_starved = false, mask_ready_starved = false;
+	uint64_t mask_frame_misses = 0, mask_ready_misses = 0;
+	uint64_t frame_seq = 0, mask_frame_seq = 0, mask_ready_seq = 0;
+	// Spike dump threshold (ms, whole-frame GPU). Above the ~4ms
+	// saturated means to isolate true outliers; tune in one place.
+	static constexpr double spike_threshold_ms = 5.0;
+	// Rendered-frame cadence reference (early-outs don't advance it):
+	// gaps >1.5 periods are vsyncs with no submission (missed deadlines).
+	XrTime last_rendered_predicted = 0;
+	XrDuration last_cadence_period = 0;
+	uint64_t vsync_misses = 0;
 
 	// ~5s logcat window accumulators (mask perf line). Render thread only.
 	// Minima characterize dip frames (a 2ms total with two live groups =
@@ -597,6 +621,8 @@ private:
 	double mask_log_sum_track = 0, mask_log_sum_sync = 0;
 	uint64_t mask_log_unmetered = 0;
 	uint64_t mask_log_min_groups = 0;
+	uint64_t mask_log_spikes = 0;
+	uint64_t mask_log_misses = 0;
 	struct mask_feather_acc
 	{
 		double sum_gpu = 0, max_gpu = 0, min_gpu = 0, sum_cpu = 0;

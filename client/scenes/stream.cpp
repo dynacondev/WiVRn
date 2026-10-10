@@ -907,6 +907,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
 
+	++frame_seq;
+	mask_frame_seq = frame_seq;
+	// Rendered-frame cadence (early-outs above never reach here): gaps
+	// over 1.5 periods are vsyncs that produced no submission, i.e. a
+	// missed deadline upstream or a parked frame. A refresh-rate switch
+	// resets the reference instead of counting (period itself moved).
+	mask_frame_misses = 0;
+	if (last_rendered_predicted != 0 and frame_state.predictedDisplayPeriod > 0)
+	{
+		if (frame_state.predictedDisplayPeriod != last_cadence_period and last_cadence_period != 0)
+		{
+			// Refresh rate changed: re-arm silently.
+		}
+		else if (frame_state.predictedDisplayTime - last_rendered_predicted >
+		         frame_state.predictedDisplayPeriod + frame_state.predictedDisplayPeriod / 2)
+		{
+			// Rounded: a 1.75-period gap skipped one vsync, not zero.
+			mask_frame_misses = (uint64_t)((frame_state.predictedDisplayTime - last_rendered_predicted +
+			                                frame_state.predictedDisplayPeriod / 2) /
+			                               frame_state.predictedDisplayPeriod) -
+			                    1;
+			vsync_misses += mask_frame_misses;
+		}
+	}
+	last_rendered_predicted = frame_state.predictedDisplayTime;
+	last_cadence_period = frame_state.predictedDisplayPeriod;
+
 	gpu_timestamps timestamps;
 	// Previous frame's mask samples still sit in mask_frame_samples (this
 	// frame's record() calls haven't run yet): attach their GPU times now,
@@ -942,6 +969,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	mask_frame_samples.clear();
 	mask_ready_unmetered = mask_frame_unmetered;
 	mask_frame_unmetered = 0;
+	// Forensic doubles ride the same 1-frame stagger: everything moved
+	// here describes the frame whose GPU brackets were just read back.
+	mask_ready_video_wait_ms = mask_frame_video_wait_ms;
+	mask_frame_video_wait_ms = 0;
+	mask_ready_skipped_wait_ms = mask_frame_skipped_wait_ms;
+	mask_frame_skipped_wait_ms = 0;
+	mask_ready_submit_ms = mask_frame_submit_ms;
+	mask_frame_submit_ms = 0;
+	mask_ready_endframe_ms = mask_frame_endframe_ms;
+	mask_frame_endframe_ms = 0;
+	mask_ready_starved = mask_frame_starved;
+	mask_frame_starved = false;
+	mask_ready_misses = mask_frame_misses;
+	mask_frame_misses = 0;
+	mask_ready_seq = mask_frame_seq;
 
 	session.begin_frame();
 
@@ -1130,7 +1172,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		assert(swapchain);
 		// defoveate the image, apply scale/bias
 		int image_index = swapchain.acquire();
+		XrTime video_wait_t0 = instance.now();
 		swapchain.wait();
+		// Host-side image wait (compositor backpressure lives here,
+		// invisible to GPU brackets and record clocks alike).
+		mask_frame_video_wait_ms = (instance.now() - video_wait_t0) * 1e-6;
 
 		switch (gui_status)
 		{
@@ -1435,7 +1481,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					++g.images_outstanding;
 					acquired_groups.push_back(&g);
 					spdlog::debug("Fiducial mask acquire: feather {}px image {} ({} of {} outstanding)", f, mask_index, g.images_outstanding, g.swapchain.image_count());
-					if (not g.swapchain.wait(100'000'000))
+					XrTime group_wait_t0 = instance.now();
+					bool waited = g.swapchain.wait(100'000'000);
+					// Same host-wait bookkeeping as the video swapchain above.
+					double group_wait_ms = (instance.now() - group_wait_t0) * 1e-6;
+					if (not waited)
 					{
 						// Never park forever on an unavailable image: release
 						// the untouched acquisition to keep pairing and skip
@@ -1444,6 +1494,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						--g.images_outstanding;
 						acquired_groups.pop_back();
 						g.active = false;
+						// A 100ms timeout is itself the starvation signal: no
+						// sample is pushed for a skipped group, so bank its
+						// wait separately or the dump goes blind exactly when
+						// backpressure bites.
+						mask_frame_skipped_wait_ms += group_wait_ms;
 						if (not g.wait_warned)
 						{
 							g.wait_warned = true;
@@ -1474,14 +1529,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						if (metered)
 							command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
-						mask_frame_samples.push_back({f, 0, stage_cpu});
+						mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
 						throw;
 					}
 					if (metered)
-						command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
+					command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
 					else
 						++mask_frame_unmetered;
-					mask_frame_samples.push_back({f, 0, stage_cpu});
+					mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
 					g.active = true;
 						mask_frame = true;
 					}
@@ -1672,7 +1727,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		submit_info.pNext = &sem_info;
 
 		device.resetFences(*fence);
+		XrTime submit_t0 = instance.now();
 		queue.lock()->submit(submit_info, *fence);
+		// Driver-side submit cost (normally ~0.05ms; spikes here are
+		// driver contention, not GPU execution — the brackets can't see
+		// it, this clock can).
+		mask_frame_submit_ms = (instance.now() - submit_t0) * 1e-6;
 #if WIVRN_FEATURE_RENDERDOC
 		renderdoc_end(*vk_instance);
 #endif
@@ -1874,7 +1934,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			spdlog::info("mask frame {}: entering end_frame", mask_trace_count);
 		try
 		{
+			XrTime endframe_t0 = instance.now();
 			render_end();
+			// Layer fixup + xrEndFrame host cost (compositor round-trip
+			// lives here; a stall here is a late frame with fast brackets).
+			mask_frame_endframe_ms = (instance.now() - endframe_t0) * 1e-6;
 		}
 		catch (std::system_error & e)
 		{
