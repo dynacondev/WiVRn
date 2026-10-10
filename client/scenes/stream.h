@@ -25,6 +25,7 @@
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
 #include "render/feather_mask.h"
+#include "render/debug_lines.h"
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
@@ -105,6 +106,7 @@ private:
 	std::array<accumulator_images, decoder_count> decoders; // Locked by decoder_mutex
 
 	std::optional<stream_defoveator> defoveator;
+	std::optional<debug_lines_renderer> gizmo_lines; // rebuilt with the video swapchain
 
 	vk::raii::Fence fence = nullptr;
 	vk::raii::CommandBuffer command_buffer = nullptr;
@@ -339,6 +341,7 @@ private:
 		double last_sync_ms = 0;
 		double last_solve_ms = 0; // board fusion cost (max over fiducials)
 		double last_horizon_ms = 0; // predicted - now: how far poses are extrapolated
+		size_t dbg_segments = 0, dbg_boxes = 0; // last recorded debug-line counts (heartbeat)
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
 
@@ -380,20 +383,6 @@ private:
 		// Keyed by (payload, entity): same print seen twice holds twice.
 		// Entity ids may collide across tracker contexts, payloads disambiguate.
 		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, held_code> held_codes;
-		// Shared white overlay texture (tinted per layer via
-		// colorScaleBias). Explicit acquire/fill/release pairing like the
-		// mask swapchain, never the shared pool. Filled with a CLEAR-only
-		// render pass: xr swapchain images carry no TRANSFER_DST usage,
-		// so clearColorImage is invalid on them (silently dropped).
-		xr::swapchain debug_swapchain;
-		vk::raii::RenderPass debug_pass{nullptr};
-		struct debug_target
-		{
-			vk::Image image{};
-			vk::raii::ImageView view{nullptr};
-			vk::raii::Framebuffer fb{nullptr};
-		};
-		std::vector<debug_target> debug_targets;
 
 		// First-acquisition alpha fade, per instance (mask-blend path only:
 		// the binary projected layer type has no opacity control). Each

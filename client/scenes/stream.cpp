@@ -861,7 +861,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Fiducial debug overlays (tinted quads at raw sighting poses). The
 	// white texture is acquired/filled here (command buffer still open)
 	// and released after submit, mirroring the mask swapchain pairing.
-	bool debug_acquired = false;
 
 	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
@@ -1281,6 +1280,122 @@ void scenes::stream::render(const XrFrameState & frame_state)
 #endif
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
+	
+	// Debug line overlays (QR boxes, tripods, fused boxes): world-space
+	// 1px segments recorded into the eye images - zero composition
+	// layers (the old per-quad layers blew maxLayerCount). After the
+	// slot-1 stamp so forensics still bracket video-only above. MVP
+	// shared with the cutouts below (computed once here).
+	std::array<glm::mat4, 2> world_mvp;
+	for (uint32_t view = 0; view < view_count; ++view)
+		world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+	fp.dbg_segments = 0;
+	fp.dbg_boxes = 0;
+	if (gizmo_lines and fp.debug_overlays)
+	{
+		using vtx = debug_lines_renderer::vertex;
+		std::vector<vtx> segs;
+		segs.reserve(256);
+		XrTime dbg_now = instance.now();
+		auto seg = [&](glm::vec3 a, glm::vec3 b, float r, float g, float bl, float al) {
+			segs.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
+			segs.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
+		};
+		auto box_edges = [&](glm::vec3 c, glm::vec3 r, glm::vec3 u, float hw, float hh, float cr, float cg, float cb, float ca) {
+			glm::vec3 v0 = c - r * hw - u * hh, v1 = c + r * hw - u * hh;
+			glm::vec3 v2 = c + r * hw + u * hh, v3 = c - r * hw + u * hh;
+			seg(v0, v1, cr, cg, cb, ca);
+			seg(v1, v2, cr, cg, cb, ca);
+			seg(v2, v3, cr, cg, cb, ca);
+			seg(v3, v0, cr, cg, cb, ca);
+		};
+		auto tripod = [&](glm::vec3 o, glm::vec3 x, glm::vec3 y, glm::vec3 z, float len, float a) {
+			seg(o, o + x * len, 1.f, 0.f, 0.f, a);
+			seg(o, o + y * len, 0.f, 1.f, 0.f, a);
+			seg(o, o + z * len, 0.f, 0.f, 1.f, a);
+		};
+		auto tag_frame = [&](const XrPosef & p, glm::vec3 & o, glm::vec3 & x, glm::vec3 & y, glm::vec3 & z) {
+			glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+			o = glm::vec3(p.position.x, p.position.y, p.position.z);
+			x = q * glm::vec3(1, 0, 0);
+			y = q * glm::vec3(0, 1, 0);
+			z = q * glm::vec3(0, 0, 1);
+		};
+		for (const auto & [id, h]: fp.held_codes)
+		{
+			(void)id;
+			if (h.matched and not fp.debug_matched)
+				continue;
+			if (not h.matched and not fp.debug_unmatched)
+				continue;
+			if (h.extents.width <= 0 or h.extents.height <= 0)
+				continue;
+			float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+				fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen);
+			if (a <= 0.01f)
+				continue;
+			glm::vec3 c, x, y, z;
+			tag_frame(h.pose, c, x, y, z);
+			box_edges(c, x, y, h.extents.width * 0.5f, h.extents.height * 0.5f,
+				(h.matched ? 0.f : 1.f), (h.matched ? 1.f : 0.f), 0.f, a);
+			++fp.dbg_boxes;
+			if (fp.debug_axes and h.extents.width > 0)
+			tripod(c, x, y, z, h.extents.width, a);
+		}
+		if (fp.debug_corrected)
+		{
+			for (const auto & [payload, co]: fp.corrected_tags)
+			{
+				(void)payload;
+				if (co.size_m <= 0)
+					continue;
+				float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+					fiducial_passthrough_state::stale_hold(dbg_now, co.last_seen);
+				if (a <= 0.01f)
+					continue;
+				glm::vec3 c, x, y, z;
+				tag_frame(co.pose, c, x, y, z);
+				box_edges(c, x, y, co.size_m * 0.5f, co.size_m * 0.5f, 1.f, 0.55f, 0.f, a);
+				++fp.dbg_boxes;
+			}
+		}
+		if (fp.debug_origin)
+		{
+			for (const auto & [fid, bp]: board_poses)
+			{
+				(void)fid;
+				if (not bp.has_offset or bp.tag_size_m <= 0)
+					continue;
+				float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+					fiducial_passthrough_state::stale_hold(dbg_now, bp.time);
+				if (a <= 0.01f)
+					continue;
+				glm::vec3 o, x, y, z;
+				tag_frame(bp.pose, o, x, y, z);
+				float len = bp.tag_size_m * 1.5f;
+				tripod(o, x, y, z, len, a);
+				// White center diamond (distinct from the tag tripod).
+				float d = len * 0.25f;
+				seg(o + x * d, o + y * d, 1.f, 1.f, 1.f, a);
+				seg(o + y * d, o - x * d, 1.f, 1.f, 1.f, a);
+				seg(o - x * d, o - y * d, 1.f, 1.f, 1.f, a);
+				seg(o - y * d, o + x * d, 1.f, 1.f, 1.f, a);
+				++fp.dbg_boxes;
+			}
+		}
+		fp.dbg_segments = segs.size() / 2;
+		if (not segs.empty())
+		{
+			std::array<vk::Extent2D, 2> eye_ext;
+			std::array<glm::mat4, 2> eye_mvp;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+				eye_mvp[view] = world_mvp[view];
+			}
+			gizmo_lines->record(command_buffer, (size_t)image_index, eye_ext, eye_mvp, segs.data(), segs.size());
+		}
+	}
 
 
 		// Feathered mask record, one stack per feather group (independent
@@ -1311,10 +1426,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				int hh = std::max(64, mh / 2);
 				int qw = std::max(64, mw / 4);
 				int qh = std::max(64, mh / 4);
-				// View-only transforms shared by the cutouts.
-				std::array<glm::mat4, 2> world_mvp;
-				for (uint32_t view = 0; view < 2; ++view)
-					world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+				// View-only transforms: world_mvp computed once above (shared
+				// with the debug line overlays).
 				// Marker window cutouts: raw instant pose of every matched
 				// code (unfiltered, SLAM-held) expanded by the debug
 				// window, punched through the masks so true code locations
@@ -1623,132 +1736,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_frame = false;
 		}
 
-		// Debug overlay texture: 4x4 white, tinted per quad via
-		// colorScaleBias at submit (after draw_gui, so overlays sit on
-		// top of everything). Refilled every acquire (trivial cost, no
-		// per-image tracking). Command buffer still open here.
-		if (fp.debug_overlays and
-		    (fp.debug_matched or fp.debug_unmatched or fp.debug_axes or fp.debug_origin or fp.debug_corrected))
-		{
-			bool any = false;
-			for (const auto & [id, h]: fp.held_codes)
-			{
-				(void)id;
-				if (h.extents.width > 0 and h.extents.height > 0 and
-				    ((h.matched and fp.debug_matched) or (not h.matched and fp.debug_unmatched) or fp.debug_axes or
-				     fp.debug_origin or fp.debug_corrected))
-				{
-					any = true;
-					break;
-				}
-			}
-			if (any)
-			{
-				// Outstanding tracks the acquire so a mid-fill throw still
-				// releases (never break the acquire/release pairing).
-				bool outstanding = false;
-				try
-				{
-					if (not fp.debug_swapchain)
-					{
-						device.waitIdle();
-						fp.debug_swapchain = xr::swapchain(instance, session, device, swapchain_format, 4, 4);
-						// CLEAR-only pass mirroring the mask raster pass
-						// (UNDEFINED -> GENERAL); per-image framebuffers.
-						vk::AttachmentDescription dbg_attachment{
-						        .format = swapchain_format,
-						        .samples = vk::SampleCountFlagBits::e1,
-						        .loadOp = vk::AttachmentLoadOp::eClear,
-						        .storeOp = vk::AttachmentStoreOp::eStore,
-						        .initialLayout = vk::ImageLayout::eUndefined,
-						        .finalLayout = vk::ImageLayout::eGeneral,
-						};
-						vk::AttachmentReference dbg_ref{
-						        .attachment = 0,
-						        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-						};
-						vk::SubpassDescription dbg_subpass{
-						        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-						        .colorAttachmentCount = 1,
-						        .pColorAttachments = &dbg_ref,
-						};
-						vk::RenderPassCreateInfo dbg_rp_info{
-						        .attachmentCount = 1,
-						        .pAttachments = &dbg_attachment,
-						        .subpassCount = 1,
-						        .pSubpasses = &dbg_subpass,
-						};
-						fp.debug_pass = vk::raii::RenderPass(device, dbg_rp_info);
-						for (vk::Image img: fp.debug_swapchain.images())
-						{
-							vk::raii::ImageView view(device,
-							                        vk::ImageViewCreateInfo{
-							                                .image = img,
-							                                .viewType = vk::ImageViewType::e2D,
-							                                .format = swapchain_format,
-							                                .subresourceRange = {
-							                                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-							                                        .baseMipLevel = 0,
-							                                        .levelCount = 1,
-							                                        .baseArrayLayer = 0,
-							                                        .layerCount = 1,
-							                                },
-							                        });
-							vk::ImageView raw = *view;
-							vk::raii::Framebuffer fb(device,
-							                         vk::FramebufferCreateInfo{
-							                                 .renderPass = *fp.debug_pass,
-							                                 .attachmentCount = 1,
-							                                 .pAttachments = &raw,
-							                                 .width = 4,
-							                                 .height = 4,
-							                                 .layers = 1,
-							                         });
-							fp.debug_targets.push_back({img, std::move(view), std::move(fb)});
-						}
-						spdlog::info("Fiducial debug overlay swapchain: 4x4");
-					}
-					int debug_index = fp.debug_swapchain.acquire();
-					if (not fp.debug_swapchain.wait(100'000'000))
-					{
-						fp.debug_swapchain.release();
-					}
-					else
-					{
-						outstanding = true;
-						vk::ClearValue white{};
-						white.color.float32.fill(1);
-						vk::RenderPassBeginInfo begin_dbg{
-						        .renderPass = *fp.debug_pass,
-						        .framebuffer = *fp.debug_targets[debug_index].fb,
-						        .renderArea = {.offset = {0, 0}, .extent = {4, 4}},
-						        .clearValueCount = 1,
-						        .pClearValues = &white,
-						};
-						command_buffer.beginRenderPass(begin_dbg, vk::SubpassContents::eInline);
-						command_buffer.endRenderPass();
-						debug_acquired = true;
-						outstanding = false;
-					}
-				}
-				catch (std::exception & e)
-				{
-					spdlog::warn("Fiducial debug overlay acquire failed: {}", e.what());
-					if (outstanding)
-					{
-						outstanding = false;
-						try
-						{
-							fp.debug_swapchain.release();
-						}
-						catch (std::exception & e2)
-						{
-							spdlog::warn("Fiducial debug overlay release failed: {}", e2.what());
-						}
-					}
-				}
-			}
-		}
 
 		command_buffer.end();
 
@@ -1799,9 +1786,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			spdlog::debug("Fiducial mask release: feather {}px ({} outstanding)", g->feather_px, g->images_outstanding);
 		}
 		acquired_groups.clear();
-		// Paired with the debug overlay acquire above.
-		if (debug_acquired)
-			fp.debug_swapchain.release();
 
 		// Surface-projected passthrough needs the FB passthrough object
 		// alive even for opaque (non-alpha) server video
@@ -1918,29 +1902,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
 
-		// Fiducial debug overlays last: raw sighting quads (green matched,
-		// red unmatched, SLAM-held) on top of video, mask and passthrough.
-		// White texture from above, tint + opacity via colorScaleBias.
-		if (debug_acquired)
+		// Fiducial debug overlays record as world-space lines (zero
+		// composition layers); this heartbeat reports what was recorded.
+		static XrTime last_dbg_log = 0;
+		XrTime dbg_now = instance.now();
+		if (fp.debug_overlays and dbg_now - last_dbg_log > 5000000000LL)
 		{
-			XrTime dbg_now = instance.now();
-			// One white-quad submitter: tint + opacity via colorScaleBias on
-			// the just-pushed layer. Quads draw front-face only per spec.
-			auto submit_quad = [&](const XrPosef & pose, float w, float h, float r, float g, float b, float a) {
-				add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-				               application::space(xr::spaces::world),
-				               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
-				               XrSwapchainSubImage{
-				                       .swapchain = fp.debug_swapchain,
-				                       .imageRect = {{0, 0}, {4, 4}},
-				                       .imageArrayIndex = 0,
-				               },
-				               pose,
-				               XrExtent2Df{w, h});
-				if (composition_layer_color_scale_bias_supported)
-					set_color_scale_bias({r * a, g * a, b * a, a}, {});
-			};
-			size_t n_quad = 0, n_axes = 0, n_origin = 0;
+			last_dbg_log = dbg_now;
+			spdlog::info("Fiducial debug lines: {} boxes, {} segments", fp.dbg_boxes, fp.dbg_segments);
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;
@@ -1950,42 +1919,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					continue;
 				if (h.extents.width <= 0 or h.extents.height <= 0)
 					continue;
-				// 3s stale fade (last_seen refreshes on new data: fade resets).
-				float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
-					fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen);
-				if (a <= 0.01f)
+				if (fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen) <= 0.01f)
 					continue;
-				float r = h.matched ? 0.f : 1.f;
-				float g = h.matched ? 1.f : 0.f;
-				submit_quad(h.pose, h.extents.width, h.extents.height, r, g, 0.f, a);
-				++n_quad;
-				// XYZ tripod (orientation + face-polarity check): X/Y shafts in
-				// the face plane, Z spanning the Z-Y plane, doubled: quads draw
-				// front-face only, so one normal per side.
-				if (fp.debug_axes)
-				{
-					float len = h.extents.width;
-					float thin = len * 0.08f;
-					if (len > 0)
-					{
-						glm::quat tq(h.pose.orientation.w, h.pose.orientation.x,
-						             h.pose.orientation.y, h.pose.orientation.z);
-						glm::vec3 tp(h.pose.position.x, h.pose.position.y, h.pose.position.z);
-						submit_quad(h.pose, len, thin, 1.f, 0.f, 0.f, a);
-						++n_axes;
-						submit_quad(h.pose, thin, len, 0.f, 1.f, 0.f, a);
-						++n_axes;
-						for (float yaw: {-90.f, 90.f})
-						{
-							glm::quat qz = tq * glm::angleAxis(glm::radians(yaw), glm::vec3(0, 1, 0));
-							XrPosef zp{.orientation = {qz.x, qz.y, qz.z, qz.w}, .position = {tp.x, tp.y, tp.z}};
-							submit_quad(zp, len, thin, 0.f, 0.f, 1.f, a);
-							++n_axes;
-						}
-					}
-				}
+				spdlog::info("Fiducial debug box: {} {:.0f} x {:.0f}mm at ({:.2f},{:.2f},{:.2f}){}",
+					h.payload.substr(0, 32), (double)(h.extents.width * 1000),
+					(double)(h.extents.height * 1000), (double)h.pose.position.x,
+					(double)h.pose.position.y, (double)h.pose.position.z,
+					h.matched ? " (matched)" : " (unmatched)");
 			}
-			// Orange: fused-corrected tag boxes on their own clock.
 			if (fp.debug_corrected)
 			{
 				for (const auto & [payload, c]: fp.corrected_tags)
@@ -1993,93 +1934,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					(void)payload;
 					if (c.size_m <= 0)
 						continue;
-					float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
-						fiducial_passthrough_state::stale_hold(dbg_now, c.last_seen);
-					if (a <= 0.01f)
+					if (fiducial_passthrough_state::stale_hold(dbg_now, c.last_seen) <= 0.01f)
 						continue;
-					submit_quad(c.pose, c.size_m, c.size_m, 1.f, 0.55f, 0.f, a);
-					++n_quad;
+					spdlog::info("Fiducial corrected box: {} {:.0f}mm fid \"{}\" at ({:.2f},{:.2f},{:.2f})",
+						payload.substr(0, 32), (double)(c.size_m * 1000), c.fiducial_id,
+						(double)c.pose.position.x, (double)c.pose.position.y,
+						(double)c.pose.position.z);
 				}
-			}
-			// Origin tripods: fused board origins, larger + thinner shafts than
-			// the tag tripods plus a white center square (distinct at a glance).
-			// Only when a transform separates origin from tags (identity offsets
-			// coincide with the tag tripod: nothing extra to verify). Same fade.
-			if (fp.debug_origin)
-			{
-				for (const auto & [fid, bp]: board_poses)
-				{
-					(void)fid;
-					if (not bp.has_offset or bp.tag_size_m <= 0)
-						continue;
-					float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
-						fiducial_passthrough_state::stale_hold(dbg_now, bp.time);
-					if (a <= 0.01f)
-						continue;
-					float len = bp.tag_size_m * 1.5f;
-					float thin = len * 0.05f;
-					float sq = len * 0.25f;
-					glm::quat bq(bp.pose.orientation.w, bp.pose.orientation.x,
-					             bp.pose.orientation.y, bp.pose.orientation.z);
-					glm::vec3 bt(bp.pose.position.x, bp.pose.position.y, bp.pose.position.z);
-					submit_quad(bp.pose, len, thin, 1.f, 0.f, 0.f, a);
-					++n_origin;
-					submit_quad(bp.pose, thin, len, 0.f, 1.f, 0.f, a);
-					++n_origin;
-					for (float yaw: {-90.f, 90.f})
-					{
-						glm::quat qz = bq * glm::angleAxis(glm::radians(yaw), glm::vec3(0, 1, 0));
-						XrPosef zp{.orientation = {qz.x, qz.y, qz.z, qz.w}, .position = {bt.x, bt.y, bt.z}};
-						submit_quad(zp, len, thin, 0.f, 0.f, 1.f, a);
-						++n_origin;
-					}
-					submit_quad(bp.pose, sq, sq, 1.f, 1.f, 1.f, a);
-					++n_origin;
-				}
-			}
-			// Heartbeat inventory: submitted counts + per-quad detail (poses
-			// distinguish marker quads from stuck/ghost ones). Faded-out quads
-			// are skipped above and omitted here too.
-			static XrTime last_dbg_log = 0;
-			if (dbg_now - last_dbg_log > 5000000000LL)
-			{
-				last_dbg_log = dbg_now;
-				spdlog::info("Fiducial debug quads: {} submitted ({} axes, {} origin)", n_quad, n_axes, n_origin);
-				for (const auto & [id, h]: fp.held_codes)
-				{
-					(void)id;
-					if (h.matched and not fp.debug_matched)
-						continue;
-					if (not h.matched and not fp.debug_unmatched)
-						continue;
-					if (h.extents.width <= 0 or h.extents.height <= 0)
-						continue;
-					float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
-						fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen);
-					if (a <= 0.01f)
-						continue;
-					spdlog::info("Fiducial debug quad: {} {:.0f} x {:.0f}mm at ({:.2f},{:.2f},{:.2f}){}",
-						h.payload.substr(0, 32), (double)(h.extents.width * 1000),
-						(double)(h.extents.height * 1000), (double)h.pose.position.x,
-						(double)h.pose.position.y, (double)h.pose.position.z,
-						h.matched ? " (matched)" : " (unmatched)");
-				}
-				if (fp.debug_corrected)
-				{
-					for (const auto & [payload, c]: fp.corrected_tags)
-					{
-						(void)payload;
-						if (c.size_m <= 0)
-							continue;
-						if (fiducial_passthrough_state::stale_hold(dbg_now, c.last_seen) <= 0.01f)
-							continue;
-						spdlog::info("Fiducial corrected quad: {} {:.0f}mm fid \"{}\" at ({:.2f},{:.2f},{:.2f})",
-							payload.substr(0, 32), (double)(c.size_m * 1000), c.fiducial_id,
-							(double)c.pose.position.x, (double)c.pose.position.y,
-							(double)c.pose.position.z);
-					}
-				}
-			}
+		}
 		}
 
 		// First frames of each mask activation are traced end to end: a hang
@@ -2269,6 +2131,10 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	        swapchain.images(),
 	        extent,
 	        swapchain.format());
+
+	// Debug line overlays share the video swapchain lifetime (framebuffers
+	// per image); rebuilt here so stale VkImages never linger.
+	gizmo_lines.emplace(device, swapchain.format(), swapchain.images(), extent);
 }
 
 scene::meta & scenes::stream::get_meta_scene()
