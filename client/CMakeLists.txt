@@ -13,9 +13,24 @@ set(SPIRV_REFLECT_INSTALL OFF)
 
 FetchContent_MakeAvailable(simdjson spdlog glm fastgltf imgui stb implot uni-algo entt spirv-reflect)
 
-# Fiducial board fusion deps: Eigen + manif (header-only). tiny_solver is
-# vendored, see thirdparty/tiny_solver/README.md.
-FetchContent_MakeAvailable(eigen manif)
+# Fiducial board fusion deps: Eigen via its own CMake; manif header-only.
+# manif's CMakeLists unconditionally find_package(Eigen3) (no system Eigen
+# on Android), so populate without building and define the interface
+# target here. tiny_solver is vendored, see thirdparty/tiny_solver/README.md.
+# Eigen configures inside our build (add_subdirectory) and defaults its
+# doc/test suite ON: force both off in cache before making it available.
+# (Nothing in-tree consumes BUILD_TESTING; test binaries use
+# WIVRN_BUILD_TEST. Plain set() would not reach the sub-configure.)
+set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(eigen)
+FetchContent_GetProperties(manif)
+if(NOT manif_POPULATED)
+	FetchContent_Populate(manif)
+endif()
+add_library(manif INTERFACE)
+target_include_directories(manif SYSTEM INTERFACE ${manif_SOURCE_DIR}/include ${manif_SOURCE_DIR}/external/tl)
+target_link_libraries(manif INTERFACE Eigen3::Eigen)
 add_library(tinysolver INTERFACE)
 target_include_directories(tinysolver SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/tiny_solver)
 if(ANDROID AND WIVRN_USE_ANDROID_BIN_LIBKTX)

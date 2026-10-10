@@ -1367,26 +1367,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
 							continue;
-						for (auto & [skey, inst]: ost.instances)
-						{
-							(void)skey;
-							if (not inst.anchored)
-								continue;
-							glm::quat q(inst.world_pose.orientation.w, inst.world_pose.orientation.x,
-							            inst.world_pose.orientation.y, inst.world_pose.orientation.z);
-							glm::vec3 t(inst.world_pose.position.x, inst.world_pose.position.y, inst.world_pose.position.z);
-							glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-							                  glm::scale(glm::mat4(1), glm::vec3(inst.world_scale.x, inst.world_scale.y, inst.world_scale.z));
-							std::array<glm::mat4, 2> mvp;
-							for (uint32_t view = 0; view < 2; ++view)
-								mvp[view] = world_mvp[view] * model;
-							float op = fiducial_passthrough_state::fade_factor(
-							        frame_state.predictedDisplayTime, inst.fade_start,
-							        std::max(0.f, ost.def.fade_in_ms));
-							if (not draw_visible(oid, mvp))
-								continue;
-							draws.push_back({oid, mvp, op});
-						}
+						const auto & fu = ost.fused;
+						if (not fu.placed)
+							continue;
+						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						std::array<glm::mat4, 2> mvp;
+						for (uint32_t view = 0; view < 2; ++view)
+							mvp[view] = world_mvp[view] * model;
+						float op = fiducial_passthrough_state::fade_factor(
+						        frame_state.predictedDisplayTime, fu.fade_start,
+						        std::max(0.f, ost.def.fade_in_ms));
+						if (not draw_visible(oid, mvp))
+							continue;
+						draws.push_back({oid, mvp, op});
 					}
 					if (draws.empty())
 					{
@@ -1806,6 +1803,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (composition_layer_color_scale_bias_supported)
 					set_color_scale_bias({r * a, g * a, 0.f, a}, {});
 			}
+			// Orange: fused-corrected tag boxes, reverse-computed from
+			// each live board pose. Green raw vs orange corrected shows
+			// fusion disagreement at a glance; a persistent split on one
+			// tag is print/offset error, not noise.
+			if (fp.debug_corrected)
+			{
+				for (const auto & [payload, c]: fp.corrected_tags)
+				{
+					(void)payload;
+					if (c.size_m <= 0)
+						continue;
+					float a = std::clamp(fp.debug_opacity, 0.f, 1.f);
+					add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+					               application::space(xr::spaces::world),
+					               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
+					               XrSwapchainSubImage{
+					                       .swapchain = fp.debug_swapchain,
+					                       .imageRect = {{0, 0}, {4, 4}},
+					                       .imageArrayIndex = 0,
+					               },
+					               c.pose,
+					               XrExtent2Df{c.size_m, c.size_m});
+					if (composition_layer_color_scale_bias_supported)
+						set_color_scale_bias({1.0f * a, 0.55f * a, 0.f, a}, {});
+				}
+			}
 			// Heartbeat inventory: which debug quads are actually submitted
 			// (poses distinguish marker quads from a stuck/ghost one).
 			static XrTime last_dbg_log = 0;
@@ -1831,6 +1854,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					             h.matched ? " (matched)" : " (unmatched)");
 				}
 				spdlog::info("Fiducial debug quads: {} submitted", n);
+				if (fp.debug_corrected)
+				{
+					for (const auto & [payload, c]: fp.corrected_tags)
+					{
+						(void)payload;
+						if (c.size_m <= 0)
+							continue;
+						spdlog::info("Fiducial corrected quad: {} {:.0f}mm fid \"{}\" at ({:.2f},{:.2f},{:.2f})",
+						             payload.substr(0, 32), (double)(c.size_m * 1000), c.fiducial_id,
+						             (double)c.pose.position.x, (double)c.pose.position.y,
+						             (double)c.pose.position.z);
+					}
+				}
 			}
 		}
 

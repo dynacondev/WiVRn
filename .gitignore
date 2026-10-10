@@ -9,6 +9,8 @@ _deps/
 
 build/
 build-*/
+cmake-fetch/
+cmake-fetch-*/
 **/result
 
 __pycache__/

@@ -103,25 +103,6 @@ bool scenes::stream::fiducial_passthrough_wanted()
 
 namespace
 {
-// Filter tuning carried through from the fiducial (resolver + smoothing
-// move are future work; the ops stay at the instance filter for now).
-xr::fiducial_filter::tuning tuning_for(const to_headset::fiducial_entry & f)
-{
-	xr::fiducial_filter::tuning t;
-	t.window_size = std::max(2, f.window_size);
-	t.min_samples = std::clamp(f.min_samples, 1, t.window_size);
-	t.sigma_k = std::max(0.5f, f.sigma_k);
-	t.pos_gain = std::max(0.1f, f.pos_gain);
-	t.rot_gain = std::max(0.1f, f.rot_gain);
-	t.euro_min_cutoff = std::max(0.05f, f.euro_min_cutoff);
-	t.euro_beta = std::max(0.f, f.euro_beta);
-	t.knee_inner_mm = f.knee_inner_mm;
-	t.knee_outer_mm = std::max(t.knee_inner_mm, f.knee_outer_mm);
-	t.knee_inner_deg = f.knee_inner_deg;
-	t.knee_outer_deg = std::max(t.knee_inner_deg, f.knee_outer_deg);
-	return t;
-}
-
 // base * offset (translation unaffected by scale; scale applies later at
 // the object). Offset quaternion stored xyzw.
 XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const std::array<float, 4> & q)
@@ -132,6 +113,23 @@ XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const
 	glm::vec3 op(p[0], p[1], p[2]);
 	glm::quat rq = bq * oq;
 	glm::vec3 rp = bp + bq * op;
+	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
+}
+
+// Tag pose reverse-computed from a fused board pose: tag = board *
+// offset^-1 (orange corrected overlay vs the raw green sightings).
+// Computed per frame (K tiny).
+XrPosef board_to_tag(const XrPosef & board, const std::array<float, 3> & p, const std::array<float, 4> & q)
+{
+	glm::quat bq(board.orientation.w, board.orientation.x, board.orientation.y, board.orientation.z);
+	glm::vec3 bp(board.position.x, board.position.y, board.position.z);
+	glm::mat4 fm = glm::translate(glm::mat4(1), bp) * glm::mat4_cast(bq);
+	glm::quat oq(q[3], q[0], q[1], q[2]);
+	glm::vec3 op(p[0], p[1], p[2]);
+	glm::mat4 om = glm::translate(glm::mat4(1), op) * glm::mat4_cast(oq);
+	glm::mat4 tm = fm * glm::inverse(om);
+	glm::quat rq = glm::quat_cast(tm);
+	glm::vec3 rp(tm[3]);
 	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
 }
 } // namespace
@@ -177,12 +175,6 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 				++it;
 			else
 				it = fiducial_trackers.erase(it);
-		}
-		for (const auto & f: map.fiducials)
-		{
-			if (f.markers.size() > 1)
-				spdlog::warn("Fiducial \"{}\": multi-marker resolve not implemented, using first of {} markers",
-				             f.id, (unsigned)f.markers.size());
 		}
 	}
 
@@ -292,28 +284,33 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	}
 	auto t_track1 = std::chrono::steady_clock::now();
 
-	// Resolver (single-marker): solved fiducial frame per (fiducial,
-	// entity) = observed * marker offset. Rebuilt every frame.
-	fiducial_sightings.clear();
+	// Resolver: one board hypothesis (vote) per (fiducial, marker,
+	// entity) = observed * marker offset. ALL markers of a fiducial vote
+	// now (was: markers[0] only). Rebuilt every frame.
+	fiducial_votes.clear();
 	for (const auto & f: map.fiducials)
 	{
-		if (f.markers.empty())
-			continue;
-		const auto & m = f.markers[0];
-		auto tr = fiducial_trackers.find(m.marker_data);
-		if (tr == fiducial_trackers.end())
-			continue;
-		for (const auto & s: tr->second.sightings())
+		for (const auto & m: f.markers)
 		{
-			if (s.payload != m.marker_data)
+			auto tr = fiducial_trackers.find(m.marker_data);
+			if (tr == fiducial_trackers.end())
 				continue;
-			fiducial_sightings[{f.id, s.entity_id}] = {
-			        .fiducial_id = f.id,
-			        .payload = s.payload,
-			        .solved = compose_pose(s.pose, m.position, m.orientation),
-			        .extents = s.extents,
-			        .time = s.time,
-			};
+			for (const auto & s: tr->second.sightings())
+			{
+				if (s.payload != m.marker_data)
+					continue;
+				fiducial_vote v;
+				v.fiducial_id = f.id;
+				v.payload = s.payload;
+				v.solved = compose_pose(s.pose, m.position, m.orientation);
+				v.observed = s.pose;
+				v.tag_size_m = m.marker_size_m;
+				for (int k = 0; k < 3; ++k)
+					v.offset_pos[k] = m.position[k];
+				for (int k = 0; k < 4; ++k)
+					v.offset_quat[k] = m.orientation[k];
+				fiducial_votes.push_back(std::move(v));
+			}
 		}
 	}
 
@@ -350,7 +347,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.calibrated = false;
 			fp.held_codes.clear();
 			passthrough_objects.clear();
-			fiducial_sightings.clear();
+			fiducial_votes.clear();
+			board_poses.clear();
+			board_warm_start.clear();
+			fp.corrected_tags.clear();
 			for (const auto & o: map.objects)
 			{
 				if (o.type != "3d-passthrough")
@@ -367,7 +367,123 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fp.status = "no fiducial map from server";
 	}
 
-	// ---- behavior objects: instances per (object, fiducial, entity) ----
+	// ---- fused board poses: one solve per fiducial ----
+	// Head pose once per frame for the weight model (distance/incidence).
+	// Neutral fallback (face-on at 1m) when untrackable: geometry still fuses.
+	glm::vec3 head_pos{0};
+	bool have_head = false;
+	if (auto head = application::locate_controller(application::space(xr::spaces::view), world_space, predicted_display_time))
+	{
+		head_pos = head->first;
+		have_head = true;
+	}
+	fp.last_horizon_ms = (predicted_display_time - now) * 1e-6;
+	fp.last_solve_ms = 0;
+	fp.corrected_tags.clear();
+	for (auto & [fid, bp]: board_poses)
+	{
+		(void)fid;
+		bp.live = false;
+	}
+	for (const auto & f: map.fiducials)
+	{
+		std::vector<xr::board_vote> bv;
+		for (const auto & v: fiducial_votes)
+		{
+			if (v.fiducial_id != f.id)
+				continue;
+			xr::board_vote b;
+			b.payload = v.payload;
+			b.observed = v.observed;
+			for (int k = 0; k < 3; ++k)
+				b.offset_pos[k] = v.offset_pos[k];
+			for (int k = 0; k < 4; ++k)
+				b.offset_quat[k] = v.offset_quat[k];
+			b.tag_size_m = v.tag_size_m;
+			glm::vec3 tp(v.observed.position.x, v.observed.position.y, v.observed.position.z);
+			glm::quat tq(v.observed.orientation.w, v.observed.orientation.x, v.observed.orientation.y,
+			             v.observed.orientation.z);
+			float d = have_head ? glm::length(tp - head_pos) : 1.0f;
+			b.distance_m = d;
+			if (have_head and d > 1e-6f)
+			{
+				glm::vec3 n = tq * glm::vec3(0, 0, 1);
+				b.cos_incidence = std::abs(glm::dot(n, (tp - head_pos) / d));
+			}
+			else
+				b.cos_incidence = 1.0f;
+			bv.push_back(std::move(b));
+		}
+		if (bv.empty())
+			continue;
+		std::optional<XrPosef> warm;
+		if (auto it = board_warm_start.find(f.id); it != board_warm_start.end())
+			warm = it->second;
+		xr::board_solution sol = xr::solve_board(bv, warm);
+		if (not sol.ok)
+			continue;
+		board_warm_start[f.id] = sol.board_pose;
+		auto & bp = board_poses[f.id];
+		bp.pose = sol.board_pose;
+		bp.time = now;
+		bp.live = true;
+		bp.rms_mm = sol.rms_mm;
+		bp.rms_deg = sol.rms_deg;
+		bp.solve_us = sol.solve_us;
+		bp.lm_iters = sol.lm_iters;
+		bp.single = sol.single;
+		bp.tags_used = 0;
+		for (const auto & t: sol.tags)
+			bp.tags_used += t.used;
+		bp.tags_visible = (int)sol.tags.size();
+		bp.tag_stats = std::move(sol.tags);
+		fp.last_solve_ms = std::max(fp.last_solve_ms, sol.solve_us * 1e-3);
+		// Orange overlay inputs: reverse-compute each voting tag from
+		// the fused board pose.
+		for (const auto & v: bv)
+		{
+			std::array<float, 3> op{v.offset_pos[0], v.offset_pos[1], v.offset_pos[2]};
+			std::array<float, 4> oq{v.offset_quat[0], v.offset_quat[1], v.offset_quat[2], v.offset_quat[3]};
+			fp.corrected_tags[v.payload] = {board_to_tag(sol.board_pose, op, oq), v.tag_size_m, f.id};
+		}
+		// Logging: heartbeat per fiducial + visible-set changes.
+		// `board solve:` is the tuning instrument (more logging better).
+		static XrTime last_solve_log = 0;
+		static std::map<std::string, std::string> last_sets;
+		std::string set;
+		for (const auto & v: bv)
+		{
+			set += v.payload.substr(0, 32);
+			set += ',';
+		}
+		auto lsit = last_sets.find(f.id);
+		if (lsit == last_sets.end() or lsit->second != set)
+		{
+			last_sets[f.id] = set;
+			spdlog::info("board solve: fid \"{}\" visible set -> {}", f.id, set);
+		}
+		if (now - last_solve_log > 2'000'000'000LL)
+		{
+			last_solve_log = now;
+			std::string down;
+			for (const auto & t: bp.tag_stats)
+			{
+				if (not t.used)
+				{
+					down += t.payload.substr(0, 32);
+					down += '(';
+					down += std::to_string(t.weight).substr(0, 4);
+					down += ')';
+				}
+			}
+			spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms{}",
+			             f.id, bp.tags_used, bp.tags_visible, (double)bp.rms_mm, (double)bp.rms_deg,
+			             bp.lm_iters, bp.solve_us, fp.last_horizon_ms,
+			             down.empty() ? "" : std::string(" down ") + down);
+		}
+	}
+
+	// ---- behavior objects: first referenced board pose wins ----
 	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
 	{
 		if (std::ranges::any_of(map.objects, [&](const to_headset::passthrough_object & o) { return o.id == oit->first; }))
@@ -405,107 +521,58 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				}
 			}
 		}
-		// Instances: every referenced fiducial, every live sighting. Same
-		// QR seen twice places twice; several fiducials place per pairing.
+		// Placement: first referenced fiducial with a pose (live or
+		// held) wins. Held poses keep rendering through occlusion
+		// (hold-last); the filter that used to smooth this is
+		// TEMP-disabled, so this is the raw fused output.
 		for (const auto & fid: def.fiducial)
 		{
-			auto fdef = std::ranges::find(map.fiducials, fid, &to_headset::fiducial_entry::id);
-			if (fdef == map.fiducials.end())
+			auto bpit = board_poses.find(fid);
+			if (bpit == board_poses.end())
 				continue;
-			xr::fiducial_filter::tuning t = tuning_for(*fdef);
-			for (const auto & [skey, fs]: fiducial_sightings)
+			auto & fu = ost.fused;
+			bool gap = fu.last_solve > 0 and (now - fu.last_solve) > 1'000'000'000LL;
+			fu.world_pose = compose_pose(bpit->second.pose, def.position, def.orientation);
+			fu.world_scale = {def.scale, def.scale, def.scale};
+			if (not fu.placed)
 			{
-				if (fs.fiducial_id != fid)
-					continue;
-				auto [iit, fresh] = ost.instances.try_emplace(skey);
-				auto & inst = iit->second;
-				if (fresh)
-					inst.filter.configure(t);
-				XrPosef target = compose_pose(fs.solved, def.position, def.orientation);
-				glm::quat tq(target.orientation.w, target.orientation.x, target.orientation.y, target.orientation.z);
-				glm::vec3 tp(target.position.x, target.position.y, target.position.z);
-				inst.filter.ingest(tp, tq, fs.time);
-				inst.samples_ingested++;
-				inst.last_seen = now;
-				if (not inst.anchored)
-				{
-					// Auto-anchor: the single allowed snap (only behavior).
-					inst.filter.snap();
-					auto r = inst.filter.rendered();
-					inst.world_pose = {
-					        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
-					        .position = {r.pos.x, r.pos.y, r.pos.z},
-					};
-					inst.world_scale = {def.scale, def.scale, def.scale};
-					inst.anchored = true;
-					inst.anchored_at = now;
-					inst.last_predicted = predicted_display_time;
-					inst.fade_start = predicted_display_time;
-					spdlog::info("Passthrough object \"{}\" auto-anchored to fiducial \"{}\"", def.id, fid);
-				}
+				fu.placed = true;
+				fu.placed_at = now;
+				fu.fade_start = predicted_display_time;
+				spdlog::info("Passthrough object \"{}\" placed on fiducial \"{}\"", def.id, fid);
 			}
-		}
-		// Follow every anchored instance; prune ids unseen for 60s (the
-		// runtime recycles long-gone entity ids: without expiry a return
-		// would leave a frozen ghost beside the fresh instance).
-		for (auto iit = ost.instances.begin(); iit != ost.instances.end();)
-		{
-			auto & inst = iit->second;
-			if (now - inst.last_seen > 60'000'000'000LL)
+			if (bpit->second.live)
 			{
-				iit = ost.instances.erase(iit);
-				continue;
+				fu.last_solve = now;
+				if (gap)
+					fu.fade_start = predicted_display_time; // reacquire fade
 			}
-			++iit;
-			if (not inst.anchored or not inst.filter.has_target())
-				continue;
-			double dt = inst.last_predicted > 0 ? (predicted_display_time - inst.last_predicted) * 1e-9 : 1.0 / 72.0;
-			inst.last_predicted = predicted_display_time;
-			auto r = inst.filter.advance(std::clamp(dt, 0.0, 0.25));
-			inst.world_pose = {
-			        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
-			        .position = {r.pos.x, r.pos.y, r.pos.z},
-			};
-			inst.world_scale = {def.scale, def.scale, def.scale};
-			if (auto target = inst.filter.resolve())
-			{
-				inst.target_render_err_mm = glm::length(target->pos - r.pos) * 1000.f;
-				float c = std::clamp(std::abs(glm::dot(target->quat, r.quat)), 0.f, 1.f);
-				inst.target_render_err_deg = 2.f * std::acos(c) * 57.29577951308232f;
-			}
+			break;
 		}
 	}
 
-	// ---- render shim: first live instance drives the single render path
+	// ---- render shim: first placed object drives the single render path
 	// (per-feather groups replace this) ----
 	fp.calibrated = false;
-	bool shimmed = false;
 	const passthrough_object_state * shim_ost = nullptr;
 	for (auto & [oid, ost]: passthrough_objects)
 	{
 		(void)oid;
 		if (ost.def.type != "3d-passthrough" or not ost.soup_ready)
 			continue;
-		for (auto & [skey, inst]: ost.instances)
-		{
-			(void)skey;
-			if (not inst.anchored)
-				continue;
-			fp.calibrated = true;
-			fp.world_pose = inst.world_pose;
-			fp.world_scale = inst.world_scale;
-			fp.status = ost.status;
-			shim_ost = &ost;
-			shimmed = true;
-			break;
-		}
-		if (shimmed)
-			break;
+		if (not ost.fused.placed)
+			continue;
+		fp.calibrated = true;
+		fp.world_pose = ost.fused.world_pose;
+		fp.world_scale = ost.fused.world_scale;
+		fp.status = ost.status;
+		shim_ost = &ost;
+		break;
 	}
 
 	// Strict gating: tracking above runs unconditionally (status UI and
-	// debug overlays), but nothing mesh-related submits until an instance
-	// auto-anchors.
+	// debug overlays), but nothing mesh-related submits until an object
+	// is placed on a fused board pose.
 	if (not fp.calibrated)
 		return;
 
@@ -580,9 +647,9 @@ void scenes::stream::gui_passthrough()
 		fp.debug_opacity = std::clamp(pct / 100, 0.f, 1.f);
 	if (ImGui::SliderInt(_S("Marker window cutout"), &fp.debug_window_mm, -1, 512, fp.debug_window_mm < 0 ? "Disabled" : "%d mm"))
 		fp.debug_window_mm = std::clamp(fp.debug_window_mm, -1, 512);
-	ImGui::BeginDisabled(true);
-	ImGui::Text("%s", _S("Multi-code corrected position (orange) — coming later"));
-	ImGui::EndDisabled();
+	ImGui::Checkbox(_S("Corrected tags (orange)"), &fp.debug_corrected);
+	if (ImGui::Button(_S("Run board solver self-test")))
+		xr::board_solver_selftest();
 	if (not fp.held_codes.empty())
 	{
 		ImGui::Text("%s (%zu):", _S("Codes in view"), fp.held_codes.size());
@@ -616,12 +683,11 @@ void scenes::stream::gui_fiducial_status()
 	for (const auto & f: map->fiducials)
 	{
 		std::string label = f.tag.empty() ? f.id : f.tag;
-		// Live if any current sighting resolves through this fiducial.
+		// Live if any current vote comes through this fiducial.
 		bool live = false;
-		for (const auto & [key, fs]: fiducial_sightings)
+		for (const auto & v: fiducial_votes)
 		{
-			(void)key;
-			if (fs.fiducial_id == f.id)
+			if (v.fiducial_id == f.id)
 			{
 				live = true;
 				break;
@@ -641,12 +707,6 @@ void scenes::stream::gui_fiducial_status()
 	{
 		(void)oid;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
-		size_t anchored = 0;
-		for (const auto & [key, inst]: ost.instances)
-		{
-			(void)key;
-			anchored += inst.anchored;
-		}
 		if (ost.def.type != "3d-passthrough")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
@@ -658,23 +718,38 @@ void scenes::stream::gui_fiducial_status()
 			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
 			continue;
 		}
-		ImGui::Text("%s %.40s: %zu tris, %zu %s", _S("Object"), label.c_str(), ost.triangle_count,
-		            anchored, anchored == 1 ? _S("instance") : _S("instances"));
-		size_t shown = 0;
-		for (const auto & [key, inst]: ost.instances)
+		if (not ost.fused.placed)
 		{
-			if (shown >= 8)
+			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), _S("seeking"));
+			continue;
+		}
+		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
+		ImGui::Text("%s %.40s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		// Per-fiducial solve stats for placed objects.
+		for (const auto & fid: ost.def.fiducial)
+		{
+			auto bpit = board_poses.find(fid);
+			if (bpit == board_poses.end())
+				continue;
+			const auto & bp = bpit->second;
+			ImGui::Text("  %s %.40s: %d/%d tags rms %.1fmm %.2fdeg %.0fus%s",
+			            _S("board"), fid.c_str(), bp.tags_used, bp.tags_visible,
+			            (double)bp.rms_mm, (double)bp.rms_deg, bp.solve_us,
+			            bp.single ? " (single)" : "");
+			size_t shown = 0;
+			for (const auto & t: bp.tag_stats)
 			{
-				ImGui::Text("  ... +%zu", ost.instances.size() - shown);
-				break;
+				if (shown >= 8)
+				{
+					ImGui::Text("  ... +%zu", bp.tag_stats.size() - shown);
+					break;
+				}
+				++shown;
+				ImGui::TextColored(t.used ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f},
+				                   "  %.32s res %.1fmm %.2fdeg w %.2f",
+				                   t.payload.c_str(), (double)t.res_mm, (double)t.res_deg, (double)t.weight);
 			}
-			++shown;
-			double age_s = (instance.now() - inst.anchored_at) * 1e-9;
-			ImGui::Text("  %s %.1fs %s, err %.1fmm %.2fdeg, %llu %s",
-			            _S("placed"), age_s, _S("ago"),
-			            (double)inst.target_render_err_mm, (double)inst.target_render_err_deg,
-			            (unsigned long long)inst.samples_ingested, _S("samples"));
-			(void)key;
 		}
 	}
 	if (fiducial_trackers.empty())

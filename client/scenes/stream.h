@@ -28,7 +28,7 @@
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
-#include "xr/fiducial_filter.h"
+#include "xr/board_solver.h"
 #include "stream_defoveator.h"
 #include "utils/thread_safe.h"
 #include "wifi_lock.h"
@@ -251,36 +251,52 @@ private:
 	// Union of configured marker payloads (any fiducial). Green vs red.
 	std::set<std::string> configured_marker_payloads;
 
-	// Solved fiducial frame per (fiducial, entity): observed marker pose
-	// composed with the marker-to-fiducial offset. Single-marker resolve
-	// only; multi-marker averaging is future work (first marker used).
-	// Rebuilt every frame; render thread only.
-	struct fiducial_sighting
+	// One board hypothesis per (fiducial, marker, entity): observed tag
+	// pose composed with the marker-to-fiducial offset. ALL markers of a
+	// fiducial vote; board_solver fuses each fiducial's votes into one
+	// pose. Rebuilt every frame; render thread only.
+	struct fiducial_vote
 	{
 		std::string fiducial_id;
 		std::string payload;
-		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}};
-		XrExtent2Df extents{0, 0};
-		XrTime time = 0;
+		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}}; // board hypothesis
+		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}}; // raw tag pose (incidence/overlay)
+		float tag_size_m = 0;
+		float offset_pos[3] = {0, 0, 0}; // marker->board offset (overlay reverse-compute)
+		float offset_quat[4] = {0, 0, 0, 1}; // xyzw
 	};
-	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_sighting> fiducial_sightings;
+	std::vector<fiducial_vote> fiducial_votes;
 
-	// One placement per (object, fiducial, entity) sighting: the same QR
-	// seen twice places the object twice; one object over several
-	// fiducials places once per visible pairing (never fused).
-	struct object_instance
+	// Fused board pose per fiducial id: live solution when votes exist,
+	// held (frozen) otherwise. Render thread only.
+	struct board_fused
 	{
-		bool anchored = false; // auto-aligned on first sighting (only behavior)
-		XrTime anchored_at = 0;
-		XrTime last_seen = 0; // last live sighting; unseen 60s prunes (id recycling)
-		xr::fiducial_filter filter; // tuned from the fiducial (carried through)
+		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrTime time = 0; // last live solution (stale age = now - time)
+		bool live = false; // solved this frame
+		float rms_mm = 0, rms_deg = 0;
+		double solve_us = 0;
+		int lm_iters = 0;
+		int tags_visible = 0, tags_used = 0;
+		bool single = true;
+		std::vector<xr::board_tag_stat> tag_stats;
+	};
+	std::map<std::string /*fiducial id*/, board_fused> board_poses;
+	// Warm starts for the solver (fiducial id -> last fused pose).
+	// Solver init only, not output smoothing.
+	std::map<std::string, XrPosef> board_warm_start;
+
+	// Single fused placement per object. The per-(fiducial,entity)
+	// instance fan-out + fiducial_filter are TEMP-disabled (filtering
+	// returns after the fusion is verified); git history has them.
+	struct fused_placement
+	{
+		bool placed = false; // any fused solution ever (hold-last on loss)
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
-		XrTime last_predicted = 0;
+		XrTime placed_at = 0;
 		XrTime fade_start = 0;
-		uint64_t samples_ingested = 0;
-		float target_render_err_mm = 0;
-		float target_render_err_deg = 0;
+		XrTime last_solve = 0; // last live frame (stale age)
 	};
 	struct passthrough_object_state
 	{
@@ -293,7 +309,7 @@ private:
 		size_t vertex_count = 0;
 		size_t triangle_count = 0;
 		std::string status = "waiting for fiducial map";
-		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, object_instance> instances; // key (fiducial, entity)
+		fused_placement fused;
 	};
 	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
 
@@ -315,8 +331,23 @@ private:
 		// (C0 diagnostics; one frame stale like the GPU readback).
 		double last_tracker_ms = 0;
 		double last_sync_ms = 0;
+		double last_solve_ms = 0; // board fusion cost (max over fiducials)
+		double last_horizon_ms = 0; // predicted - now: how far poses are extrapolated
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
+
+		// Multi-code corrected tag poses (orange overlay): each live
+		// board tag reverse-computed from the fused board pose
+		// (predicted = fused * offset^-1), vs the raw green sightings.
+		// Rebuilt every frame from live solutions only.
+		struct corrected_tag
+		{
+			XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+			float size_m = 0;
+			std::string fiducial_id;
+		};
+		std::map<std::string /*payload*/, corrected_tag> corrected_tags;
+		bool debug_corrected = true; // orange: fused-corrected tag boxes
 
 		// Fiducial marker debugging (Passthrough tab, session-scoped,
 		// render thread only). Raw instant poses while visible, frozen
