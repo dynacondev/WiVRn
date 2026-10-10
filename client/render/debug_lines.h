@@ -58,6 +58,14 @@ public:
 	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents, const std::array<glm::mat4, 2> & mvp,
 	            const vertex * verts, size_t vert_count, bool blended = true);
+	void record_tris(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                 const std::array<vk::Extent2D, 2> & extents, const std::array<glm::mat4, 2> & mvp,
+	                 const vertex * verts, size_t vert_count);
+
+	// TEMP diagnostic twin: triangle list through the same renderpass /
+	// framebuffers / barrier / vertex buffer, unblended. Tri-visible vs
+	// lines-invisible bisects primitive-topology faults from shared-infra
+	// faults. Revert with the line-visibility verdict.
 
 private:
 	vk::raii::Device * device = nullptr;
@@ -66,6 +74,7 @@ private:
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 	vk::raii::Pipeline pipeline_unblended{nullptr}; // TEMP diagnostic: blend-off variant
+	vk::raii::Pipeline pipeline_tri{nullptr}; // TEMP diagnostic: triangle twin (topology bisect)
 
 	struct target
 	{

@@ -187,6 +187,14 @@ debug_lines_renderer::debug_lines_renderer(vk::raii::Device & device, vk::Format
 	pipeline_off_info.pColorBlendState = &blend_off;
 	pipeline_unblended = vk::raii::Pipeline(device, nullptr, pipeline_off_info);
 
+	// TEMP diagnostic twin: triangle list, unblended (topology bisect:
+	// tri-visible + lines-invisible convicts line rasterization).
+	vk::PipelineInputAssemblyStateCreateInfo tri_assembly = input_assembly;
+	tri_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::GraphicsPipelineCreateInfo pipeline_tri_info = pipeline_off_info;
+	pipeline_tri_info.pInputAssemblyState = &tri_assembly;
+	pipeline_tri = vk::raii::Pipeline(device, nullptr, pipeline_tri_info);
+
 	// Per-(image, eye) framebuffers (one layer each, like the defoveator).
 	for (vk::Image image: images)
 	{
@@ -253,6 +261,79 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		// Same-queue dependency on the defoveate writes above (cf. the
 		// cutout barrier): separate render passes need it spelled out.
 		// Images always arrive via defoveate (OPTIMAL), so no transition.
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    {},
+		                    {},
+		                    {},
+		                    vk::ImageMemoryBarrier{
+		                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+		                            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead |
+		                                             vk::AccessFlagBits::eColorAttachmentWrite,
+		                            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                            .image = images[image_index],
+		                            .subresourceRange = {
+		                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                                    .levelCount = 1,
+		                                    .baseArrayLayer = eye,
+		                                    .layerCount = 1,
+		                            },
+		                    });
+		cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, push{mvp[eye]});
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)extents[eye].width,
+		                        .height = (float)extents[eye].height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
+		vk::RenderPassBeginInfo begin_info{
+		        .renderPass = *renderpass,
+		        .framebuffer = *tgt.framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .clearValueCount = 0,
+		};
+		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+		cmd.draw((uint32_t)vert_count, 1, 0, 0);
+		cmd.endRenderPass();
+	}
+}
+
+void debug_lines_renderer::record_tris(vk::raii::CommandBuffer & cmd, size_t image_index,
+                                       const std::array<vk::Extent2D, 2> & extents,
+                                       const std::array<glm::mat4, 2> & mvp, const vertex * verts,
+                                       size_t vert_count)
+{
+	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
+		return;
+
+	size_t need = vert_count * sizeof(vertex);
+	if (not staging or staging.info().size < need)
+	{
+		staging = buffer_allocation(
+		        *device,
+		        vk::BufferCreateInfo{
+		                .size = need,
+		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "debug lines");
+	}
+	std::memcpy(staging.map(), verts, need);
+	staging.unmap();
+
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_tri);
+	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
+
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		auto & tgt = targets[image_index][eye];
 		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                    {},

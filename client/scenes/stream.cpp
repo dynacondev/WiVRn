@@ -1434,6 +1434,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			gizmo_lines->record(command_buffer, (size_t)image_index, eye_ext, eye_mvp, diag,
 			                    sizeof(diag) / sizeof(diag[0]), false);
+			// TEMP topology twin: same everything, triangles. Tri-visible
+			// + lines-invisible convicts line rasterization; neither
+			// visible convicts shared infra (framebuffer/barrier/layout).
+			const vtx tri[] = {
+			        {{-0.6f, -0.6f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{0.6f, -0.6f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			        {{0.f, 0.6f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
+			};
+			gizmo_lines->record_tris(command_buffer, (size_t)image_index, eye_ext, eye_mvp, tri,
+			                         sizeof(tri) / sizeof(tri[0]));
 		}
 	}
 
@@ -2183,7 +2193,7 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// Debug line overlays share the video swapchain lifetime (framebuffers
 	// per image); rebuilt here so stale VkImages never linger.
 	gizmo_lines.emplace(device, swapchain.format(), swapchain.images(), extent);
-	spdlog::info("Debug lines: {} eye images", swapchain.images().size());
+	spdlog::info("Debug lines: {} eye images (tri-diag ON)", swapchain.images().size());
 }
 
 scene::meta & scenes::stream::get_meta_scene()
