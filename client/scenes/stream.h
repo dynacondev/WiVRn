@@ -281,6 +281,11 @@ private:
 		int tags_visible = 0, tags_used = 0;
 		bool single = true;
 		std::vector<xr::board_tag_stat> tag_stats;
+		// True when any marker carries a non-trivial offset (position or
+		// orientation): the board origin then sits apart from the tags
+		// and earns its own origin tripod in the debug overlay.
+		bool has_offset = false;
+		float tag_size_m = 0; // max over voting markers (gizmo scale)
 	};
 	std::map<std::string /*fiducial id*/, board_fused> board_poses;
 	// Warm starts for the solver (fiducial id -> last fused pose).
@@ -351,6 +356,7 @@ private:
 		std::map<std::string /*payload*/, corrected_tag> corrected_tags;
 		bool debug_corrected = true; // orange: fused-corrected tag boxes
 		bool debug_axes = true; // RGB XYZ tripod on sighted tags (orientation/polarity check)
+		bool debug_origin = true; // larger tripod + center square at fused board origins (offset check)
 
 		// Fiducial marker debugging (Passthrough tab, session-scoped,
 		// render thread only). Raw instant poses while visible, frozen

@@ -1627,14 +1627,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// colorScaleBias at submit (after draw_gui, so overlays sit on
 		// top of everything). Refilled every acquire (trivial cost, no
 		// per-image tracking). Command buffer still open here.
-		if (fp.debug_overlays and (fp.debug_matched or fp.debug_unmatched))
+		if (fp.debug_overlays and
+		    (fp.debug_matched or fp.debug_unmatched or fp.debug_axes or fp.debug_origin or fp.debug_corrected))
 		{
 			bool any = false;
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;
 				if (h.extents.width > 0 and h.extents.height > 0 and
-				    ((h.matched and fp.debug_matched) or (not h.matched and fp.debug_unmatched)))
+				    ((h.matched and fp.debug_matched) or (not h.matched and fp.debug_unmatched) or fp.debug_axes or
+				     fp.debug_origin or fp.debug_corrected))
 				{
 					any = true;
 					break;
@@ -1938,7 +1940,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (composition_layer_color_scale_bias_supported)
 					set_color_scale_bias({r * a, g * a, b * a, a}, {});
 			};
-			size_t n_quad = 0, n_axes = 0;
+			size_t n_quad = 0, n_axes = 0, n_origin = 0;
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;
@@ -1999,6 +2001,42 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					++n_quad;
 				}
 			}
+			// Origin tripods: fused board origins, larger + thinner shafts than
+			// the tag tripods plus a white center square (distinct at a glance).
+			// Only when a transform separates origin from tags (identity offsets
+			// coincide with the tag tripod: nothing extra to verify). Same fade.
+			if (fp.debug_origin)
+			{
+				for (const auto & [fid, bp]: board_poses)
+				{
+					(void)fid;
+					if (not bp.has_offset or bp.tag_size_m <= 0)
+						continue;
+					float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+						fiducial_passthrough_state::stale_hold(dbg_now, bp.time);
+					if (a <= 0.01f)
+						continue;
+					float len = bp.tag_size_m * 1.5f;
+					float thin = len * 0.05f;
+					float sq = len * 0.25f;
+					glm::quat bq(bp.pose.orientation.w, bp.pose.orientation.x,
+					             bp.pose.orientation.y, bp.pose.orientation.z);
+					glm::vec3 bt(bp.pose.position.x, bp.pose.position.y, bp.pose.position.z);
+					submit_quad(bp.pose, len, thin, 1.f, 0.f, 0.f, a);
+					++n_origin;
+					submit_quad(bp.pose, thin, len, 0.f, 1.f, 0.f, a);
+					++n_origin;
+					for (float yaw: {-90.f, 90.f})
+					{
+						glm::quat qz = bq * glm::angleAxis(glm::radians(yaw), glm::vec3(0, 1, 0));
+						XrPosef zp{.orientation = {qz.x, qz.y, qz.z, qz.w}, .position = {bt.x, bt.y, bt.z}};
+						submit_quad(zp, len, thin, 0.f, 0.f, 1.f, a);
+						++n_origin;
+					}
+					submit_quad(bp.pose, sq, sq, 1.f, 1.f, 1.f, a);
+					++n_origin;
+				}
+			}
 			// Heartbeat inventory: submitted counts + per-quad detail (poses
 			// distinguish marker quads from stuck/ghost ones). Faded-out quads
 			// are skipped above and omitted here too.
@@ -2006,7 +2044,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (dbg_now - last_dbg_log > 5000000000LL)
 			{
 				last_dbg_log = dbg_now;
-				spdlog::info("Fiducial debug quads: {} submitted ({} axes)", n_quad, n_axes);
+				spdlog::info("Fiducial debug quads: {} submitted ({} axes, {} origin)", n_quad, n_axes, n_origin);
 				for (const auto & [id, h]: fp.held_codes)
 				{
 					(void)id;

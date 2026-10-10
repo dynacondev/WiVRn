@@ -395,6 +395,23 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	}
 	for (const auto & f: map.fiducials)
 	{
+		// Origin-tripod inputs: a non-trivial marker offset puts the
+		// board origin apart from the tags. Position threshold 2mm,
+		// angle threshold 1deg (both far below real rig offsets, far
+		// above float/config noise).
+		bool has_offset = false;
+		float tag_size = 0;
+		for (const auto & m: f.markers)
+		{
+			tag_size = std::max(tag_size, m.marker_size_m);
+			float pp = m.position[0] * m.position[0] + m.position[1] * m.position[1] + m.position[2] * m.position[2];
+			float qa = 2.f * std::acos(std::clamp(std::abs(m.orientation[3]), 0.f, 1.f)) * 57.29577951308232f;
+			if (pp > 0.002f * 0.002f or qa > 1.f)
+			{
+				has_offset = true;
+				break;
+			}
+		}
 		std::vector<xr::board_vote> bv;
 		for (const auto & v: fiducial_votes)
 		{
@@ -445,6 +462,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			bp.tags_used += t.used;
 		bp.tags_visible = (int)sol.tags.size();
 		bp.tag_stats = std::move(sol.tags);
+		bp.has_offset = has_offset;
+		bp.tag_size_m = tag_size;
 		fp.last_solve_ms = std::max(fp.last_solve_ms, sol.solve_us * 1e-3);
 		// Orange overlay inputs: each tag re-projected from the fused
 		// board pose with its AUTHORED offset (predicted = fused *
@@ -655,6 +674,7 @@ void scenes::stream::gui_passthrough()
 		fp.debug_window_mm = std::clamp(fp.debug_window_mm, -1, 512);
 	ImGui::Checkbox(_S("Corrected tags (orange)"), &fp.debug_corrected);
 	ImGui::Checkbox(_S("Axes gizmo (RGB=XYZ)"), &fp.debug_axes);
+	ImGui::Checkbox(_S("Origin tripod (offset boards)"), &fp.debug_origin);
 	if (ImGui::Button(_S("Run board solver self-test")))
 		xr::board_solver_selftest();
 	if (not fp.held_codes.empty())
