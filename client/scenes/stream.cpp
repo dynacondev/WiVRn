@@ -1408,8 +1408,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				eye_mvp[view] = world_mvp[view];
 			}
 			gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
-			// TEMP diagnostic readout: first vert through the eye-0 MVP on
-			// CPU. NDC inside [-1,1] exonerates the mapping chain.
+			// Mapping readout: first vert through the eye-0 MVP on CPU.
+			// NDC inside [-1,1] exonerates the mapping chain.
 			glm::vec4 clip = eye_mvp[0] * glm::vec4(tris[0].pos[0], tris[0].pos[1], tris[0].pos[2], 1.f);
 			if (clip.w > 1e-9f)
 			{
@@ -1968,7 +1968,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (fp.debug_overlays and dbg_now - last_dbg_log > 5000000000LL)
 		{
 			last_dbg_log = dbg_now;
-			// TEMP diagnostic readout (see record site): NDC inside [-1,1]
+			// Mapping readout (see record site): NDC inside [-1,1]
 			// exonerates the mapping chain; view/img identify the target.
 			if (fp.dbg_have_ndc)
 				spdlog::info("Fiducial debug lines: {} boxes, {} tris, ndc ({:.2f},{:.2f}) w {:.1f} view {}x{} img {}",

@@ -29,12 +29,12 @@
 #include "vk/allocation.h"
 #include "xr/swapchain.h"
 
-// World-space debug line renderer: 1px line segments (position + RGBA)
+// World-space debug gizmo renderer: thin triangles (position + RGBA)
 // composited as ONE transparent projection layer (standard alpha blend,
 // no FB extensions needed). One layer always: no per-quad layers, so
-// maxLayerCount can never overflow no matter the tag count. Lines have
-// no faces, so no facing math and no backface doubling. Blending is in
-// the pipeline.
+// maxLayerCount can never overflow no matter the tag count. Triangles
+// are double-sided (cull off), so no facing math and no backface
+// doubling. Blending is in the pipeline.
 //
 // Own swapchain, CLEAR every frame (UNDEFINED initial: no layout history
 // is ever assumed — the eye-image LOAD variant of this class died on
