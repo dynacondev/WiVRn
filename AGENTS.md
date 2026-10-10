@@ -18,6 +18,10 @@ cmake --preset client && cmake --build build-client       # linux debug client o
 # macOS local configure needs homebrew ffmpeg visible + no pipewire/system-openxr/system-ktx:
 # export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
 # cmake --preset client -DWIVRN_USE_PIPEWIRE=OFF -DWIVRN_USE_SYSTEM_OPENXR=OFF -DWIVRN_USE_SYSTEM_LIBKTX=OFF
+# (macOS host build itself is NOT green: pre-existing Linux-isms in common/
+# + LunarG /usr/local SDK vs -Wundef. Validate client code via
+# ./gradlew assembleDebug instead; add -DCMAKE_CXX_FLAGS="-Wno-error=undef"
+# to keep host configure useful.)
 ./gradlew assembleRelease  # real headset APK, needs ANDROID_HOME, Java 17, ks.keystore + signingKeyPassword in gradle.properties (local OK)
 # Remote-only (separate Linux machine, reference — do not run here):
 # cmake --preset server && cmake --build build-server
@@ -85,6 +89,14 @@ inert unless set; full flow in `docs/profiling.md`.
   (`docs/configuration.md#fiducials-and-passthrough`).
 - `common/wivrn_packets.h` + `wivrn_serialization*.h` define the
   wire protocol — keep client/server in sync; no compat layer.
+- Board fusion: `client/xr/board_solver.{h,cpp}` (Eigen 3.4.0 +
+  manif 0.0.5, both FetchContent; tiny_solver vendored in
+  `client/thirdparty/`). Single-node SE(3), LOO-subset selection,
+  trimmed cost, Cauchy IRLS. Gradle builds `targets "wivrn"` only so
+  dep test/bench trees never build. In-app self-test button in the
+  Passthrough tab; `board solve:` logcat lines are the tuning
+  instrument. Pose filtering/smoothing TEMP-disabled (files stay,
+  unreferenced) until fusion is verified on-device.
 
 ## Mask perf (active feat/markerboard work — keep)
 
