@@ -260,9 +260,8 @@ Each `passthrough` entry (behavior object) has:
   (alpha-gradient blend band around the mesh silhouette, default `24`;
   `0` disables feathering). Mask stacks group by this value so each
   object feathers independently; applied live. The client selects a blur
-  tier automatically (0 hard edge, 1 half-res with full-res upscale,
-  2/4 quarter, 8 eighth
-  with exact spread mapping, clamped to 128px), so tap density and cost
+   tier automatically (0 hard edge, 1 half-res, 2/4 quarter, 8 eighth
+   with exact spread mapping, clamped to 128px), so tap density and cost
   stay flat at any width. Feathered groups submit half-resolution mask
   images (the V upscale writes half pixels; the compositor expands to
   full); tier-0 stays full.

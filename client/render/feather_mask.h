@@ -221,9 +221,9 @@ private:
 	std::map<std::string, mesh_buffers> meshes;
 	void flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh);
 
-	// Marker window-cutout quad (two world-space triangles, rewritten per
-	// record via the persistent VMA mapping). Created lazily on first
-	// cutout use.
+	// Marker window-cutout quads (two world-space triangles each, batched
+	// per record with one upload + firstVertex draws, unmapped to flush).
+	// Grown on demand; created lazily on first cutout use.
 	buffer_allocation cutout_verts;
 
 	// Framebuffers + views per swapchain image (images cycle; entries for
