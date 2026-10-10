@@ -1319,10 +1319,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for
-					// fully-culled groups, which cost nothing). Conservative:
-					// any w<=0 corner (behind camera flips projection) keeps
-					// the draw; the NDC box grows by the feather bleed + 1px
-					// so blur contributions survive culling (pixel-exact).
+					// fully-culled groups, which cost nothing).
+					// Conservative and exact: per eye, skip only if every
+					// corner is either behind the camera (w<0, all of them:
+					// fully behind the near plane, the GPU clips it all) or
+					// outside a common side with w>0; any w<0 mixed with
+					// w>=0 straddles the plane and is kept. The NDC box
+					// grows by the feather bleed + 1px so blur contributions
+					// survive culling (pixel-exact output).
 					float margin_x = (f * 0.5f + 1.f) / ((float)mw * 0.5f);
 					float margin_y = (f * 0.5f + 1.f) / ((float)mh * 0.5f);
 					auto draw_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
@@ -1331,18 +1335,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							return true;
 						for (uint32_t view = 0; view < 2; ++view)
 						{
+							// Skip this eye only if every corner is either
+							// behind the camera (all of them: fully behind
+							// the near plane, the GPU clips it all) or
+							// outside a common side with w>=0. Mixed signs
+							// straddle the plane and are always kept.
+							bool any_front = false, any_behind = false, any_inside = false;
 							for (int corner = 0; corner < 8; ++corner)
 							{
 								glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
 								            (corner & 2) ? bounds->second.y : bounds->first.y,
 								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
 								glm::vec4 c = draw_mvp[view] * q;
-								if (c.w <= 0)
-									return true;
+								if (c.w < 0)
+								{
+									any_behind = true;
+									continue;
+								}
+								any_front = true;
 								if (glm::abs(c.x) <= c.w * (1.f + margin_x) and
 								    glm::abs(c.y) <= c.w * (1.f + margin_y) and c.z >= 0 and c.z <= c.w)
-									return true;
+									any_inside = true;
 							}
+							bool skip_eye = not any_front or (not any_behind and not any_inside);
+							if (not skip_eye)
+								return true;
 						}
 						return false;
 					};
