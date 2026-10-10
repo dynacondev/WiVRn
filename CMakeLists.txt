@@ -277,7 +277,16 @@ FetchContent_Declare(entt          EXCLUDE_FROM_ALL SYSTEM URL https://github.co
 FetchContent_Declare(curl          EXCLUDE_FROM_ALL SYSTEM URL https://github.com/curl/curl/releases/download/curl-8_17_0/curl-8.17.0.tar.xz
                                    URL_HASH SHA256=955f6e729ad6b3566260e8fef68620e76ba3c31acf0a18524416a185acf77992)
 FetchContent_Declare(spirv-reflect EXCLUDE_FROM_ALL SYSTEM URL https://github.com/KhronosGroup/SPIRV-Reflect/archive/refs/tags/vulkan-sdk-1.4.328.1.tar.gz
-                                   URL_HASH SHA256=77f4b5b5630d960d7c17e39ddd5bf2e7dd62e6d8da24259ed14ca5b59783ea35)
+                                 URL_HASH SHA256=77f4b5b5630d960d7c17e39ddd5bf2e7dd62e6d8da24259ed14ca5b59783ea35)
+
+# Fiducial board pose fusion (client only): Eigen (linear algebra) + manif
+# (Lie theory, analytic SE(3) Jacobians). Header-only; made available in
+# client/CMakeLists.txt. tiny_solver (dense LM loop) is vendored, not
+# fetched, see client/thirdparty/tiny_solver/README.md.
+FetchContent_Declare(eigen          EXCLUDE_FROM_ALL SYSTEM URL https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.tar.gz
+                                   URL_HASH SHA256=8586084f71f9bde545ee7fa6d00288b264a2b7ac3607b974e54d13e7162c1c72)
+FetchContent_Declare(manif          EXCLUDE_FROM_ALL SYSTEM GIT_REPOSITORY https://github.com/artivis/manif.git
+                                   GIT_TAG 0.0.5)
 
 file(GLOB MONADO_PATCHES CONFIGURE_DEPENDS patches/monado/*)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS monado-rev)

@@ -15,6 +15,9 @@ client-only — do NOT build `server` or `dashboard` on this machine
 
 ```bash
 cmake --preset client && cmake --build build-client       # linux debug client only (local OK)
+# macOS local configure needs homebrew ffmpeg visible + no pipewire/system-openxr/system-ktx:
+# export PKG_CONFIG_PATH="/opt/homebrew/lib/pkgconfig:$PKG_CONFIG_PATH"
+# cmake --preset client -DWIVRN_USE_PIPEWIRE=OFF -DWIVRN_USE_SYSTEM_OPENXR=OFF -DWIVRN_USE_SYSTEM_LIBKTX=OFF
 ./gradlew assembleRelease  # real headset APK, needs ANDROID_HOME, Java 17, ks.keystore + signingKeyPassword in gradle.properties (local OK)
 # Remote-only (separate Linux machine, reference — do not run here):
 # cmake --preset server && cmake --build build-server

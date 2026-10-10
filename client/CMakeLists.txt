@@ -12,6 +12,12 @@ set(SPIRV_REFLECT_STATIC_LIB ON)
 set(SPIRV_REFLECT_INSTALL OFF)
 
 FetchContent_MakeAvailable(simdjson spdlog glm fastgltf imgui stb implot uni-algo entt spirv-reflect)
+
+# Fiducial board fusion deps: Eigen + manif (header-only). tiny_solver is
+# vendored, see thirdparty/tiny_solver/README.md.
+FetchContent_MakeAvailable(eigen manif)
+add_library(tinysolver INTERFACE)
+target_include_directories(tinysolver SYSTEM INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/tiny_solver)
 if(ANDROID AND WIVRN_USE_ANDROID_BIN_LIBKTX)
     if(NOT EXISTS ${FETCHCONTENT_BASE_DIR}/KTX-Software-${KTX_VERSION}-Android.zip)
         file(DOWNLOAD
@@ -160,16 +166,19 @@ wivrn_compile_glsl(wivrn SHADERS ${VULKAN_SHADERS})
 target_link_libraries(wivrn
     Boost::locale
     Boost::url
+    Eigen3::Eigen
     EnTT::EnTT
     fastgltf
     FreetypeHarfbuzz
     glm::glm
     imspinner
     ktx
+    manif
     simdjson
     spdlog::spdlog
     spirv-reflect-static
     stb
+    tinysolver
     uni-algo
     Vulkan::Vulkan
     wivrn-common
