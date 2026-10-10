@@ -145,7 +145,6 @@ public:
 	void reset_targets()
 	{
 		targets.clear();
-		merged_targets.clear();
 	}
 
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
@@ -191,15 +190,6 @@ private:
 	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
 	// reads the push block's src_texel prefix).
 	vk::raii::Pipeline downsample_pipeline{nullptr};
-	// Merged tier-1 pass: raster + H + V in one render pass (3 subpasses)
-	// with transient A/B intermediates (CLEAR/DONT_CARE and
-	// DONT_CARE/DONT_CARE, so tile GPUs never round-trip them to DRAM).
-	// Same shaders/layouts as the split passes (blur keeps sampler reads,
-	// only attachment layouts change); one pipeline per subpass.
-	vk::raii::RenderPass merged_renderpass{nullptr};
-	vk::raii::Pipeline merged_raster_pipeline{nullptr};
-	vk::raii::Pipeline merged_h_pipeline{nullptr};
-	vk::raii::Pipeline merged_v_pipeline{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// One set per (pass, eye): descriptor updates are host-side writes
@@ -230,7 +220,7 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	void update_source(vk::ImageView view, uint32_t set, vk::ImageLayout layout = vk::ImageLayout::eGeneral);
+	void update_source(vk::ImageView view, uint32_t set);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
 	// shared-read (uploads are rare, map-change only); the pending copy
@@ -273,21 +263,4 @@ private:
 		}
 	};
 	std::unordered_map<VkImage, frame_targets> targets;
-
-	// Merged tier-1 framebuffers: [A_view, B_view, swapchain_view] per eye
-	// at half extent. The views are owned elsewhere (intermediates above,
-	// swapchain entry in targets); only the framebuffers are cached here,
-	// keyed by swapchain image like targets (same stale-handle hazard,
-	// same reset_targets() cover).
-	struct merged_frame_targets
-	{
-		vk::Extent2D extent;
-		std::array<vk::raii::Framebuffer, 2> framebuffers;
-		merged_frame_targets(vk::Extent2D extent_, std::array<vk::raii::Framebuffer, 2> framebuffers_) :
-		        extent(extent_),
-		        framebuffers(std::move(framebuffers_))
-		{
-		}
-	};
-	std::unordered_map<VkImage, merged_frame_targets> merged_targets;
 };

@@ -346,111 +346,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	blur_r8_renderpass = vk::raii::RenderPass(device, blur_r8_rp_info);
 
-	// Merged tier-1 pass (see header): raster clears transient A, H reads
-	// A into transient B, V reads B into the submitted swapchain image.
-	// A/B are DONT_CARE store, so tile GPUs keep them on-chip and only
-	// the submitted image round-trips to DRAM. All attachments share the
-	// half extent (tier-1 submits half); record() uses the split passes
-	// when out ever differs. BY_REGION dependencies make each handoff
-	// tile-local; the blur shaders keep sampler reads, so only layouts
-	// change (COLOR_ATTACHMENT vs SHADER_READ).
-	vk::AttachmentDescription merged_attachments[3] = {
-	        {
-	                .format = blur_format,
-	                .samples = vk::SampleCountFlagBits::e1,
-	                .loadOp = vk::AttachmentLoadOp::eClear,
-	                .storeOp = vk::AttachmentStoreOp::eDontCare,
-	                .initialLayout = vk::ImageLayout::eUndefined,
-	                .finalLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        },
-	        {
-	                .format = blur_format,
-	                .samples = vk::SampleCountFlagBits::e1,
-	                .loadOp = vk::AttachmentLoadOp::eDontCare,
-	                .storeOp = vk::AttachmentStoreOp::eDontCare,
-	                .initialLayout = vk::ImageLayout::eUndefined,
-	                .finalLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        },
-	        {
-	                .format = format,
-	                .samples = vk::SampleCountFlagBits::e1,
-	                .loadOp = vk::AttachmentLoadOp::eDontCare,
-	                .storeOp = vk::AttachmentStoreOp::eStore,
-	                .initialLayout = vk::ImageLayout::eUndefined,
-	                .finalLayout = vk::ImageLayout::eGeneral,
-	        },
-	};
-	vk::AttachmentReference merged_s0_color{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::AttachmentReference merged_s1_input{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	};
-	vk::AttachmentReference merged_s1_color{
-	        .attachment = 1,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::AttachmentReference merged_s2_input{
-	        .attachment = 1,
-	        .layout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	};
-	vk::AttachmentReference merged_s2_color{
-	        .attachment = 2,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::SubpassDescription merged_subpasses[3] = {
-	        {
-	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	                .colorAttachmentCount = 1,
-	                .pColorAttachments = &merged_s0_color,
-	        },
-	        {
-	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	                .inputAttachmentCount = 1,
-	                .pInputAttachments = &merged_s1_input,
-	                .colorAttachmentCount = 1,
-	                .pColorAttachments = &merged_s1_color,
-	        },
-	        {
-	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	                .inputAttachmentCount = 1,
-	                .pInputAttachments = &merged_s2_input,
-	                .colorAttachmentCount = 1,
-	                .pColorAttachments = &merged_s2_color,
-	        },
-	};
-	vk::SubpassDependency merged_deps[2] = {
-	        {
-	                .srcSubpass = 0,
-	                .dstSubpass = 1,
-	                .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	                .dstStageMask = vk::PipelineStageFlagBits::eFragmentShader,
-	                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-	                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-	        },
-	        {
-	                .srcSubpass = 1,
-	                .dstSubpass = 2,
-	                .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	                .dstStageMask = vk::PipelineStageFlagBits::eFragmentShader,
-	                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-	                .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-	        },
-	};
-	vk::RenderPassCreateInfo merged_rp_info{
-	        .attachmentCount = 3,
-	        .pAttachments = merged_attachments,
-	        .subpassCount = 3,
-	        .pSubpasses = merged_subpasses,
-	        .dependencyCount = 2,
-	        .pDependencies = merged_deps,
-	};
-	merged_renderpass = vk::raii::RenderPass(device, merged_rp_info);
-
 	auto blur_vert = load_shader(device, "blur.vert");
 	auto blur_frag = load_shader(device, "blur.frag");
 	vk::PipelineShaderStageCreateInfo blur_stages[2] = {
@@ -554,56 +449,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .renderPass = *blur_r8_renderpass,
 	};
 	blur_r8_pipeline = vk::raii::Pipeline(device, nullptr, blur_r8_pipeline_info);
-
-	// Merged tier-1 pipelines: same shaders/state as the split passes,
-	// bound to the merged subpasses above (raster 0, H 1, V 2).
-	vk::GraphicsPipelineCreateInfo merged_raster_info{
-	        .stageCount = 2,
-	        .pStages = stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *pipeline_layout,
-	        .renderPass = *merged_renderpass,
-	        .subpass = 0,
-	};
-	merged_raster_pipeline = vk::raii::Pipeline(device, nullptr, merged_raster_info);
-
-	vk::GraphicsPipelineCreateInfo merged_h_info{
-	        .stageCount = 2,
-	        .pStages = blur_stages,
-	        .pVertexInputState = &blur_vertex_input,
-	        .pInputAssemblyState = &blur_input_assembly,
-	        .pViewportState = &blur_viewport_state,
-	        .pRasterizationState = &blur_rasterization,
-	        .pMultisampleState = &blur_multisample,
-	        .pColorBlendState = &blur_blend,
-	        .pDynamicState = &blur_dynamic,
-	        .layout = *blur_layout,
-	        .renderPass = *merged_renderpass,
-	        .subpass = 1,
-	};
-	merged_h_pipeline = vk::raii::Pipeline(device, nullptr, merged_h_info);
-
-	vk::GraphicsPipelineCreateInfo merged_v_info{
-	        .stageCount = 2,
-	        .pStages = blur_stages,
-	        .pVertexInputState = &blur_vertex_input,
-	        .pInputAssemblyState = &blur_input_assembly,
-	        .pViewportState = &blur_viewport_state,
-	        .pRasterizationState = &blur_rasterization,
-	        .pMultisampleState = &blur_multisample,
-	        .pColorBlendState = &blur_blend,
-	        .pDynamicState = &blur_dynamic,
-	        .layout = *blur_layout,
-	        .renderPass = *merged_renderpass,
-	        .subpass = 2,
-	};
-	merged_v_pipeline = vk::raii::Pipeline(device, nullptr, merged_v_info);
 
 	// Box-downsample pipeline: same fullscreen vertex shader, same layout
 	// (reads only the push prefix); R8 throughout (intermediates only).
@@ -955,12 +800,12 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	                    {});
 }
 
-void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, vk::ImageLayout layout)
+void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set)
 {
 	vk::DescriptorImageInfo image_info{
 	        .sampler = *sampler,
 	        .imageView = view,
-	        .imageLayout = layout,
+	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	vk::WriteDescriptorSet write{
 	        .dstSet = *descriptor_sets[set],
@@ -1227,165 +1072,63 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		else if (tier == 1)
 		{
 		// Stages 1+2+3 per eye: raster into half-res A, H into half-res B,
-		// V into the submitted (half-res) swapchain image. Eye-outer order
-		// (each eye's chain completes before the next eye starts) keeps that
-		// eye's tiles hot. One descriptor set per eye (see header): re-pointed
-		// per level, each written once per frame.
+		// V upscale into the swapchain image. Eye-outer order (each eye's
+		// chain completes before the next eye starts) keeps that eye's
+		// tiles hot; same passes, pushes and clears as the old per-pass
+		// loops. One descriptor set per eye (see header): re-pointed per
+		// pass, each written once per frame.
 		std::array<uint32_t, 0> no_offsets{};
 		blur_push base{
 		        .texel = {1.f / half_extent.width, 1.f / half_extent.height},
 		        .spread = spread,
 		};
-		// Merged single-pass form needs one shared extent (always true:
-		// feathered groups submit half); otherwise the split passes below run
-		// instead (identical work, separate round-trips). Flip to false for a
-		// control run against the merged path.
-		bool use_merged = (out_extent.width == half_extent.width and out_extent.height == half_extent.height);
-		if (use_merged)
+		for (int eye = 0; eye < 2; ++eye)
 		{
-			auto mit = merged_targets.find(image);
-			if (mit == merged_targets.end() or mit->second.extent.width != out_extent.width or
-			    mit->second.extent.height != out_extent.height)
 			{
-				if (mit != merged_targets.end())
-					merged_targets.erase(mit);
-				// NOTE: views below are named locals, not &* temporaries: the
-				// framebuffer create-info stores the pointer (house idiom, cf.
-				// the targets map above).
-				vk::ImageView raw_a[2] = {*target_a.views[0], *target_a.views[1]};
-				vk::ImageView raw_b[2] = {*target_b.views[0], *target_b.views[1]};
-				vk::ImageView raw_s[2] = {*it->second.views[0], *it->second.views[1]};
-				std::array<vk::raii::Framebuffer, 2> mfb{{
-				        [&] {
-					        vk::ImageView atts[3] = {raw_a[0], raw_b[0], raw_s[0]};
-					        vk::FramebufferCreateInfo fb_info{
-					                .renderPass = *merged_renderpass,
-					                .attachmentCount = 3,
-					                .pAttachments = atts,
-					                .width = half_extent.width,
-					                .height = half_extent.height,
-					                .layers = 1,
-					        };
-					        return vk::raii::Framebuffer(device, fb_info);
-				        }(),
-				        [&] {
-					        vk::ImageView atts[3] = {raw_a[1], raw_b[1], raw_s[1]};
-					        vk::FramebufferCreateInfo fb_info{
-					                .renderPass = *merged_renderpass,
-					                .attachmentCount = 3,
-					                .pAttachments = atts,
-					                .width = half_extent.width,
-					                .height = half_extent.height,
-					                .layers = 1,
-					        };
-					        return vk::raii::Framebuffer(device, fb_info);
-				        }(),
-				}};
-				mit = merged_targets.emplace(image, merged_frame_targets(out_extent, std::move(mfb))).first;
+				section_clock raster_clk(&ms_raster);
+				raster_silhouette(*target_a.raster_fbs[eye], half_extent, eye, raster_r8_pipeline, raster_r8_renderpass);
 			}
-			for (int eye = 0; eye < 2; ++eye)
-			{
-				{
-					section_clock raster_clk(&ms_raster);
-					vk::RenderPassBeginInfo begin_m{
-					        .renderPass = *merged_renderpass,
-					        .framebuffer = *mit->second.framebuffers[eye],
-					        .renderArea = {.offset = {0, 0}, .extent = half_extent},
-					        .clearValueCount = 1,
-					        .pClearValues = &clear,
-					};
-					cmd.beginRenderPass(begin_m, vk::SubpassContents::eInline);
-					set_full_viewport(half_extent);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *merged_raster_pipeline);
-					for (const auto & d: draws)
-					{
-						auto dit = meshes.find(d.mesh);
-						if (dit == meshes.end() or dit->second.index_count == 0)
-							continue;
-						cmd.bindVertexBuffers(0, (vk::Buffer)*dit->second.vertex_buffer, (vk::DeviceSize)0);
-						cmd.bindIndexBuffer(*dit->second.index_buffer, 0, vk::IndexType::eUint32);
-						cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-						                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
-						cmd.drawIndexed(dit->second.index_count, 1, 0, 0, 0);
-						++n_draws;
-					}
-				}
-				section_clock blur_clk(&ms_blur);
-				update_source(*target_a.views[eye], eye, vk::ImageLayout::eShaderReadOnlyOptimal);
-				update_source(*target_b.views[eye], 2 + eye, vk::ImageLayout::eShaderReadOnlyOptimal);
-				cmd.nextSubpass(vk::SubpassContents::eInline);
-				set_full_viewport(half_extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *merged_h_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
-				blur_push push = base;
-				push.dir[0] = 1;
-				push.dir[1] = 0;
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
-				cmd.draw(3, 1, 0, 0);
-				cmd.nextSubpass(vk::SubpassContents::eInline);
-				set_full_viewport(half_extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *merged_v_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
-				blur_push push_v = base;
-				push_v.dir[0] = 0;
-				push_v.dir[1] = 1;
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
-				cmd.draw(3, 1, 0, 0);
-				cmd.endRenderPass();
-			}
-		}
-		else
-		{
-			for (int eye = 0; eye < 2; ++eye)
-			{
-				{
-					section_clock raster_clk(&ms_raster);
-					raster_silhouette(*target_a.raster_fbs[eye], half_extent, eye, raster_r8_pipeline, raster_r8_renderpass);
-				}
-				make_readable(*target_a.image);
-				section_clock blur_clk(&ms_blur);
-				update_source(*target_a.views[eye], eye);
-				vk::RenderPassBeginInfo begin_h{
-				        .renderPass = *blur_r8_renderpass,
-				        .framebuffer = *target_b.blur_fbs[eye],
-				        .renderArea = {.offset = {0, 0}, .extent = half_extent},
-				        .clearValueCount = 1,
-				        .pClearValues = &clear,
-				};
-				cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
-				set_full_viewport(half_extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
-				blur_push push = base;
-				push.dir[0] = 1;
-				push.dir[1] = 0;
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
-				cmd.draw(3, 1, 0, 0);
-				cmd.endRenderPass();
-				make_readable(*target_b.image);
-				update_source(*target_b.views[eye], 2 + eye);
-				vk::RenderPassBeginInfo begin_v{
-				        .renderPass = *blur_renderpass,
-				        .framebuffer = *it->second.framebuffers[eye],
-				        .renderArea = {.offset = {0, 0}, .extent = out_extent},
-				        .clearValueCount = 1,
-				        .pClearValues = &clear,
-				};
-				cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
-				set_full_viewport(out_extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
-				blur_push push_v = base;
-				push_v.dir[0] = 0;
-				push_v.dir[1] = 1;
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
-				cmd.draw(3, 1, 0, 0);
-				cmd.endRenderPass();
-			}
+			make_readable(*target_a.image);
+			section_clock blur_clk(&ms_blur);
+			update_source(*target_a.views[eye], eye);
+			vk::RenderPassBeginInfo begin_h{
+			        .renderPass = *blur_r8_renderpass,
+			        .framebuffer = *target_b.blur_fbs[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = half_extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
+			set_full_viewport(half_extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline);
+			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
+			blur_push push = base;
+			push.dir[0] = 1;
+			push.dir[1] = 0;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+			make_readable(*target_b.image);
+			update_source(*target_b.views[eye], 2 + eye);
+			vk::RenderPassBeginInfo begin_v{
+			        .renderPass = *blur_renderpass,
+			        .framebuffer = *it->second.framebuffers[eye],
+			        .renderArea = {.offset = {0, 0}, .extent = out_extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
+			set_full_viewport(out_extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
+			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
+			blur_push push_v = base;
+			push_v.dir[0] = 0;
+			push_v.dir[1] = 1;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
 		}
 		} // tier == 1
 		else

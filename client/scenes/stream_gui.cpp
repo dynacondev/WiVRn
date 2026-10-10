@@ -145,7 +145,9 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		acc.sum_cpu += s.cpu.total_ms;
 		acc.frames += 1;
 		acc.tier = s.cpu.tier;
-		acc.draws = s.cpu.draws;
+		// Max, not last: a trailing culled/empty sample would otherwise
+		// report draws=0 for a group that drew all window.
+		acc.draws = std::max(acc.draws, s.cpu.draws);
 	}
 	global_metrics[metrics_offset].mask_gpu_time = (float)(mask_gpu_sum_ms * 1e-3);
 	global_metrics[metrics_offset].mask_cpu_time = (float)(mask_cpu_sum_ms * 1e-3);

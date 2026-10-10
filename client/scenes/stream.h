@@ -373,10 +373,6 @@ private:
 		// Mask stacks grouped by feather-px: objects sharing a feather
 		// value raster into one shared blur chain (independent feathering
 		// per object, one mask layer per group). Render thread only.
-		// Groups drop out only after cull_hysteresis_frames consecutive
-		// fully-culled frames (below): single-frame boundary dither would
-		// otherwise flap acquire/record/submit and swing frame totals.
-		static constexpr uint32_t cull_hysteresis_frames = 4;
 		struct mask_group
 		{
 			float feather_px = 24;
@@ -394,9 +390,6 @@ private:
 			uint32_t images_outstanding = 0;
 			XrExtent2Di extent{0, 0};
 			bool active = false; // submitting this frame
-			// Consecutive fully-culled frames while still submitting
-			// (hysteresis: drop only after cull_hysteresis_frames).
-			uint32_t culled_frames = 0;
 			// Uploaded object soups by object id (hash compare avoids
 			// re-upload; renderer mirrors).
 			std::map<std::string, std::string> mesh_hashes;

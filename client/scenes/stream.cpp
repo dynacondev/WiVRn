@@ -1288,11 +1288,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// value; member objects contribute soups, anchored instances
 		// contribute draws. Dedicated member swapchains with explicit
 		// acquire/release pairing (never the shared pool).
-		//
-		// Cutout bypass DISABLED (diagnostic complete): the rasterized
-		// silhouette applies the window. Set true only to re-validate
-		// plumbing with a transparent mask (full game video).
-		static constexpr bool mask_bypass_cutout = false;
 		try
 		{
 			mask_frame = false;
@@ -1505,29 +1500,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							draws.push_back({oid, mvp, op});
 						}
 					}
-					// Hysteresis on the cull gate: a group that submitted last
-					// frame lingers through brief full culls (empty draws
-					// record transparent) instead of flapping
-					// acquire/record/submit, which swings frame totals by
-					// milliseconds for meshes dithering on the cull
-					// boundary. Appear is instant (non-empty draws reset
-					// below); disappear lingers at most
-					// cull_hysteresis_frames - 1 extra frames, invisible
-					// (fully off-screen). Never-active groups skip
-					// immediately (no warmup cost).
 					if (draws.empty())
 					{
-						// Linger (fall through with empty draws) unless the
-						// group never submitted or the cull overstayed.
-						if (not g.active or ++g.culled_frames >= fiducial_passthrough_state::cull_hysteresis_frames)
-						{
-							g.culled_frames = 0;
-							g.active = false;
-							continue;
-						}
+						g.active = false;
+						continue;
 					}
-					else
-						g.culled_frames = 0;
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release
 					// list immediately, so wait/record/stamp throws (outer
@@ -1580,7 +1557,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.renderer->record(
 						        command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						        not mask_bypass_cutout, f, cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
+						        true, f, cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
 					}
 					catch (...)
 					{
@@ -1596,15 +1573,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
 					g.active = true;
 						mask_frame = true;
-					}
-				}
-				if (mask_frame and mask_bypass_cutout)
-				{
-					static bool bypass_logged = false;
-					if (not bypass_logged)
-					{
-						bypass_logged = true;
-						spdlog::info("Mask cutout bypassed (diagnostic): submitting transparent mask, full video expected");
 					}
 				}
 			}
