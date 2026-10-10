@@ -99,7 +99,10 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 
 	// Current frame's video state, joining next frame's GPU brackets via
 	// the frame/ready stagger (set every call: no stale flags survive).
-	mask_frame_starved = std::ranges::any_of(blit_handles, [](const auto & h) { return not h; });
+	// True starvation mirrors the house video_starved check (both views
+	// null): the alpha slot is null whenever use_alpha is false, so
+	// counting it would pin the flag on every opaque frame.
+	mask_frame_starved = not blit_handles[0] and not blit_handles[1];
 
 	// Sometimes the render function can be called with almost the same predicted_display_time,
 	// which can cause issues with the bandwidth estimation.
@@ -168,26 +171,41 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	mask_log_sum_sync += fiducial_passthrough.last_sync_ms;
 	mask_log_unmetered += mask_ready_unmetered;
 	mask_log_misses += mask_ready_misses;
-	// Spike forensics: whole-frame brackets, group brackets, host waits,
+	mask_log_starved_frames += mask_ready_starved ? 1 : 0;
+	mask_log_vr_sum += mask_ready_vr_prefix_ms + mask_ready_vr_defoveate_ms;
+	mask_log_vr_max = std::max(mask_log_vr_max, mask_ready_vr_prefix_ms + mask_ready_vr_defoveate_ms);
+	// Spike forensics: video-region brackets, group brackets, host waits,
 	// submit path, cadence and video state all describe the same
-	// (previous) frame via the frame/ready stagger above. The whole-vs-
-	// mask split is the primary discriminator: equal means our GPU work
-	// genuinely ran slow (clocks/contention); a large non-mask residual
-	// points at video/defoveate or inter-bracket bubbles instead.
-	// Threshold-gated (spike_threshold_ms): spike frames only, so the log
-	// stays quiet in steady state.
+	// (previous) frame via the frame/ready stagger above. Slots 0/1 cover
+	// the video region only (prologue through defoveate; the mask stacks
+	// record later under slots 2+), so video and mask are reported side
+	// by side, never subtracted. Equal-and-slow means our GPU work
+	// genuinely ran slow (clocks/contention); a hot video region with a
+	// cool mask points at blits/defoveate instead. Threshold-gated (whole
+	// or mask side): spike frames only, so the log stays quiet in steady
+	// state. A bracket/seq mismatch means a skipped submit left stale pool
+	// brackets behind: attribute nothing, log the gap instead.
 	double spike_whole_ms = (double)timestamps.gpu_time * 1e3;
-	if (spike_whole_ms > spike_threshold_ms)
+	if (not mask_ready_samples.empty() and mask_ready_record_seq != mask_ready_bracket_seq)
+	{
+		// Submit epoch mismatch with samples present: samples recorded
+		// but their submit skipped (mid-body throw), pool brackets stale.
+		// Attribute nothing, log the gap instead. (Empty frames skip this:
+		// with no samples there is nothing to misattribute.)
+		spdlog::info("mask gap: seq {} (samples from submit {}, brackets from submit {})", mask_ready_seq, mask_ready_record_seq, mask_ready_bracket_seq);
+	}
+	else if (spike_whole_ms > spike_threshold_ms or mask_gpu_sum_ms > spike_mask_threshold_ms)
 	{
 		++mask_log_spikes;
 		std::string spike_groups;
 		for (auto & s: mask_ready_samples)
 			spike_groups += fmt::format("[f={:.1f} gpu={:.2f} wait={:.2f}] ", (double)s.feather_px, s.gpu_ms, s.wait_ms);
-		spdlog::info("mask spike: seq {} whole {:.2f}ms mask {:.2f}ms nonmask {:.2f}ms groups {}{}waits [video {:.2f}ms skipped {:.2f}ms] submit {:.2f}ms endframe {:.2f}ms cadence {} video {}",
+		spdlog::info("mask spike: seq {} video {:.2f}ms [blits {:.2f} defov {:.2f}] mask {:.2f}ms groups {}{}waits [video {:.2f}ms skipped {:.2f}ms] submit {:.2f}ms endframe {:.2f}ms cadence {} video {}",
 		             mask_ready_seq,
 		             spike_whole_ms,
+		             mask_ready_vr_prefix_ms,
+		             mask_ready_vr_defoveate_ms,
 		             mask_gpu_sum_ms,
-		             spike_whole_ms - mask_gpu_sum_ms,
 		             mask_ready_samples.size(),
 		             spike_groups,
 		             mask_ready_video_wait_ms,
@@ -271,7 +289,7 @@ void scenes::stream::log_mask_perf(XrTime now)
 		                      a.tier,
 		                      a.draws);
 	}
-	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max / {:.2f} min, groups min {}, record cpu {:.2f}ms mean / {:.2f} max, track {:.2f}ms sync {:.2f}ms, unmetered {} misses {} spikes {} {}",
+	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max / {:.2f} min, groups min {}, record cpu {:.2f}ms mean / {:.2f} max, track {:.2f}ms sync {:.2f}ms, unmetered {} misses {} spikes {} starved {} vr {:.2f}/{:.2f}ms {}",
 	             mask_log_frames,
 	             mask_log_sum_gpu / (double)mask_log_frames,
 	             mask_log_max_gpu,
@@ -284,6 +302,9 @@ void scenes::stream::log_mask_perf(XrTime now)
 	             mask_log_unmetered,
 	             mask_log_misses,
 	             mask_log_spikes,
+	             mask_log_starved_frames,
+	             mask_log_vr_sum / (double)mask_log_frames,
+	             mask_log_vr_max,
 	             detail);
 	mask_log_frames = 0;
 	mask_log_sum_gpu = mask_log_max_gpu = mask_log_min_gpu = 0;
@@ -292,6 +313,8 @@ void scenes::stream::log_mask_perf(XrTime now)
 	mask_log_unmetered = 0;
 	mask_log_spikes = 0;
 	mask_log_misses = 0;
+	mask_log_starved_frames = 0;
+	mask_log_vr_sum = mask_log_vr_max = 0;
 	mask_log_min_groups = 0;
 	mask_log_per_feather.clear();
 }

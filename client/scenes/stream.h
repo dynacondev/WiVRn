@@ -510,13 +510,18 @@ private:
 		float gpu_time = 0;
 	};
 
-	// Mask perf brackets: slots 0,1 stay the whole-frame pair; metered
-	// group i uses 2+2i (TOP_OF_PIPE at record entry) and 3+2i
+	// Mask perf brackets: slots 0,1 bracket the video region (prologue
+	// through defoveate; the mask stacks record later under slots 2+).
+	// Metered group i uses 2+2i (TOP_OF_PIPE at record entry) and 3+2i
 	// (BOTTOM_OF_PIPE at record exit). Groups beyond the cap still record
 	// (CPU stats included) but share no stamp slots; they count as
-	// unmetered in the log line.
+	// unmetered in the log line. Slot video_split_first splits the
+	// video region into blit/barrier setup vs defoveate execution (the
+	// defoveate delta reuses slot 1); written every submit
+	// (unconditional, so the readback never waits on an unwritten stamp).
 	static const inline uint32_t max_metered_mask_groups = 4;
 	static const inline int mask_group_slot_first = 2;
+	static const inline int video_split_first = mask_group_slot_first + 2 * max_metered_mask_groups;
 
 	struct global_metric
 	{
@@ -541,7 +546,7 @@ private:
 		const char * unit;
 	};
 
-	static const inline int size_gpu_timestamps = mask_group_slot_first + 2 * max_metered_mask_groups;
+	static const inline int size_gpu_timestamps = mask_group_slot_first + 2 * max_metered_mask_groups + 1;
 
 	struct decoder_metric
 	{
@@ -602,9 +607,31 @@ private:
 	bool mask_frame_starved = false, mask_ready_starved = false;
 	uint64_t mask_frame_misses = 0, mask_ready_misses = 0;
 	uint64_t frame_seq = 0, mask_frame_seq = 0, mask_ready_seq = 0;
+	// Video-region split of the slots-0/1 bracket (blit/barrier setup vs
+	// defoveate), same stagger as the doubles above.
+	double mask_frame_vr_prefix_ms = 0, mask_ready_vr_prefix_ms = 0;
+	double mask_frame_vr_defoveate_ms = 0, mask_ready_vr_defoveate_ms = 0;
+	// Submit epoch guard: the pool always holds the last submit's stamps,
+	// so the brackets read back belong to last_submit_seq. A skipped
+	// submit (mid-body throw) would otherwise misattribute stale brackets
+	// to the next frame; the dump then emits a gap line instead.
+	uint64_t last_submit_seq = 0, mask_frame_bracket_seq = 0, mask_ready_bracket_seq = 0;
+	// Record epoch: stamped on every pushed sample (constant within a
+	// frame). The pool and the samples advance in lockstep across idle
+	// gaps (both frozen by early-outs), so record-vs-bracket mismatch
+	// isolates exactly one case: samples recorded but their submit
+	// skipped (mid-body throw), leaving stale pool brackets behind. Only
+	// meaningful with non-empty samples (empty frames skip the guard).
+	uint64_t mask_frame_record_seq = 0, mask_ready_record_seq = 0;
+	// Set by the no-render early-out; the cadence check re-arms silently
+	// when set instead of counting idle gaps as deadline misses.
+	bool early_out_since_render = false;
 	// Spike dump threshold (ms, whole-frame GPU). Above the ~4ms
 	// saturated means to isolate true outliers; tune in one place.
 	static constexpr double spike_threshold_ms = 5.0;
+	// Mask-side trigger: mask-dominant spikes with a small video region
+	// would otherwise go undumped (their whole stays under threshold).
+	static constexpr double spike_mask_threshold_ms = 4.0;
 	// Rendered-frame cadence reference (early-outs don't advance it):
 	// gaps >1.5 periods are vsyncs with no submission (missed deadlines).
 	XrTime last_rendered_predicted = 0;
@@ -623,6 +650,8 @@ private:
 	uint64_t mask_log_min_groups = 0;
 	uint64_t mask_log_spikes = 0;
 	uint64_t mask_log_misses = 0;
+	uint64_t mask_log_starved_frames = 0;
+	double mask_log_vr_sum = 0, mask_log_vr_max = 0;
 	struct mask_feather_acc
 	{
 		double sum_gpu = 0, max_gpu = 0, min_gpu = 0, sum_cpu = 0;

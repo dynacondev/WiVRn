@@ -869,6 +869,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// TODO: stop/restart video stream
 		session.begin_frame();
 		session.end_frame(frame_state.predictedDisplayTime, {});
+		// Idle gap, not a deadline miss: the cadence check re-arms
+		// silently when set instead of counting (spike forensics).
+		early_out_since_render = true;
 		return;
 	}
 
@@ -914,7 +917,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// missed deadline upstream or a parked frame. A refresh-rate switch
 	// resets the reference instead of counting (period itself moved).
 	mask_frame_misses = 0;
-	if (last_rendered_predicted != 0 and frame_state.predictedDisplayPeriod > 0)
+	if (early_out_since_render)
+	{
+		// Gap spans idle frames (decoders empty at connect, shutdown):
+		// re-arm silently, count nothing.
+		early_out_since_render = false;
+	}
+	else if (last_rendered_predicted != 0 and frame_state.predictedDisplayPeriod > 0)
 	{
 		if (frame_state.predictedDisplayPeriod != last_cadence_period and last_cadence_period != 0)
 		{
@@ -934,7 +943,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	last_rendered_predicted = frame_state.predictedDisplayTime;
 	last_cadence_period = frame_state.predictedDisplayPeriod;
 
-	gpu_timestamps timestamps;
+	gpu_timestamps timestamps{};
 	// Previous frame's mask samples still sit in mask_frame_samples (this
 	// frame's record() calls haven't run yet): attach their GPU times now,
 	// then hand them to accumulate_metrics via mask_ready_*. Only the
@@ -963,7 +972,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				uint64_t end = timestamps2[mask_group_slot_first + 2 * i + 1];
 				mask_frame_samples[i].gpu_ms = (double)(end - begin) * period_ms;
 			}
+			// Video-region split stamp lives at a fixed address past the
+			// metered prefix (unlike the metered groups): separate bounded
+			// read, same eWait safety (written every submit). The
+			// defoveate delta reuses slot 1, so only one extra stamp.
+			auto [res_vr, vr_stamps] = query_pool.getResults<uint64_t>(
+			        video_split_first,
+			        1,
+			        sizeof(uint64_t),
+			        sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+			if (res_vr == vk::Result::eSuccess)
+			{
+				mask_frame_vr_prefix_ms = (double)(vr_stamps[0] - timestamps2[0]) * period_ms;
+				mask_frame_vr_defoveate_ms = (double)(timestamps2[1] - vr_stamps[0]) * period_ms;
+			}
 		}
+		// Bracket epoch: the pool always holds the last submit's stamps,
+		// so the brackets just attached belong to last_submit_seq. A
+		// skipped submit (mid-body throw) breaks that pairing; the dump
+		// then emits a gap line instead of misattributing stale brackets.
+		mask_frame_bracket_seq = last_submit_seq;
 	}
 	mask_ready_samples = std::move(mask_frame_samples);
 	mask_frame_samples.clear();
@@ -984,6 +1013,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	mask_ready_misses = mask_frame_misses;
 	mask_frame_misses = 0;
 	mask_ready_seq = mask_frame_seq;
+	mask_ready_bracket_seq = mask_frame_bracket_seq;
+	mask_ready_record_seq = mask_frame_record_seq;
 
 	session.begin_frame();
 
@@ -1128,6 +1159,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
+
+	// Video-region split stamp (spike forensics): everything before this
+	// is blit/barrier setup, everything after (up to slot 1) is defoveate.
+	// Unconditional, like slot 1: the split readback eWaits on it.
+	command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, video_split_first);
 
 	// Allow the headset to time warp if we are redisplaying a frame
 	if ((not application::get_hmd_traits().discard_frame) or
@@ -1515,6 +1551,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// readback). The catch keeps TOP/BOTTOM paired: a missing
 					// BOTTOM_OF_PIPE would hang the eWait readback.
 					uint32_t stamp = (uint32_t)mask_frame_samples.size();
+					mask_frame_record_seq = frame_seq;
 					bool metered = stamp < max_metered_mask_groups;
 					if (metered)
 						command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, mask_group_slot_first + 2 * stamp);
@@ -1733,6 +1770,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// driver contention, not GPU execution — the brackets can't see
 		// it, this clock can).
 		mask_frame_submit_ms = (instance.now() - submit_t0) * 1e-6;
+		// Submit epoch for the bracket guard below: the pool now holds
+		// this frame's stamps.
+		last_submit_seq = frame_seq;
 #if WIVRN_FEATURE_RENDERDOC
 		renderdoc_end(*vk_instance);
 #endif
