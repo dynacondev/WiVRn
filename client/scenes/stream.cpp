@@ -1014,6 +1014,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	mask_frame_misses = 0;
 	mask_ready_seq = mask_frame_seq;
 	mask_ready_bracket_seq = mask_frame_bracket_seq;
+	mask_ready_vr_prefix_ms = mask_frame_vr_prefix_ms;
+	mask_ready_vr_defoveate_ms = mask_frame_vr_defoveate_ms;
 	mask_ready_record_seq = mask_frame_record_seq;
 
 	session.begin_frame();
@@ -1503,11 +1505,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							draws.push_back({oid, mvp, op});
 						}
 					}
+					// Hysteresis on the cull gate: a group that submitted last
+					// frame lingers through brief full culls (empty draws
+					// record transparent) instead of flapping
+					// acquire/record/submit, which swings frame totals by
+					// milliseconds for meshes dithering on the cull
+					// boundary. Appear is instant (non-empty draws reset
+					// below); disappear lingers at most
+					// cull_hysteresis_frames - 1 extra frames, invisible
+					// (fully off-screen). Never-active groups skip
+					// immediately (no warmup cost).
 					if (draws.empty())
 					{
-						g.active = false;
-						continue;
+						// Linger (fall through with empty draws) unless the
+						// group never submitted or the cull overstayed.
+						if (not g.active or ++g.culled_frames >= fiducial_passthrough_state::cull_hysteresis_frames)
+						{
+							g.culled_frames = 0;
+							g.active = false;
+							continue;
+						}
 					}
+					else
+						g.culled_frames = 0;
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release
 					// list immediately, so wait/record/stamp throws (outer
