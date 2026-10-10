@@ -1,65 +1,109 @@
-# WiVRn mask perf — what actually mattered
+# AGENTS.md — WiVRn
 
-Measured on Quest (90Hz, 11.1ms budget; eye 1680x1760, mask 2496x2624) via
-per-group GPU timestamp brackets + per-stage CPU clocks (`mask perf:`
-logcat line, Statistics tab). Mixed = 2 groups (f=12+f=24 or 23+24).
+FOSS PCVR streamer: Linux PC runs VR apps, streams to Android headset.
+`server/` PC OpenXR runtime (Monado fork) · `client/` headset app ·
+`dashboard/` Qt6/Kirigami GUI · `common/` shared protocol ·
+`tools/wivrnctl` systemd helper · `tools/perfetto/` tracing ·
+`tools/wireshark/` dissector.
 
-## Cost model (use this before optimizing)
+## Build
 
-- Cost ≈ **pass count x pass size**. Each fullscreen pass pays a ~fixed
-  tile store/load round-trip (~0.3-0.5ms); shader fetches are second-order
-  (5-tap saved ~30% on tier-1, ~0% on tier-2).
-- **Swapchain (XR-shared, uncached) round-trips dominate**: V-upscale
-  writes + compositor reads. Intermediates (cached/compressed) are cheap
-  in comparison — shrinking them 4x bought ~15%.
-- **Positional tail penalty under saturation**: with 2 stacks the second
-  recorded group cost ~4ms extra regardless of feather/size/passes. It is
-  NOT intrinsic — vanishes once total traffic drops under the wall.
-- Record order = `passthrough_objects` map order (object id); logged as
-  `mask groups order:`. Slow-slot questions are unanswerable without it.
-- 5s means hide regimes; per-window **minima** reveal them (2ms dip =
-  skipped group; 5ms spike ≠ skip). `groups min` separates the two.
+Use presets (Ninja, `Debug`+`WERROR=ON` by default); never hand-roll
+`-DWIVRN_BUILD_*` flags when a preset fits. Local builds are
+client-only — do NOT build `server` or `dashboard` on this machine
+(they build on a separate Linux machine); Android client builds are fine here:
 
-## What worked (mixed 8.0 -> 0.85ms)
+```bash
+cmake --preset client && cmake --build build-client       # linux debug client only (local OK)
+./gradlew assembleRelease  # real headset APK, needs ANDROID_HOME, Java 17, ks.keystore + signingKeyPassword in gradle.properties (local OK)
+# Remote-only (separate Linux machine, reference — do not run here):
+# cmake --preset server && cmake --build build-server
+# cmake --preset dashboard -DWIVRN_BUILD_SERVER=ON && cmake --build build-dashboard
+# cmake --preset server-tracing && cmake --build build-server-tracing  # Perfetto, see docs/profiling.md
+```
 
-1. **Half-res member swapchains + compositor upscale** (the breakthrough,
-   ~8x): V writes half pixels, runtime bilinear-upscales (free,
-   equivalent filtering). Tier-0 keeps full (exact, 0.08ms anyway).
-2. **Collapse Stage-1** (8->6 passes tiered): seed-rasterize at level 1
-   directly; same-group 4.2->1.45ms combined with below.
-3. **5-tap kernel** (9->5 taps, 3 fetches, renormalized): ~30% off
-   fetch-bound passes. Keep spreads calibrated per tier (sigma match).
-4. **Tier-0 raster-direct**: deleted the identity copy pass (was pure
-   waste: spread-0 blur); tier-0 now ~0.08ms, leave it alone.
-5. **The scoreboard itself**: per-group GPU brackets, CPU clocks, order
-   log, min/max/min-groups. Every finding above came from it. Keep it.
+Details in `docs/building.md`. Server needs Vulkan ≥1.4.304 and ≥1
+encoder (`WIVRN_USE_NVENC/VAAPI/VULKAN_ENCODE/X264`); client build needs
+`rsvg-convert`, `ktx` CLI, `glslangValidator`; `WIVRN_COMPRESS_GLB=ON`
+additionally needs `gltf-transform`. Client requires Boost ≥1.84 with
+`url` component (server-only: 1.75+). `WIVRN_USE_SYSTEM_*=OFF` fetches
+bundled deps instead of system ones. Mutually exclusive CMake pairs
+fail configure: `GIT_TAG` vs `GIT_DESC`/`GIT_COMMIT`,
+`WIVRN_OPTIMIZE_SHADERS` vs `WIVRN_DEBUG_SHADERS`,
+`WIVRN_TRACE_MONADO=ON` requires `WIVRN_USE_PERFETTO=ON` (+ system
+percetto, Monado never fetches it).
 
-## What didn't (or barely)
+Monado is pinned: rev in `monado-rev`, patches in `patches/monado/`
+applied at FetchContent time. Never edit fetched Monado sources; fix
+in `patches/monado/` + bump nothing (rev file drives refetch).
+Flatpak manifest is generated: `tools/gen_flatpak_manifest.py --gitlocal`.
 
-- **SDF full replacement** (reverted): 5.1x single-group, ~1x mixed.
-  Jump Flood passes cost more than gaussian at headset resolutions;
-  keep gaussian for small feathers. Lesson: match algorithm to regime.
-- **Intermediate shrinking** (half-A/B, quarter-tier-2, RG16F): each
-  helped its tier ~2x solo but barely moved mixed totals — the wall was
-  swapchain traffic, not intermediates. Shrink outputs first.
-- **Punch scissor**: correct but debug-only; negligible in numbers.
-- **Single-composite unification**: saves ~2 full passes (~1ms) but not
-  the saturation mechanism. Downgraded; quantize (one shared stack) is
-  the structural hammer if mixed ever regresses.
-- **Theories ruled out**: descriptor aliasing (real bug, fixed, but it
-  caused wrong-output not slowness); DVFS (10x too big for clocks);
-  marker flicker (dips persist with steady QR); mesh size (same model
-  fast-when-first, slow-when-second); swapchain image counts
-  (runtime-managed, properly waited).
+## Check
 
-## Benchmark discipline (hard-won)
+```bash
+clang-format --dry-run -Werror <file>  # C++ style: tabs, width 8 (.clang-format); CI checks client server dashboard common tools/wireshark with clang-format 22
+ruff check && ruff format --check       # only lints tools/**/*.py (ruff.toml)
+cmake --preset server -DWIVRN_BUILD_TEST=ON && cmake --build build-server --target list-apps vdf  # only test binaries in repo (common/ Steam/VDF helpers) — remote-only, do not run here
+```
 
-- Matrix: solo per tier + mixed + same-feather; 60s runs, fixed
-  resolution/refresh/markers; overlays off; ignore first log line.
-- `tier=` field meanings changed across commits (blur 0/1/2/4/8, then
-  SDF divs, then blur again) — check which commit a log came from.
-- Resolution constancy: eye + mask swapchain sizes are in every log
-  (`Creating new swapchain`, `Fiducial mask swapchain`) — verify before
-  comparing across runs.
-- Tripwires per commit: name the control that must NOT move (e.g.
-  tier-1 ~2.2ms during tier-2 work) or the refactor leaked.
+No `ctest` suite (`BUILD_TESTING=OFF` for Monado, no top-level tests).
+Dashboard compiles QML via `qt_add_qml_module` — QML errors surface at
+build time, read them there. `WIVRN_WERROR=ON` is default in presets;
+CI builds `Release`.
+
+## Run / debug
+
+Server and headset APK must be same version or connection fails.
+Ports: 9757 TCP+UDP (WiVRn), 5353/UDP (Avahi, must be running).
+Config: `docs/configuration.md`; files later in list win:
+`/usr/share/wivrn/config.json` → `/etc/wivrn/config.json` →
+`$XDG_CONFIG_HOME/wivrn/config.json`. Flatpak config lives under
+`~/.var/app/io.github.wivrn.wivrn/`.
+
+```bash
+XRT_LOG=debug XRT_COMPOSITOR_LOG=debug wivrn-server   # server logs
+WIVRN_DUMP_VIDEO=/tmp/vdump wivrn-server              # dump sent frames, play with mpv
+adb logcat '*:S' WiVRn:V                              # headset logs; '*:F' for crashes
+adb reverse tcp:9757 tcp:9757 && adb shell am start -a android.intent.action.VIEW -d "wivrn+tcp://localhost:9757" $(adb shell pm list packages | grep wivrn | cut -d: -f2)  # USB
+```
+
+APK package per variant: `.local` local, `.github` release,
+`.github.testing` CI, `.github.nightly` nightlies, no suffix = store
+(`docs/debugging.md`). Tracing: `WIVRN_TRACING=inprocess|system`,
+inert unless set; full flow in `docs/profiling.md`.
+
+## Conventions
+
+- i18n: `tools/update_messages.sh [lang]` regenerates `locale/`; client
+  uses gettext `_()`/`_F()`, dashboard uses `i18n()` in QML/C++.
+- QR fiducials: one payload string = one identity. Same payload printed
+  twice is NOT two trackables; for multi-location coverage print
+  distinct payloads and link one object to several fiducial ids
+  (`docs/configuration.md#fiducials-and-passthrough`).
+- `common/wivrn_packets.h` + `wivrn_serialization*.h` define the
+  wire protocol — keep client/server in sync; no compat layer.
+
+## Mask perf (active feat/markerboard work — keep)
+
+Measured on Quest (90Hz; eye 1680x1760, mask 2496x2624) via per-group
+GPU brackets + per-stage CPU clocks (`mask perf:` logcat line).
+Mixed = 2 groups (f=12+f=24 or 23+24).
+
+- Cost ≈ **pass count × pass size**. Fullscreen passes pay ~0.3–0.5ms
+  tile round-trip; shader fetches second-order (5-tap saved ~30%
+  tier-1, ~0% tier-2). **Swapchain (XR-shared, uncached) traffic
+  dominates**; shrinking cached intermediates 4× bought ~15%.
+- Fixes that moved mixed 8.0→0.85ms: half-res member swapchains +
+  compositor upscale (~8×); seed-rasterize at level 1 (8→6 passes);
+  5-tap kernel (keep sigma-matched spreads); tier-0 raster-direct
+  (~0.08ms, leave alone).
+- Dead ends: SDF/Jump-Flood replacement (reverted, 5.1× solo cost);
+  intermediate shrinking; punch scissor (debug-only); descriptor
+  aliasing/DVFS/marker-flicker/mesh-size theories ruled out.
+- Discipline: solo-per-tier + mixed + same-feather matrix, 60s runs,
+  fixed res/refresh/markers, overlays off, ignore first log line.
+  `tier=` meanings changed across commits — check commit before
+  comparing logs. Verify res constancy via `Creating new swapchain` /
+  `Fiducial mask swapchain` lines. Record order = `passthrough_objects`
+  map order (`mask groups order:` log); per-window minima (`groups min`)
+  separate skipped groups (2ms dips) from spikes.
