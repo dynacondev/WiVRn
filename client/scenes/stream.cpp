@@ -1215,6 +1215,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				for (float f: live_feathers)
 				{
 					auto & g = fp.mask_groups[f];
+					// Eager setup (map arrival, not first visibility):
+					// member swapchain + intermediates ready before first
+					// draws, so first-visible frames pay record+submit only
+					// (no allocations/stalls mid-game). All change-gated:
+					// steady state is a size compare + extent compare.
+					// Tier-0 groups keep a full-res swapchain (exact hard
+					// edge); feathered groups submit half (V writes half,
+					// compositor upscales). g.extent tracks the submitted
+					// size; record() still works intermediates at full.
+					int gw = (f <= 0) ? mw : hw;
+					int gh = (f <= 0) ? mh : hh;
+					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
+					{
+						// Rare path (first frame, feather/config change):
+						// nothing outstanding (previous images released last
+						// frame), mirroring setup_reprojection_swapchain.
+						device.waitIdle();
+						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
+						g.renderer->reset_targets();
+						g.images_outstanding = 0;
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
+					}
+					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for
@@ -1291,23 +1314,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.active = false;
 						continue;
-					}
-					// Tier-0 groups keep a full-res swapchain (exact hard
-					// edge); feathered groups submit half (V writes half,
-					// compositor upscales). g.extent tracks the submitted
-					// size; record() still works intermediates at full.
-					int gw = (f <= 0) ? mw : hw;
-					int gh = (f <= 0) ? mh : hh;
-					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
-					{
-						// Rare path (first frame, feather/config change):
-						// nothing outstanding (previous images released last
-						// frame), mirroring setup_reprojection_swapchain.
-						device.waitIdle();
-						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
-						g.renderer->reset_targets();
-						g.images_outstanding = 0;
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
 					}
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release

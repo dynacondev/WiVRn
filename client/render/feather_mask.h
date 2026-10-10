@@ -127,6 +127,11 @@ public:
 		targets.clear();
 	}
 
+	// Ensure intermediates for an extent (idempotent, change-gated). Public
+	// so the scene can warm targets at map arrival, before first draws;
+	// record() calls it too (same gate, no double work).
+	void ensure_targets(vk::Extent2D extent);
+
 private:
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;
@@ -195,7 +200,6 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	void ensure_targets(vk::Extent2D extent);
 	void update_source(vk::ImageView view, uint32_t set);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
