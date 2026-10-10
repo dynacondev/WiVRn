@@ -1281,15 +1281,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 	
-	// Debug line overlays (QR boxes, tripods, fused boxes): world-space
-	// 1px segments recorded into the eye images - zero composition
-	// layers (the old per-quad layers blew maxLayerCount). After the
-	// slot-1 stamp so forensics still bracket video-only above. MVP
-	// shared with the cutouts below (computed once here).
+	// Debug overlays (QR boxes, tripods, fused boxes): triangle geometry
+	// recorded into our own transparent swapchain, submitted as ONE
+	// projection layer (maxLayerCount unreachable). MVP shared with the
+	// cutouts below (computed once here).
 	std::array<glm::mat4, 2> world_mvp;
 	for (uint32_t view = 0; view < view_count; ++view)
 		world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
-	fp.dbg_segments = 0;
+	fp.dbg_tris = 0;
 	fp.dbg_boxes = 0;
 	// -1 until the hook below acquires our debug image (submit + release
 	// it after the passthrough layer, before endFrame).
@@ -1298,25 +1297,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		gizmo_lines->begin_frame();
 		using vtx = debug_lines_renderer::vertex;
-		std::vector<vtx> segs;
-		segs.reserve(256);
+		std::vector<vtx> tris;
+		tris.reserve(512);
 		XrTime dbg_now = instance.now();
-		auto seg = [&](glm::vec3 a, glm::vec3 b, float r, float g, float bl, float al) {
-			segs.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
-			segs.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
+		auto tri = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c, float r, float g, float bl, float al) {
+			tris.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
+			tris.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
+			tris.push_back({{c.x, c.y, c.z}, {r, g, bl, al}});
 		};
-		auto box_edges = [&](glm::vec3 c, glm::vec3 r, glm::vec3 u, float hw, float hh, float cr, float cg, float cb, float ca) {
+		// Filled quad (double-sided: cull is off, so no facing math).
+		auto box_fill = [&](glm::vec3 c, glm::vec3 r, glm::vec3 u, float hw, float hh, float cr, float cg, float cb, float ca) {
 			glm::vec3 v0 = c - r * hw - u * hh, v1 = c + r * hw - u * hh;
 			glm::vec3 v2 = c + r * hw + u * hh, v3 = c - r * hw + u * hh;
-			seg(v0, v1, cr, cg, cb, ca);
-			seg(v1, v2, cr, cg, cb, ca);
-			seg(v2, v3, cr, cg, cb, ca);
-			seg(v3, v0, cr, cg, cb, ca);
+			tri(v0, v1, v2, cr, cg, cb, ca);
+			tri(v0, v2, v3, cr, cg, cb, ca);
 		};
-		auto tripod = [&](glm::vec3 o, glm::vec3 x, glm::vec3 y, glm::vec3 z, float len, float a) {
-			seg(o, o + x * len, 1.f, 0.f, 0.f, a);
-			seg(o, o + y * len, 0.f, 1.f, 0.f, a);
-			seg(o, o + z * len, 0.f, 0.f, 1.f, a);
+		// Shaft from o along dir, width across wdir (flat quad, 2 tris).
+		auto shaft = [&](glm::vec3 o, glm::vec3 dir, glm::vec3 wdir, float len, float wdt, float cr, float cg, float cb, float ca) {
+			glm::vec3 e = o + dir * len, s = wdir * (wdt * 0.5f);
+			tri(o - s, o + s, e + s, cr, cg, cb, ca);
+			tri(o - s, e + s, e - s, cr, cg, cb, ca);
+		};
+		auto tripod = [&](glm::vec3 o, glm::vec3 x, glm::vec3 y, glm::vec3 z, float len, float wdt, float a) {
+			shaft(o, x, y, len, wdt, 1.f, 0.f, 0.f, a);
+			shaft(o, y, x, len, wdt, 0.f, 1.f, 0.f, a);
+			shaft(o, z, x, len, wdt, 0.f, 0.f, 1.f, a);
 		};
 		auto tag_frame = [&](const XrPosef & p, glm::vec3 & o, glm::vec3 & x, glm::vec3 & y, glm::vec3 & z) {
 			glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
@@ -1340,11 +1345,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				continue;
 			glm::vec3 c, x, y, z;
 			tag_frame(h.pose, c, x, y, z);
-			box_edges(c, x, y, h.extents.width * 0.5f, h.extents.height * 0.5f,
+			box_fill(c, x, y, h.extents.width * 0.5f, h.extents.height * 0.5f,
 				(h.matched ? 0.f : 1.f), (h.matched ? 1.f : 0.f), 0.f, a);
 			++fp.dbg_boxes;
 			if (fp.debug_axes and h.extents.width > 0)
-			tripod(c, x, y, z, h.extents.width, a);
+			tripod(c, x, y, z, h.extents.width, h.extents.width * 0.08f, a);
 		}
 		if (fp.debug_corrected)
 		{
@@ -1359,7 +1364,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					continue;
 				glm::vec3 c, x, y, z;
 				tag_frame(co.pose, c, x, y, z);
-				box_edges(c, x, y, co.size_m * 0.5f, co.size_m * 0.5f, 1.f, 0.55f, 0.f, a);
+				box_fill(c, x, y, co.size_m * 0.5f, co.size_m * 0.5f, 1.f, 0.55f, 0.f, a);
 				++fp.dbg_boxes;
 			}
 		}
@@ -1377,27 +1382,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				glm::vec3 o, x, y, z;
 				tag_frame(bp.pose, o, x, y, z);
 				float len = bp.tag_size_m * 1.5f;
-				tripod(o, x, y, z, len, a);
-				// White center diamond (distinct from the tag tripod).
+				tripod(o, x, y, z, len, len * 0.05f, a);
+				// White center square (distinct from the tag tripod).
 				float d = len * 0.25f;
-				seg(o + x * d, o + y * d, 1.f, 1.f, 1.f, a);
-				seg(o + y * d, o - x * d, 1.f, 1.f, 1.f, a);
-				seg(o - x * d, o - y * d, 1.f, 1.f, 1.f, a);
-				seg(o - y * d, o + x * d, 1.f, 1.f, 1.f, a);
+				box_fill(o, x, y, d, d, 1.f, 1.f, 1.f, a);
 				++fp.dbg_boxes;
 			}
 		}
-		fp.dbg_segments = segs.size() / 2;
+		fp.dbg_tris = tris.size() / 3;
 		fp.dbg_have_ndc = false;
-		// Own swapchain: acquire once when anything (gizmos or the TEMP
-		// diagnostics below) will record. Skip the frame on timeout.
-		static constexpr bool kDbgIdentityDiag = true;
-		if (not segs.empty() or kDbgIdentityDiag)
+		// Own swapchain: acquire once when gizmos will record. Skip the
+		// frame on timeout.
+		if (not tris.empty())
 		{
 			gizmo_lines->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
 			dbg_image = gizmo_lines->acquire();
 		}
-		if (dbg_image >= 0 and not segs.empty())
+		if (dbg_image >= 0 and not tris.empty())
 		{
 			std::array<vk::Extent2D, 2> eye_ext;
 			std::array<glm::mat4, 2> eye_mvp;
@@ -1406,10 +1407,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
 				eye_mvp[view] = world_mvp[view];
 			}
-			gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, segs.data(), segs.size());
+			gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
 			// TEMP diagnostic readout: first vert through the eye-0 MVP on
 			// CPU. NDC inside [-1,1] exonerates the mapping chain.
-			glm::vec4 clip = eye_mvp[0] * glm::vec4(segs[0].pos[0], segs[0].pos[1], segs[0].pos[2], 1.f);
+			glm::vec4 clip = eye_mvp[0] * glm::vec4(tris[0].pos[0], tris[0].pos[1], tris[0].pos[2], 1.f);
 			if (clip.w > 1e-9f)
 			{
 				fp.dbg_ndc[0] = clip.x / clip.w;
@@ -1419,43 +1420,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			fp.dbg_view_w = eye_ext[0].width;
 			fp.dbg_view_h = eye_ext[0].height;
-			fp.dbg_img = (uint32_t)image_index;
-		}
-		// TEMP diagnostic draw: unmissable identity-MVP white diagonal +
-		// cross through the BLEND-OFF pipeline, plus the triangle twin.
-		// Now on our own swapchain (CLEAR images): visible => renderer
-		// works end to end; invisible => pipeline/framebuffer fault.
-		// Revert with the flag.
-		if (kDbgIdentityDiag and dbg_image >= 0)
-		{
-			using vtx = debug_lines_renderer::vertex;
-			const vtx diag[] = {
-			        {{-0.9f, -0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{0.9f, 0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{-0.9f, 0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{0.9f, 0.f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{0.f, -0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{0.f, 0.9f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			};
-			std::array<vk::Extent2D, 2> eye_ext;
-			std::array<glm::mat4, 2> eye_mvp;
-			for (uint32_t view = 0; view < view_count; ++view)
-			{
-				eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
-				eye_mvp[view] = glm::mat4(1);
-			}
-			gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, diag,
-			                    sizeof(diag) / sizeof(diag[0]), false);
-			// TEMP topology twin: same everything, triangles. Tri-visible
-			// + lines-invisible convicts line rasterization; neither
-			// visible convicts shared infra (framebuffer/barrier/layout).
-			const vtx tri[] = {
-			        {{-0.6f, -0.6f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{0.6f, -0.6f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			        {{0.f, 0.6f, 0.f}, {1.f, 1.f, 1.f, 1.f}},
-			};
-			gizmo_lines->record_tris(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tri,
-			                         sizeof(tri) / sizeof(tri[0]));
+			fp.dbg_img = (uint32_t)dbg_image;
 		}
 	}
 
@@ -2006,12 +1971,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// TEMP diagnostic readout (see record site): NDC inside [-1,1]
 			// exonerates the mapping chain; view/img identify the target.
 			if (fp.dbg_have_ndc)
-				spdlog::info("Fiducial debug lines: {} boxes, {} segments, ndc ({:.2f},{:.2f}) w {:.1f} view {}x{} img {}",
-				             fp.dbg_boxes, fp.dbg_segments, (double)fp.dbg_ndc[0], (double)fp.dbg_ndc[1],
+				spdlog::info("Fiducial debug lines: {} boxes, {} tris, ndc ({:.2f},{:.2f}) w {:.1f} view {}x{} img {}",
+				             fp.dbg_boxes, fp.dbg_tris, (double)fp.dbg_ndc[0], (double)fp.dbg_ndc[1],
 				             (double)fp.dbg_ndc[2], fp.dbg_view_w, fp.dbg_view_h, fp.dbg_img);
 			else
-				spdlog::info("Fiducial debug lines: {} boxes, {} segments (no ndc)", fp.dbg_boxes,
-				             fp.dbg_segments);
+				spdlog::info("Fiducial debug lines: {} boxes, {} tris (no ndc)", fp.dbg_boxes,
+				             fp.dbg_tris);
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;

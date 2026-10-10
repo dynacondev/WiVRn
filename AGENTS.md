@@ -101,6 +101,12 @@ inert unless set; full flow in `docs/profiling.md`.
   Passthrough tab; `board solve:` logcat lines are the tuning
   instrument. Pose filtering/smoothing TEMP-disabled (files stay,
   unreferenced) until fusion is verified on-device.
+- Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
+  transparent projection layer (never per-quad layers — those blow
+  `maxLayerCount`). Geometry is thin triangles (line topology never
+  rasterized on the Quest path — do not reintroduce it); own swapchain,
+  CLEAR-on-UNDEFINED every frame (never LOAD an eye image: its layout
+  is unobservable without validation layers).
 
 ## Mask perf (active feat/markerboard work — keep)
 

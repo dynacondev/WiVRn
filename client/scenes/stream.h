@@ -341,7 +341,7 @@ private:
 		double last_sync_ms = 0;
 		double last_solve_ms = 0; // board fusion cost (max over fiducials)
 		double last_horizon_ms = 0; // predicted - now: how far poses are extrapolated
-		size_t dbg_segments = 0, dbg_boxes = 0; // last recorded debug-line counts (heartbeat)
+		size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts (heartbeat)
 		// TEMP diagnostic mapping readout (heartbeat): first-vert NDC +
 		// viewport + target indices. NDC inside [-1,1] exonerates mapping.
 		float dbg_ndc[3] = {0, 0, 0};

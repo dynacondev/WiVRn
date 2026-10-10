@@ -91,139 +91,10 @@ int debug_lines_renderer::acquire()
 	return idx;
 }
 
+
 void debug_lines_renderer::release()
 {
 	swapchain_.release();
-}
-
-void debug_lines_renderer::begin_frame()
-{
-	staging_used = 0;
-}
-
-// Append-only upload shared by record paths (one upload serves all draws
-// in a frame; draws reference their own ranges). Fixed generous cap:
-// frame usage is hundreds of verts; growing mid-frame would orphan
-// earlier draws. Returns first-vertex index, or UINT32_MAX when dropped.
-static uint32_t upload_verts(vk::raii::Device & device, buffer_allocation & staging, const debug_lines_renderer::vertex * verts,
-                             size_t vert_count, size_t & staging_used)
-{
-	static constexpr size_t kStagingCapVerts = 4096;
-	if (staging_used + vert_count > kStagingCapVerts)
-	{
-		static bool warned = false;
-		if (not warned)
-		{
-			warned = true;
-			spdlog::warn("debug_lines: frame vertex overflow, dropping");
-		}
-		return UINT32_MAX;
-	}
-	if (not staging or staging.info().size < kStagingCapVerts * sizeof(debug_lines_renderer::vertex))
-	{
-		staging = buffer_allocation(
-		        device,
-		        vk::BufferCreateInfo{
-		                .size = kStagingCapVerts * sizeof(debug_lines_renderer::vertex),
-		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
-		        },
-		        VmaAllocationCreateInfo{
-		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-		                .usage = VMA_MEMORY_USAGE_AUTO,
-		        },
-		        "debug lines");
-	}
-	uint32_t first_vertex = (uint32_t)staging_used;
-	std::memcpy((char *)staging.map() + first_vertex * sizeof(debug_lines_renderer::vertex), verts,
-	            vert_count * sizeof(debug_lines_renderer::vertex));
-	staging.unmap();
-	staging_used += vert_count;
-	return first_vertex;
-}
-
-void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
-                                  const std::array<vk::Extent2D, 2> & extents,
-                                  const std::array<glm::mat4, 2> & mvp, const vertex * verts, size_t vert_count,
-                                  bool blended)
-{
-	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
-		return;
-	uint32_t first_vertex = upload_verts(*device, staging, verts, vert_count, staging_used);
-	if (first_vertex == UINT32_MAX)
-		return;
-
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, blended ? *pipeline : *pipeline_unblended);
-	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
-
-	// Fresh CLEAR images every frame: no barrier, no layout history.
-	for (uint32_t eye = 0; eye < 2; ++eye)
-	{
-		auto & tgt = targets[image_index][eye];
-		cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, push{mvp[eye]});
-		cmd.setViewport(0, vk::Viewport{
-		                        .x = 0,
-		                        .y = 0,
-		                        .width = (float)extents[eye].width,
-		                        .height = (float)extents[eye].height,
-		                        .minDepth = 0,
-		                        .maxDepth = 1,
-		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
-		vk::ClearValue clear{};
-		clear.color.float32.fill(0);
-		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = *renderpass,
-		        .framebuffer = *tgt.framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
-		        .clearValueCount = 1,
-		        .pClearValues = &clear,
-		};
-		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		cmd.draw((uint32_t)vert_count, 1, first_vertex, 0);
-		cmd.endRenderPass();
-	}
-}
-
-void debug_lines_renderer::record_tris(vk::raii::CommandBuffer & cmd, size_t image_index,
-                                       const std::array<vk::Extent2D, 2> & extents,
-                                       const std::array<glm::mat4, 2> & mvp, const vertex * verts,
-                                       size_t vert_count)
-{
-	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
-		return;
-	uint32_t first_vertex = upload_verts(*device, staging, verts, vert_count, staging_used);
-	if (first_vertex == UINT32_MAX)
-		return;
-
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_tri);
-	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
-
-	for (uint32_t eye = 0; eye < 2; ++eye)
-	{
-		auto & tgt = targets[image_index][eye];
-		cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, push{mvp[eye]});
-		cmd.setViewport(0, vk::Viewport{
-		                        .x = 0,
-		                        .y = 0,
-		                        .width = (float)extents[eye].width,
-		                        .height = (float)extents[eye].height,
-		                        .minDepth = 0,
-		                        .maxDepth = 1,
-		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
-		vk::ClearValue clear{};
-		clear.color.float32.fill(0);
-		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = *renderpass,
-		        .framebuffer = *tgt.framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
-		        .clearValueCount = 1,
-		        .pClearValues = &clear,
-		};
-		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		cmd.draw((uint32_t)vert_count, 1, first_vertex, 0);
-		cmd.endRenderPass();
-	}
 }
 
 void debug_lines_renderer::init_pipelines(vk::Format format)
@@ -271,7 +142,7 @@ void debug_lines_renderer::init_pipelines(vk::Format format)
 	};
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly{
-	        .topology = vk::PrimitiveTopology::eLineList,
+	        .topology = vk::PrimitiveTopology::eTriangleList, // lines never rasterized on this path
 	};
 
 	vk::PipelineViewportStateCreateInfo viewport_state{
@@ -365,24 +236,91 @@ void debug_lines_renderer::init_pipelines(vk::Format format)
 	        .renderPass = *renderpass,
 	};
 	pipeline = vk::raii::Pipeline(*device, nullptr, pipeline_info);
+}
 
-	// TEMP diagnostic twin: identical except blending off (isolates blend
-	// faults from pipeline/framebuffer faults).
-	vk::PipelineColorBlendAttachmentState blend_off_attachment = blend_attachment;
-	blend_off_attachment.blendEnable = VK_FALSE;
-	vk::PipelineColorBlendStateCreateInfo blend_off{
-	        .attachmentCount = 1,
-	        .pAttachments = &blend_off_attachment,
-	};
-	vk::GraphicsPipelineCreateInfo pipeline_off_info = pipeline_info;
-	pipeline_off_info.pColorBlendState = &blend_off;
-	pipeline_unblended = vk::raii::Pipeline(*device, nullptr, pipeline_off_info);
+void debug_lines_renderer::begin_frame()
+{
+	staging_used = 0;
+}
 
-	// TEMP diagnostic twin: triangle list, unblended (topology bisect:
-	// tri-visible + lines-invisible convicts line rasterization).
-	vk::PipelineInputAssemblyStateCreateInfo tri_assembly = input_assembly;
-	tri_assembly.topology = vk::PrimitiveTopology::eTriangleList;
-	vk::GraphicsPipelineCreateInfo pipeline_tri_info = pipeline_off_info;
-	pipeline_tri_info.pInputAssemblyState = &tri_assembly;
-	pipeline_tri = vk::raii::Pipeline(*device, nullptr, pipeline_tri_info);
+// Append-only upload shared by record paths (one upload serves all draws
+// in a frame; draws reference their own ranges). Fixed generous cap:
+// frame usage is hundreds of verts; growing mid-frame would orphan
+// earlier draws. Returns first-vertex index, or UINT32_MAX when dropped.
+static uint32_t upload_verts(vk::raii::Device & device, buffer_allocation & staging, const debug_lines_renderer::vertex * verts,
+                             size_t vert_count, size_t & staging_used)
+{
+	static constexpr size_t kStagingCapVerts = 4096;
+	if (staging_used + vert_count > kStagingCapVerts)
+	{
+		static bool warned = false;
+		if (not warned)
+		{
+			warned = true;
+			spdlog::warn("debug_lines: frame vertex overflow, dropping");
+		}
+		return UINT32_MAX;
+	}
+	if (not staging or staging.info().size < kStagingCapVerts * sizeof(debug_lines_renderer::vertex))
+	{
+		staging = buffer_allocation(
+		        device,
+		        vk::BufferCreateInfo{
+		                .size = kStagingCapVerts * sizeof(debug_lines_renderer::vertex),
+		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "debug lines");
+	}
+	uint32_t first_vertex = (uint32_t)staging_used;
+	std::memcpy((char *)staging.map() + first_vertex * sizeof(debug_lines_renderer::vertex), verts,
+	            vert_count * sizeof(debug_lines_renderer::vertex));
+	staging.unmap();
+	staging_used += vert_count;
+	return first_vertex;
+}
+
+void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
+                                  const std::array<vk::Extent2D, 2> & extents,
+                                  const std::array<glm::mat4, 2> & mvp, const vertex * verts, size_t vert_count)
+{
+	if (vert_count == 0 or verts == nullptr or image_index >= targets.size())
+		return;
+	uint32_t first_vertex = upload_verts(*device, staging, verts, vert_count, staging_used);
+	if (first_vertex == UINT32_MAX)
+		return;
+
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
+
+	// Fresh CLEAR images every frame: no barrier, no layout history.
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		auto & tgt = targets[image_index][eye];
+		cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, push{mvp[eye]});
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)extents[eye].width,
+		                        .height = (float)extents[eye].height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
+		vk::ClearValue clear{};
+		clear.color.float32.fill(0);
+		vk::RenderPassBeginInfo begin_info{
+		        .renderPass = *renderpass,
+		        .framebuffer = *tgt.framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .clearValueCount = 1,
+		        .pClearValues = &clear,
+		};
+		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+		cmd.draw((uint32_t)vert_count, 1, first_vertex, 0);
+		cmd.endRenderPass();
+	}
 }
