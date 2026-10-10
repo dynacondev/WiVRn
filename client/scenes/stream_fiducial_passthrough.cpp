@@ -379,7 +379,15 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	}
 	fp.last_horizon_ms = (predicted_display_time - now) * 1e-6;
 	fp.last_solve_ms = 0;
-	fp.corrected_tags.clear();
+	// Corrected tags persist across frames (stamped below on live
+	// solves) so the overlay fades instead of popping; prune past 10s.
+	for (auto it = fp.corrected_tags.begin(); it != fp.corrected_tags.end();)
+	{
+		if (now - it->second.last_seen > 10'000'000'000LL)
+			it = fp.corrected_tags.erase(it);
+		else
+			++it;
+	}
 	for (auto & [fid, bp]: board_poses)
 	{
 		(void)fid;
@@ -443,7 +451,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// authored: the inverse of the vote path, so no extra math).
 		// Green raw vs orange corrected shows disagreement at a glance.
 		for (const auto & m: f.markers)
-			fp.corrected_tags[m.marker_data] = {compose_pose(sol.board_pose, m.position, m.orientation), m.marker_size_m, f.id};
+			fp.corrected_tags[m.marker_data] = {compose_pose(sol.board_pose, m.position, m.orientation), m.marker_size_m, f.id, now};
 		// Logging: heartbeat per fiducial + visible-set changes.
 		// `board solve:` is the tuning instrument (more logging better).
 		static XrTime last_solve_log = 0;
@@ -646,12 +654,13 @@ void scenes::stream::gui_passthrough()
 	if (ImGui::SliderInt(_S("Marker window cutout"), &fp.debug_window_mm, -1, 512, fp.debug_window_mm < 0 ? "Disabled" : "%d mm"))
 		fp.debug_window_mm = std::clamp(fp.debug_window_mm, -1, 512);
 	ImGui::Checkbox(_S("Corrected tags (orange)"), &fp.debug_corrected);
+	ImGui::Checkbox(_S("Axes gizmo (RGB=XYZ)"), &fp.debug_axes);
 	if (ImGui::Button(_S("Run board solver self-test")))
 		xr::board_solver_selftest();
 	if (not fp.held_codes.empty())
 	{
 		ImGui::Text("%s (%zu):", _S("Codes in view"), fp.held_codes.size());
-		ImGui::BeginChild("debug_codes", {0, 140});
+		ImGui::BeginChild("debug_codes", {0, 280});
 		for (const auto & [id, h]: fp.held_codes)
 		{
 			(void)id;

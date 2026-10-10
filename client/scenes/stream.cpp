@@ -1318,14 +1318,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Marker window cutouts: raw instant pose of every matched
 				// code (unfiltered, SLAM-held) expanded by the debug
 				// window, punched through the masks so true code locations
-				// stay visible even when meshes are offset.
+				// stay visible even when meshes are offset. Fully-faded
+				// codes (stale past the overlay fade) are excluded, so the
+				// window closes as the quads fade out.
 				std::vector<std::array<glm::vec3, 6>> cutouts;
 				if (fp.debug_overlays and fp.debug_window_mm >= 0)
 				{
+					XrTime cut_now = instance.now();
 					for (const auto & [id, h]: fp.held_codes)
 					{
 						(void)id;
 						if (not h.matched or h.extents.width <= 0 or h.extents.height <= 0)
+							continue;
+						if (fiducial_passthrough_state::stale_hold(cut_now, h.last_seen) <= 0.01f)
 							continue;
 						glm::quat mq(h.pose.orientation.w, h.pose.orientation.x, h.pose.orientation.y, h.pose.orientation.z);
 						glm::vec3 c(h.pose.position.x, h.pose.position.y, h.pose.position.z);
@@ -1359,6 +1364,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->set_mesh(oid, ost.soup);
 						g.mesh_hashes[oid] = ost.soup_hash;
 					}
+				}
+				// Debug-only cutout group (no objects): lets the marker
+				// window punch with a fiducials-only config. Reserved key
+				// (never an object feather); flows through eager setup,
+				// record (empty draws, cutouts punch), submit and stale
+				// drop like any group. Claimed only while fresh codes
+				// exist, so it reaps itself on loss.
+				if (live_feathers.empty() and not cutouts.empty())
+				{
+					const float df = fiducial_passthrough_state::kDebugCutoutFeather;
+					live_feathers.push_back(df);
+					auto & g = fp.mask_groups[df];
+					g.feather_px = df;
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
 				}
 				// Permanent record-order log: group costs are positional, so
 				// the per-group loop order below is load-bearing diagnostics.
@@ -1499,8 +1519,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					if (draws.empty())
 					{
-						g.active = false;
-						continue;
+						// Debug cutout group carries no draws; its cutouts
+						// still punch (record() early-outs only when meshes
+						// AND cutouts are both absent).
+						if (f != fiducial_passthrough_state::kDebugCutoutFeather or cutouts.empty())
+						{
+							g.active = false;
+							continue;
+						}
 					}
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release
@@ -1895,6 +1921,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// White texture from above, tint + opacity via colorScaleBias.
 		if (debug_acquired)
 		{
+			XrTime dbg_now = instance.now();
+			// One white-quad submitter: tint + opacity via colorScaleBias on
+			// the just-pushed layer. Quads draw front-face only per spec.
+			auto submit_quad = [&](const XrPosef & pose, float w, float h, float r, float g, float b, float a) {
+				add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+				               application::space(xr::spaces::world),
+				               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
+				               XrSwapchainSubImage{
+				                       .swapchain = fp.debug_swapchain,
+				                       .imageRect = {{0, 0}, {4, 4}},
+				                       .imageArrayIndex = 0,
+				               },
+				               pose,
+				               XrExtent2Df{w, h});
+				if (composition_layer_color_scale_bias_supported)
+					set_color_scale_bias({r * a, g * a, b * a, a}, {});
+			};
+			size_t n_quad = 0, n_axes = 0;
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;
@@ -1904,26 +1948,42 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					continue;
 				if (h.extents.width <= 0 or h.extents.height <= 0)
 					continue;
-				float a = std::clamp(fp.debug_opacity, 0.f, 1.f);
+				// 3s stale fade (last_seen refreshes on new data: fade resets).
+				float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+					fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen);
+				if (a <= 0.01f)
+					continue;
 				float r = h.matched ? 0.f : 1.f;
 				float g = h.matched ? 1.f : 0.f;
-				add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-				               application::space(xr::spaces::world),
-				               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
-				               XrSwapchainSubImage{
-				                       .swapchain = fp.debug_swapchain,
-				                       .imageRect = {{0, 0}, {4, 4}},
-				                       .imageArrayIndex = 0,
-				               },
-				               h.pose,
-				               XrExtent2Df{h.extents.width, h.extents.height});
-				if (composition_layer_color_scale_bias_supported)
-					set_color_scale_bias({r * a, g * a, 0.f, a}, {});
+				submit_quad(h.pose, h.extents.width, h.extents.height, r, g, 0.f, a);
+				++n_quad;
+				// XYZ tripod (orientation + face-polarity check): X/Y shafts in
+				// the face plane, Z spanning the Z-Y plane, doubled: quads draw
+				// front-face only, so one normal per side.
+				if (fp.debug_axes)
+				{
+					float len = h.extents.width;
+					float thin = len * 0.08f;
+					if (len > 0)
+					{
+						glm::quat tq(h.pose.orientation.w, h.pose.orientation.x,
+						             h.pose.orientation.y, h.pose.orientation.z);
+						glm::vec3 tp(h.pose.position.x, h.pose.position.y, h.pose.position.z);
+						submit_quad(h.pose, len, thin, 1.f, 0.f, 0.f, a);
+						++n_axes;
+						submit_quad(h.pose, thin, len, 0.f, 1.f, 0.f, a);
+						++n_axes;
+						for (float yaw: {-90.f, 90.f})
+						{
+							glm::quat qz = tq * glm::angleAxis(glm::radians(yaw), glm::vec3(0, 1, 0));
+							XrPosef zp{.orientation = {qz.x, qz.y, qz.z, qz.w}, .position = {tp.x, tp.y, tp.z}};
+							submit_quad(zp, len, thin, 0.f, 0.f, 1.f, a);
+							++n_axes;
+						}
+					}
+				}
 			}
-			// Orange: fused-corrected tag boxes, reverse-computed from
-			// each live board pose. Green raw vs orange corrected shows
-			// fusion disagreement at a glance; a persistent split on one
-			// tag is print/offset error, not noise.
+			// Orange: fused-corrected tag boxes on their own clock.
 			if (fp.debug_corrected)
 			{
 				for (const auto & [payload, c]: fp.corrected_tags)
@@ -1931,29 +1991,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					(void)payload;
 					if (c.size_m <= 0)
 						continue;
-					float a = std::clamp(fp.debug_opacity, 0.f, 1.f);
-					add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-					               application::space(xr::spaces::world),
-					               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
-					               XrSwapchainSubImage{
-					                       .swapchain = fp.debug_swapchain,
-					                       .imageRect = {{0, 0}, {4, 4}},
-					                       .imageArrayIndex = 0,
-					               },
-					               c.pose,
-					               XrExtent2Df{c.size_m, c.size_m});
-					if (composition_layer_color_scale_bias_supported)
-						set_color_scale_bias({1.0f * a, 0.55f * a, 0.f, a}, {});
+					float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+						fiducial_passthrough_state::stale_hold(dbg_now, c.last_seen);
+					if (a <= 0.01f)
+						continue;
+					submit_quad(c.pose, c.size_m, c.size_m, 1.f, 0.55f, 0.f, a);
+					++n_quad;
 				}
 			}
-			// Heartbeat inventory: which debug quads are actually submitted
-			// (poses distinguish marker quads from a stuck/ghost one).
+			// Heartbeat inventory: submitted counts + per-quad detail (poses
+			// distinguish marker quads from stuck/ghost ones). Faded-out quads
+			// are skipped above and omitted here too.
 			static XrTime last_dbg_log = 0;
-			XrTime dbg_now = instance.now();
-			if (dbg_now - last_dbg_log > 5'000'000'000LL)
+			if (dbg_now - last_dbg_log > 5000000000LL)
 			{
 				last_dbg_log = dbg_now;
-				size_t n = 0;
+				spdlog::info("Fiducial debug quads: {} submitted ({} axes)", n_quad, n_axes);
 				for (const auto & [id, h]: fp.held_codes)
 				{
 					(void)id;
@@ -1963,14 +2016,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						continue;
 					if (h.extents.width <= 0 or h.extents.height <= 0)
 						continue;
-					++n;
+					float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+						fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen);
+					if (a <= 0.01f)
+						continue;
 					spdlog::info("Fiducial debug quad: {} {:.0f} x {:.0f}mm at ({:.2f},{:.2f},{:.2f}){}",
-					             h.payload.substr(0, 32), (double)(h.extents.width * 1000),
-					             (double)(h.extents.height * 1000), (double)h.pose.position.x,
-					             (double)h.pose.position.y, (double)h.pose.position.z,
-					             h.matched ? " (matched)" : " (unmatched)");
+						h.payload.substr(0, 32), (double)(h.extents.width * 1000),
+						(double)(h.extents.height * 1000), (double)h.pose.position.x,
+						(double)h.pose.position.y, (double)h.pose.position.z,
+						h.matched ? " (matched)" : " (unmatched)");
 				}
-				spdlog::info("Fiducial debug quads: {} submitted", n);
 				if (fp.debug_corrected)
 				{
 					for (const auto & [payload, c]: fp.corrected_tags)
@@ -1978,10 +2033,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						(void)payload;
 						if (c.size_m <= 0)
 							continue;
+						if (fiducial_passthrough_state::stale_hold(dbg_now, c.last_seen) <= 0.01f)
+							continue;
 						spdlog::info("Fiducial corrected quad: {} {:.0f}mm fid \"{}\" at ({:.2f},{:.2f},{:.2f})",
-						             payload.substr(0, 32), (double)(c.size_m * 1000), c.fiducial_id,
-						             (double)c.pose.position.x, (double)c.pose.position.y,
-						             (double)c.pose.position.z);
+							payload.substr(0, 32), (double)(c.size_m * 1000), c.fiducial_id,
+							(double)c.pose.position.x, (double)c.pose.position.y,
+							(double)c.pose.position.z);
 					}
 				}
 			}

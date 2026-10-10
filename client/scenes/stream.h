@@ -337,18 +337,20 @@ private:
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
 
-		// Multi-code corrected tag poses (orange overlay): each live
-		// board tag reverse-computed from the fused board pose
-		// (predicted = fused * offset^-1), vs the raw green sightings.
-		// Rebuilt every frame from live solutions only.
+		// Multi-code corrected tag poses (orange overlay): each board
+		// tag re-projected from the fused board pose with its authored
+		// offset, vs the raw green sightings. Refreshed on live frames;
+		// stale entries fade like the quads (last_seen) and prune past 10s.
 		struct corrected_tag
 		{
 			XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
 			float size_m = 0;
 			std::string fiducial_id;
+			XrTime last_seen = 0;
 		};
 		std::map<std::string /*payload*/, corrected_tag> corrected_tags;
 		bool debug_corrected = true; // orange: fused-corrected tag boxes
+		bool debug_axes = true; // RGB XYZ tripod on sighted tags (orientation/polarity check)
 
 		// Fiducial marker debugging (Passthrough tab, session-scoped,
 		// render thread only). Raw instant poses while visible, frozen
@@ -401,6 +403,26 @@ private:
 			double t = std::clamp((predicted - start) * 1e-6 / dur_ms, 0.0, 1.0);
 			return t * t * (3 - 2 * t);
 		}
+
+		// Stale-hold multiplier for debug overlays (quads, orange, axes):
+		// full presence on fresh data, smooth 3s fade-out on SLAM hold.
+		// last_seen stamps in predicted-display-time base while now runs
+		// host base: the horizon (~30ms) rides along as a constant, moot
+		// against 3000ms. Returns 0 (gone) .. 1 (fresh).
+		static constexpr double kStaleFadeS = 3.0;
+		static float stale_hold(XrTime now, XrTime last_seen)
+		{
+			if (last_seen == 0)
+				return 0;
+			double t = std::clamp((now - last_seen) * 1e-9 / kStaleFadeS, 0.0, 1.0);
+			return (float)(1.0 - t * t * (3 - 2 * t));
+		}
+
+		// Reserved feather key for the debug-only cutout group (no
+		// objects): object feathers are >= 0, and tier_for_feather(-1)
+		// is tier 0 (full-res, crisp punch). Lets the marker window work
+		// with a fiducials-only config.
+		static constexpr float kDebugCutoutFeather = -1.0f;
 
 		// Mask stacks grouped by feather-px: objects sharing a feather
 		// value raster into one shared blur chain (independent feathering

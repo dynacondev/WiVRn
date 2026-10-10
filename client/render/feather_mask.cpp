@@ -1008,7 +1008,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	}
 	else
 	{
-		if (meshes.empty())
+		// No meshes: nothing to raster, but cutouts still punch (the
+		// debug-only group has no meshes by design). Tier branches below
+		// run over empty draws (clear passes), then the punch stamps.
+		if (meshes.empty() and cutouts.empty())
 		{
 			fill_stats();
 			return;
