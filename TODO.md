@@ -3,8 +3,8 @@
 - [x] 1. R8 intermediates — A/B/D/E to R8_UNORM, RGBA8 submits stay
 - [x] 2. Frustum skip — AABB at upload, per-draw NDC test + feather margin, filter before acquire
 - [x] 3. Eye-outer reorder — {raster,H,V} per eye instead of per pass
-- [ ] 4. Mask last — block to just before submit
-- [ ] 5. Mask first — block to right after cmd begin
+- [ ] 4. Mask last — SKIPPED as no-op (mask already records last; only debug fill follows)
+- [ ] 5. Mask first — block before defoveate (real phase shift; frozen-safe outside timewarp-if)
 - [x] 6. CPU C0 — tracker/sync timers in mask perf line (measure first)
 - [ ] 7. CPU C1 — stagger + back off snapshots (round-robin 1 tracker/frame, slow when held-stable)
 - [ ] 8. CPU C2 — fingerprint gate (rebuild map_key/uni/exists only on source change)

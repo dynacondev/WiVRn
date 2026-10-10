@@ -1086,117 +1086,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
-	// Allow the headset to time warp if we are redisplaying a frame
-	if ((not application::get_hmd_traits().discard_frame) or
-	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
-	    is_gui_interactable())
+	// Mask records here (before video/defoveate) as a submit-phase
+	// experiment (TODO #5): identical passes, draws and targets, ~2ms
+	// earlier in the submit. Runs every frame exactly as at its old site
+	// (outside the timewarp-if below, so frozen frames keep their window).
 	{
-		XrExtent2Di extents[view_count];
-		{
-			int32_t max_width = 0;
-			int32_t max_height = 0;
-			for (size_t i = 0; i < view_count; ++i)
-			{
-				extents[i] = stream_defoveator::defoveated_size(foveation[i]);
-				max_width = std::max(max_width, extents[i].width);
-				max_height = std::max(max_height, extents[i].height);
-			}
-			if (not swapchain)
-				setup_reprojection_swapchain(max_width, max_height);
-			else if (swapchain.width() < max_width or swapchain.height() < max_height)
-			{
-				// If the defoveated image is larger than the swapchain, try to reallocate one
-				try
-				{
-					spdlog::info("Recreating swapchain, from {}x{} to {}x{}",
-					             swapchain.width(),
-					             swapchain.height(),
-					             max_width,
-					             max_height);
-					setup_reprojection_swapchain(max_width, max_height);
-				}
-				catch (std::exception & e)
-				{
-					spdlog::warn("failed to increase swapchain size");
-					for (size_t i = 0; i < view_count; ++i)
-					{
-						extents[i].width = std::min(extents[i].width, swapchain.width());
-						extents[i].height = std::min(extents[i].height, swapchain.height());
-					}
-				}
-			}
-		}
-		assert(swapchain);
-		// defoveate the image, apply scale/bias
-		int image_index = swapchain.acquire();
-		swapchain.wait();
-
-		switch (gui_status)
-		{
-			case stream_tab::hidden:
-			case stream_tab::foveation_settings:
-			case stream_tab::compact:
-			case stream_tab::overlay_only:
-				dimming = dimming - frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
-				break;
-			case stream_tab::stats:
-			case stream_tab::settings:
-			case stream_tab::applications:
-			case stream_tab::application_launcher:
-				dimming = dimming + frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
-				break;
-		}
-
-		dimming = std::clamp<float>(dimming, 0, 1);
-		float x = dimming * dimming * (3 - 2 * dimming); // Easing function
-
-		const float scale = std::lerp(1, constants::stream::dimming_scale, x);
-		const float bias = std::lerp(0, constants::stream::dimming_bias, x);
-
-		defoveator->defoveate(command_buffer,
-		                      foveation,
-		                      images,
-		                      {scale, scale, scale, 1.},
-		                      {bias, bias, bias, 0.},
-		                      image_index);
-
-#if WIVRN_USE_V4L2
-		// the blit handles keep CAPTURE buffers alive until this cmd buffer's fence has completed
-		inplace_vector<vk::ImageMemoryBarrier, decoder_count> foreign_release_barriers;
-		for (const auto & handle: current_blit_handles)
-		{
-			if (handle && handle->foreign_queue_family != vk::QueueFamilyIgnored)
-			{
-				foreign_release_barriers.push_back({
-				        .srcAccessMask = vk::AccessFlagBits::eShaderRead,
-				        .dstAccessMask = vk::AccessFlagBits::eNone,
-				        .oldLayout = handle->current_layout,
-				        .newLayout = vk::ImageLayout::eGeneral,
-				        .srcQueueFamilyIndex = queue_family_index,
-				        .dstQueueFamilyIndex = handle->foreign_queue_family,
-				        .image = handle->image,
-				        .subresourceRange = {
-				                .aspectMask = vk::ImageAspectFlagBits::eColor,
-				                .levelCount = 1,
-				                .layerCount = 1,
-				        },
-				});
-				handle->current_layout = vk::ImageLayout::eGeneral;
-			}
-		}
-		if (!foreign_release_barriers.empty())
-		{
-			command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
-			                               vk::PipelineStageFlagBits::eBottomOfPipe,
-			                               {},
-			                               {},
-			                               {},
-			                               foreign_release_barriers);
-		}
-#endif
-
-		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
-
 		// Feathered mask record, one stack per feather group (independent
 		// feathering per object). Groups share a blur chain per feather
 		// value; member objects contribute soups, anchored instances
@@ -1217,8 +1111,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			else
 			{
-				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
-				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
+				// Mask swapchain sizing mirrors the extents computation in
+				// the video path below (defoveated eye size, 64-quantized):
+				// recomputed here (foveation is fixed above; values are
+				// identical by construction).
+				XrExtent2Di mask_ref = stream_defoveator::defoveated_size(foveation[0]);
+				int mw = std::max(64, (mask_ref.width + 32) / 64 * 64);
+				int mh = std::max(64, (mask_ref.height + 32) / 64 * 64);
 				// Member mask swapchains run at half resolution: the V
 				// upscale writes half pixels and the compositor expands to
 				// full on submit (bilinear, equivalent filtering to the old
@@ -1492,6 +1391,122 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			acquired_groups.clear();
 			mask_frame = false;
 		}
+	}
+
+	// Allow the headset to time warp if we are redisplaying a frame
+	if ((not application::get_hmd_traits().discard_frame) or
+	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
+	    is_gui_interactable())
+	{
+		XrExtent2Di extents[view_count];
+		{
+			int32_t max_width = 0;
+			int32_t max_height = 0;
+			for (size_t i = 0; i < view_count; ++i)
+			{
+				extents[i] = stream_defoveator::defoveated_size(foveation[i]);
+				max_width = std::max(max_width, extents[i].width);
+				max_height = std::max(max_height, extents[i].height);
+			}
+			if (not swapchain)
+				setup_reprojection_swapchain(max_width, max_height);
+			else if (swapchain.width() < max_width or swapchain.height() < max_height)
+			{
+				// If the defoveated image is larger than the swapchain, try to reallocate one
+				try
+				{
+					spdlog::info("Recreating swapchain, from {}x{} to {}x{}",
+					             swapchain.width(),
+					             swapchain.height(),
+					             max_width,
+					             max_height);
+					setup_reprojection_swapchain(max_width, max_height);
+				}
+				catch (std::exception & e)
+				{
+					spdlog::warn("failed to increase swapchain size");
+					for (size_t i = 0; i < view_count; ++i)
+					{
+						extents[i].width = std::min(extents[i].width, swapchain.width());
+						extents[i].height = std::min(extents[i].height, swapchain.height());
+					}
+				}
+			}
+		}
+		assert(swapchain);
+		// defoveate the image, apply scale/bias
+		int image_index = swapchain.acquire();
+		swapchain.wait();
+
+		switch (gui_status)
+		{
+			case stream_tab::hidden:
+			case stream_tab::foveation_settings:
+			case stream_tab::compact:
+			case stream_tab::overlay_only:
+				dimming = dimming - frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
+				break;
+			case stream_tab::stats:
+			case stream_tab::settings:
+			case stream_tab::applications:
+			case stream_tab::application_launcher:
+				dimming = dimming + frame_state.predictedDisplayPeriod / (1e9 * constants::stream::fade_duration);
+				break;
+		}
+
+		dimming = std::clamp<float>(dimming, 0, 1);
+		float x = dimming * dimming * (3 - 2 * dimming); // Easing function
+
+		const float scale = std::lerp(1, constants::stream::dimming_scale, x);
+		const float bias = std::lerp(0, constants::stream::dimming_bias, x);
+
+		defoveator->defoveate(command_buffer,
+		                      foveation,
+		                      images,
+		                      {scale, scale, scale, 1.},
+		                      {bias, bias, bias, 0.},
+		                      image_index);
+
+#if WIVRN_USE_V4L2
+		// the blit handles keep CAPTURE buffers alive until this cmd buffer's fence has completed
+		inplace_vector<vk::ImageMemoryBarrier, decoder_count> foreign_release_barriers;
+		for (const auto & handle: current_blit_handles)
+		{
+			if (handle && handle->foreign_queue_family != vk::QueueFamilyIgnored)
+			{
+				foreign_release_barriers.push_back({
+				        .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+				        .dstAccessMask = vk::AccessFlagBits::eNone,
+				        .oldLayout = handle->current_layout,
+				        .newLayout = vk::ImageLayout::eGeneral,
+				        .srcQueueFamilyIndex = queue_family_index,
+				        .dstQueueFamilyIndex = handle->foreign_queue_family,
+				        .image = handle->image,
+				        .subresourceRange = {
+				                .aspectMask = vk::ImageAspectFlagBits::eColor,
+				                .levelCount = 1,
+				                .layerCount = 1,
+				        },
+				});
+				handle->current_layout = vk::ImageLayout::eGeneral;
+			}
+		}
+		if (!foreign_release_barriers.empty())
+		{
+			command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+			                               vk::PipelineStageFlagBits::eBottomOfPipe,
+			                               {},
+			                               {},
+			                               {},
+			                               foreign_release_barriers);
+		}
+#endif
+
+		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
+
+
+		// Mask records above (before video/defoveate) as a submit-phase experiment;
+		// this site intentionally left empty.
 
 		// Debug overlay texture: 4x4 white, tinted per quad via
 		// colorScaleBias at submit (after draw_gui, so overlays sit on
