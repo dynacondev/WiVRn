@@ -160,6 +160,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	}
 	mask_log_sum_cpu += mask_cpu_sum_ms;
 	mask_log_max_cpu = std::max(mask_log_max_cpu, mask_cpu_sum_ms);
+	mask_log_sum_track += fiducial_passthrough.last_tracker_ms;
+	mask_log_sum_sync += fiducial_passthrough.last_sync_ms;
 	mask_log_unmetered += mask_ready_unmetered;
 	mask_ready_samples.clear();
 	mask_ready_unmetered = 0;
@@ -235,7 +237,7 @@ void scenes::stream::log_mask_perf(XrTime now)
 		                      a.tier,
 		                      a.draws);
 	}
-	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max / {:.2f} min, groups min {}, record cpu {:.2f}ms mean / {:.2f} max, unmetered {} {}",
+	spdlog::info("mask perf: {} frames, total gpu {:.2f}ms mean / {:.2f} max / {:.2f} min, groups min {}, record cpu {:.2f}ms mean / {:.2f} max, track {:.2f}ms sync {:.2f}ms, unmetered {} {}",
 	             mask_log_frames,
 	             mask_log_sum_gpu / (double)mask_log_frames,
 	             mask_log_max_gpu,
@@ -243,11 +245,14 @@ void scenes::stream::log_mask_perf(XrTime now)
 	             mask_log_min_groups,
 	             mask_log_sum_cpu / (double)mask_log_frames,
 	             mask_log_max_cpu,
+	             mask_log_sum_track / (double)mask_log_frames,
+	             mask_log_sum_sync / (double)mask_log_frames,
 	             mask_log_unmetered,
 	             detail);
 	mask_log_frames = 0;
 	mask_log_sum_gpu = mask_log_max_gpu = mask_log_min_gpu = 0;
 	mask_log_sum_cpu = mask_log_max_cpu = 0;
+	mask_log_sum_track = mask_log_sum_sync = 0;
 	mask_log_unmetered = 0;
 	mask_log_min_groups = 0;
 	mask_log_per_feather.clear();

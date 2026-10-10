@@ -309,6 +309,12 @@ private:
 		std::string last_map_key; // map identity; a change wipes instances
 		std::string last_key;   // fingerprint of map + cache, resets attempted
 		std::string status = "waiting for fiducial map";
+		// Last-frame host cost split (ms, render thread): tracker XR work
+		// vs map fingerprint/sync churn. Fed by
+		// update_fiducial_passthrough, reported in the mask perf log line
+		// (C0 diagnostics; one frame stale like the GPU readback).
+		double last_tracker_ms = 0;
+		double last_sync_ms = 0;
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
 
@@ -582,6 +588,7 @@ private:
 	uint64_t mask_log_frames = 0;
 	double mask_log_sum_gpu = 0, mask_log_max_gpu = 0, mask_log_min_gpu = 0;
 	double mask_log_sum_cpu = 0, mask_log_max_cpu = 0;
+	double mask_log_sum_track = 0, mask_log_sum_sync = 0;
 	uint64_t mask_log_unmetered = 0;
 	uint64_t mask_log_min_groups = 0;
 	struct mask_feather_acc

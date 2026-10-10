@@ -34,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <glm/gtc/quaternion.hpp>
 #include <memory>
@@ -206,6 +207,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 {
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto & fp = fiducial_passthrough;
+	// C0 cost split (clocks only, no behavior change): sync churn (map
+	// copy, fingerprint strings, exists() syscalls, tracker sync, resolver,
+	// hold-store) vs tracker XR work (snapshot + query per tracker).
+	auto t_sync0 = std::chrono::steady_clock::now();
 	// Snapshot, never held across model file loads below: the network
 	// thread serves chunks through the same lock.
 	to_headset::fiducial_map map = *fiducial_map.lock();
@@ -279,11 +284,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// feeds the status UI and the debug overlays pre-placement).
 	sync_fiducial_trackers(map);
 	XrTime now = instance.now();
+	auto t_track0 = std::chrono::steady_clock::now();
 	for (auto & [payload, tr]: fiducial_trackers)
 	{
 		(void)payload;
 		tr.update(world_space, now, predicted_display_time);
 	}
+	auto t_track1 = std::chrono::steady_clock::now();
 
 	// Resolver (single-marker): solved fiducial frame per (fiducial,
 	// entity) = observed * marker offset. Rebuilt every frame.
@@ -326,6 +333,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			h.matched = configured_marker_payloads.contains(s.payload);
 		}
 	}
+	auto t_sync1 = std::chrono::steady_clock::now();
+	fp.last_tracker_ms = std::chrono::duration<double, std::milli>(t_track1 - t_track0).count();
+	fp.last_sync_ms = std::chrono::duration<double, std::milli>(t_sync1 - t_sync0).count() - fp.last_tracker_ms;
 
 	if (key != fp.last_key)
 	{
