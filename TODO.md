@@ -2,7 +2,7 @@
 
 - [x] 1. R8 intermediates — A/B/D/E to R8_UNORM, RGBA8 submits stay
 - [x] 2. Frustum skip — AABB at upload, per-draw NDC test + feather margin, filter before acquire
-- [ ] 3. Eye-outer reorder — {raster,H,V} per eye instead of per pass
+- [x] 3. Eye-outer reorder — {raster,H,V} per eye instead of per pass
 - [ ] 4. Mask last — block to just before submit
 - [ ] 5. Mask first — block to right after cmd begin
 - [x] 6. CPU C0 — tracker/sync timers in mask perf line (measure first)
