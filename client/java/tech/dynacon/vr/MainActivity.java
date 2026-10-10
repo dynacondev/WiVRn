@@ -1,4 +1,4 @@
-package org.meumeu.wivrn;
+package tech.dynacon.vr;
 
 public class MainActivity extends android.app.NativeActivity
 {
@@ -25,7 +25,7 @@ public class MainActivity extends android.app.NativeActivity
 		super.onCreate(savedInstanceState);
 
 		this.BatteryInfoReceiver = new BroadcastReceiver();
-		this.netcb = new org.meumeu.wivrn.NetworkInfoCallback();
+		this.netcb = new tech.dynacon.vr.NetworkInfoCallback();
 
 		this.registerReceiver(this.BatteryInfoReceiver, new android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED));
 	}

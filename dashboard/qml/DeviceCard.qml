@@ -43,7 +43,7 @@ Kirigami.Card {
             Layout.fillWidth: true
             Layout.column: 0
             Layout.row: 1
-            text: device_card.is_wivrn_installed ? i18n("WiVRn is already installed on this device") : ""
+            text: device_card.is_wivrn_installed ? i18n("DynaconVR is already installed on this device") : ""
         }
 
         Controls.Button {
@@ -51,7 +51,7 @@ Kirigami.Card {
             Layout.column: 1
             Layout.row: 0
             Layout.rowSpan: 2
-            text: device_card.is_wivrn_installed ? i18n("Reinstall WiVRn") : i18n("Install WiVRn")
+            text: device_card.is_wivrn_installed ? i18n("Reinstall DynaconVR") : i18n("Install DynaconVR")
             icon.name: "install-symbolic"
             onClicked: device_card.install()
             enabled: !ApkInstaller.busy

@@ -9,7 +9,7 @@ import io.github.wivrn.wivrn
 
 Kirigami.ApplicationWindow {
     id: root
-    title: i18n("WiVRn dashboard")
+    title: i18n("DynaconVR Dashboard")
 
     ConnectUsbDialog {
         id: select_usb_device
@@ -48,8 +48,8 @@ Kirigami.ApplicationWindow {
 
     Kirigami.PromptDialog {
         id: confirm_close
-        title: i18n("Quit WiVRn")
-        subtitle: i18n("The WiVRn server is active.\nClosing the window will terminate it.")
+        title: i18n("Quit DynaconVR")
+        subtitle: i18n("The DynaconVR Server is active.\nClosing the window will terminate it.")
         iconName: "dialog-warning"
         popupType: Controls.Popup.Native
         standardButtons: Kirigami.Dialog.Ok | Kirigami.Dialog.Cancel
@@ -214,7 +214,7 @@ Kirigami.ApplicationWindow {
 
                     Kirigami.InlineMessage {
                         Layout.fillWidth: true
-                        text: i18n("Steam is installed as a snap. Snaps are not compatible with WiVRn.")
+                        text: i18n("Steam is installed as a snap. Snaps are not compatible with DynaconVR.")
                         type: Kirigami.MessageType.Warning
                         showCloseButton: true
                         visible: DashboardSettings.show_system_checks && Steam.snap

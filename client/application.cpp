@@ -1565,7 +1565,7 @@ std::pair<XrAction, XrActionType> application::get_action(std::string_view reque
 }
 
 #ifdef __ANDROID__
-extern "C" void Java_org_meumeu_wivrn_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj)
+extern "C" void Java_tech_dynacon_vr_MainActivity_onNewIntent(JNIEnv * env, jobject instance, jobject intent_obj)
 {
 	jni::jni_thread::setup_thread(env);
 	jni::object<"android/content/Intent"> intent{intent_obj};
@@ -1927,7 +1927,7 @@ void application::set_usb_networking(bool enabled)
 			                   .call<jni::object<"android/net/NetworkRequest$Builder">>("addTransportType", jni::Int(8) /*TRANSPORT_USB*/)
 			                   .call<jni::object<"android/net/NetworkRequest">>("build");
 
-			// system_service.call<void>("requestNetwork", req, jni::new_object<"org/meumeu/wivrn/NetworkInfoCallback">());
+			// system_service.call<void>("requestNetwork", req, jni::new_object<"tech/dynacon/vr/NetworkInfoCallback">());
 			system_service.call<void>("requestNetwork", req, cb);
 		}
 		else

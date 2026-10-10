@@ -93,14 +93,14 @@ void request_permission(const char * permission, std::function<void(bool)> callb
 	}
 }
 
-extern "C" void Java_org_meumeu_wivrn_MainActivity_onRequestPermissionsResult(
+extern "C" void Java_tech_dynacon_vr_MainActivity_onRequestPermissionsResult(
         JNIEnv * env,
         jobject instance,
         int requestCode,
         jobjectArray permissions,
         jintArray grantResults);
 
-void Java_org_meumeu_wivrn_MainActivity_onRequestPermissionsResult(
+void Java_tech_dynacon_vr_MainActivity_onRequestPermissionsResult(
         JNIEnv * env,
         jobject instance,
         int request_code,

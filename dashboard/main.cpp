@@ -23,9 +23,9 @@ int main(int argc, char * argv[])
 
 	KAboutData aboutData(
 	        QStringLiteral("wivrn-dashboard"),
-	        i18nc("@title", "WiVRn"),
+	        i18nc("@title", "DynaconVR"),
 	        wivrn::display_version(),
-	        i18n("WiVRn server"),
+	        i18n("DynaconVR Server"),
 	        KAboutLicense::GPL_V3,
 	        i18n("(c) 2022-2026 WiVRn development team"));
 

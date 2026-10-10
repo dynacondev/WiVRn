@@ -129,7 +129,7 @@ Kirigami.ScrollablePage {
                     text: i18n("Enable SteamVR tracked devices support")
                 }
                 Kirigami.ContextualHelpButton {
-                    toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to WiVRn.\nAn external tool such as motoc is needed for calibration.")
+                    toolTipText: i18n("Allows the use of lighthouse-based controllers and trackers.\nRequires SteamVR to be installed.\nDevices must be be powered on before connecting to DynaconVR.\nAn external tool such as motoc is needed for calibration.")
                 }
             }
             Controls.CheckBox {

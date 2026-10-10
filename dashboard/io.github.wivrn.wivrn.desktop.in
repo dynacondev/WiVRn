@@ -1,7 +1,7 @@
 [Desktop Entry]
-Name=WiVRn server
+Name=DynaconVR Server
 Comment=Play your PC VR games on a standalone headset
-GenericName=WiVRn dashboard
+GenericName=DynaconVR Dashboard
 Exec=@CMAKE_INSTALL_PREFIX@/bin/wivrn-dashboard
 Icon=io.github.wivrn.wivrn
 Type=Application

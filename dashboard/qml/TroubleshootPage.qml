@@ -17,11 +17,11 @@ Kirigami.ScrollablePage {
         rowSpacing: Kirigami.Units.largeSpacing * 2
 
         TroubleshootCard {
-            title: i18n("I cannot find the WiVRn app on my headset")
-            details: i18n("If you installed WiVRn over USB on a Meta or Pico headset, the app is in the \"unknown sources\" section.")
+            title: i18n("I cannot find the DynaconVR app on my headset")
+            details: i18n("If you installed DynaconVR over USB on a Meta or Pico headset, the app is in the \"unknown sources\" section.")
         }
         TroubleshootCard {
-            title: i18n("I cannot see my computer in the WiVRn app")
+            title: i18n("I cannot see my computer in the DynaconVR app")
             details: i18n("If you have a firewall, make sure that port 5353/UDP is open.")
         }
         TroubleshootCard {
@@ -33,7 +33,7 @@ Kirigami.ScrollablePage {
             details: i18n("If you have a firewall, make sure that port 9757 is open both for TCP and UDP.")
         }
         TroubleshootCard {
-            title: i18n("I have an \"Incompatible WiVRn server\" error on my headset")
+            title: i18n("I have an \"Incompatible DynaconVR Server\" error on my headset")
             details: i18n("<p>The version of the headset app and the server on your computer must match.</p><ul><li>The headset app version is in the \"About\" page</li><li>The server version is <b>%1</b></li></ul>", ApkInstaller.currentVersion)
         }
         TroubleshootCard {
@@ -55,7 +55,7 @@ Kirigami.ScrollablePage {
         }
         TroubleshootCard {
             title: i18n("I have no sound on my headset")
-            details: i18n("When the headset is connected, select \"WiVRn\" as the default audio output device for applications to use it.")
+            details: i18n("When the headset is connected, select \"DynaconVR\" as the default audio output device for applications to use it.")
         }
         TroubleshootCard {
             title: i18n("Some games fail to start or have input issues")

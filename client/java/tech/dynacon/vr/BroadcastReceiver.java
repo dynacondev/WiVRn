@@ -1,4 +1,4 @@
-package org.meumeu.wivrn;
+package tech.dynacon.vr;
 
 public class BroadcastReceiver extends android.content.BroadcastReceiver
 {

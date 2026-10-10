@@ -357,7 +357,7 @@ void scenes::stream::gui_performance_metrics()
 		if (is_gui_interactable())
 			ImGui::Text("%s", _S("Press the grip button to move the window"));
 		else
-			ImGui::Text("%s", _S("Press both thumbsticks to display the WiVRn window"));
+			ImGui::Text("%s", _S("Press both thumbsticks to display the DynaconVR window"));
 	}
 }
 
@@ -620,7 +620,7 @@ void scenes::stream::gui_toasts()
 
 	if (!toast->has_value())
 	{
-		ImGui::Text("%s", _S("Press both thumbsticks to display the WiVRn window"));
+		ImGui::Text("%s", _S("Press both thumbsticks to display the DynaconVR window"));
 		return;
 	}
 

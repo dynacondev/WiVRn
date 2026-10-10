@@ -70,9 +70,9 @@ static std::optional<std::string> wivrn_app_path()
 	if (auto app_path = wivrn::flatpak_key(wivrn::flatpak::section::instance, "app-path"))
 	{
 		if (app_path->starts_with("/var"))
-			return find_dir(*app_path, "io.github.wivrn.wivrn");
+			return find_dir(*app_path, "tech.dynacon.vr");
 		// assume it's in home
-		return "xdg-data/flatpak/app/io.github.wivrn.wivrn";
+		return "xdg-data/flatpak/app/tech.dynacon.vr";
 	}
 	return {};
 }

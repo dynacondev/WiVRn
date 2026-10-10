@@ -1376,7 +1376,7 @@ void top_bar(float height, ImTextureID logo, const std::vector<top_bar_item> & r
 	ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4{0, 0, 0, 0});
 	ImGui::BeginChild("TopBar", {ImGui::GetWindowSize().x, height}, 0, ImGuiWindowFlags_NoScrollbar);
 	{
-		// logo: WiVRn mascot followed by the wordmark
+		// logo: DynaconVR mascot followed by the wordmark
 		const float logo_size = 44;
 		ImGui::SetCursorPos({margin, (height - logo_size) * 0.5f});
 		if (logo)
@@ -1384,7 +1384,7 @@ void top_bar(float height, ImTextureID logo, const std::vector<top_bar_item> & r
 		ImGui::SameLine(0, 12);
 		ImGui::PushFont(nullptr, ImGui::GetStyle().FontSizeBase * 1.3f);
 		ImGui::SetCursorPosY((height - ImGui::GetFontSize()) * 0.5f);
-		ImGui::TextUnformatted("WiVRn");
+		ImGui::TextUnformatted("DynaconVR");
 		ImGui::PopFont();
 
 		// right-aligned cluster

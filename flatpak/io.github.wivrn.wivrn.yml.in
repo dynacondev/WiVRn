@@ -1,5 +1,5 @@
 # kate: syntax yaml
-id: io.github.wivrn.wivrn
+id: tech.dynacon.vr
 runtime: org.kde.Platform
 runtime-version: '6.11'
 sdk: org.kde.Sdk

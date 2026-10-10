@@ -163,7 +163,7 @@ Kirigami.ScrollablePage {
 
             visible: parent.count == 0
 
-            text: WivrnServer.pairingEnabled ? i18n("Start the WiVRn app on your headset and use the PIN: %1", WivrnServer.pin) : i18n("Enable pairing to allow your headset to connect to this computer")
+            text: WivrnServer.pairingEnabled ? i18n("Start the DynaconVR app on your headset and use the PIN: %1", WivrnServer.pin) : i18n("Enable pairing to allow your headset to connect to this computer")
 
             // explanation: ""
 

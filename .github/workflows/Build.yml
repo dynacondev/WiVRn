@@ -316,17 +316,17 @@ jobs:
                 VERSION_CODE=$(( $VERSION_CODE + 1 ))
           fi
 
-          APPNAME=WiVRn
+          APPNAME=DynaconVR
         else
           VERSION_CODE=1
 
           if [ ${{ github.ref_type }} = 'tag' ]
           then
                 SUFFIX=".github"
-                APPNAME="WiVRn"
+                APPNAME="DynaconVR"
           else
                 SUFFIX=".github.testing"
-                APPNAME="WiVRn Testing"
+                APPNAME="DynaconVR Testing"
           fi
         fi
 

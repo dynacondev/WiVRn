@@ -61,12 +61,12 @@ Kirigami.ScrollablePage {
             id: page_welcome
             Controls.Label {
                 font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
-                text: i18n("Welcome to WiVRn")
+                text: i18n("Welcome to DynaconVR")
             }
             Controls.Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: i18n("This wizard will help you set up WiVRn on your headset and connect it to your computer.")
+                text: i18n("This wizard will help you set up DynaconVR on your headset and connect it to your computer.")
             }
 
             Item {
@@ -134,12 +134,12 @@ Kirigami.ScrollablePage {
         WizardStep {
             Controls.Label {
                 font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
-                text: i18n("Install the WiVRn app on your headset")
+                text: i18n("Install the DynaconVR app on your headset")
             }
             Controls.Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: i18n("In order to use WiVRn, you will have to install the client app on your headset.\nYou can either install it from the Meta store or directly over USB.")
+                text: i18n("In order to use DynaconVR, you will have to install the client app on your headset.\nYou can either install it from the Meta store or directly over USB.")
             }
 
             Controls.Label {
@@ -298,7 +298,7 @@ Kirigami.ScrollablePage {
             Controls.Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: i18n("WiVRn entirely replaces SteamVR, you should not start SteamVR while WiVRn is running.")
+                text: i18n("DynaconVR entirely replaces SteamVR, you should not start SteamVR while DynaconVR is running.")
             }
 
             SteamLaunchOptions {
@@ -310,13 +310,13 @@ Kirigami.ScrollablePage {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
                 font.pointSize: Kirigami.Theme.defaultFont.pointSize * 1.35
-                text: i18n("Start the WiVRn app on your headset")
+                text: i18n("Start the DynaconVR app on your headset")
                 Layout.topMargin: 2 * Kirigami.Units.largeSpacing
             }
             Controls.Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: i18n("To connect over WiFi, start the WiVRn app on your headset, connect to \"%1\" and enter PIN \"%2\".", WivrnServer.hostname, WivrnServer.pin)
+                text: i18n("To connect over WiFi, start the DynaconVR app on your headset, connect to \"%1\" and enter PIN \"%2\".", WivrnServer.hostname, WivrnServer.pin)
             }
 
             RowLayout {
@@ -350,7 +350,7 @@ Kirigami.ScrollablePage {
             }
             BetterLabel {
                 Layout.fillWidth: true
-                text: i18n("If you installed WiVRn over USB on a Meta or Pico headset, the app is in the \"unknown sources\" section.")
+                text: i18n("If you installed DynaconVR over USB on a Meta or Pico headset, the app is in the \"unknown sources\" section.")
                 Layout.topMargin: Kirigami.Units.largeSpacing
             }
             BetterLabel {
@@ -403,7 +403,7 @@ Kirigami.ScrollablePage {
             Controls.Label {
                 Layout.fillWidth: true
                 wrapMode: Text.WordWrap
-                text: i18n("When the headset is connected, select \"WiVRn\" as the default audio output device for applications to use it.")
+                text: i18n("When the headset is connected, select \"DynaconVR\" as the default audio output device for applications to use it.")
             }
             Item {
                 Layout.fillHeight: true

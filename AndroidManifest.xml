@@ -120,7 +120,7 @@
         <!-- Theme.Black.NoTitleBar.Fullscreen gives solid black instead of a (bad stereoscopic) gradient on app transition. -->
         <activity
             android:exported="true"
-            android:name="org.meumeu.wivrn.MainActivity"
+            android:name="tech.dynacon.vr.MainActivity"
             android:configChanges="screenSize|screenLayout|orientation|keyboardHidden|keyboard|navigation|uiMode|density"
             android:excludeFromRecents="true"
             android:launchMode="singleTask"

@@ -61,7 +61,7 @@ public:
 		pkexec = escape_sandbox("pkexec",
 		                        "sh",
 		                        "-c",
-		                        "printf '[WiVRn]\\ntitle=WiVRn server\ndescription=WiVRn OpenXR streaming server\nports=" + std::to_string(wivrn::default_port) + "\n' > /" + conf.string() + " && ufw allow wivrn");
+		                        "printf '[DynaconVR]\\ntitle=DynaconVR Server\ndescription=DynaconVR OpenXR streaming server\nports=" + std::to_string(wivrn::default_port) + "\n' > /" + conf.string() + " && ufw allow wivrn");
 		pkexec->setProcessChannelMode(QProcess::MergedChannels);
 		pkexec->start();
 
@@ -120,7 +120,7 @@ public:
 			qInfo() << "Creating firewalld wivrn service";
 			QMap<QString, QVariant> map;
 
-			map["short"] = QString("WiVRn");
+			map["short"] = QString("DynaconVR");
 			map["description"] = QString("OpenXR streaming service");
 			{
 				QList<QVariant> ports;

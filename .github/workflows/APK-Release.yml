@@ -63,7 +63,7 @@ jobs:
     - name: Build
       run: |
         chmod +x gradlew
-        ./gradlew -Psuffix=".github.nightly" -Pwivrn_css=images/wivrn-nightly.css -Pwivrn_app_name="WiVRn Nightly" -Pwivrn_compress_glb=ON assemble${{ matrix.buildtype }}
+        ./gradlew -Psuffix=".github.nightly" -Pwivrn_css=images/wivrn-nightly.css -Pwivrn_app_name="DynaconVR Nightly" -Pwivrn_compress_glb=ON assemble${{ matrix.buildtype }}
 
     - name: Prepare before archiving artifacts
       run: |

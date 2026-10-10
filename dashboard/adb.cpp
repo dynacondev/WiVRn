@@ -177,7 +177,7 @@ QCoro::Task<> adb::add_device(QString serial)
 
 	for (auto & line: QString{out_list_packages}.split('\n'))
 	{
-		if (line == "package:org.meumeu.wivrn" or line.startsWith("package:org.meumeu.wivrn."))
+		if (line == "package:tech.dynacon.vr" or line.startsWith("package:tech.dynacon.vr."))
 		{
 			new_dev.is_wivrn_installed = true;
 			new_dev.app = line.mid(8);

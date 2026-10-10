@@ -9,7 +9,7 @@ import io.github.wivrn.wivrn
 
 Kirigami.ScrollablePage {
     id: apk_install
-    title: i18n("Install the WiVRn app on your headset")
+    title: i18n("Install the DynaconVR app on your headset")
 
     flickable.interactive: false
 

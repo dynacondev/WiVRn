@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
 	<id>io.github.wivrn.wivrn</id>
-	<name>WiVRn server</name>
+	<name>DynaconVR Server</name>
 	<metadata_license>FSFAP</metadata_license>
 	<project_license>GPL-3.0-or-later</project_license>
 	<summary>Play your PC VR games on a standalone headset</summary>
 	<description>
-		<p>WiVRn allows you to run your VR games from your PC and play them from a standalone headset.</p>
+		<p>DynaconVR allows you to run your VR games from your PC and play them from a standalone headset.</p>
 
-		<p>Works with the WiVRn client app on standalone headsets, available as an APK and on the Meta Store.</p>
+		<p>Works with the DynaconVR client app on standalone headsets, available as an APK and on the Meta Store.</p>
 
 		<p>Features:</p>
 		<ul>
