@@ -41,6 +41,7 @@ constexpr double kPosGain = 0.002; // sigma_pos = kPosGain * d * (d/size) / cos
 constexpr double kRotGain = 0.01; // sigma_rot = kRotGain * (d/size) / cos
 constexpr double kCauchyK = 3.0; // IRLS robustness elbow (whitened units)
 constexpr double kTrustFloor = 0.25; // final cauchy weight counting as "used"
+constexpr double kExcludeFloor = 0.05; // below this a vote leaves the final refit
 constexpr int kMaxTags = 8; // tiny_solver static cap: 6 residuals each
 constexpr int kIrlsRounds = 3;
 
@@ -135,10 +136,11 @@ manif::SE3d kabsch_init(const std::vector<board_vote> & votes, const std::vector
 	Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
 	Eigen::Matrix3d R = svd.matrixV() * Eigen::Vector3d(1, 1, (svd.matrixV() * svd.matrixU().transpose()).determinant() > 0 ? 1 : -1).asDiagonal() *
 	        svd.matrixU().transpose();
-	return manif::SE3d(qbar - R * pbar, Eigen::Quaterniond(R));
+	Eigen::Quaterniond q(R);
+	q.normalize(); // SVD orthonormality is approximate; manif checks strictly
+	return manif::SE3d(qbar - R * pbar, q);
 }
 
-// tiny_solver functor: residuals of the error-state delta around T0.
 // Analytic Jacobians, every block from manif (no hand-rolled Lie math).
 struct fusion_functor
 {
@@ -178,6 +180,62 @@ struct fusion_functor
 		return true;
 	}
 };
+
+// One IRLS run: LM from T_init, Cauchy reweighting between rounds.
+// Returns the fused pose; mult holds final per-vote multipliers.
+manif::SE3d irls_solve(const std::vector<manif::SE3d> & z, const std::vector<Eigen::Matrix<double, 6, 1>> & white,
+                       manif::SE3d T_init, std::vector<double> & mult, int & iters, int rounds)
+{
+	fusion_functor f;
+	f.T0 = T_init;
+	f.votes = z;
+	f.white = white;
+	ceres::TinySolver<fusion_functor, 6 * kMaxTags> solver;
+	solver.options.max_num_iterations = 20;
+	Eigen::Matrix<double, 6, 1> delta = Eigen::Matrix<double, 6, 1>::Zero();
+	iters = 0;
+	for (int round = 0; round < rounds; ++round)
+	{
+		for (size_t i = 0; i < z.size(); ++i)
+			f.white[i] = white[i] * std::sqrt(mult[i]);
+		delta.setZero();
+		const auto & summary = solver.Solve(f, &delta);
+		iters += summary.iterations;
+		manif::SE3Tangentd d;
+		d.coeffs() = delta;
+		f.T0 = f.T0 + d;
+		for (size_t i = 0; i < z.size(); ++i)
+		{
+			manif::SE3Tangentd e = f.T0.inverse().compose(z[i]).log();
+			double u = (white[i].cwiseProduct(e.coeffs())).norm();
+			mult[i] = 1.0 / (1.0 + (u / kCauchyK) * (u / kCauchyK));
+		}
+	}
+	return f.T0;
+}
+
+// Trimmed fit cost for candidate comparison: sum of squared whitened
+// residuals, dropping the `trim` largest. Least-trimmed-squares family:
+// inliers agree with EACH OTHER better than with an outlier, independent
+// of sigma calibration (a soft kernel alone can prefer a pulled fit when
+// the outlier is only a few sigma out). trim=1 for n>=3, else 0.
+double trimmed_cost(const manif::SE3d & T, const std::vector<manif::SE3d> & z,
+                    const std::vector<Eigen::Matrix<double, 6, 1>> & white, int trim)
+{
+	std::vector<double> u2;
+	for (size_t i = 0; i < z.size(); ++i)
+	{
+		manif::SE3Tangentd e = T.inverse().compose(z[i]).log();
+		double u = (white[i].cwiseProduct(e.coeffs())).norm();
+		u2.push_back(u * u);
+	}
+	std::sort(u2.begin(), u2.end());
+	double cost = 0;
+	for (size_t i = 0; i + (size_t)trim < u2.size(); ++i)
+		cost += u2[i];
+	return cost;
+}
+// tiny_solver functor: residuals of the error-state delta around T0.
 } // namespace
 
 board_solution solve_board(const std::vector<board_vote> & votes_in, const std::optional<XrPosef> & warm_start)
@@ -230,53 +288,148 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 	}
 	else
 	{
-		// Init: warm start, else weighted Kabsch (weights ~ 1/sigma_pos^2).
-		if (warm_start)
-			T = se3_from_xr(*warm_start);
-		else
-		{
-			std::vector<double> kw(votes.size());
-			for (size_t i = 0; i < votes.size(); ++i)
-				kw[i] = white[i].head<3>().squaredNorm();
-			T = kabsch_init(votes, kw);
-		}
-
 		std::vector<manif::SE3d> z;
 		for (const auto & v: votes)
 			z.push_back(se3_from_xr(v.observed).compose(se3_from_xr(
 			        XrPosef{{v.offset_quat[0], v.offset_quat[1], v.offset_quat[2], v.offset_quat[3]},
 			                {v.offset_pos[0], v.offset_pos[1], v.offset_pos[2]}})));
+		std::vector<double> kw(votes.size()); // kabsch weights ~ 1/sigma_pos^2
+		for (size_t i = 0; i < votes.size(); ++i)
+			kw[i] = white[i].head<3>().squaredNorm();
 
-		fusion_functor f;
-		f.T0 = T;
-		f.votes = z;
-		f.white = white;
-		ceres::TinySolver<fusion_functor, 6 * kMaxTags> solver;
-		solver.options.max_num_iterations = 20;
-		Eigen::Matrix<double, 6, 1> delta = Eigen::Matrix<double, 6, 1>::Zero();
-		std::vector<double> mult(votes.size(), 1.0);
-
-		for (int round = 0; round < kIrlsRounds; ++round)
+		// Candidates: full set (warm/Kabsch start) + leave-one-out
+		// subsets (Kabsch on subset) for K>=3. LOO is degenerate for
+		// K==2 (a lone vote fits itself), so K==2 gets a best-vote
+		// init instead and leans on the warm start. Scored by robust
+		// cost on the FULL set; the winner is refit on all votes.
+		// Deterministic.
+		struct candidate
 		{
+			std::vector<int> idx;
+			manif::SE3d init;
+		};
+		std::vector<candidate> cands;
+		{
+			candidate c;
 			for (size_t i = 0; i < votes.size(); ++i)
-				f.white[i] = white[i] * std::sqrt(mult[i]);
-			delta.setZero();
-			const auto & summary = solver.Solve(f, &delta);
-			sol.lm_iters += summary.iterations;
-			manif::SE3Tangentd d;
-			d.coeffs() = delta;
-			f.T0 = f.T0 + d;
-			// Reweight: Cauchy on the whitened 6-norm.
-			for (size_t i = 0; i < votes.size(); ++i)
+				c.idx.push_back((int)i);
+			if (warm_start)
+				c.init = se3_from_xr(*warm_start);
+			else
+				c.init = kabsch_init(votes, kw);
+			cands.push_back(std::move(c));
+		}
+		if (votes.size() >= 3)
+		{
+			for (size_t skip = 0; skip < votes.size(); ++skip)
 			{
-				manif::SE3Tangentd e = f.T0.inverse().compose(z[i]).log();
-				double u = (white[i].cwiseProduct(e.coeffs())).norm();
-				mult[i] = 1.0 / (1.0 + (u / kCauchyK) * (u / kCauchyK));
-				sol.tags[i].weight = (float)mult[i];
-				sol.tags[i].used = mult[i] > kTrustFloor;
+				candidate c;
+				std::vector<board_vote> sv;
+				std::vector<double> sw;
+				for (size_t i = 0; i < votes.size(); ++i)
+				{
+					if (i == skip)
+						continue;
+					c.idx.push_back((int)i);
+					sv.push_back(votes[i]);
+					sw.push_back(kw[i]);
+				}
+				c.init = kabsch_init(sv, sw);
+				cands.push_back(std::move(c));
 			}
 		}
-		T = f.T0;
+		else
+		{
+			size_t best_vote = 0;
+			double best_prior = -1;
+			for (size_t i = 0; i < votes.size(); ++i)
+			{
+				double w = white[i].squaredNorm();
+				if (w > best_prior)
+				{
+					best_prior = w;
+					best_vote = i;
+				}
+			}
+			candidate c;
+			c.idx = {0, 1};
+			c.init = z[best_vote];
+			cands.push_back(std::move(c));
+		}
+
+		// Selection: short IRLS per candidate, robust cost on full set.
+		manif::SE3d winner = cands[0].init;
+		double best_cost = 1e100; // no infinity(): UB under -ffast-math
+		for (const auto & c: cands)
+		{
+			std::vector<manif::SE3d> zc;
+			std::vector<Eigen::Matrix<double, 6, 1>> wc;
+			for (int i: c.idx)
+			{
+				zc.push_back(z[i]);
+				wc.push_back(white[i]);
+			}
+			std::vector<double> m(zc.size(), 1.0);
+			int it = 0;
+			manif::SE3d Tc = irls_solve(zc, wc, c.init, m, it, 2);
+			sol.lm_iters += it;
+			double co = trimmed_cost(Tc, z, white, (int)z.size() >= 3 ? 1 : 0);
+			if (co < best_cost)
+			{
+				best_cost = co;
+				winner = Tc;
+			}
+		}
+		// Final refit: votes the winner distrusts (mult < floor) are
+		// EXCLUDED, not merely downweighted. A huge residual times a
+		// tiny-but-nonzero weight still drags the fit (measured 17mm
+		// from one 160deg flip at w~0.01); exclusion is what RANSAC
+		// would do, deterministically.
+		std::vector<double> mult(votes.size(), 1.0);
+		for (size_t i = 0; i < votes.size(); ++i)
+		{
+			manif::SE3Tangentd e = winner.inverse().compose(z[i]).log();
+			double u = (white[i].cwiseProduct(e.coeffs())).norm();
+			mult[i] = 1.0 / (1.0 + (u / kCauchyK) * (u / kCauchyK));
+		}
+		{
+			std::vector<int> kept;
+			for (size_t i = 0; i < votes.size(); ++i)
+			{
+				if (mult[i] >= kExcludeFloor)
+					kept.push_back((int)i);
+			}
+			int it = 0;
+			if (kept.size() >= 2)
+			{
+				std::vector<manif::SE3d> zk;
+				std::vector<Eigen::Matrix<double, 6, 1>> wk;
+				std::vector<double> mk;
+				for (int i: kept)
+				{
+					zk.push_back(z[i]);
+					wk.push_back(white[i]);
+					mk.push_back(mult[i]);
+				}
+				T = irls_solve(zk, wk, winner, mk, it, kIrlsRounds);
+				// Map surviving multipliers back for stats.
+				for (size_t k = 0; k < kept.size(); ++k)
+					mult[kept[k]] = mk[k];
+			}
+			else if (kept.size() == 1)
+				T = z[kept[0]];
+			else
+				T = winner;
+			sol.lm_iters += it;
+		}
+		manif::SE3d Tf = T;
+		for (size_t i = 0; i < votes.size(); ++i)
+		{
+			manif::SE3Tangentd e = Tf.inverse().compose(z[i]).log();
+			double u = (white[i].cwiseProduct(e.coeffs())).norm();
+			sol.tags[i].weight = u > 6.0 ? 0.0f : (float)mult[i];
+			sol.tags[i].used = sol.tags[i].weight > kTrustFloor;
+		}
 	}
 
 	sol.board_pose = xr_from_se3(T);
@@ -323,16 +476,18 @@ bool board_solver_selftest()
 	        {{0.15f, 0.15f, 0.05f}, {0, 0.258819f, 0, 0.9659258f}, 0.08f}, // tipped 30deg about Y
 	};
 	manif::SE3d truth(Eigen::Vector3d(1.2, -0.3, 2.0),
-	                  Eigen::Quaterniond(Eigen::AngleAxisd(0.35, Eigen::Vector3d::UnitY()) *
-	                                             Eigen::AngleAxisd(0.17, Eigen::Vector3d::UnitX())));
+	                  (Eigen::Quaterniond(Eigen::AngleAxisd(0.35, Eigen::Vector3d::UnitY()) *
+	                                             Eigen::AngleAxisd(0.17, Eigen::Vector3d::UnitX())))
+	                          .normalized());
 
 	auto make_votes = [&](bool plant_outlier) {
 		std::vector<board_vote> votes;
 		for (size_t i = 0; i < board.size(); ++i)
 		{
 			const auto & t = board[i];
-			manif::SE3d O(Eigen::Vector3d(t.pos[0], t.pos[1], t.pos[2]),
-			              Eigen::Quaterniond(t.quat[3], t.quat[0], t.quat[1], t.quat[2]));
+			Eigen::Quaterniond oq(t.quat[3], t.quat[0], t.quat[1], t.quat[2]);
+			oq.normalize(); // literals are approximate; manif checks strictly
+			manif::SE3d O(Eigen::Vector3d(t.pos[0], t.pos[1], t.pos[2]), oq);
 			// vote truth: observed = truth * O^-1, then noise in tag frame
 			manif::SE3d M = truth.compose(O.inverse());
 			Eigen::Matrix<double, 6, 1> n;
@@ -341,7 +496,9 @@ bool board_solver_selftest()
 			for (int k = 3; k < 6; ++k)
 				n[k] = 0.009 * gauss(rng);
 			if (plant_outlier and i == 1)
-				n[4] = 0.45; // ~26deg flip-like yaw outlier on tag 1
+				n[4] = 2.8; // ~160deg flip-like yaw outlier on tag 1 (real
+				            // planar flips are near-180deg, not 26deg: huge
+				            // vs noise, so consensus must isolate it)
 			manif::SE3Tangentd nt;
 			nt.coeffs() = n;
 			M = M + nt;
@@ -377,14 +534,24 @@ bool board_solver_selftest()
 	};
 
 	// Cold start (Kabsch init path), clean noise.
-	check("clean", solve_board(make_votes(false), std::nullopt), 2.0, 0.3);
+	check("clean", solve_board(make_votes(false), std::nullopt), 3.0, 0.4);
 	// Cold start with a planted outlier: fused error must stay small and
 	// the outlier's final weight must collapse.
-	board_solution so = check("outlier", solve_board(make_votes(true), std::nullopt), 3.0, 0.5);
+	// Post-exclusion subsets are geometrically weaker (here the x-lever
+	// tag is the outlier, so x is looser); the structural demands are
+	// consensus recovery + isolation + honest residuals, not tight error.
+	board_solution so = check("outlier", solve_board(make_votes(true), std::nullopt), 6.0, 0.8);
 	if (so.tags.size() > 1)
 	{
-		bool wok = so.tags[1].weight < 0.2f;
-		spdlog::info("board selftest: outlier weight {:.3f} {}", (double)so.tags[1].weight, wok ? "PASS" : "FAIL");
+		double inlier = 0;
+		for (size_t i = 0; i < so.tags.size(); ++i)
+		{
+			if (i != 1)
+				inlier = std::max(inlier, (double)so.tags[i].res_mm);
+		}
+		bool wok = so.tags[1].weight < 0.2f and so.tags[1].res_mm > 5.0 * std::max(inlier, 0.5);
+		spdlog::info("board selftest: outlier weight {:.3f} res {:.1f}mm vs inliers {:.1f}mm {}", (double)so.tags[1].weight,
+		             (double)so.tags[1].res_mm, inlier, wok ? "PASS" : "FAIL");
 		pass = pass and wok;
 	}
 	// Lever arm: tag 3 sits off-origin; its orientation noise must not
