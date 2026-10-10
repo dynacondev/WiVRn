@@ -17,6 +17,12 @@ logcat line, Statistics tab). Mixed = 2 groups (f=12+f=24 or 23+24).
   NOT intrinsic — vanishes once total traffic drops under the wall.
 - Record order = `passthrough_objects` map order (object id); logged as
   `mask groups order:`. Slow-slot questions are unanswerable without it.
+- XR acquire order is load-bearing: member swapchains must be acquired
+  AFTER the video swapchain each frame. Member-before-video wedges member
+  pools within seconds (`xrWait/AcquireSwapchainImage: CALL_ORDER_INVALID`
+  forever; ~6 healthy frames then dead; video unaffected). Submit reorder
+  is therefore unavailable as a phase lever — record order implies
+  acquire order (record needs its image).
 - 5s means hide regimes; per-window **minima** reveal them (2ms dip =
   skipped group; 5ms spike ≠ skip). `groups min` separates the two.
 
