@@ -382,6 +382,12 @@ private:
 			xr::swapchain swapchain;
 			bool acquired = false;
 			bool wait_warned = false; // image-wait timeout already reported
+			// Images currently outstanding (acquired, not yet released).
+			// Compared against swapchain.image_count() when acquires fail:
+			// outstanding == pool means pool exhaustion (leak or compositor
+			// hold); outstanding ~0 means the runtime rejects valid
+			// acquires (session/swapchain state — different investigation).
+			uint32_t images_outstanding = 0;
 			XrExtent2Di extent{0, 0};
 			bool active = false; // submitting this frame
 			// Uploaded object soups by object id (hash compare avoids

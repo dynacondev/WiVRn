@@ -1306,15 +1306,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						device.waitIdle();
 						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
 						g.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px)", gw, gh, f);
+						g.images_outstanding = 0;
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
 					}
 					int mask_index = g.swapchain.acquire();
+					// Paired from acquisition: the group joins the release
+					// list immediately, so wait/record/stamp throws (outer
+					// catch) release its image instead of leaking it (one
+					// leaked image per frame drains the pool in pool-depth
+					// frames, then acquires fail permanently).
+					++g.images_outstanding;
+					acquired_groups.push_back(&g);
+					spdlog::debug("Fiducial mask acquire: feather {}px image {} ({} of {} outstanding)", f, mask_index, g.images_outstanding, g.swapchain.image_count());
 					if (not g.swapchain.wait(100'000'000))
 					{
 						// Never park forever on an unavailable image: release
 						// the untouched acquisition to keep pairing and skip
 						// the group this frame.
 						g.swapchain.release();
+						--g.images_outstanding;
+						acquired_groups.pop_back();
 						g.active = false;
 						if (not g.wait_warned)
 						{
@@ -1355,7 +1366,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						++mask_frame_unmetered;
 					mask_frame_samples.push_back({f, 0, stage_cpu});
 					g.active = true;
-						acquired_groups.push_back(&g);
 						mask_frame = true;
 					}
 				}
@@ -1372,7 +1382,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		catch (std::exception & e)
 		{
-			spdlog::warn("Fiducial mask record failed: {}", e.what());
+			spdlog::warn("Fiducial mask record failed: {} ({} mask images outstanding across groups)", e.what(), acquired_groups.size());
 			// Release everything acquired above, otherwise images stay
 			// outstanding and the pairing breaks.
 			for (auto * g: acquired_groups)
@@ -1382,6 +1392,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				try
 				{
 					g->swapchain.release();
+					--g->images_outstanding;
 				}
 				catch (std::exception & e2)
 				{
@@ -1670,6 +1681,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			g->acquired = false;
 			g->swapchain.release();
+			--g->images_outstanding;
+			spdlog::debug("Fiducial mask release: feather {}px ({} outstanding)", g->feather_px, g->images_outstanding);
 		}
 		acquired_groups.clear();
 		// Paired with the debug overlay acquire above.
