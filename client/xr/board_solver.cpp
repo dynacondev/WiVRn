@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <random>
 
 #include <Eigen/Dense>
@@ -51,10 +52,12 @@ constexpr double kExcludeFloor = 0.05; // below this a vote leaves the final ref
 constexpr int kMaxTags = 8; // tiny_solver static cap: 6 residuals each
 constexpr int kIrlsRounds = 3;
 // Settle time constant (REFINE-ME, see settle_from_age in the header):
-// tau=0.75s from run-B/D evidence (O(1s) transients, ~1/s churn). The 2s
-// heartbeat cannot resolve sub-second curves, so this guess stands until
-// the post-build run measures residual-vs-age and fits it properly.
-constexpr double kSettleTauS = 0.75;
+// tau=0.4s, refined from 0.75s on run-E evidence: young-but-agreeing tags
+// sit at settled residual levels by s~=0.5 (age~=0.5s), while true
+// transients (8-25mm) live at s<0.1. s(0.5s)~=0.7 now instead of 0.5:
+// re-latch soft entry preserved, settled-level voice restored sooner.
+// Flip safety is tau-independent (outlier u>>k at any tau).
+constexpr double kSettleTauS = 0.4;
 // Flip-report thresholds (forensics, not model): any tag beyond either
 // fires `board flip:` immediately at the call site. Chosen far above the
 // inlier envelope (worst seen 6.6mm/1.65deg) and far below real flips
@@ -85,6 +88,25 @@ float quat_angle_deg(const Eigen::Quaterniond & a, const Eigen::Quaterniond & b)
 	return (float)(2.0 * std::acos(d) * 57.29577951308232);
 }
 
+// G1b finite-intake guard (defense in depth behind the tracker intake
+// check): 0*NaN = NaN, so even a zero-weighted non-finite vote poisons
+// centroids. Drops non-finite votes (NaN/Inf anywhere, zero quaternions
+// that Eigen would silently NaN on normalize in se3_from_xr).
+bool vote_finite(const board_vote & v)
+{
+	const auto & op = v.observed.position;
+	const auto & oq = v.observed.orientation;
+	double on = (double)oq.x * oq.x + (double)oq.y * oq.y + (double)oq.z * oq.z + (double)oq.w * oq.w;
+	double fn = (double)v.offset_quat[0] * v.offset_quat[0] + (double)v.offset_quat[1] * v.offset_quat[1] +
+	        (double)v.offset_quat[2] * v.offset_quat[2] + (double)v.offset_quat[3] * v.offset_quat[3];
+	return std::isfinite(op.x) and std::isfinite(op.y) and std::isfinite(op.z) and std::isfinite(oq.x) and
+	        std::isfinite(oq.y) and std::isfinite(oq.z) and std::isfinite(oq.w) and on > 1e-12 and
+	        std::isfinite(v.offset_pos[0]) and std::isfinite(v.offset_pos[1]) and std::isfinite(v.offset_pos[2]) and
+	        std::isfinite(v.offset_quat[0]) and std::isfinite(v.offset_quat[1]) and std::isfinite(v.offset_quat[2]) and
+	        std::isfinite(v.offset_quat[3]) and fn > 1e-12 and std::isfinite(v.tag_size_m) and
+	        std::isfinite(v.distance_m) and std::isfinite(v.cos_incidence) and std::isfinite(v.settle);
+}
+
 // Per-vote diagonal whitening from the TEMP model (1/sigma per axis).
 Eigen::Matrix<double, 6, 1> whitening(const board_vote & v)
 {
@@ -107,8 +129,29 @@ Eigen::Matrix<double, 6, 1> whitening(const board_vote & v)
 
 // Weighted Kabsch over tag corners (closed-form LS init). P = board-frame
 // corners, Q = world-frame corners. Library-owned SVD; assembly is ours.
+// G2 NaN guard: all-zero weights (all-fresh storm: every vote settle~=0)
+// would 0/0 the centroids into a (NaN-translation, valid-rotation) pose
+// that poisons selection (reproduced run-E K3 line; host repro R1). Fall
+// back to uniform weights: no information => no preference => geometric
+// consensus, which is the right answer for fresh-but-valid votes. (Also
+// note: MANIF_ASSERT is compiled out under NDEBUG, so device release
+// silently propagates NaN where host/debug builds throw — guards, not
+// asserts, are the load-bearing defense. Debug-APK users: an all-fresh
+// storm would abort pre-guards; post-guards it cannot occur.)
 manif::SE3d kabsch_init(const std::vector<board_vote> & votes, const std::vector<double> & w)
 {
+	double wsum_check = 0;
+	for (double x: w)
+		wsum_check += x;
+	std::vector<double> wu;
+	const std::vector<double> * wp = &w;
+	if (not std::isfinite(wsum_check) or wsum_check <= 0)
+	{
+		wu.assign(w.size(), 1.0);
+		wp = &wu;
+		spdlog::debug("board_solver: kabsch zero-weight fallback ({} votes)", votes.size());
+	}
+	const std::vector<double> & ww = *wp;
 	Eigen::Vector3d pbar = Eigen::Vector3d::Zero(), qbar = Eigen::Vector3d::Zero();
 	double wsum = 0;
 	for (size_t i = 0; i < votes.size(); ++i)
@@ -129,9 +172,9 @@ manif::SE3d kabsch_init(const std::vector<board_vote> & votes, const std::vector
 				Eigen::Vector3d cl(cx * h, cy * h, 0); // tag frame
 				Eigen::Vector3d cb = Oinv * cl; // board frame
 				Eigen::Vector3d cw = R * cl + t; // world frame
-				pbar += w[i] * cb;
-				qbar += w[i] * cw;
-				wsum += w[i];
+				pbar += ww[i] * cb;
+				qbar += ww[i] * cw;
+				wsum += ww[i];
 			}
 	}
 	pbar /= wsum;
@@ -154,7 +197,7 @@ manif::SE3d kabsch_init(const std::vector<board_vote> & votes, const std::vector
 			{
 				Eigen::Vector3d cb = Oinv * Eigen::Vector3d(cx * h, cy * h, 0);
 				Eigen::Vector3d cw = R * Eigen::Vector3d(cx * h, cy * h, 0) + t;
-				H += w[i] * (cb - pbar) * (cw - qbar).transpose();
+				H += ww[i] * (cb - pbar) * (cw - qbar).transpose();
 			}
 	}
 	Eigen::JacobiSVD<Eigen::Matrix3d> svd(H, Eigen::ComputeFullU | Eigen::ComputeFullV);
@@ -277,9 +320,23 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 	if (votes_in.empty())
 		return sol;
 
+	// G1b: drop non-finite votes at the door (see vote_finite). Empty =>
+	// !ok, and the caller treats it exactly like occlusion (hold-last).
+	std::vector<board_vote> votes_in_f;
+	votes_in_f.reserve(votes_in.size());
+	for (const auto & v: votes_in)
+	{
+		if (vote_finite(v))
+			votes_in_f.push_back(v);
+		else
+			spdlog::debug("board_solver: dropping non-finite vote {}", v.payload.substr(0, 32));
+	}
+	if (votes_in_f.empty())
+		return sol;
+
 	// Cap: keep the highest-prior-weight tags (boards are small; a log
 	// line if this ever bites).
-	std::vector<board_vote> votes = votes_in;
+	std::vector<board_vote> votes = std::move(votes_in_f);
 	std::vector<Eigen::Matrix<double, 6, 1>> white;
 	for (const auto & v: votes)
 		white.push_back(whitening(v));
@@ -513,6 +570,30 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 	sol.rms_mm = (float)std::sqrt(se / votes.size());
 	sol.rms_deg = (float)std::sqrt(sa / votes.size());
 	sol.solve_us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+	// G3 post-solve finite guard: NaN must never reach the renderer or the
+	// warm start (run-E K3 line: poisoned translation, valid rotation).
+	// !ok reuses the entire hold-last path at the caller. The per-vote dump
+	// (settle + finite flags) diagnoses any future seed the G1/G2 guards
+	// did not catch (e.g. the run-E s=0.49 echo puzzle).
+	{
+		const auto & p = sol.board_pose.position;
+		const auto & q = sol.board_pose.orientation;
+		bool okp = std::isfinite(p.x) and std::isfinite(p.y) and std::isfinite(p.z) and std::isfinite(q.x) and
+		        std::isfinite(q.y) and std::isfinite(q.z) and std::isfinite(q.w);
+		if (not okp)
+		{
+			std::string vs;
+			for (const auto & v: votes)
+			{
+				char buf[128];
+				snprintf(buf, sizeof(buf), " [%s s%.2f %c]", v.payload.substr(0, 32).c_str(), (double)v.settle,
+				         vote_finite(v) ? 'f' : '!');
+				vs += buf;
+			}
+			spdlog::warn("board nan: non-finite fused pose ({} votes){}", votes.size(), vs);
+			return sol;
+		}
+	}
 	sol.ok = true;
 	return sol;
 }
@@ -616,10 +697,11 @@ bool board_solver_selftest()
 		             (double)so.tags[1].res_mm, inlier, wok ? "PASS" : "FAIL");
 		pass = pass and wok;
 	}
-		// Settle curve sanity (unit-adjacent, no votes needed).
+		// Settle curve sanity (unit-adjacent, no votes needed). The 0.4s probe
+	// locks kSettleTauS: retuning tau must update this assert deliberately.
 	{
-		bool cok = settle_from_age(0) == 0 and std::abs(settle_from_age(0.75) - 0.6321) < 0.01 and
-		        settle_from_age(7.5) > 0.9999 and settle_from_age(-1) == 0;
+		bool cok = settle_from_age(0) == 0 and std::abs(settle_from_age(0.4) - 0.6321) < 0.01 and
+		        settle_from_age(4.0) > 0.9999 and settle_from_age(-1) == 0;
 		spdlog::info("board selftest: settle curve {}", cok ? "PASS" : "FAIL");
 		pass = pass and cok;
 	}
@@ -642,6 +724,28 @@ bool board_solver_selftest()
 		spdlog::info("board selftest: young-flip err {:.2f}mm {:.3f}deg weight {:.4f} {}", mm, deg,
 		             sy.tags.size() > 1 ? (double)sy.tags[1].weight : -1.0, yok ? "PASS" : "FAIL");
 		pass = pass and yok;
+	}
+	// NaN regression (run-E K3 line): an all-fresh frame (every vote
+	// settle=0) must NOT produce a non-finite pose. The G2 uniform-weight
+	// fallback turns it into an unweighted consensus (== clean fit here).
+	// Pre-fix this aborted (host, MANIF_ASSERT) or NaN-propagated (device).
+	// Bound is init-quality (~4mm), not refit-quality: with every vote
+	// settle-suppressed the refit has no members, so T is the Kabsch init;
+	// refinement engages as tracks age past ~0.5s. Transient by definition.
+	{
+		std::vector<board_vote> votes = make_votes(false);
+		for (auto & v: votes)
+			v.settle = 0;
+		board_solution sn = solve_board(votes, std::nullopt);
+		const auto & p = sn.board_pose.position;
+		bool fin = std::isfinite(p.x) and std::isfinite(p.y) and std::isfinite(p.z);
+		manif::SE3d F = se3_from_xr(sn.board_pose);
+		manif::SE3d E = truth.inverse().compose(F);
+		double mm = Eigen::Vector3d(E.translation().x(), E.translation().y(), E.translation().z()).norm() * 1000.0;
+		bool nok = sn.ok and fin and mm < 5.0;
+		spdlog::info("board selftest: all-fresh err {:.2f}mm finite {} {}", mm, fin ? "yes" : "no",
+		             nok ? "PASS" : "FAIL");
+		pass = pass and nok;
 	}
 	// Lever arm: tag 3 sits off-origin; its orientation noise must not
 	// smear position. Fused position error must beat the worst single

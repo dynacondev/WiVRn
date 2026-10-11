@@ -238,7 +238,7 @@ private:
 
 	void fail(const std::string & reason);
 	bool poll_ready(XrFutureEXT future, bool & ready);
-	std::optional<std::string> read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer);
+	static bool pose_finite(const XrPosef & p);	std::optional<std::string> read_payload(XrSpatialSnapshotEXT snapshot, XrSpatialBufferEXT buffer);
 	void complete_context();
 	void start_discovery();
 	void complete_discovery(XrSpace world_space, XrTime predicted_time);

@@ -106,10 +106,16 @@ inert unless set; full flow in `docs/profiling.md`.
   on residual-detectable flips (K>=2 only; K==1 flips show as pop dang).
   Pop lines carry enter/exit attribution + dt-since-last-solve (teleport
   recovery vs true pops); heartbeat carries board position (move visibility).
-  Track-settle falloff (tau=0.75s REFINE-ME): latch age per vote softens
+  Track-settle falloff (tau=0.4s, refined from 0.75 on run-E: transients live
+  at s<0.1, agreeing tags settled by s~=0.5): latch age per vote softens
   freshly (re-)latched tracks via sqrt(settle) whitening; per-tag `s` in
   `board tags:` is the settle-curve instrument; weight = settle*cauchy
-  (down-with-low-s = young, down-with-high-s = outlier). Pose filtering/smoothing TEMP-disabled (files stay,
+  (down-with-low-s = young, down-with-high-s = outlier). K=1 jump guard
+  (50mm/30deg/frame, teleport-silence bypass): residual-blind singletons
+  hold last-good instead of displaying flips; `board hold:` engage/release
+  lines. Finite guards throughout (intake votes, Kabsch wsum fallback,
+  post-solve `board nan:` + hold): NaN can never reach the mesh or warm
+  start (run-E K3 all-fresh-storm line). Pose filtering/smoothing TEMP-disabled (files stay,
   unreferenced) until fusion is verified on-device.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow

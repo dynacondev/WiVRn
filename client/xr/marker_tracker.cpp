@@ -21,6 +21,7 @@
 #include "xr/instance.h"
 #include "xr/system.h"
 #include <algorithm>
+#include <cmath>
 #include <spdlog/spdlog.h>
 
 namespace
@@ -74,6 +75,19 @@ void xr::marker_tracker::fail(const std::string & reason)
 	status_text = reason;
 	retry_at = last_now + retry_delay_ns;
 	spdlog::warn("marker_tracker: {}", reason);
+}
+
+// G1a finite-intake guard: drop runtime poses that are non-finite (or carry
+// a zero quaternion that Eigen would silently NaN on normalize downstream)
+// before they enter sightings. 0*NaN poisons every computation even at zero
+// weight, so this fires at the door; silent in release (debug level).
+bool xr::marker_tracker::pose_finite(const XrPosef & p)
+{
+	const auto & t = p.position;
+	const auto & q = p.orientation;
+	double n = (double)q.x * q.x + (double)q.y * q.y + (double)q.z * q.z + (double)q.w * q.w;
+	return std::isfinite(t.x) and std::isfinite(t.y) and std::isfinite(t.z) and std::isfinite(q.x) and
+	        std::isfinite(q.y) and std::isfinite(q.z) and std::isfinite(q.w) and n > 1e-12;
 }
 
 bool xr::marker_tracker::poll_ready(XrFutureEXT future, bool & ready)
@@ -506,6 +520,11 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			}
 			XrSpatialEntityIdEXT eid = i < result.entityIdCountOutput ? entity_ids[i] : XR_NULL_SPATIAL_ENTITY_ID_EXT;
 			ensure_entity(eid, predicted_time);
+			if (not pose_finite(bound_boxes[i].center))
+			{
+				spdlog::debug("marker_tracker: dropping non-finite pose (discovery)");
+				continue;
+			}
 			auto lit = latch_times.find(eid);
 			all_sightings.push_back(code_sighting{
 			        .payload = *payload,
@@ -700,6 +719,11 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		if (not tracked_last.contains(eid))
 			latch_times[eid] = now;
 		tracked_now.insert(eid);
+		if (not pose_finite(bound_boxes[i].center))
+		{
+			spdlog::debug("marker_tracker: dropping non-finite pose (update)");
+			continue;
+		}
 		auto payload = read_payload(snapshot, marker_data[i].data);
 		if (not payload)
 			continue;

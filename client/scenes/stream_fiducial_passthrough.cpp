@@ -510,6 +510,62 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		xr::board_solution sol = xr::solve_board(bv, warm);
 		if (not sol.ok)
 			continue;
+		// K==1 jump guard: the passthrough path is residual-blind (a lone
+		// vote fits itself), so a flipped singleton displays inverted
+		// (run-E: user-visible inverts through the flip storm). Frame jumps
+		// are physically impossible by hand — carry speeds run ~5mm/frame,
+		// so dpos 50mm (4.5m/s) / dang 30deg (2700deg/s) clear legit motion
+		// including 42mm bistable swaps (~1deg) while sitting far below
+		// flips (70mm+/40deg+). On trigger, skip ALL state writes: the frame
+		// becomes an occlusion frame downstream (hold-last) and the warm
+		// reference never advances to garbage. Release on resolve / K>=2
+		// consensus / teleport-silence. No frame timeout: a rig yanked
+		// mid-visibility with no silence and no set change is vanishingly
+		// rare, and set changes / silence release first. First sighting (no
+		// reference) always accepts: unknowable without history.
+		static std::map<std::string, XrTime> last_solve_t;
+		static std::map<std::string, bool> holding;
+		double solve_dt = 0;
+		if (auto ltit0 = last_solve_t.find(f.id); ltit0 != last_solve_t.end())
+			solve_dt = (now - ltit0->second) * 1e-9;
+		last_solve_t[f.id] = now; // cadence advances even when held
+		bool held = false;
+		if (sol.single and warm)
+		{
+			float dx = sol.board_pose.position.x - warm->position.x;
+			float dy = sol.board_pose.position.y - warm->position.y;
+			float dz = sol.board_pose.position.z - warm->position.z;
+			float dpos = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
+			float dot = std::abs(sol.board_pose.orientation.w * warm->orientation.w +
+			                     sol.board_pose.orientation.x * warm->orientation.x +
+			                     sol.board_pose.orientation.y * warm->orientation.y +
+			                     sol.board_pose.orientation.z * warm->orientation.z);
+			float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
+			bool teleport = solve_dt > 0.25; // silence => the rig may have moved
+			if (not teleport and (dpos > 50.f or dang > 30.f))
+			{
+				held = true;
+				if (not holding[f.id])
+				{
+					holding[f.id] = true;
+					spdlog::info("board hold: fid \"{}\" K1 jump {:.2f}mm {:.2f}deg dt{:.2f}s (holding last good)",
+					             f.id, (double)dpos, (double)dang, solve_dt);
+				}
+			}
+			else if (holding[f.id])
+			{
+				holding[f.id] = false;
+				spdlog::info("board hold: fid \"{}\" resumed ({:.2f}mm{})", f.id, (double)dpos,
+				             teleport ? ", teleport accepted" : "");
+			}
+		}
+		else if (holding[f.id])
+		{
+			holding[f.id] = false;
+			spdlog::info("board hold: fid \"{}\" consensus resumed", f.id);
+		}
+		if (held)
+			continue;
 		board_warm_start[f.id] = sol.board_pose;
 		auto & bp = board_poses[f.id];
 		bp.pose = sol.board_pose;
@@ -540,7 +596,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		static std::map<std::string, std::string> last_sets;
 		static std::map<std::string, XrPosef> last_board_pose;
 		static std::map<std::string, int> last_board_n;
-		static std::map<std::string, XrTime> last_solve_t;
 		std::string set;
 		for (const auto & v: bv)
 		{
@@ -617,11 +672,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				             lnit->second, (int)bv.size(), (double)dpos, (double)dang, dt, moves);
 			}
 		}
-		// Stash every solve (not just transitions) so pops compare
-		// consecutive solutions, never stale ones.
+		// Stash every accepted solve (held frames `continue` above, so the
+		// pop reference never advances to garbage either).
 		last_board_pose[f.id] = sol.board_pose;
 		last_board_n[f.id] = (int)bv.size();
-		last_solve_t[f.id] = now;
 		// Per-tag detail builder, shared by the heartbeat `board tags:`
 		// line and the immediate `board flip:` line below.
 		auto tag_detail = [&]() {
