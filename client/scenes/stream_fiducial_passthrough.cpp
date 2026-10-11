@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <glm/gtc/quaternion.hpp>
 #include <memory>
 #include <spdlog/spdlog.h>
@@ -375,6 +376,37 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			board_poses.clear();
 			board_warm_start.clear();
 			fp.corrected_tags.clear();
+			// `board config:` makes every future log self-describing:
+			// authored tag-in-board offsets + sizes + object links, so
+			// tuning sessions never guess what geometry produced the data.
+			for (const auto & f: map.fiducials)
+			{
+				std::string cfg;
+				for (const auto & m: f.markers)
+				{
+					cfg += " [";
+					cfg += m.marker_data.substr(0, 32);
+					char buf[192];
+					snprintf(buf, sizeof(buf), " %.0fmm pos(%.1f,%.1f,%.1f) quat(%.3f,%.3f,%.3f,%.3f)]",
+					         (double)(m.marker_size_m * 1000.f), (double)(m.position[0] * 1000.f),
+					         (double)(m.position[1] * 1000.f), (double)(m.position[2] * 1000.f),
+					         (double)m.orientation[0], (double)m.orientation[1], (double)m.orientation[2],
+					         (double)m.orientation[3]);
+					cfg += buf;
+				}
+				spdlog::info("board config: fid \"{}\" {} markers{}",
+				             f.id, f.is_static ? "static" : "moving", cfg);
+			}
+			for (const auto & o: map.objects)
+			{
+				std::string fids;
+				for (const auto & fid: o.fiducial)
+				{
+					fids += fid;
+					fids += ',';
+				}
+				spdlog::info("board config: object \"{}\" type \"{}\" fids -> {}", o.id, o.type, fids);
+			}
 			for (const auto & o: map.objects)
 			{
 				if (o.type != "3d-passthrough")
@@ -499,6 +531,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// `board solve:` is the tuning instrument (more logging better).
 		static XrTime last_solve_log = 0;
 		static std::map<std::string, std::string> last_sets;
+		static std::map<std::string, XrPosef> last_board_pose;
+		static std::map<std::string, int> last_board_n;
 		std::string set;
 		for (const auto & v: bv)
 		{
@@ -510,7 +544,30 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		{
 			last_sets[f.id] = set;
 			spdlog::info("board solve: fid \"{}\" visible set -> {}", f.id, set);
+			// `board pop:` measures the felt artifact directly: how far
+			// the fused pose jumps when the visible set changes. Fires on
+			// transitions only (~0.5/s), not every frame.
+			auto lpit = last_board_pose.find(f.id);
+			auto lnit = last_board_n.find(f.id);
+			if (lpit != last_board_pose.end() and lnit != last_board_n.end())
+			{
+				float dx = sol.board_pose.position.x - lpit->second.position.x;
+				float dy = sol.board_pose.position.y - lpit->second.position.y;
+				float dz = sol.board_pose.position.z - lpit->second.position.z;
+				float dpos = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
+				float dot = std::abs(sol.board_pose.orientation.w * lpit->second.orientation.w +
+				                     sol.board_pose.orientation.x * lpit->second.orientation.x +
+				                     sol.board_pose.orientation.y * lpit->second.orientation.y +
+				                     sol.board_pose.orientation.z * lpit->second.orientation.z);
+				float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
+				spdlog::info("board pop: fid \"{}\" {}->{} dpos {:.2f}mm dang {:.3f}deg", f.id,
+				             lnit->second, (int)bv.size(), (double)dpos, (double)dang);
+			}
 		}
+		// Stash every solve (not just transitions) so pops compare
+		// consecutive solutions, never stale ones.
+		last_board_pose[f.id] = sol.board_pose;
+		last_board_n[f.id] = (int)bv.size();
 		if (now - last_solve_log > 2'000'000'000LL)
 		{
 			last_solve_log = now;
@@ -525,10 +582,45 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 					down += ')';
 				}
 			}
-			spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms{}",
+			// LOO outcome rides the heartbeat when the solver ran (!single):
+			// full = full set won, drop:J = LOO subset without tag J won,
+			// N/A = K==2 (runner-up is an init variant, not a subset).
+			std::string loo;
+			if (not bp.single)
+			{
+				char buf[128];
+				if (sol.loo_dropped >= 0)
+					snprintf(buf, sizeof(buf), " loo drop:%d cost:%.2f margin:%.2f", sol.loo_dropped,
+					         (double)sol.select_cost, (double)sol.select_margin);
+				else
+					snprintf(buf, sizeof(buf), " loo N/A cost:%.2f margin:%.2f", (double)sol.select_cost,
+					         (double)sol.select_margin);
+				loo = buf;
+			}
+			spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms{}{}",
 			             f.id, bp.tags_used, bp.tags_visible, (double)bp.rms_mm, (double)bp.rms_deg,
 			             bp.lm_iters, bp.solve_us, fp.last_horizon_ms,
-			             down.empty() ? "" : std::string(" down ") + down);
+			             down.empty() ? "" : std::string(" down ") + down, loo);
+			// `board tags:` per-tag detail for the weight-model fit: residual
+			// vector (board frame: constant = systematic, wandering = noise),
+			// whitened norm u (Cauchy input: plateau/elbow/rejected), range,
+			// incidence, final weight. K>=2 only; K==1 is trivially exact.
+			if (bv.size() >= 2)
+			{
+				std::string detail;
+				for (size_t i = 0; i < bv.size() and i < bp.tag_stats.size(); ++i)
+				{
+					const auto & t = bp.tag_stats[i];
+					char buf[256];
+					snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f %s]",
+					         t.payload.substr(0, 32).c_str(), (double)t.res_vec[0], (double)t.res_vec[1],
+					         (double)t.res_vec[2], (double)t.res_mm, (double)t.res_deg, (double)t.white_u,
+					         (double)bv[i].distance_m, (double)bv[i].cos_incidence, (double)t.weight,
+					         t.used ? "used" : "down");
+					detail += buf;
+				}
+				spdlog::info("board tags: fid \"{}\"{}", f.id, detail);
+			}
 		}
 	}
 

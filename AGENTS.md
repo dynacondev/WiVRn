@@ -99,7 +99,10 @@ inert unless set; full flow in `docs/profiling.md`.
   trimmed cost, Cauchy IRLS. Gradle builds `targets "wivrn"` only so
   dep test/bench trees never build. In-app self-test button in the
   Passthrough tab; `board solve:` logcat lines are the tuning
-  instrument. Pose filtering/smoothing TEMP-disabled (files stay,
+  instrument, with `board tags:` per-tag detail (board-frame residual
+  vector, whitened u, range, incidence, weight), `board pop:`
+  transition-jump sizes, `board config:` geometry dumps, and LOO outcome
+  (`loo drop/cost/margin`) on the heartbeat. Pose filtering/smoothing TEMP-disabled (files stay,
   unreferenced) until fusion is verified on-device.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow

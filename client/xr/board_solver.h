@@ -58,6 +58,13 @@ struct board_tag_stat
 	float res_mm = 0; // unwhitened position residual vs fused pose
 	float res_deg = 0; // unwhitened rotation residual vs fused pose
 	bool used = false; // weight above the trust floor
+	float res_vec[3] = {0, 0, 0}; // position residual in fused-board frame, mm:
+	// E = T^-1 o Z is board->board, so E.translation is already board-frame.
+	// Stable across head motion: a constant vector here is a systematic
+	// (print/offset) error, a wandering one is noise. Tuning instrument.
+	float white_u = 0; // final whitened residual norm (Cauchy input units):
+	// u << kCauchyK = plateau (weight ~1), u ~ k = elbow, u >> k = rejected.
+	// Its inlier distribution is what kCauchyK is fit against.
 };
 
 struct board_solution
@@ -70,6 +77,13 @@ struct board_solution
 	float rms_deg = 0;
 	int lm_iters = 0; // total tiny_solver iterations across IRLS rounds
 	double solve_us = 0;
+	// LOO selection outcome (K>=3; -1 when N/A: K==1 passthrough, or K==2
+	// where the runner-up is an init variant on the full set, not a subset).
+	int loo_dropped = -1; // full set won (-1) or the dropped vote index
+	float select_cost = 0; // winning trimmed cost (whitened^2 units)
+	float select_margin = 0; // runner-up minus winner: how decisive selection
+	// was. ~0 repeatedly at K>=3 means LOO cannot discriminate (tags agree
+	// to within noise, or disagree below the whitening scale).
 };
 
 board_solution solve_board(const std::vector<board_vote> & votes,

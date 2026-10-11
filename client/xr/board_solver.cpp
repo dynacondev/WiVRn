@@ -360,8 +360,11 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 		// Selection: short IRLS per candidate, robust cost on full set.
 		manif::SE3d winner = cands[0].init;
 		double best_cost = 1e100; // no infinity(): UB under -ffast-math
-		for (const auto & c: cands)
+		double second_cost = 1e100;
+		int best_idx = 0;
+		for (size_t ci = 0; ci < cands.size(); ++ci)
 		{
+			const auto & c = cands[ci];
 			std::vector<manif::SE3d> zc;
 			std::vector<Eigen::Matrix<double, 6, 1>> wc;
 			for (int i: c.idx)
@@ -376,10 +379,19 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 			double co = trimmed_cost(Tc, z, white, (int)z.size() >= 3 ? 1 : 0);
 			if (co < best_cost)
 			{
+				second_cost = best_cost;
 				best_cost = co;
+				best_idx = (int)ci;
 				winner = Tc;
 			}
+			else if (co < second_cost)
+				second_cost = co;
 		}
+		sol.select_cost = (float)best_cost;
+		sol.select_margin = cands.size() > 1 ? (float)(second_cost - best_cost) : 0.f;
+		// Candidate 0 is the full set; 1+j drops vote j (K>=3). K==2's
+		// runner-up is an init variant, not a subset: report N/A (-1).
+		sol.loo_dropped = (votes.size() >= 3 and best_idx > 0) ? best_idx - 1 : -1;
 		// Final refit: votes the winner distrusts (mult < floor) are
 		// EXCLUDED, not merely downweighted. A huge residual times a
 		// tiny-but-nonzero weight still drags the fit (measured 17mm
@@ -427,6 +439,7 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 		{
 			manif::SE3Tangentd e = Tf.inverse().compose(z[i]).log();
 			double u = (white[i].cwiseProduct(e.coeffs())).norm();
+			sol.tags[i].white_u = (float)u;
 			sol.tags[i].weight = u > 6.0 ? 0.0f : (float)mult[i];
 			sol.tags[i].used = sol.tags[i].weight > kTrustFloor;
 		}
@@ -444,6 +457,11 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 		Eigen::Vector3d tp(E.translation().x(), E.translation().y(), E.translation().z());
 		Eigen::Quaterniond eq(E.asSO3().quat());
 		sol.tags[i].res_mm = (float)(tp.norm() * 1000.0);
+		// E is board->board (T^-1 o Z), so tp is already in fused-board
+		// frame: constant across frames = systematic, wandering = noise.
+		sol.tags[i].res_vec[0] = (float)(tp.x() * 1000.0);
+		sol.tags[i].res_vec[1] = (float)(tp.y() * 1000.0);
+		sol.tags[i].res_vec[2] = (float)(tp.z() * 1000.0);
 		sol.tags[i].res_deg = quat_angle_deg(eq, Eigen::Quaterniond::Identity());
 		se += sol.tags[i].res_mm * sol.tags[i].res_mm;
 		sa += sol.tags[i].res_deg * sol.tags[i].res_deg;
