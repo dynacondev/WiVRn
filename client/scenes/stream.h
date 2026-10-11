@@ -262,7 +262,6 @@ private:
 	{
 		std::string fiducial_id;
 		std::string payload;
-		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}}; // board hypothesis
 		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}}; // raw tag pose (incidence/overlay)
 		float tag_size_m = 0;
 		std::array<float, 3> offset_pos{0, 0, 0}; // EFFECTIVE marker->board
@@ -296,8 +295,8 @@ private:
 	std::map<std::string, XrPosef> board_warm_start;
 
 	// Single fused placement per object. The per-(fiducial,entity)
-	// instance fan-out + fiducial_filter are TEMP-disabled (filtering
-	// returns after the fusion is verified); git history has them.
+	// instance fan-out stays deleted; output smoothing lives in
+	// client/xr/fiducial_filter.* (separate track), not here.
 	struct fused_placement
 	{
 		bool placed = false; // any fused solution ever (hold-last on loss)
@@ -473,6 +472,16 @@ private:
 	// marker payload, driven on the render thread from
 	// update_fiducial_passthrough(). Instances fan out per sighted entity.
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
+
+	// Board-fusion helpers (pure: all state via params/statics, no this).
+	// guard_k1_jump: residual-blind singletons hold last-good instead of
+	// displaying flips; true => skip the frame (occlusion-equivalent).
+	static bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
+	                          const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
+	// log_board_tuning: heartbeat + set-change + pop + flip log lines.
+	static void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
+	                             const xr::board_solution & sol, const board_fused & bp, double horizon_ms,
+	                             XrTime now, double dt);
 
 	stream(std::string server_name, scene & parent_scene);
 

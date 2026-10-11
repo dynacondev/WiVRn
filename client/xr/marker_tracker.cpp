@@ -72,7 +72,6 @@ xr::marker_tracker::marker_tracker(instance & inst_, session & sess_, system & s
 void xr::marker_tracker::fail(const std::string & reason)
 {
 	current_state = state::failed;
-	status_text = reason;
 	retry_at = last_now + retry_delay_ns;
 	spdlog::warn("marker_tracker: {}", reason);
 }
@@ -148,7 +147,6 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	first_tick_at = 0;
 	last_rate_log = 0;
 	current_state = state::idle;
-	status_text = "checking capabilities";
 
 	if (marker_payload.empty())
 	{
@@ -251,7 +249,6 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	}
 
 	current_state = state::creating_context;
-	status_text = "creating spatial context";
 	spdlog::info("marker_tracker: spatial context creating (pose component: {})",
 	             bounded_pose ? "BOUNDED_2D" : "none: markers carry no pose");
 }
@@ -337,7 +334,6 @@ void xr::marker_tracker::complete_context()
 	context_future = XR_NULL_FUTURE_EXT;
 	spatial_context = spatial_context_handle(completion.spatialContext, xrDestroySpatialContextEXT);
 	current_state = state::ready;
-	status_text = "seeking marker";
 	last_discovery_start = 0;
 	spdlog::info("marker_tracker: spatial context ready");
 }
@@ -408,7 +404,6 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			spdlog::warn("marker_tracker: QR capability exposes no pose component, markers cannot be located");
 		}
 		current.tracked = false;
-		status_text = "marker has no pose component";
 		return;
 	}
 
@@ -549,7 +544,6 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			current.tracked = true;
 			current.pose = bound_boxes[i].center;
 			current.time = predicted_time;
-			status_text = "tracking marker";
 			found = true;
 		}
 		if (not found)
@@ -567,7 +561,6 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			if (current.tracked)
 				spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
 			current.tracked = false;
-			status_text = "marker not in view";
 		}
 		return;
 	}
@@ -698,7 +691,6 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 	if (not bounded_pose)
 	{
 		current.tracked = false;
-		status_text = "marker has no pose component";
 		return;
 	}
 	// Rebuild sightings from this tick; ids the runtime no longer returns
@@ -751,7 +743,6 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		current.tracked = true;
 		current.pose = bound_boxes[i].center;
 		current.time = predicted_time;
-		status_text = "tracking marker";
 		matched_tick = true;
 	}
 	for (auto it = spatial_entities.begin(); it != spatial_entities.end();)
@@ -770,7 +761,6 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		if (current.tracked)
 			spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
 		current.tracked = false;
-		status_text = "marker not in view";
 	}
 	if (first_tick_at == 0)
 		first_tick_at = now;

@@ -98,28 +98,20 @@ inert unless set; full flow in `docs/profiling.md`.
   `client/thirdparty/`). Single-node SE(3), LOO-subset selection,
   trimmed cost, Cauchy IRLS. Gradle builds `targets "wivrn"` only so
   dep test/bench trees never build. In-app self-test button in the
-  Passthrough tab; `board solve:` logcat lines are the tuning
-  instrument, with `board tags:` per-tag detail (board-frame residual
-  vector, whitened u, range, incidence, weight), `board pop:`
-  transition-jump sizes, `board config:` geometry dumps, and LOO outcome
-  (`loo drop/cost/margin`) on the heartbeat. `board flip:` fires per-frame
-  on residual-detectable flips (K>=2 only; K==1 flips show as pop dang).
-  Pop lines carry enter/exit attribution + dt-since-last-solve (teleport
-  recovery vs true pops); heartbeat carries board position (move visibility).
-  Track-settle falloff (tau=0.4s, refined from 0.75 on run-E: transients live
-  at s<0.1, agreeing tags settled by s~=0.5): latch age per vote softens
-  freshly (re-)latched tracks via sqrt(settle) whitening; per-tag `s` in
-  `board tags:` is the settle-curve instrument; weight = settle*cauchy
-  (down-with-low-s = young, down-with-high-s = outlier). K=1 jump guard
-  (50mm/30deg/frame, teleport-silence bypass): residual-blind singletons
-  hold last-good instead of displaying flips; `board hold:` engage/release
-  lines. Finite guards throughout (intake votes, Kabsch wsum fallback,
-  post-solve `board nan:` + hold): NaN can never reach the mesh or warm
-  start (run-E K3 all-fresh-storm line). Rotation-outlier force-exclusion
-  (6deg fixed, incidence-blind): flips always carry 11deg+ rotation vs
-  <=3.4deg settled at any incidence, while position can't separate them
-  (grazing 1/cos blowup parks flips at u~2); weight exactly 0 + refit exit. Pose filtering/smoothing TEMP-disabled (files stay,
-  unreferenced) until fusion is verified on-device.
+  Passthrough tab. Tuning log lines: `board solve:` (heartbeat: rms,
+  iters, solve_us, horizon, board position, `loo drop/cost/margin`),
+  `board tags:` (per-tag residual vector, whitened u, range, incidence,
+  weight, settle s), `board pop:` (transition jumps + enter/exit + dt),
+  `board flip:` (per-frame, K>=2; K=1 flips show as pop dang),
+  `board config:` (geometry dumps), `board hold:` (K=1 jump-guard
+  engage/release), `board nan:` (non-finite fused pose, never fires).
+  Robustness stack: track-settle falloff (tau=0.4s, sqrt(settle)
+  whitening; down-with-low-s = young, down-with-high-s = outlier),
+  K=1 jump guard (50mm/30deg/frame, teleport-silence bypass, hold-last),
+  rotation-outlier force-exclusion (6deg fixed, incidence-blind),
+  finite guards (vote intake, Kabsch wsum fallback, post-solve hold).
+  Output smoothing is a separate track (`client/xr/fiducial_filter.*`,
+  rigid-only v1); fusion emits raw poses.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow
   `maxLayerCount`). Geometry is thin triangles (line topology never

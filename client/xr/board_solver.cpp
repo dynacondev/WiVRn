@@ -118,7 +118,10 @@ bool vote_finite(const board_vote & v)
 	        std::isfinite(v.distance_m) and std::isfinite(v.cos_incidence) and std::isfinite(v.settle);
 }
 
-// Per-vote diagonal whitening from the TEMP model (1/sigma per axis).
+// Per-vote diagonal whitening from the v1 weight model (fit round 2:
+// gains + tau from on-device runs; see kSettleTauS). Physical sketch:
+// position noise ~ d^2/size (triangulation-like), rotation ~ d/size,
+// both blow up at grazing incidence.
 Eigen::Matrix<double, 6, 1> whitening(const board_vote & v)
 {
 	double d = std::max<double>(v.distance_m, 1e-3);

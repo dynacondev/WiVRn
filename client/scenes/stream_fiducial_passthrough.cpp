@@ -134,6 +134,223 @@ void effective_offset(const std::array<float, 3> & p, const std::array<float, 4>
 }
 } // namespace
 
+// K==1 jump guard: the passthrough path is residual-blind (a lone vote fits
+// itself), so a flipped singleton displays inverted (run-E: user-visible
+// inverts through the flip storm). Frame jumps are physically impossible by
+// hand — carry speeds run ~5mm/frame, so dpos 50mm (4.5m/s) / dang 30deg
+// (2700deg/s) clear legit motion including 42mm bistable swaps (~1deg) while
+// sitting far below flips (70mm+/40deg+). Returns true when the frame must be
+// skipped: the caller `continue`s, making it an occlusion frame downstream
+// (hold-last) whose warm reference never advances to garbage. Release on
+// resolve / K>=2 consensus / teleport-silence. No frame timeout: a rig yanked
+// mid-visibility with no silence and no set change is vanishingly rare, and
+// set changes / silence release first. First sighting (no reference) always
+// accepts: unknowable without history.
+bool scenes::stream::guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
+                                      const std::optional<XrPosef> & warm, XrTime now, double & dt_out)
+{
+	static std::map<std::string, XrTime> last_solve_t;
+	static std::map<std::string, bool> holding;
+	double solve_dt = 0;
+	if (auto ltit0 = last_solve_t.find(fid); ltit0 != last_solve_t.end())
+		solve_dt = (now - ltit0->second) * 1e-9;
+	last_solve_t[fid] = now; // cadence advances even when held
+	dt_out = solve_dt;
+	bool held = false;
+	if (sol.single and warm)
+	{
+		float dx = sol.board_pose.position.x - warm->position.x;
+		float dy = sol.board_pose.position.y - warm->position.y;
+		float dz = sol.board_pose.position.z - warm->position.z;
+		float dpos = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
+		float dot = std::abs(sol.board_pose.orientation.w * warm->orientation.w +
+		                     sol.board_pose.orientation.x * warm->orientation.x +
+		                     sol.board_pose.orientation.y * warm->orientation.y +
+		                     sol.board_pose.orientation.z * warm->orientation.z);
+		float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
+		bool teleport = solve_dt > 0.25; // silence => the rig may have moved
+		if (not teleport and (dpos > 50.f or dang > 30.f))
+		{
+			held = true;
+			if (not holding[fid])
+			{
+				holding[fid] = true;
+				spdlog::info("board hold: fid \"{}\" K1 jump {:.2f}mm {:.2f}deg dt{:.2f}s (holding last good)",
+				             fid, (double)dpos, (double)dang, solve_dt);
+			}
+		}
+		else if (holding[fid])
+		{
+			holding[fid] = false;
+			spdlog::info("board hold: fid \"{}\" resumed ({:.2f}mm{})", fid, (double)dpos,
+			             teleport ? ", teleport accepted" : "");
+		}
+	}
+	else if (holding[fid])
+	{
+		holding[fid] = false;
+		spdlog::info("board hold: fid \"{}\" consensus resumed", fid);
+	}
+	return held;
+}
+
+// Tuning-instrument logging: heartbeat per fiducial + visible-set changes
+// (`board solve:` / `board tags:` / `board pop:` / `board flip:` lines).
+// Pure code motion out of the per-fiducial loop (no behavior change):
+// per-fid state lives in function statics, exactly as before.
+void scenes::stream::log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
+                                         const xr::board_solution & sol, const board_fused & bp,
+                                         double horizon_ms, XrTime now, double dt)
+{
+	// `board solve:` is the tuning instrument (more logging better).
+	static XrTime last_solve_log = 0;
+	static std::map<std::string, std::string> last_sets;
+	static std::map<std::string, XrPosef> last_board_pose;
+	static std::map<std::string, int> last_board_n;
+	std::string set;
+	for (const auto & v: bv)
+	{
+		set += v.payload.substr(0, 32);
+		set += ',';
+	}
+	auto lsit = last_sets.find(fid);
+	if (lsit == last_sets.end() or lsit->second != set)
+	{
+		// Attribute the transition: which payloads entered/exited
+		// (set strings are comma-joined truncated payloads). Tests the
+		// grazing-entry hypothesis: big pops should name entering tags
+		// that the `board tags:` line then shows at low cos / high u.
+		std::string entered, exited;
+		if (lsit != last_sets.end())
+		{
+			auto split = [](const std::string & s) {
+				std::vector<std::string> out;
+				size_t b = 0;
+				while (b < s.size())
+				{
+					size_t c = s.find(',', b);
+					if (c == std::string::npos)
+						break;
+					if (c > b)
+						out.push_back(s.substr(b, c - b));
+					b = c + 1;
+				}
+				return out;
+			};
+			auto old_tags = split(lsit->second);
+			auto new_tags = split(set);
+			for (const auto & t: new_tags)
+			{
+				if (std::ranges::find(old_tags, t) == old_tags.end())
+					entered += t + ',';
+			}
+			for (const auto & t: old_tags)
+			{
+				if (std::ranges::find(new_tags, t) == new_tags.end())
+					exited += t + ',';
+			}
+		}
+		last_sets[fid] = set;
+		spdlog::info("board solve: fid \"{}\" visible set -> {}", fid, set);
+		// `board pop:` measures the felt artifact directly: how far
+		// the fused pose jumps when the visible set changes. Fires on
+		// transitions only (~0.5/s), not every frame. dt since the
+		// previous solve separates true pops (dt~frame) from
+		// teleport-recovery after silence (rig move / total loss).
+		auto lpit = last_board_pose.find(fid);
+		auto lnit = last_board_n.find(fid);
+		if (lpit != last_board_pose.end() and lnit != last_board_n.end())
+		{
+			float dx = sol.board_pose.position.x - lpit->second.position.x;
+			float dy = sol.board_pose.position.y - lpit->second.position.y;
+			float dz = sol.board_pose.position.z - lpit->second.position.z;
+			float dpos = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
+			float dot = std::abs(sol.board_pose.orientation.w * lpit->second.orientation.w +
+			                     sol.board_pose.orientation.x * lpit->second.orientation.x +
+			                     sol.board_pose.orientation.y * lpit->second.orientation.y +
+			                     sol.board_pose.orientation.z * lpit->second.orientation.z);
+			float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
+			std::string moves;
+			if (not entered.empty())
+				moves += " enter " + entered.substr(0, entered.size() - 1);
+			if (not exited.empty())
+				moves += " exit " + exited.substr(0, exited.size() - 1);
+			spdlog::info("board pop: fid \"{}\" {}->{} dpos {:.2f}mm dang {:.3f}deg dt{:.2f}s{}", fid,
+			             lnit->second, (int)bv.size(), (double)dpos, (double)dang, dt, moves);
+		}
+	}
+	// Stash every accepted solve (held frames `continue` before this call,
+	// so the pop reference never advances to garbage either).
+	last_board_pose[fid] = sol.board_pose;
+	last_board_n[fid] = (int)bv.size();
+	// Per-tag detail builder, shared by the heartbeat `board tags:`
+	// line and the immediate `board flip:` line below.
+	auto tag_detail = [&]() {
+		std::string detail;
+		for (size_t i = 0; i < bv.size() and i < bp.tag_stats.size(); ++i)
+		{
+			const auto & t = bp.tag_stats[i];
+			char buf[256];
+			snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f s%.2f %s]",
+			         t.payload.substr(0, 32).c_str(), (double)t.res_vec[0], (double)t.res_vec[1],
+			         (double)t.res_vec[2], (double)t.res_mm, (double)t.res_deg, (double)t.white_u,
+			         (double)bv[i].distance_m, (double)bv[i].cos_incidence, (double)t.weight,
+			         (double)t.settle, t.used ? "used" : "down");
+			detail += buf;
+		}
+		return detail;
+	};
+	// `board flip:` immediate forensics: any tag beyond the report
+	// thresholds (50mm/10deg: far above noise, far below real flips).
+	// Unthrottled but fires rarely; single-frame flips never survive
+	// to the 2s heartbeat, and this is the only per-frame flip record.
+	// Residual-blind at K==1 (passthrough fits itself): K==1 flips show
+	// as `board pop:` dang instead.
+	if (sol.has_flip)
+		spdlog::info("board flip: fid \"{}\" K{}{}", fid, (int)bv.size(), tag_detail());
+	if (now - last_solve_log > 2'000'000'000LL)
+	{
+		last_solve_log = now;
+		std::string down;
+		for (const auto & t: bp.tag_stats)
+		{
+			if (not t.used)
+			{
+				down += t.payload.substr(0, 32);
+				down += '(';
+				down += std::to_string(t.weight).substr(0, 4);
+				down += ')';
+			}
+		}
+		// LOO outcome rides the heartbeat when the solver ran (!single):
+		// full = full set won, drop:J = LOO subset without tag J won,
+		// N/A = K==2 (runner-up is an init variant, not a subset).
+		std::string loo;
+		if (not bp.single)
+		{
+			char buf[128];
+			if (sol.loo_dropped >= 0)
+				snprintf(buf, sizeof(buf), " loo drop:%d cost:%.2f margin:%.2f", sol.loo_dropped,
+				         (double)sol.select_cost, (double)sol.select_margin);
+			else
+				snprintf(buf, sizeof(buf), " loo N/A cost:%.2f margin:%.2f", (double)sol.select_cost,
+				         (double)sol.select_margin);
+			loo = buf;
+		}
+		spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms at ({:.2f},{:.2f},{:.2f}){}{}",
+		             fid, bp.tags_used, bp.tags_visible, (double)bp.rms_mm, (double)bp.rms_deg,
+		             bp.lm_iters, bp.solve_us, horizon_ms, (double)sol.board_pose.position.x,
+		             (double)sol.board_pose.position.y, (double)sol.board_pose.position.z,
+		             down.empty() ? "" : std::string(" down ") + down, loo);
+		// `board tags:` per-tag detail for the weight-model fit: residual
+		// vector (board frame: constant = systematic, wandering = noise),
+		// whitened norm u (Cauchy input: plateau/elbow/rejected), range,
+		// incidence, final weight. K>=2 only; K==1 is trivially exact.
+		if (bv.size() >= 2)
+			spdlog::info("board tags: fid \"{}\"{}", fid, tag_detail());
+	}
+}
+
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
 {
 	auto & fp = fiducial_passthrough;
@@ -305,7 +522,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				fiducial_vote v;
 				v.fiducial_id = f.id;
 				v.payload = s.payload;
-				v.solved = compose_pose(s.pose, ep, eq);
 				v.observed = s.pose;
 				v.tag_size_m = m.marker_size_m;
 				v.offset_pos = ep;
@@ -484,7 +700,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			b.tag_size_m = v.tag_size_m;
 			// Settle from latch age (fail open: unknown latch = settled).
 			// Latch stamps mix snapshot clocks (discovery: predicted_time,
-			// update: now; ~20ms basis skew, negligible vs tau=0.75s).
+			// update: now; ~20ms basis skew, negligible vs tau=0.4s).
 			b.settle = 1;
 			if (v.latch_time != 0 and now >= v.latch_time)
 				b.settle = (float)xr::settle_from_age((now - v.latch_time) * 1e-9);
@@ -510,61 +726,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		xr::board_solution sol = xr::solve_board(bv, warm);
 		if (not sol.ok)
 			continue;
-		// K==1 jump guard: the passthrough path is residual-blind (a lone
-		// vote fits itself), so a flipped singleton displays inverted
-		// (run-E: user-visible inverts through the flip storm). Frame jumps
-		// are physically impossible by hand — carry speeds run ~5mm/frame,
-		// so dpos 50mm (4.5m/s) / dang 30deg (2700deg/s) clear legit motion
-		// including 42mm bistable swaps (~1deg) while sitting far below
-		// flips (70mm+/40deg+). On trigger, skip ALL state writes: the frame
-		// becomes an occlusion frame downstream (hold-last) and the warm
-		// reference never advances to garbage. Release on resolve / K>=2
-		// consensus / teleport-silence. No frame timeout: a rig yanked
-		// mid-visibility with no silence and no set change is vanishingly
-		// rare, and set changes / silence release first. First sighting (no
-		// reference) always accepts: unknowable without history.
-		static std::map<std::string, XrTime> last_solve_t;
-		static std::map<std::string, bool> holding;
+		// Residual-blind singletons hold last-good instead of displaying
+		// flips (guard_k1_jump above); held frames skip all state writes.
 		double solve_dt = 0;
-		if (auto ltit0 = last_solve_t.find(f.id); ltit0 != last_solve_t.end())
-			solve_dt = (now - ltit0->second) * 1e-9;
-		last_solve_t[f.id] = now; // cadence advances even when held
-		bool held = false;
-		if (sol.single and warm)
-		{
-			float dx = sol.board_pose.position.x - warm->position.x;
-			float dy = sol.board_pose.position.y - warm->position.y;
-			float dz = sol.board_pose.position.z - warm->position.z;
-			float dpos = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
-			float dot = std::abs(sol.board_pose.orientation.w * warm->orientation.w +
-			                     sol.board_pose.orientation.x * warm->orientation.x +
-			                     sol.board_pose.orientation.y * warm->orientation.y +
-			                     sol.board_pose.orientation.z * warm->orientation.z);
-			float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
-			bool teleport = solve_dt > 0.25; // silence => the rig may have moved
-			if (not teleport and (dpos > 50.f or dang > 30.f))
-			{
-				held = true;
-				if (not holding[f.id])
-				{
-					holding[f.id] = true;
-					spdlog::info("board hold: fid \"{}\" K1 jump {:.2f}mm {:.2f}deg dt{:.2f}s (holding last good)",
-					             f.id, (double)dpos, (double)dang, solve_dt);
-				}
-			}
-			else if (holding[f.id])
-			{
-				holding[f.id] = false;
-				spdlog::info("board hold: fid \"{}\" resumed ({:.2f}mm{})", f.id, (double)dpos,
-				             teleport ? ", teleport accepted" : "");
-			}
-		}
-		else if (holding[f.id])
-		{
-			holding[f.id] = false;
-			spdlog::info("board hold: fid \"{}\" consensus resumed", f.id);
-		}
-		if (held)
+		if (guard_k1_jump(f.id, sol, warm, now, solve_dt))
 			continue;
 		board_warm_start[f.id] = sol.board_pose;
 		auto & bp = board_poses[f.id];
@@ -590,158 +755,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// Green raw vs orange corrected shows disagreement at a glance.
 		for (const auto & m: f.markers)
 			fp.corrected_tags[m.marker_data] = {compose_pose(sol.board_pose, m.position, m.orientation), m.marker_size_m, f.id, now};
-		// Logging: heartbeat per fiducial + visible-set changes.
-		// `board solve:` is the tuning instrument (more logging better).
-		static XrTime last_solve_log = 0;
-		static std::map<std::string, std::string> last_sets;
-		static std::map<std::string, XrPosef> last_board_pose;
-		static std::map<std::string, int> last_board_n;
-		std::string set;
-		for (const auto & v: bv)
-		{
-			set += v.payload.substr(0, 32);
-			set += ',';
-		}
-		auto lsit = last_sets.find(f.id);
-		if (lsit == last_sets.end() or lsit->second != set)
-		{
-			// Attribute the transition: which payloads entered/exited
-			// (set strings are comma-joined truncated payloads). Tests the
-			// grazing-entry hypothesis: big pops should name entering tags
-			// that the `board tags:` line then shows at low cos / high u.
-			std::string entered, exited;
-			if (lsit != last_sets.end())
-			{
-				auto split = [](const std::string & s) {
-					std::vector<std::string> out;
-					size_t b = 0;
-					while (b < s.size())
-					{
-						size_t c = s.find(',', b);
-						if (c == std::string::npos)
-							break;
-						if (c > b)
-							out.push_back(s.substr(b, c - b));
-						b = c + 1;
-					}
-					return out;
-				};
-				auto old_tags = split(lsit->second);
-				auto new_tags = split(set);
-				for (const auto & t: new_tags)
-				{
-					if (std::ranges::find(old_tags, t) == old_tags.end())
-						entered += t + ',';
-				}
-				for (const auto & t: old_tags)
-				{
-					if (std::ranges::find(new_tags, t) == new_tags.end())
-						exited += t + ',';
-				}
-			}
-			last_sets[f.id] = set;
-			spdlog::info("board solve: fid \"{}\" visible set -> {}", f.id, set);
-			// `board pop:` measures the felt artifact directly: how far
-			// the fused pose jumps when the visible set changes. Fires on
-			// transitions only (~0.5/s), not every frame. dt since the
-			// previous solve separates true pops (dt~frame) from
-			// teleport-recovery after silence (rig move / total loss).
-			auto lpit = last_board_pose.find(f.id);
-			auto lnit = last_board_n.find(f.id);
-			if (lpit != last_board_pose.end() and lnit != last_board_n.end())
-			{
-				float dx = sol.board_pose.position.x - lpit->second.position.x;
-				float dy = sol.board_pose.position.y - lpit->second.position.y;
-				float dz = sol.board_pose.position.z - lpit->second.position.z;
-				float dpos = std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
-				float dot = std::abs(sol.board_pose.orientation.w * lpit->second.orientation.w +
-				                     sol.board_pose.orientation.x * lpit->second.orientation.x +
-				                     sol.board_pose.orientation.y * lpit->second.orientation.y +
-				                     sol.board_pose.orientation.z * lpit->second.orientation.z);
-				float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
-				double dt = 0;
-				auto ltit = last_solve_t.find(f.id);
-				if (ltit != last_solve_t.end())
-					dt = (now - ltit->second) * 1e-9;
-				std::string moves;
-				if (not entered.empty())
-					moves += " enter " + entered.substr(0, entered.size() - 1);
-				if (not exited.empty())
-					moves += " exit " + exited.substr(0, exited.size() - 1);
-				spdlog::info("board pop: fid \"{}\" {}->{} dpos {:.2f}mm dang {:.3f}deg dt{:.2f}s{}", f.id,
-				             lnit->second, (int)bv.size(), (double)dpos, (double)dang, dt, moves);
-			}
-		}
-		// Stash every accepted solve (held frames `continue` above, so the
-		// pop reference never advances to garbage either).
-		last_board_pose[f.id] = sol.board_pose;
-		last_board_n[f.id] = (int)bv.size();
-		// Per-tag detail builder, shared by the heartbeat `board tags:`
-		// line and the immediate `board flip:` line below.
-		auto tag_detail = [&]() {
-			std::string detail;
-			for (size_t i = 0; i < bv.size() and i < bp.tag_stats.size(); ++i)
-			{
-				const auto & t = bp.tag_stats[i];
-				char buf[256];
-				snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f s%.2f %s]",
-				         t.payload.substr(0, 32).c_str(), (double)t.res_vec[0], (double)t.res_vec[1],
-				         (double)t.res_vec[2], (double)t.res_mm, (double)t.res_deg, (double)t.white_u,
-				         (double)bv[i].distance_m, (double)bv[i].cos_incidence, (double)t.weight,
-				         (double)t.settle, t.used ? "used" : "down");
-				detail += buf;
-			}
-			return detail;
-		};
-		// `board flip:` immediate forensics: any tag beyond the report
-		// thresholds (50mm/10deg: far above noise, far below real flips).
-		// Unthrottled but fires rarely; single-frame flips never survive
-		// to the 2s heartbeat, and this is the only per-frame flip record.
-		// Residual-blind at K==1 (passthrough fits itself): K==1 flips show
-		// as `board pop:` dang instead.
-		if (sol.has_flip)
-			spdlog::info("board flip: fid \"{}\" K{}{}", f.id, (int)bv.size(), tag_detail());
-		if (now - last_solve_log > 2'000'000'000LL)
-		{
-			last_solve_log = now;
-			std::string down;
-			for (const auto & t: bp.tag_stats)
-			{
-				if (not t.used)
-				{
-					down += t.payload.substr(0, 32);
-					down += '(';
-					down += std::to_string(t.weight).substr(0, 4);
-					down += ')';
-				}
-			}
-			// LOO outcome rides the heartbeat when the solver ran (!single):
-			// full = full set won, drop:J = LOO subset without tag J won,
-			// N/A = K==2 (runner-up is an init variant, not a subset).
-			std::string loo;
-			if (not bp.single)
-			{
-				char buf[128];
-				if (sol.loo_dropped >= 0)
-					snprintf(buf, sizeof(buf), " loo drop:%d cost:%.2f margin:%.2f", sol.loo_dropped,
-					         (double)sol.select_cost, (double)sol.select_margin);
-				else
-					snprintf(buf, sizeof(buf), " loo N/A cost:%.2f margin:%.2f", (double)sol.select_cost,
-					         (double)sol.select_margin);
-				loo = buf;
-			}
-			spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms at ({:.2f},{:.2f},{:.2f}){}{}",
-			             f.id, bp.tags_used, bp.tags_visible, (double)bp.rms_mm, (double)bp.rms_deg,
-			             bp.lm_iters, bp.solve_us, fp.last_horizon_ms, (double)sol.board_pose.position.x,
-			             (double)sol.board_pose.position.y, (double)sol.board_pose.position.z,
-			             down.empty() ? "" : std::string(" down ") + down, loo);
-			// `board tags:` per-tag detail for the weight-model fit: residual
-			// vector (board frame: constant = systematic, wandering = noise),
-			// whitened norm u (Cauchy input: plateau/elbow/rejected), range,
-			// incidence, final weight. K>=2 only; K==1 is trivially exact.
-			if (bv.size() >= 2)
-				spdlog::info("board tags: fid \"{}\"{}", f.id, tag_detail());
-		}
+		// Tuning-instrument logging (heartbeat + set changes + pops + flips).
+		log_board_tuning(f.id, bv, sol, bp, fp.last_horizon_ms, now, solve_dt);
 	}
 
 	// ---- behavior objects: first referenced board pose wins ----
@@ -784,8 +799,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		}
 		// Placement: first referenced fiducial with a pose (live or
 		// held) wins. Held poses keep rendering through occlusion
-		// (hold-last); the filter that used to smooth this is
-		// TEMP-disabled, so this is the raw fused output.
+		// (hold-last); output smoothing is a separate track
+		// (client/xr/fiducial_filter.*), so this is the raw fused output.
 		for (const auto & fid: def.fiducial)
 		{
 			auto bpit = board_poses.find(fid);

@@ -75,30 +75,10 @@ public:
 	// Render thread only. predicted_time stamps the discovery snapshot.
 	void update(XrSpace world_space, XrTime now, XrTime predicted_time);
 
-	sighting latest() const
-	{
-		return current;
-	}
-	const std::string & status() const
-	{
-		return status_text;
-	}
-	const std::string & configured_tag() const
-	{
-		return marker_tag;
-	}
 	// Display label for UI/logs: the tag, or the payload when untagged.
 	const std::string & label() const
 	{
 		return marker_tag.empty() ? marker_payload : marker_tag;
-	}
-	float configured_size() const
-	{
-		return marker_size_m;
-	}
-	bool configured_static() const
-	{
-		return marker_static;
 	}
 	// Every code sighted by the latest snapshot pass (matched entry and
 	// unmatched alike), refreshed every frame. Consumers hold their own
@@ -221,7 +201,6 @@ private:
 	XrTime last_rate_log = 0;
 
 	sighting current;
-	std::string status_text = "idle";
 
 	// Query scratch storage (grown on demand, reused across snapshots).
 	// bounds[i] parallels marker_data[i]; both parallel entity_ids[i].
