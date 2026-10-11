@@ -1368,7 +1368,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				++fp.dbg_boxes;
 			}
 		}
-		if (fp.debug_origin)
+		if (fp.debug_origin or fp.debug_smoothed)
 		{
 			for (const auto & [fid, bp]: board_poses)
 			{
@@ -1379,14 +1379,30 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					fiducial_passthrough_state::stale_hold(dbg_now, bp.time);
 				if (a <= 0.01f)
 					continue;
-				glm::vec3 o, x, y, z;
-				tag_frame(bp.pose, o, x, y, z);
-				float len = bp.tag_size_m * 1.5f;
-				tripod(o, x, y, z, len, len * 0.05f, a);
-				// White center square (distinct from the tag tripod).
-				float d = len * 0.25f;
-				box_fill(o, x, y, d, d, 1.f, 1.f, 1.f, a);
-				++fp.dbg_boxes;
+				if (fp.debug_origin)
+				{
+					// Raw origin tripod (pre-smoothing solve) + white square.
+					glm::vec3 o, x, y, z;
+					tag_frame(bp.raw_pose, o, x, y, z);
+					float len = bp.tag_size_m * 1.5f;
+					tripod(o, x, y, z, len, len * 0.05f, a);
+					// White center square (distinct from the tag tripod).
+					float d = len * 0.25f;
+					box_fill(o, x, y, d, d, 1.f, 1.f, 1.f, a);
+					++fp.dbg_boxes;
+				}
+				if (fp.debug_smoothed)
+				{
+					// Smoothed twin (smaller, cyan square): raw vs filtered
+					// disagree visibly exactly when the filter is working.
+					glm::vec3 o, x, y, z;
+					tag_frame(bp.pose, o, x, y, z);
+					float len = bp.tag_size_m * 1.0f;
+					tripod(o, x, y, z, len, len * 0.06f, a);
+					float d = len * 0.25f;
+					box_fill(o, x, y, d, d, 0.f, 1.f, 1.f, a);
+					++fp.dbg_boxes;
+				}
 			}
 		}
 		fp.dbg_tris = tris.size() / 3;

@@ -200,7 +200,8 @@ bool scenes::stream::guard_k1_jump(const std::string & fid, const xr::board_solu
 // per-fid state lives in function statics, exactly as before.
 void scenes::stream::log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
                                          const xr::board_solution & sol, const board_fused & bp,
-                                         double horizon_ms, XrTime now, double dt)
+                                         double horizon_ms, XrTime now, double dt,
+                                         const xr::board_filter_diag & fdiag)
 {
 	// `board solve:` is the tuning instrument (more logging better).
 	static XrTime last_solve_log = 0;
@@ -348,6 +349,23 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 		// incidence, final weight. K>=2 only; K==1 is trivially exact.
 		if (bv.size() >= 2)
 			spdlog::info("board tags: fid \"{}\"{}", fid, tag_detail());
+		// `board smooth:` filter state: innovation (raw vs smoothed),
+		// applied alpha, caller strength, shaping activity (dz = deadzone
+		// holding, cap = slew bound, snap = teleport re-acquisition).
+		std::string shaping;
+		if (fdiag.snapped)
+			shaping = "snap";
+		else
+		{
+			if (fdiag.deadzoned)
+				shaping += "dz";
+			if (fdiag.capped)
+				shaping += "cap";
+			if (shaping.empty())
+				shaping = "ok";
+		}
+		spdlog::info("board smooth: fid \"{}\" innov {:.2f}mm {:.3f}deg alpha {:.4f} w {:.3f} {}", fid,
+		             fdiag.innov_mm, fdiag.innov_deg, fdiag.alpha, fdiag.strength, shaping);
 	}
 }
 
@@ -592,6 +610,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			fiducial_votes.clear();
 			board_poses.clear();
 			board_warm_start.clear();
+			board_filters.clear();
 			fp.corrected_tags.clear();
 			// `board config:` makes every future log self-describing:
 			// authored tag-in-board offsets + sizes + object links, so
@@ -733,7 +752,22 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			continue;
 		board_warm_start[f.id] = sol.board_pose;
 		auto & bp = board_poses[f.id];
-		bp.pose = sol.board_pose;
+		// Post-resolution smoothing (D-hybrid rigid filter; multi and
+		// single-tag flow through identically). Strength from fusion stats;
+		// dt from the last accepted solve (holds/total-loss freeze the
+		// clock, so returns snap via the teleport path when stale).
+		int used = 0;
+		for (const auto & t: sol.tags)
+			used += t.used;
+		double fdt = 0;
+		if (bp.time != 0 and now >= bp.time)
+			fdt = (now - bp.time) * 1e-9;
+		float w = xr::board_filter::strength(used, (int)sol.tags.size(), sol.rms_mm, sol.single);
+		xr::board_filter_diag fdiag;
+		XrPosef smoothed = board_filters[f.id].update(sol.board_pose, w, fdt, &fdiag);
+		board_warm_start[f.id] = smoothed;
+		bp.pose = smoothed;
+		bp.raw_pose = sol.board_pose;
 		bp.time = now;
 		bp.live = true;
 		bp.rms_mm = sol.rms_mm;
@@ -749,14 +783,14 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		bp.has_offset = has_offset;
 		bp.tag_size_m = tag_size;
 		fp.last_solve_ms = std::max(fp.last_solve_ms, sol.solve_us * 1e-3);
-		// Orange overlay inputs: each tag re-projected from the fused
-		// board pose with its AUTHORED offset (predicted = fused *
+		// Orange overlay inputs: each tag re-projected from the SMOOTHED
+		// board pose with its AUTHORED offset (predicted = smoothed *
 		// authored: the inverse of the vote path, so no extra math).
 		// Green raw vs orange corrected shows disagreement at a glance.
 		for (const auto & m: f.markers)
-			fp.corrected_tags[m.marker_data] = {compose_pose(sol.board_pose, m.position, m.orientation), m.marker_size_m, f.id, now};
+			fp.corrected_tags[m.marker_data] = {compose_pose(smoothed, m.position, m.orientation), m.marker_size_m, f.id, now};
 		// Tuning-instrument logging (heartbeat + set changes + pops + flips).
-		log_board_tuning(f.id, bv, sol, bp, fp.last_horizon_ms, now, solve_dt);
+		log_board_tuning(f.id, bv, sol, bp, fp.last_horizon_ms, now, solve_dt, fdiag);
 	}
 
 	// ---- behavior objects: first referenced board pose wins ----
@@ -926,8 +960,12 @@ void scenes::stream::gui_passthrough()
 	ImGui::Checkbox(_S("Corrected tags (orange)"), &fp.debug_corrected);
 	ImGui::Checkbox(_S("Axes gizmo (RGB=XYZ)"), &fp.debug_axes);
 	ImGui::Checkbox(_S("Origin tripod (offset boards)"), &fp.debug_origin);
+	ImGui::Checkbox(_S("Smoothed tripod (cyan, filtered pose)"), &fp.debug_smoothed);
 	if (ImGui::Button(_S("Run board solver self-test")))
+	{
 		xr::board_solver_selftest();
+		xr::board_filter_selftest();
+	}
 	if (not fp.held_codes.empty())
 	{
 		ImGui::Text("%s (%zu):", _S("Codes in view"), fp.held_codes.size());

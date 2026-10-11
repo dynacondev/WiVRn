@@ -30,6 +30,7 @@
 #include "scene.h"
 #include "scenes/input_profile.h"
 #include "xr/board_solver.h"
+#include "xr/board_filter.h"
 #include "stream_defoveator.h"
 #include "utils/thread_safe.h"
 #include "wifi_lock.h"
@@ -274,7 +275,8 @@ private:
 	// held (frozen) otherwise. Render thread only.
 	struct board_fused
 	{
-		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}}; // smoothed (displayed) board pose
+		XrPosef raw_pose{{0, 0, 0, 1}, {0, 0, 0}}; // pre-smoothing solve (raw origin gizmo)
 		XrTime time = 0; // last live solution (stale age = now - time)
 		bool live = false; // solved this frame
 		float rms_mm = 0, rms_deg = 0;
@@ -293,10 +295,13 @@ private:
 	// Warm starts for the solver (fiducial id -> last fused pose).
 	// Solver init only, not output smoothing.
 	std::map<std::string, XrPosef> board_warm_start;
+	// Post-resolution smoothing state per fiducial (D-hybrid rigid filter;
+	// multi and single-tag flow through identically). Cleared with the map.
+	std::map<std::string, xr::board_filter> board_filters;
 
 	// Single fused placement per object. The per-(fiducial,entity)
-	// instance fan-out stays deleted; output smoothing lives in
-	// client/xr/fiducial_filter.* (separate track), not here.
+	// instance fan-out stays deleted; output smoothing is the D-hybrid
+	// rigid filter (board_filters above), not per-tag filtering.
 	struct fused_placement
 	{
 		bool placed = false; // any fused solution ever (hold-last on loss)
@@ -365,7 +370,7 @@ private:
 		bool debug_corrected = true; // orange: fused-corrected tag boxes
 		bool debug_axes = true; // RGB XYZ tripod on sighted tags (orientation/polarity check)
 		bool debug_origin = true; // larger tripod + center square at fused board origins (offset check)
-
+		bool debug_smoothed = true; // twin tripod (smaller, cyan square) at the SMOOTHED pose; origin stays raw
 		// Fiducial marker debugging (Passthrough tab, session-scoped,
 		// render thread only). Raw instant poses while visible, frozen
 		// SLAM hold when lost; overlays submit even before calibration.
@@ -478,10 +483,10 @@ private:
 	// displaying flips; true => skip the frame (occlusion-equivalent).
 	static bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
 	                          const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
-	// log_board_tuning: heartbeat + set-change + pop + flip log lines.
+	// log_board_tuning: heartbeat + set-change + pop + flip + smooth lines.
 	static void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
 	                             const xr::board_solution & sol, const board_fused & bp, double horizon_ms,
-	                             XrTime now, double dt);
+	                             XrTime now, double dt, const xr::board_filter_diag & fdiag);
 
 	stream(std::string server_name, scene & parent_scene);
 

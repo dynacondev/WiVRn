@@ -110,8 +110,10 @@ inert unless set; full flow in `docs/profiling.md`.
   K=1 jump guard (50mm/30deg/frame, teleport-silence bypass, hold-last),
   rotation-outlier force-exclusion (6deg fixed, incidence-blind),
   finite guards (vote intake, Kabsch wsum fallback, post-solve hold).
-  Output smoothing is a separate track (`client/xr/fiducial_filter.*`,
-  rigid-only v1); fusion emits raw poses.
+  Output smoothing (`client/xr/board_filter.*`, rigid D-hybrid v1:
+  strength-adaptive blend + soft deadzone + slew cap; multi and single-tag
+  alike; `board smooth:` line carries innovation/alpha/strength/shaping).
+  Displayed poses are smoothed; raw solves feed logs + the raw gizmo.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow
   `maxLayerCount`). Geometry is thin triangles (line topology never
