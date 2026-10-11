@@ -33,17 +33,29 @@ namespace xr
 {
 namespace
 {
-// TEMP v1 weight model: parametric guesses, tuned on-device via the
-// `board solve:` logs + Passthrough-tab residuals. Physical sketch:
-// position noise grows ~ d^2/size (triangulation-like), rotation noise
-// ~ d/size, both blow up at grazing incidence.
-constexpr double kPosGain = 0.002; // sigma_pos = kPosGain * d * (d/size) / cos
-constexpr double kRotGain = 0.01; // sigma_rot = kRotGain * (d/size) / cos
+// v1 weight model, fit round 1 (run-B: 35 tag samples, d 0.5-0.9m, size
+// 45-60mm; worst inliers 6.6mm@u0.37 / 1.65deg). Gains set so the inlier
+// envelope sits at u~1 (elbow: noisy-but-legit tags, typically grazing,
+// are softened but kept). Typical inliers (1-3mm) land at u~0.2-0.5
+// (weight ~1); flips (100mm+) land at u>15 (mult<0.02: EXCLUDED from the
+// refit, so a K=2 flip resolves to the good singleton instead of their
+// mean). kCauchyK=3 stays: the elbow now separates inliers from flips
+// instead of sitting ~8x above all data. Physical sketch unchanged:
+// position noise ~ d^2/size (triangulation-like), rotation ~ d/size,
+// both blow up at grazing incidence.
+constexpr double kPosGain = 0.0007; // sigma_pos = kPosGain * d * (d/size) / cos
+constexpr double kRotGain = 0.0015; // sigma_rot = kRotGain * (d/size) / cos
 constexpr double kCauchyK = 3.0; // IRLS robustness elbow (whitened units)
 constexpr double kTrustFloor = 0.25; // final cauchy weight counting as "used"
 constexpr double kExcludeFloor = 0.05; // below this a vote leaves the final refit
 constexpr int kMaxTags = 8; // tiny_solver static cap: 6 residuals each
 constexpr int kIrlsRounds = 3;
+// Flip-report thresholds (forensics, not model): any tag beyond either
+// fires `board flip:` immediately at the call site. Chosen far above the
+// inlier envelope (worst seen 6.6mm/1.65deg) and far below real flips
+// (80mm+/40deg+ observed): fires on flips, never on noise.
+constexpr float kFlipReportMm = 50.0f;
+constexpr float kFlipReportDeg = 10.0f;
 
 manif::SE3d se3_from_xr(const XrPosef & p)
 {
@@ -463,6 +475,8 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 		sol.tags[i].res_vec[1] = (float)(tp.y() * 1000.0);
 		sol.tags[i].res_vec[2] = (float)(tp.z() * 1000.0);
 		sol.tags[i].res_deg = quat_angle_deg(eq, Eigen::Quaterniond::Identity());
+		if (sol.tags[i].res_mm > kFlipReportMm or sol.tags[i].res_deg > kFlipReportDeg)
+			sol.has_flip = true;
 		se += sol.tags[i].res_mm * sol.tags[i].res_mm;
 		sa += sol.tags[i].res_deg * sol.tags[i].res_deg;
 	}

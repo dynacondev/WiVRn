@@ -533,6 +533,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		static std::map<std::string, std::string> last_sets;
 		static std::map<std::string, XrPosef> last_board_pose;
 		static std::map<std::string, int> last_board_n;
+		static std::map<std::string, XrTime> last_solve_t;
 		std::string set;
 		for (const auto & v: bv)
 		{
@@ -542,11 +543,47 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		auto lsit = last_sets.find(f.id);
 		if (lsit == last_sets.end() or lsit->second != set)
 		{
+			// Attribute the transition: which payloads entered/exited
+			// (set strings are comma-joined truncated payloads). Tests the
+			// grazing-entry hypothesis: big pops should name entering tags
+			// that the `board tags:` line then shows at low cos / high u.
+			std::string entered, exited;
+			if (lsit != last_sets.end())
+			{
+				auto split = [](const std::string & s) {
+					std::vector<std::string> out;
+					size_t b = 0;
+					while (b < s.size())
+					{
+						size_t c = s.find(',', b);
+						if (c == std::string::npos)
+							break;
+						if (c > b)
+							out.push_back(s.substr(b, c - b));
+						b = c + 1;
+					}
+					return out;
+				};
+				auto old_tags = split(lsit->second);
+				auto new_tags = split(set);
+				for (const auto & t: new_tags)
+				{
+					if (std::ranges::find(old_tags, t) == old_tags.end())
+						entered += t + ',';
+				}
+				for (const auto & t: old_tags)
+				{
+					if (std::ranges::find(new_tags, t) == new_tags.end())
+						exited += t + ',';
+				}
+			}
 			last_sets[f.id] = set;
 			spdlog::info("board solve: fid \"{}\" visible set -> {}", f.id, set);
 			// `board pop:` measures the felt artifact directly: how far
 			// the fused pose jumps when the visible set changes. Fires on
-			// transitions only (~0.5/s), not every frame.
+			// transitions only (~0.5/s), not every frame. dt since the
+			// previous solve separates true pops (dt~frame) from
+			// teleport-recovery after silence (rig move / total loss).
 			auto lpit = last_board_pose.find(f.id);
 			auto lnit = last_board_n.find(f.id);
 			if (lpit != last_board_pose.end() and lnit != last_board_n.end())
@@ -560,14 +597,49 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				                     sol.board_pose.orientation.y * lpit->second.orientation.y +
 				                     sol.board_pose.orientation.z * lpit->second.orientation.z);
 				float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
-				spdlog::info("board pop: fid \"{}\" {}->{} dpos {:.2f}mm dang {:.3f}deg", f.id,
-				             lnit->second, (int)bv.size(), (double)dpos, (double)dang);
+				double dt = 0;
+				auto ltit = last_solve_t.find(f.id);
+				if (ltit != last_solve_t.end())
+					dt = (now - ltit->second) * 1e-9;
+				std::string moves;
+				if (not entered.empty())
+					moves += " enter " + entered.substr(0, entered.size() - 1);
+				if (not exited.empty())
+					moves += " exit " + exited.substr(0, exited.size() - 1);
+				spdlog::info("board pop: fid \"{}\" {}->{} dpos {:.2f}mm dang {:.3f}deg dt{:.2f}s{}", f.id,
+				             lnit->second, (int)bv.size(), (double)dpos, (double)dang, dt, moves);
 			}
 		}
 		// Stash every solve (not just transitions) so pops compare
 		// consecutive solutions, never stale ones.
 		last_board_pose[f.id] = sol.board_pose;
 		last_board_n[f.id] = (int)bv.size();
+		last_solve_t[f.id] = now;
+		// Per-tag detail builder, shared by the heartbeat `board tags:`
+		// line and the immediate `board flip:` line below.
+		auto tag_detail = [&]() {
+			std::string detail;
+			for (size_t i = 0; i < bv.size() and i < bp.tag_stats.size(); ++i)
+			{
+				const auto & t = bp.tag_stats[i];
+				char buf[256];
+				snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f %s]",
+				         t.payload.substr(0, 32).c_str(), (double)t.res_vec[0], (double)t.res_vec[1],
+				         (double)t.res_vec[2], (double)t.res_mm, (double)t.res_deg, (double)t.white_u,
+				         (double)bv[i].distance_m, (double)bv[i].cos_incidence, (double)t.weight,
+				         t.used ? "used" : "down");
+				detail += buf;
+			}
+			return detail;
+		};
+		// `board flip:` immediate forensics: any tag beyond the report
+		// thresholds (50mm/10deg: far above noise, far below real flips).
+		// Unthrottled but fires rarely; single-frame flips never survive
+		// to the 2s heartbeat, and this is the only per-frame flip record.
+		// Residual-blind at K==1 (passthrough fits itself): K==1 flips show
+		// as `board pop:` dang instead.
+		if (sol.has_flip)
+			spdlog::info("board flip: fid \"{}\" K{}{}", f.id, (int)bv.size(), tag_detail());
 		if (now - last_solve_log > 2'000'000'000LL)
 		{
 			last_solve_log = now;
@@ -597,30 +669,17 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 					         (double)sol.select_margin);
 				loo = buf;
 			}
-			spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms{}{}",
+			spdlog::info("board solve: fid \"{}\" tags {}/{} used rms {:.2f}mm {:.3f}deg iters {} {:.0f}us horizon {:.1f}ms at ({:.2f},{:.2f},{:.2f}){}{}",
 			             f.id, bp.tags_used, bp.tags_visible, (double)bp.rms_mm, (double)bp.rms_deg,
-			             bp.lm_iters, bp.solve_us, fp.last_horizon_ms,
+			             bp.lm_iters, bp.solve_us, fp.last_horizon_ms, (double)sol.board_pose.position.x,
+			             (double)sol.board_pose.position.y, (double)sol.board_pose.position.z,
 			             down.empty() ? "" : std::string(" down ") + down, loo);
 			// `board tags:` per-tag detail for the weight-model fit: residual
 			// vector (board frame: constant = systematic, wandering = noise),
 			// whitened norm u (Cauchy input: plateau/elbow/rejected), range,
 			// incidence, final weight. K>=2 only; K==1 is trivially exact.
 			if (bv.size() >= 2)
-			{
-				std::string detail;
-				for (size_t i = 0; i < bv.size() and i < bp.tag_stats.size(); ++i)
-				{
-					const auto & t = bp.tag_stats[i];
-					char buf[256];
-					snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f %s]",
-					         t.payload.substr(0, 32).c_str(), (double)t.res_vec[0], (double)t.res_vec[1],
-					         (double)t.res_vec[2], (double)t.res_mm, (double)t.res_deg, (double)t.white_u,
-					         (double)bv[i].distance_m, (double)bv[i].cos_incidence, (double)t.weight,
-					         t.used ? "used" : "down");
-					detail += buf;
-				}
-				spdlog::info("board tags: fid \"{}\"{}", f.id, detail);
-			}
+				spdlog::info("board tags: fid \"{}\"{}", f.id, tag_detail());
 		}
 	}
 

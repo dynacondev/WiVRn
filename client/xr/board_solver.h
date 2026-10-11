@@ -84,6 +84,13 @@ struct board_solution
 	float select_margin = 0; // runner-up minus winner: how decisive selection
 	// was. ~0 repeatedly at K>=3 means LOO cannot discriminate (tags agree
 	// to within noise, or disagree below the whitening scale).
+	bool has_flip = false; // any tag beyond the flip-report thresholds
+	// (kFlipReportMm/kFlipReportDeg in board_solver.cpp): far above the
+	// inlier envelope (max seen 6.6mm/1.65deg), far below full flips.
+	// Residual-detectable only at K>=2 (a K==1 passthrough fits itself);
+	// K==1 flips show as `board pop:` dang instead. The caller logs
+	// `board flip:` immediately (unthrottled): single-frame flips never
+	// survive to the 2s heartbeat.
 };
 
 board_solution solve_board(const std::vector<board_vote> & votes,

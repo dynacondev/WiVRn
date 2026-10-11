@@ -102,7 +102,10 @@ inert unless set; full flow in `docs/profiling.md`.
   instrument, with `board tags:` per-tag detail (board-frame residual
   vector, whitened u, range, incidence, weight), `board pop:`
   transition-jump sizes, `board config:` geometry dumps, and LOO outcome
-  (`loo drop/cost/margin`) on the heartbeat. Pose filtering/smoothing TEMP-disabled (files stay,
+  (`loo drop/cost/margin`) on the heartbeat. `board flip:` fires per-frame
+  on residual-detectable flips (K>=2 only; K==1 flips show as pop dang).
+  Pop lines carry enter/exit attribution + dt-since-last-solve (teleport
+  recovery vs true pops); heartbeat carries board position (move visibility). Pose filtering/smoothing TEMP-disabled (files stay,
   unreferenced) until fusion is verified on-device.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow
