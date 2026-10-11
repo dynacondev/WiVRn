@@ -101,7 +101,7 @@ inert unless set; full flow in `docs/profiling.md`.
   Passthrough tab. Tuning log lines: `board solve:` (heartbeat: rms,
   iters, solve_us, horizon, board position, `loo drop/cost/margin`),
   `board tags:` (per-tag residual vector, whitened u, range, incidence,
-  weight, settle s), `board pop:` (transition jumps + enter/exit + dt),
+  weight, settle s, head position), `board pop:` (transition jumps + enter/exit + dt),
   `board flip:` (per-frame, K>=2; K=1 flips show as pop dang),
   `board config:` (geometry dumps), `board hold:` (K=1 jump-guard
   engage/release), `board nan:` (non-finite fused pose, never fires).
@@ -110,6 +110,11 @@ inert unless set; full flow in `docs/profiling.md`.
   K=1 jump guard (50mm/30deg/frame, teleport-silence bypass, hold-last),
   rotation-outlier force-exclusion (6deg fixed, incidence-blind),
   finite guards (vote intake, Kabsch wsum fallback, post-solve hold).
+  Mesh persistence: placement/warm/filters/poses survive total tracking
+  loss (cleared on map change only, never on loss); reacquire fade is
+  jump-gated (25mm/3deg: resume instantly when the held pose matches,
+  fade real discontinuities); `Fiducial mesh live/lost` + `draws lost/
+  resumed` + `reacquire gap` lines name any cut layer.
   Output smoothing (`client/xr/board_filter.*`, rigid D-hybrid v1:
   strength-adaptive blend + soft deadzone + slew cap; multi and single-tag
   alike; `board smooth:` line carries innovation/alpha/strength/shaping).

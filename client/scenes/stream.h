@@ -451,6 +451,8 @@ private:
 			uint32_t images_outstanding = 0;
 			XrExtent2Di extent{0, 0};
 			bool active = false; // submitting this frame
+			bool had_draws = false; // draws present last frame (edge forensics)
+			XrTime last_draws_log = 0; // throttle for the edge log below
 			// Uploaded object soups by object id (hash compare avoids
 			// re-upload; renderer mirrors).
 			std::map<std::string, std::string> mesh_hashes;
@@ -486,7 +488,8 @@ private:
 	// log_board_tuning: heartbeat + set-change + pop + flip + smooth lines.
 	static void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
 	                             const xr::board_solution & sol, const board_fused & bp, double horizon_ms,
-	                             XrTime now, double dt, const xr::board_filter_diag & fdiag);
+	                             XrTime now, double dt, const xr::board_filter_diag & fdiag, bool have_head,
+	                             glm::vec3 head_pos);
 
 	stream(std::string server_name, scene & parent_scene);
 

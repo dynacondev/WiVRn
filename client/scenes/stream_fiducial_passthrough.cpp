@@ -201,13 +201,23 @@ bool scenes::stream::guard_k1_jump(const std::string & fid, const xr::board_solu
 void scenes::stream::log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
                                          const xr::board_solution & sol, const board_fused & bp,
                                          double horizon_ms, XrTime now, double dt,
-                                         const xr::board_filter_diag & fdiag)
+                                         const xr::board_filter_diag & fdiag, bool have_head, glm::vec3 head_pos)
 {
 	// `board solve:` is the tuning instrument (more logging better).
 	static XrTime last_solve_log = 0;
 	static std::map<std::string, std::string> last_sets;
 	static std::map<std::string, XrPosef> last_board_pose;
 	static std::map<std::string, int> last_board_n;
+	// Viewpoint per sample (world-space head position, meters): residual
+	// direction vs viewpoint separates tilt-type bias (rotates with view)
+	// from depth noise (view-axis aligned) and translation bias (constant).
+	char head_buf[64];
+	if (have_head)
+		snprintf(head_buf, sizeof(head_buf), " head(%.2f,%.2f,%.2f)", (double)head_pos.x,
+		         (double)head_pos.y, (double)head_pos.z);
+	else
+		snprintf(head_buf, sizeof(head_buf), " head--");
+	std::string head_str = head_buf;
 	std::string set;
 	for (const auto & v: bv)
 	{
@@ -307,8 +317,8 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 	// to the 2s heartbeat, and this is the only per-frame flip record.
 	// Residual-blind at K==1 (passthrough fits itself): K==1 flips show
 	// as `board pop:` dang instead.
-	if (sol.has_flip)
-		spdlog::info("board flip: fid \"{}\" K{}{}", fid, (int)bv.size(), tag_detail());
+		if (sol.has_flip)
+			spdlog::info("board flip: fid \"{}\" K{}{}{}", fid, (int)bv.size(), tag_detail(), head_str);
 	if (now - last_solve_log > 2'000'000'000LL)
 	{
 		last_solve_log = now;
@@ -348,7 +358,7 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 		// whitened norm u (Cauchy input: plateau/elbow/rejected), range,
 		// incidence, final weight. K>=2 only; K==1 is trivially exact.
 		if (bv.size() >= 2)
-			spdlog::info("board tags: fid \"{}\"{}", fid, tag_detail());
+			spdlog::info("board tags: fid \"{}\"{}{}", fid, tag_detail(), head_str);
 		// `board smooth:` filter state: innovation (raw vs smoothed),
 		// applied alpha, caller strength, shaping activity (dz = deadzone
 		// holding, cap = slew bound, snap = teleport re-acquisition).
@@ -790,7 +800,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		for (const auto & m: f.markers)
 			fp.corrected_tags[m.marker_data] = {compose_pose(smoothed, m.position, m.orientation), m.marker_size_m, f.id, now};
 		// Tuning-instrument logging (heartbeat + set changes + pops + flips).
-		log_board_tuning(f.id, bv, sol, bp, fp.last_horizon_ms, now, solve_dt, fdiag);
+		log_board_tuning(f.id, bv, sol, bp, fp.last_horizon_ms, now, solve_dt, fdiag, have_head, head_pos);
 	}
 
 	// ---- behavior objects: first referenced board pose wins ----
@@ -833,8 +843,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		}
 		// Placement: first referenced fiducial with a pose (live or
 		// held) wins. Held poses keep rendering through occlusion
-		// (hold-last); output smoothing is a separate track
-		// (client/xr/fiducial_filter.*), so this is the raw fused output.
+		// (hold-last); output smoothing is the D-hybrid rigid filter
+		// (board_filters), so this is the smoothed output. Placement,
+		// warm starts, filters and poses survive total tracking loss by
+		// design (cleared on map change only, never on loss): the object
+		// must persist, SLAM-held, with no codes visible.
 		for (const auto & fid: def.fiducial)
 		{
 			auto bpit = board_poses.find(fid);
@@ -842,6 +855,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				continue;
 			auto & fu = ost.fused;
 			bool gap = fu.last_solve > 0 and (now - fu.last_solve) > 1'000'000'000LL;
+			XrPosef prev_pose = fu.world_pose;
+			bool had_pose = fu.placed;
 			fu.world_pose = compose_pose(bpit->second.pose, def.position, def.orientation);
 			fu.world_scale = {def.scale, def.scale, def.scale};
 			if (not fu.placed)
@@ -853,9 +868,36 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			}
 			if (bpit->second.live)
 			{
+				double gap_s = fu.last_solve > 0 ? (now - fu.last_solve) * 1e-9 : 0;
 				fu.last_solve = now;
 				if (gap)
-					fu.fade_start = predicted_display_time; // reacquire fade
+				{
+					// Jump-gated reacquire fade: resume instantly when the
+					// held pose still matches (the common case — smoothing
+					// already hid small jumps), fade only real
+					// discontinuities. Gates: 25mm / 3deg (below pop
+					// visibility, above hold drift which is zero).
+					float dx = fu.world_pose.position.x - prev_pose.position.x;
+					float dy = fu.world_pose.position.y - prev_pose.position.y;
+					float dz = fu.world_pose.position.z - prev_pose.position.z;
+					float dpos =
+					        std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
+					float dot = std::abs(fu.world_pose.orientation.w * prev_pose.orientation.w +
+					                     fu.world_pose.orientation.x * prev_pose.orientation.x +
+					                     fu.world_pose.orientation.y * prev_pose.orientation.y +
+					                     fu.world_pose.orientation.z * prev_pose.orientation.z);
+					float dang =
+					        2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
+					if (had_pose and (dpos > 25.f or dang > 3.f))
+					{
+						fu.fade_start = predicted_display_time;
+						spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s jump {:.1f}mm {:.2f}deg (fading)",
+						             def.id, gap_s, (double)dpos, (double)dang);
+					}
+					else
+						spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s continuous (no fade)",
+						             def.id, gap_s);
+				}
 			}
 			break;
 		}
@@ -878,6 +920,26 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fp.status = ost.status;
 		shim_ost = &ost;
 		break;
+	}
+	// Mesh-pipeline edge forensics: calibrated should NEVER drop while an
+	// object stays placed (hold-last survives total loss). If the mesh ever
+	// cuts, this line names the moment; placed-count says whether state was
+	// destroyed (bug) or merely stale (render-side).
+	{
+		static bool was_calibrated = false;
+		if (fp.calibrated != was_calibrated)
+		{
+			size_t placed = 0;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.fused.placed)
+					++placed;
+			}
+			spdlog::info("Fiducial mesh {} ({} objects placed)", fp.calibrated ? "live" : "lost",
+			             placed);
+			was_calibrated = fp.calibrated;
+		}
 	}
 
 	// Strict gating: tracking above runs unconditionally (status UI and

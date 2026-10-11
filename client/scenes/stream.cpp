@@ -1681,9 +1681,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (f != fiducial_passthrough_state::kDebugCutoutFeather or cutouts.empty())
 						{
 							g.active = false;
+							// Mesh-pipeline edge forensics: draws present ->
+							// absent means the object stopped rasterizing
+							// (frustum-culled out of view vs state loss).
+							// Throttled: frame-edge flicker would spam.
+							if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+							{
+								g.last_draws_log = instance.now();
+								spdlog::info("Fiducial mask draws lost (feather {}px)", f);
+							}
+							g.had_draws = false;
 							continue;
 						}
 					}
+					if (not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+					{
+						g.last_draws_log = instance.now();
+						spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px)", draws.size(), f);
+					}
+					g.had_draws = true;
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release
 					// list immediately, so wait/record/stamp throws (outer
