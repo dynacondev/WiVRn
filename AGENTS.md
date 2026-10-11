@@ -115,7 +115,10 @@ inert unless set; full flow in `docs/profiling.md`.
   hold last-good instead of displaying flips; `board hold:` engage/release
   lines. Finite guards throughout (intake votes, Kabsch wsum fallback,
   post-solve `board nan:` + hold): NaN can never reach the mesh or warm
-  start (run-E K3 all-fresh-storm line). Pose filtering/smoothing TEMP-disabled (files stay,
+  start (run-E K3 all-fresh-storm line). Rotation-outlier force-exclusion
+  (6deg fixed, incidence-blind): flips always carry 11deg+ rotation vs
+  <=3.4deg settled at any incidence, while position can't separate them
+  (grazing 1/cos blowup parks flips at u~2); weight exactly 0 + refit exit. Pose filtering/smoothing TEMP-disabled (files stay,
   unreferenced) until fusion is verified on-device.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow

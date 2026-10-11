@@ -49,6 +49,17 @@ constexpr double kRotGain = 0.0015; // sigma_rot = kRotGain * (d/size) / cos
 constexpr double kCauchyK = 3.0; // IRLS robustness elbow (whitened units)
 constexpr double kTrustFloor = 0.25; // final cauchy weight counting as "used"
 constexpr double kExcludeFloor = 0.05; // below this a vote leaves the final refit
+// Rotation-outlier force-exclusion (fixed angle, incidence-independent):
+// flips always carry large rotation (observed 11-20deg) while settled
+// rotation residuals never exceed ~3.4deg at any incidence and young
+// transients stay <=3.5deg (run-F: wide empty valley 3.4-11). Position
+// cannot separate them (grazing transients fill 8-25mm; the 1/cos blowup
+// parks grazing flips at u~2 = elbow). Orientation degrades gracefully at
+// grazing (projective shape + gyro anchor), so judge rotation on a fixed
+// scale. Bypasses Cauchy/settle voice entirely: a 20deg tag is a flip at
+// any age. K>=2 only (exclusion mechanics); K==1 flips stay hold-guard
+// territory at the call site.
+constexpr float kRotOutlierDeg = 6.0f;
 constexpr int kMaxTags = 8; // tiny_solver static cap: 6 residuals each
 constexpr int kIrlsRounds = 3;
 // Settle time constant (REFINE-ME, see settle_from_age in the header):
@@ -493,6 +504,21 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 			double u = (white[i].cwiseProduct(e.coeffs())).norm();
 			mult[i] = 1.0 / (1.0 + (u / kCauchyK) * (u / kCauchyK));
 		}
+		// Rotation-outlier flags vs the winner (pre-refit consensus): measured
+		// here because the refit would otherwise drag toward the flip and
+		// understate its angle. Winner drag at K==2 halves a flip's apparent
+		// angle (~10deg for a true 20deg flip) — still above the 6deg floor
+		// with inliers (<=3.4deg) far below. Stored for the stats below.
+		std::vector<char> rot_out(votes.size(), 0);
+		{
+			Eigen::Quaterniond qw(winner.asSO3().quat());
+			for (size_t i = 0; i < votes.size(); ++i)
+			{
+				Eigen::Quaterniond qi(z[i].asSO3().quat());
+				if (quat_angle_deg(qw, qi) > kRotOutlierDeg)
+					rot_out[i] = 1;
+			}
+		}
 		{
 			std::vector<int> kept;
 			for (size_t i = 0; i < votes.size(); ++i)
@@ -502,7 +528,8 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 				// refit — soft entry is structural, not just downweighted.
 				// A fresh agreeing tag (s<floor) also sits out its first
 				// frames; K==1 is unaffected (passthrough skips the solver).
-				if (votes[i].settle * mult[i] >= kExcludeFloor)
+				// Rotation outliers leave unconditionally (see above).
+				if (not rot_out[i] and votes[i].settle * mult[i] >= kExcludeFloor)
 					kept.push_back((int)i);
 			}
 			int it = 0;
@@ -536,8 +563,9 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 			sol.tags[i].white_u = (float)u;
 			// Effective total weight: settle * cauchy. Young-but-agreeing
 			// reads w~=settle (suppressed, honest); settled-outlier reads
-			// w~=mult (down, honest). used/kept semantics follow this.
-			double eff = votes[i].settle * mult[i];
+			// w~=mult (down, honest). Rotation outliers read exactly 0
+			// (force-excluded above). used/kept semantics follow this.
+			double eff = rot_out[i] ? 0.0 : votes[i].settle * mult[i];
 			sol.tags[i].weight = u > 6.0 ? 0.0f : (float)eff;
 			sol.tags[i].used = sol.tags[i].weight > kTrustFloor;
 		}
@@ -724,6 +752,32 @@ bool board_solver_selftest()
 		spdlog::info("board selftest: young-flip err {:.2f}mm {:.3f}deg weight {:.4f} {}", mm, deg,
 		             sy.tags.size() > 1 ? (double)sy.tags[1].weight : -1.0, yok ? "PASS" : "FAIL");
 		pass = pass and yok;
+	}
+	// Grazing rotation outlier (run-F D01Y01 frame): 20deg orientation error
+	// at cos=0.17, where the 1/cos blowup parks it at u~2 (Cauchy elbow =
+	// kept, dragging ~30mm). The rotation floor (6deg, incidence-blind)
+	// must force-exclude it anyway: weight exactly 0, fused tight on the
+	// remaining three. Orientation bound is subset-loose (the outlier is the
+	// x-lever tag; dropping it weakens x-rotation observability — same
+	// structural looseness as the settled-outlier case).
+	{
+		std::vector<board_vote> votes = make_votes(false);
+		manif::SE3d M1 = se3_from_xr(votes[1].observed);
+		manif::SE3Tangentd tilt;
+		tilt.coeffs() << 0, 0, 0, 0.3491, 0, 0; // 20deg about tag X
+		votes[1].observed = xr_from_se3(M1 + tilt);
+		votes[1].distance_m = 0.86f;
+		votes[1].cos_incidence = 0.17f;
+		board_solution sg = solve_board(votes, std::nullopt);
+		manif::SE3d F = se3_from_xr(sg.board_pose);
+		manif::SE3d E = truth.inverse().compose(F);
+		double mm = Eigen::Vector3d(E.translation().x(), E.translation().y(), E.translation().z()).norm() * 1000.0;
+		double deg = quat_angle_deg(Eigen::Quaterniond(E.asSO3().quat()), Eigen::Quaterniond::Identity());
+		bool gok = sg.ok and mm < 3.5 and deg < 0.8 and sg.tags.size() > 1 and sg.tags[1].weight == 0.0f and
+		        not sg.tags[1].used;
+		spdlog::info("board selftest: graze-rot err {:.2f}mm {:.3f}deg weight {:.4f} {}", mm, deg,
+		             sg.tags.size() > 1 ? (double)sg.tags[1].weight : -1.0, gok ? "PASS" : "FAIL");
+		pass = pass and gok;
 	}
 	// NaN regression (run-E K3 line): an all-fresh frame (every vote
 	// settle=0) must NOT produce a non-finite pose. The G2 uniform-weight
