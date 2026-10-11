@@ -310,6 +310,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				v.tag_size_m = m.marker_size_m;
 				v.offset_pos = ep;
 				v.offset_quat = eq;
+				v.latch_time = s.latch_time;
 				fiducial_votes.push_back(std::move(v));
 			}
 		}
@@ -481,6 +482,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			for (int k = 0; k < 4; ++k)
 				b.offset_quat[k] = v.offset_quat[k];
 			b.tag_size_m = v.tag_size_m;
+			// Settle from latch age (fail open: unknown latch = settled).
+			// Latch stamps mix snapshot clocks (discovery: predicted_time,
+			// update: now; ~20ms basis skew, negligible vs tau=0.75s).
+			b.settle = 1;
+			if (v.latch_time != 0 and now >= v.latch_time)
+				b.settle = (float)xr::settle_from_age((now - v.latch_time) * 1e-9);
 			glm::vec3 tp(v.observed.position.x, v.observed.position.y, v.observed.position.z);
 			glm::quat tq(v.observed.orientation.w, v.observed.orientation.x, v.observed.orientation.y,
 			             v.observed.orientation.z);
@@ -623,11 +630,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			{
 				const auto & t = bp.tag_stats[i];
 				char buf[256];
-				snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f %s]",
+				snprintf(buf, sizeof(buf), " [%s r(%.1f,%.1f,%.1f) |%.2f|mm %.2fdeg u%.2f d%.2fm cos%.2f w%.3f s%.2f %s]",
 				         t.payload.substr(0, 32).c_str(), (double)t.res_vec[0], (double)t.res_vec[1],
 				         (double)t.res_vec[2], (double)t.res_mm, (double)t.res_deg, (double)t.white_u,
 				         (double)bv[i].distance_m, (double)bv[i].cos_incidence, (double)t.weight,
-				         t.used ? "used" : "down");
+				         (double)t.settle, t.used ? "used" : "down");
 				detail += buf;
 			}
 			return detail;

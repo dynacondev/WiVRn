@@ -267,6 +267,7 @@ private:
 		float tag_size_m = 0;
 		std::array<float, 3> offset_pos{0, 0, 0}; // EFFECTIVE marker->board
 		std::array<float, 4> offset_quat{0, 0, 0, 1}; // (authored tag-in-board, inverted at load)
+		XrTime latch_time = 0; // track (re)latch time, 0 = unknown (settled)
 	};
 	std::vector<fiducial_vote> fiducial_votes;
 

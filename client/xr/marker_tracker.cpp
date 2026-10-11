@@ -127,6 +127,8 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	// Entity handles die with their context; discovery re-latches within
 	// a beat. Rate stats reset per configure.
 	spatial_entities.clear();
+	latch_times.clear();
+	tracked_last.clear();
 	all_sightings.clear();
 	update_ticks = 0;
 	first_tick_at = 0;
@@ -503,7 +505,8 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 					             payload->substr(0, 64));
 			}
 			XrSpatialEntityIdEXT eid = i < result.entityIdCountOutput ? entity_ids[i] : XR_NULL_SPATIAL_ENTITY_ID_EXT;
-			ensure_entity(eid);
+			ensure_entity(eid, predicted_time);
+			auto lit = latch_times.find(eid);
 			all_sightings.push_back(code_sighting{
 			        .payload = *payload,
 			        .pose = bound_boxes[i].center,
@@ -511,6 +514,7 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			        .entity_id = eid,
 			        .time = predicted_time,
 			        .matched = matched,
+			        .latch_time = lit != latch_times.end() ? lit->second : 0,
 			});
 			if (not matched)
 				continue;
@@ -550,7 +554,7 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 	}
 }
 
-void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
+void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id, XrTime latch_time)
 {
 	if (id == XR_NULL_SPATIAL_ENTITY_ID_EXT)
 		return;
@@ -566,7 +570,10 @@ void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
 		spdlog::debug("marker_tracker: cannot create entity from id: {}", (int)res);
 		return;
 	}
-	spatial_entities.emplace(id, spatial_entity_handle(entity, xrDestroySpatialEntityEXT));
+	if (spatial_entities.emplace(id, spatial_entity_handle(entity, xrDestroySpatialEntityEXT)).second)
+		latch_times[id] = latch_time; // emplace-bool guards id reuse: a
+	// recycled id that never left still holds its original stamp; ids
+	// erased as unseen get a fresh stamp on re-latch, which is correct.
 }
 
 void xr::marker_tracker::log_rate(XrTime now)
@@ -618,6 +625,8 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 			// An id expired (runtime recycled ids): drop everything so
 			// the next discovery pass re-latches what is still around.
 			spatial_entities.clear();
+			latch_times.clear();
+			tracked_last.clear();
 		}
 		else
 			spdlog::debug("marker_tracker: update snapshot failed: {}", (int)res);
@@ -676,6 +685,7 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 	// Rebuild sightings from this tick; ids the runtime no longer returns
 	// are stale (dropped, discovery re-latches survivors).
 	std::set<XrSpatialEntityIdEXT> seen;
+	std::set<XrSpatialEntityIdEXT> tracked_now;
 	all_sightings.clear();
 	bool matched_tick = false;
 	uint32_t out = std::min({result.entityIdCountOutput, (uint32_t)marker_data.size(), (uint32_t)bound_boxes.size()});
@@ -685,6 +695,11 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		seen.insert(eid);
 		if (i >= result.entityStateCountOutput or entity_states[i] != XR_SPATIAL_ENTITY_TRACKING_STATE_TRACKING_EXT)
 			continue;
+		// Update-path resumption: TRACKING now but absent before = fresh
+		// (same-handle state flap, the counterpart to discovery re-latch).
+		if (not tracked_last.contains(eid))
+			latch_times[eid] = now;
+		tracked_now.insert(eid);
 		auto payload = read_payload(snapshot, marker_data[i].data);
 		if (not payload)
 			continue;
@@ -703,6 +718,7 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		        .entity_id = eid,
 		        .time = predicted_time,
 		        .matched = matched,
+		        .latch_time = latch_times.contains(eid) ? latch_times[eid] : 0,
 		});
 		if (not matched)
 			continue;
@@ -719,8 +735,12 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		if (seen.contains(it->first))
 			++it;
 		else
+		{
+			latch_times.erase(it->first);
 			it = spatial_entities.erase(it);
+		}
 	}
+	tracked_last = std::move(tracked_now);
 	if (not matched_tick)
 	{
 		if (current.tracked)

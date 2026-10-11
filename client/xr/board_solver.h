@@ -49,7 +49,23 @@ struct board_vote
 	float tag_size_m = 0;
 	float distance_m = 0; // head -> tag center
 	float cos_incidence = 1; // |tag normal . view dir|, 0..1
+	float settle = 1; // track-settle factor 0..1 from latch age (1 = settled):
+	// freshly (re-)latched tracks are unconverged in position (run-D:
+	// 11mm translation-only mirrors during re-sight storms) while the
+	// runtime still reports TRACKING. The whitening is scaled by
+	// sqrt(settle), so young votes soften through the same Cauchy/exclude
+	// machinery (monotonic: net effect strictly decreasing in settle).
+	// Unknown age must pass 1 (fail open: no behavior change where the
+	// signal is absent). K==1 passthrough never sees this (solver skipped).
 };
+
+// Settle curve for freshly latched tracks: 1-exp(-age/tau). tau is a
+// principled guess (kSettleTau, REFINE-ME): re-latch transients span O(1s)
+// in the logs (elevated disagreement across adjacent 2s heartbeats during
+// churn, ~1s typical recovery), so tau=0.75s lands mid-evidence (s=0.49 at
+// 0.5s, 0.74 at 1s, 0.93 at 2s). The post-build run measures the actual
+// settle curve (residual vs age in `board tags:`) and fits tau from it.
+double settle_from_age(double age_s) noexcept;
 
 struct board_tag_stat
 {
@@ -65,6 +81,10 @@ struct board_tag_stat
 	float white_u = 0; // final whitened residual norm (Cauchy input units):
 	// u << kCauchyK = plateau (weight ~1), u ~ k = elbow, u >> k = rejected.
 	// Its inlier distribution is what kCauchyK is fit against.
+	float settle = 1; // echo of the input vote's settle factor (forensics):
+	// weight below is settle * cauchy, so a suppressed-but-agreeing young
+	// tag reads w~=settle (down-with-low-s); down-with-high-s is a real
+	// outlier. Also disambiguates `loo drop` with margin~=0 (age effect).
 };
 
 struct board_solution

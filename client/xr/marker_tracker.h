@@ -111,6 +111,13 @@ public:
 		XrSpatialEntityIdEXT entity_id = XR_NULL_SPATIAL_ENTITY_ID_EXT;
 		XrTime time = 0;
 		bool matched = false;
+		// Latch time: when this track (re)appeared after absence (snapshot
+		// clock: discovery stamps predicted_time, update ticks stamp now;
+		// ~20ms mixed basis, negligible vs the 0.75s settle constant).
+		// 0 = unknown (fail open: consumers treat as settled). Freshly
+		// (re-)latched tracks are unconverged in position while the runtime
+		// still reports TRACKING; fusion softens young votes by age.
+		XrTime latch_time = 0;
 	};
 	const std::vector<code_sighting> & sightings() const
 	{
@@ -192,6 +199,15 @@ private:
 	// same frame cadence. Recreated on discovery matches; cleared when the
 	// runtime reports an id invalid. Discovery re-latches within a beat.
 	std::map<XrSpatialEntityIdEXT, spatial_entity_handle> spatial_entities;
+	// Track age per latched id: last tick the id (re)appeared TRACKING
+	// after absence (either flavor: discovery re-latch or update-path
+	// state resumption). Maintained alongside spatial_entities (stamped on
+	// latch, erased with the entity); ids TRACKING-continuous across ticks
+	// keep their original stamp. Unknown (missing entry) = settled.
+	std::map<XrSpatialEntityIdEXT, XrTime> latch_times;
+	// Ids returned TRACKING on the previous update tick: resumption
+	// detector for the update path (present-now but absent-before = fresh).
+	std::set<XrSpatialEntityIdEXT> tracked_last;
 
 	// All codes from the latest snapshot pass (see sightings()). Rebuilt
 	// every discovery/update; render thread only.
@@ -229,7 +245,7 @@ private:
 	// Synchronous live pose refresh for all latched entities, every frame.
 	// No re-enumeration, no timers.
 	void update_snapshot(XrSpace world_space, XrTime now, XrTime predicted_time);
-	void ensure_entity(XrSpatialEntityIdEXT id);
+	void ensure_entity(XrSpatialEntityIdEXT id, XrTime latch_time);
 	void log_rate(XrTime now);
 };
 } // namespace xr

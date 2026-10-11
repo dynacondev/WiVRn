@@ -50,6 +50,11 @@ constexpr double kTrustFloor = 0.25; // final cauchy weight counting as "used"
 constexpr double kExcludeFloor = 0.05; // below this a vote leaves the final refit
 constexpr int kMaxTags = 8; // tiny_solver static cap: 6 residuals each
 constexpr int kIrlsRounds = 3;
+// Settle time constant (REFINE-ME, see settle_from_age in the header):
+// tau=0.75s from run-B/D evidence (O(1s) transients, ~1/s churn). The 2s
+// heartbeat cannot resolve sub-second curves, so this guess stands until
+// the post-build run measures residual-vs-age and fits it properly.
+constexpr double kSettleTauS = 0.75;
 // Flip-report thresholds (forensics, not model): any tag beyond either
 // fires `board flip:` immediately at the call site. Chosen far above the
 // inlier envelope (worst seen 6.6mm/1.65deg) and far below real flips
@@ -88,8 +93,15 @@ Eigen::Matrix<double, 6, 1> whitening(const board_vote & v)
 	double c = std::clamp<double>(v.cos_incidence, 0.25, 1.0);
 	double sig_pos = std::clamp(kPosGain * d * (d / s) / c, 1e-4, 1.0);
 	double sig_rot = std::clamp(kRotGain * (d / s) / c, 1e-4, 1.0);
+	// Settle: scale whitening by sqrt(settle) so the vote's least-squares
+	// pull is proportional to settle while Cauchy keeps operating on the
+	// scaled system. Net effective weight settle*cauchy(mult) is strictly
+	// decreasing in settle (d/ds [s/(1+s u^2/k^2)] > 0), so young votes
+	// soften monotonically to full suppression at s=0. kabsch weights,
+	// best-vote init, and trimmed cost all derive from white: they follow.
+	double sq = std::sqrt(std::clamp<double>(v.settle, 0.0, 1.0));
 	Eigen::Matrix<double, 6, 1> w;
-	w << 1 / sig_pos, 1 / sig_pos, 1 / sig_pos, 1 / sig_rot, 1 / sig_rot, 1 / sig_rot;
+	w << sq / sig_pos, sq / sig_pos, sq / sig_pos, sq / sig_rot, sq / sig_rot, sq / sig_rot;
 	return w;
 }
 
@@ -249,6 +261,14 @@ double trimmed_cost(const manif::SE3d & T, const std::vector<manif::SE3d> & z,
 }
 // tiny_solver functor: residuals of the error-state delta around T0.
 } // namespace
+
+double settle_from_age(double age_s) noexcept
+{
+	if (age_s <= 0)
+		return 0;
+	double s = 1.0 - std::exp(-age_s / kSettleTauS);
+	return std::clamp(s, 0.0, 1.0);
+}
 
 board_solution solve_board(const std::vector<board_vote> & votes_in, const std::optional<XrPosef> & warm_start)
 {
@@ -420,7 +440,12 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 			std::vector<int> kept;
 			for (size_t i = 0; i < votes.size(); ++i)
 			{
-				if (mult[i] >= kExcludeFloor)
+				// Effective weight (settle * cauchy): a young vote with a
+				// moderate residual excludes here rather than dragging the
+				// refit — soft entry is structural, not just downweighted.
+				// A fresh agreeing tag (s<floor) also sits out its first
+				// frames; K==1 is unaffected (passthrough skips the solver).
+				if (votes[i].settle * mult[i] >= kExcludeFloor)
 					kept.push_back((int)i);
 			}
 			int it = 0;
@@ -452,7 +477,11 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 			manif::SE3Tangentd e = Tf.inverse().compose(z[i]).log();
 			double u = (white[i].cwiseProduct(e.coeffs())).norm();
 			sol.tags[i].white_u = (float)u;
-			sol.tags[i].weight = u > 6.0 ? 0.0f : (float)mult[i];
+			// Effective total weight: settle * cauchy. Young-but-agreeing
+			// reads w~=settle (suppressed, honest); settled-outlier reads
+			// w~=mult (down, honest). used/kept semantics follow this.
+			double eff = votes[i].settle * mult[i];
+			sol.tags[i].weight = u > 6.0 ? 0.0f : (float)eff;
 			sol.tags[i].used = sol.tags[i].weight > kTrustFloor;
 		}
 	}
@@ -475,6 +504,7 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 		sol.tags[i].res_vec[1] = (float)(tp.y() * 1000.0);
 		sol.tags[i].res_vec[2] = (float)(tp.z() * 1000.0);
 		sol.tags[i].res_deg = quat_angle_deg(eq, Eigen::Quaterniond::Identity());
+		sol.tags[i].settle = votes[i].settle;
 		if (sol.tags[i].res_mm > kFlipReportMm or sol.tags[i].res_deg > kFlipReportDeg)
 			sol.has_flip = true;
 		se += sol.tags[i].res_mm * sol.tags[i].res_mm;
@@ -585,6 +615,33 @@ bool board_solver_selftest()
 		spdlog::info("board selftest: outlier weight {:.3f} res {:.1f}mm vs inliers {:.1f}mm {}", (double)so.tags[1].weight,
 		             (double)so.tags[1].res_mm, inlier, wok ? "PASS" : "FAIL");
 		pass = pass and wok;
+	}
+		// Settle curve sanity (unit-adjacent, no votes needed).
+	{
+		bool cok = settle_from_age(0) == 0 and std::abs(settle_from_age(0.75) - 0.6321) < 0.01 and
+		        settle_from_age(7.5) > 0.9999 and settle_from_age(-1) == 0;
+		spdlog::info("board selftest: settle curve {}", cok ? "PASS" : "FAIL");
+		pass = pass and cok;
+	}
+	// Young flip: the planted outlier with settle=0.05 must EXCLUDE
+	// (structural soft entry — effective weight ~= settle*cauchy falls far
+	// below the floor), leaving a near-clean fit. Tighter error bounds than
+	// the settled-outlier case, where the outlier keeps pre-exclusion pull.
+	{
+		std::vector<board_vote> votes = make_votes(true);
+		for (auto & v: votes)
+			v.settle = 1;
+		votes[1].settle = 0.05;
+		board_solution sy = solve_board(votes, std::nullopt);
+		manif::SE3d F = se3_from_xr(sy.board_pose);
+		manif::SE3d E = truth.inverse().compose(F);
+		double mm = Eigen::Vector3d(E.translation().x(), E.translation().y(), E.translation().z()).norm() * 1000.0;
+		double deg = quat_angle_deg(Eigen::Quaterniond(E.asSO3().quat()), Eigen::Quaterniond::Identity());
+		bool yok = sy.ok and mm < 4.0 and deg < 0.6 and sy.tags.size() > 1 and sy.tags[1].weight < 0.05f and
+		        not sy.tags[1].used;
+		spdlog::info("board selftest: young-flip err {:.2f}mm {:.3f}deg weight {:.4f} {}", mm, deg,
+		             sy.tags.size() > 1 ? (double)sy.tags[1].weight : -1.0, yok ? "PASS" : "FAIL");
+		pass = pass and yok;
 	}
 	// Lever arm: tag 3 sits off-origin; its orientation noise must not
 	// smear position. Fused position error must beat the worst single

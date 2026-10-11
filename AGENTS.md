@@ -105,7 +105,11 @@ inert unless set; full flow in `docs/profiling.md`.
   (`loo drop/cost/margin`) on the heartbeat. `board flip:` fires per-frame
   on residual-detectable flips (K>=2 only; K==1 flips show as pop dang).
   Pop lines carry enter/exit attribution + dt-since-last-solve (teleport
-  recovery vs true pops); heartbeat carries board position (move visibility). Pose filtering/smoothing TEMP-disabled (files stay,
+  recovery vs true pops); heartbeat carries board position (move visibility).
+  Track-settle falloff (tau=0.75s REFINE-ME): latch age per vote softens
+  freshly (re-)latched tracks via sqrt(settle) whitening; per-tag `s` in
+  `board tags:` is the settle-curve instrument; weight = settle*cauchy
+  (down-with-low-s = young, down-with-high-s = outlier). Pose filtering/smoothing TEMP-disabled (files stay,
   unreferenced) until fusion is verified on-device.
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow
