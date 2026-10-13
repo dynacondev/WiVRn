@@ -7,12 +7,16 @@
 #include "tracking.h"
 
 #include <cmath>
+#include <optional>
 
 // Path atoms (defined in actions.cpp).
 namespace wivrn_macos
 {
 XrPath path_left();
 XrPath path_right();
+// Nullopt unless headset tracking is live (otherwise current_sample()
+// is synthetic — must not stand in for real controller poses here).
+std::optional<TrackingSample> streamer_headset_sample();
 // LOCAL origin latched to the client room frame (streamer.cpp); the
 // (0,1.6,0) fallback below only applies before a headset connects.
 XrPosef streamer_local_origin();
@@ -297,6 +301,25 @@ extern "C"
 		location->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
 		                          XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
 		location->pose = locate_pose(&space->data, &baseSpace->data, sample);
+		// One-shot per side (live tracking only): the exact grip-in-app-space
+		// hello_xr renders its hand cubes at (sane ~= half a meter
+		// ahead-below the views).
+		if (space->data.kind == wivrn_macos::Space::Kind::Action && wivrn_macos::streamer_headset_sample().has_value())
+		{
+			static bool logged_left = false, logged_right = false;
+			bool left = space->data.subaction != wivrn_macos::path_right();
+			bool & logged = left ? logged_left : logged_right;
+			if (!logged)
+			{
+				logged = true;
+				wivrn_macos::log(
+				        "spaces: located %s action in app space at (%.2f,%.2f,%.2f)",
+				        left ? "left" : "right",
+				        (double)location->pose.position.x,
+				        (double)location->pose.position.y,
+				        (double)location->pose.position.z);
+			}
+		}
 		return XR_SUCCESS;
 	}
 
