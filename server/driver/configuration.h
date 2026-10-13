@@ -127,9 +127,10 @@ struct configuration
 		float feather_px = 24;
 		// Surface-projected mapping: the headset projects camera imagery
 		// onto this object's mesh instead of the flat reconstruction feed.
-		// Opt-in per object (plus a live in-headset override). Ignored
-		// for 3d-passthrough-reversed (warned).
-		bool surface_projected = false;
+		// Enabled by default; opt out per object with false (plus a live
+		// in-headset override). Ignored for 3d-passthrough-reversed
+		// (warned).
+		bool surface_projected = true;
 	};
 	std::vector<fiducial_entry> fiducials;
 	std::vector<passthrough_object> passthrough_objects;

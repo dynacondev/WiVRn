@@ -300,14 +300,14 @@ Each `passthrough` entry (behavior object) has:
    size; the compositor expands to full).
 - `surface-projected`: project camera imagery onto this object's mesh
   (surface-projected passthrough) instead of the flat reconstruction
-  feed (default `false`). Opt-in per object, starting with the
-  best-aligned: mismatched geometry causes conflicting depth cues and
-  wrong scale. The mapped interior is composited over the flat feed with
-  the same feathered mask, so edges keep today's flat quality while
-  interiors gain geometry-correct parallax. Not applicable to
-  `3d-passthrough-reversed` (warned + ignored). Applied live; a
-  per-object override in the headset Passthrough tab takes precedence
-  for the session.
+  feed (default `true`; opt out per object with `false`). Prefer
+  well-aligned objects: mismatched geometry causes conflicting depth
+  cues and wrong scale. Mapped interiors feather through the same mask
+  as the flat feed, so edges keep flat quality with geometry-correct
+  parallax inside. Not applicable to `3d-passthrough-reversed`
+  (warned + ignored). Applied live; a per-object override in the
+  headset Passthrough tab (as configured / force on / force off) takes
+  precedence for the session.
 
 Poses compose as `fiducialPose = observedMarkerPose * inverse(markerOffset)` then
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
@@ -355,8 +355,7 @@ Passthrough tab (red) to help you copy it verbatim into the config.
 			"position": [0, 0.05, 0.1],
 			"orientation": [0, 0, 0],
 			"scale": 1.0,
-			"feather-px": 24,
-			"surface-projected": true
+			"feather-px": 24
 		},
 		{
 			"type": "3d-passthrough-reversed",
