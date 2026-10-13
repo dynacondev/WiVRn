@@ -40,6 +40,8 @@ add_library(wivrn-macos-runtime MODULE
 	snapshot.cpp
 	encode.cpp
 	net.cpp
+	streamer.cpp
+	bonjour.cpp
 )
 target_include_directories(wivrn-macos-runtime PRIVATE
 	${openxr_loader_SOURCE_DIR}/include
@@ -110,3 +112,15 @@ target_include_directories(wivrn-macos-net-test PRIVATE
 	.
 )
 target_link_libraries(wivrn-macos-net-test PRIVATE Vulkan::Vulkan wivrn-common)
+
+# Phase 5d proof: full pixels-to-wire-to-poses loopback (fake headset +
+# real runtime dylib + in-process mini app). Needs XR_RUNTIME_JSON and
+# must NOT set WIVRN_MACOS_HEADLESS (streaming is the point).
+add_executable(wivrn-macos-stream-test
+	test_stream.cpp
+)
+target_include_directories(wivrn-macos-stream-test PRIVATE
+	${openxr_loader_SOURCE_DIR}/include
+	.
+)
+target_link_libraries(wivrn-macos-stream-test PRIVATE openxr_loader Vulkan::Vulkan wivrn-common)

@@ -411,6 +411,27 @@ ever bites.
   (dedicated 64 KB heap recvfrom instead); received packets borrow
   socket buffers (validate inline, copy scalars only); shutdown
   ordering must be accept-joins-RX-then-teardown (else UAF/deadlock).
+- [x] Slice C+D (done 2026-10-13): `bonjour` (`_wivrn._tcp` + Linux
+  TXT keys via dns_sd.h), `streamer` (per-eye snapshot→x264→shard→
+  send on EndFrame, view_info with offset-converted display time +
+  echoed views, IDR on NACK/settings/first-frame, desc+control on
+  connect, timesync every 120 frames, session pacing from headset
+  rate, per-session GPU teardown), `wivrn-server-macos` launcher
+  (`--port/--runtime -- APP`, XR_RUNTIME_JSON + WIVRN_PORT env).
+  `wivrn-macos-stream-test` full loopback PASS: 22/22 eye frames
+  (20 stream + 2 reliable IDR), SPS on control after NACK, view_info
+  display_time>0 + Annex-B, live HEAD (4,5,6) locates at (4.00, 3.40,
+  6.00) in LOCAL. Headless runs opt out via WIVRN_MACOS_HEADLESS
+  (else tests would bind/advertise); link starts at CreateSession so
+  headsets connect during app startup (documented v1 UX: app runs
+  first). Foveation GPU deferred to fast-follow (empty foveation in
+  view_info, client handles it); env note: a sandbox permissions
+  fault once blackholed post-handshake UDP both ways (handshake/TCP
+  unaffected) — cleared externally, suites re-verified green.
+
+Accept: `xrEndFrame` → squash → x264 → 9757 → client → poses back →
+`xrWaitFrame` prediction loop closes. **CLOSED on loopback** (real
+headset validates timing/quality next).
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

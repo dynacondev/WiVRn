@@ -3,7 +3,10 @@
 // and projection-layer intake validation (GPU composite is Phase 5).
 
 #include "runtime.h"
+#include "streamer.h"
 #include "vk_context.h"
+
+#include <cstdlib>
 
 namespace
 {
@@ -117,6 +120,12 @@ extern "C"
 		}
 		session->data.lastLayerCount = projections;
 		session->data.lastCall = wivrn_macos::Session::FrameCall::End;
+		// Pixels-to-wire (no-op without a headset; see streamer). Headless
+		// test runs opt out via WIVRN_MACOS_HEADLESS so they never bind
+		// ports or advertise Bonjour.
+		static bool headless = std::getenv("WIVRN_MACOS_HEADLESS") != nullptr;
+		if (!headless)
+			wivrn_macos::Streamer::singleton().end_frame(&session->data, frameEndInfo, frameEndInfo->displayTime);
 		return XR_SUCCESS;
 	}
 

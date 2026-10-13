@@ -264,7 +264,7 @@ int main()
 	{
 		// Alternate solid colors so P-frames carry real deltas.
 		CHECK(clear_image(dev, image, pool, frame % 2 == 0 ? 0.2f : 0.8f, 0.3f, 0.9f));
-		const uint8_t * bgra = snapshot.capture(image);
+		const uint8_t * bgra = snapshot.capture(image, false);
 		CHECK(bgra != nullptr);
 		// Spot-check the snapshot saw the clear color: B=0.9 stays high;
 		// R alternates 0.2/0.8 per frame (threshold straddles both the
@@ -321,7 +321,7 @@ int main()
 	encoder.reconfig(10'000'000, 72);
 	{
 		CHECK(clear_image(dev, image, pool, 0.5f, 0.5f, 0.5f));
-		const uint8_t * bgra = snapshot.capture(image);
+		const uint8_t * bgra = snapshot.capture(image, false);
 		CHECK(bgra != nullptr);
 		std::vector<EncodedNal> nals = encoder.feed(bgra, true);
 		CHECK(!nals.empty());

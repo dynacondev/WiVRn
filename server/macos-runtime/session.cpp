@@ -3,7 +3,9 @@
 // transitions below are real; frame-driven states arrive with Phase 5/6.
 
 #include "runtime.h"
+#include "streamer.h"
 
+#include <cstdlib>
 #include <new>
 
 namespace
@@ -37,9 +39,8 @@ extern "C"
 		XrSession_T * handle = new (std::nothrow) XrSession_T;
 		if (handle == nullptr)
 			return XR_ERROR_OUT_OF_MEMORY;
-		// Graphics bindings (Phase 4: Vulkan only, v1 or v2 struct — the
-		// enable2 binding is a struct alias of the v1 one). A bare session
-		// stays valid for headless lifecycle tests.
+		// Graphics bindings (Vulkan only; v1/v2 structs are aliases). A bare
+		// session stays valid for headless lifecycle tests.
 		if (createInfo->next != nullptr)
 		{
 			const XrBaseInStructure * chain = reinterpret_cast<const XrBaseInStructure *>(createInfo->next);
@@ -86,6 +87,12 @@ extern "C"
 			self->liveSessions += 1;
 		}
 		*session = handle;
+		// Listen + advertise from session creation (not first frame), so a
+		// headset can connect while the app is still starting up. Headless
+		// runs opt out via WIVRN_MACOS_HEADLESS (see frame.cpp).
+		static bool headless = std::getenv("WIVRN_MACOS_HEADLESS") != nullptr;
+		if (!headless)
+			wivrn_macos::Streamer::singleton().ensure_started();
 		return XR_SUCCESS;
 	}
 
@@ -101,6 +108,7 @@ extern "C"
 			if (self->liveSessions > 0)
 				self->liveSessions -= 1;
 		}
+		wivrn_macos::streamer_session_destroyed(&session->data);
 		delete session;
 		return XR_SUCCESS;
 	}

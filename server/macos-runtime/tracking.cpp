@@ -5,6 +5,8 @@
 
 #include "tracking.h"
 
+#include "streamer.h"
+
 #include <chrono>
 #include <cmath>
 #include <mutex>
@@ -84,6 +86,10 @@ void set_tracking_source(std::shared_ptr<TrackingSource> source)
 
 TrackingSample current_sample()
 {
+	// Live headset feed wins when fresh; synthetic otherwise (keeps
+	// headless tests + pre-connect apps fully working).
+	if (auto headset = streamer_headset_sample())
+		return *headset;
 	std::lock_guard lock(source_mutex());
 	return active_source()->latest();
 }

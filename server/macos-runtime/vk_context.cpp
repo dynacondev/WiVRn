@@ -163,6 +163,7 @@ XrResult create_swapchain_images(Swapchain & swap)
 		swap.fences.push_back(fence);
 		swap.busy.push_back(false);
 		swap.waited.push_back(false);
+		swap.virgin.push_back(true);
 	}
 	return XR_SUCCESS;
 }
@@ -184,9 +185,11 @@ void destroy_swapchain_images(Swapchain & swap)
 	swap.fences.clear();
 	swap.busy.clear();
 	swap.waited.clear();
+	swap.virgin.clear();
 	swap.outstanding.clear();
 	swap.nextIndex = 0;
 	swap.lastAcquired = -1;
+	swap.lastReleased = -1;
 }
 
 int64_t now_ns()

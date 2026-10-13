@@ -567,8 +567,12 @@ void HeadsetLink::stream_rx_loop(std::stop_token stop)
 			auto packet = receive_one(*stream_, 100, stop);
 			if (!packet.has_value())
 				continue;
+			log("link: stream rx variant %zu (tmp-debug)", packet->index());
 			if (auto * tracking = get_as<wivrn::from_headset::tracking>(*packet))
+			{
+				log("link: stream rx tracking fd=%d (tmp-debug)", stream_->get_fd());
 				source_->update_tracking(*tracking);
+			}
 			else if (auto * inputs = get_as<wivrn::from_headset::inputs>(*packet))
 				source_->update_inputs(*inputs);
 			else if (auto * response = get_as<wivrn::from_headset::timesync_response>(*packet))

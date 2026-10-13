@@ -295,6 +295,7 @@ extern "C"
 		swap.busy[target] = false;
 		if (swap.lastAcquired == (int32_t)target && swap.outstanding.empty())
 			swap.lastAcquired = -1;
+		swap.lastReleased = (int32_t)target;
 		return XR_SUCCESS;
 	}
 
