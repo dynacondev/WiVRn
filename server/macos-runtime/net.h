@@ -72,6 +72,7 @@ private:
 	TrackingSample sample_{};
 	ViewsEcho echo_{};
 	bool live_logged_ = false;
+	bool grips_logged_ = false;
 };
 
 // Outgoing video shard batch for one eye frame (built by the streamer,

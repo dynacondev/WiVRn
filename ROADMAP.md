@@ -478,6 +478,19 @@ per-stream last_ack (newest received_from_decoder); fb journey logged
 on disp==0 only (per-display updates flooded 240/s); worker picks up
 the live force_idr flag at take (mailbox overwrites swallowed most
 NACK IDRs). Loopback PASS. Awaiting motion test (controller wave).
+Headset run 6 (same day): transport perfect (600 sends, drop=0, client
+completed to frame 326 dense, zero NACK IDRs — the Linux-faithful gate
+holds), but still no hand cubes. Root cause: our tracking_control
+requested HEAD-only, so the client only ever sent HEAD (its pattern log
+matched ours exactly) — controller samples stayed at origin identity,
+and hello_xr's grip cubes rendered out of view. Fix: pattern now asks
+HEAD + LEFT/RIGHT_GRIP + LEFT/RIGHT_AIM (11ms); controller sides go
+active only while their devices appear in packets (asleep controllers
+read inactive, not stale); first-grip receipt logs `grips live`.
+Client TEMP-DEBUG logging added (separate revertable commit): tracking
+devices+positions every ~3s, per-eye presented-frame changes, genuine
+NACKs. Loopback PASS. Awaiting controller-wave retest (controllers
+awake: button press first).
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

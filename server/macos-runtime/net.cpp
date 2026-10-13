@@ -174,16 +174,28 @@ void NetworkSource::update_tracking(const wivrn::from_headset::tracking & tracki
 {
 	std::lock_guard lock(mutex_);
 	// Head pose: prefer the HEAD device entry, hold last otherwise.
+	// Sides go active only while their devices are present in the
+	// packet (controllers asleep/absent must read inactive, not stale).
+	bool saw_left = false, saw_right = false, saw_grip = false;
 	for (const auto & pose: tracking.device_poses)
 	{
 		if (pose.device == wivrn::device_id::HEAD)
 			sample_.hmd = pose.pose;
 		else if (pose.device == wivrn::device_id::LEFT_GRIP || pose.device == wivrn::device_id::LEFT_AIM)
+		{
 			sample_.left.pose = pose.pose;
+			saw_left = true;
+			saw_grip = true;
+		}
 		else if (pose.device == wivrn::device_id::RIGHT_GRIP || pose.device == wivrn::device_id::RIGHT_AIM)
+		{
 			sample_.right.pose = pose.pose;
+			saw_right = true;
+			saw_grip = true;
+		}
 	}
-	sample_.left.active = sample_.right.active = true;
+	sample_.left.active = saw_left;
+	sample_.right.active = saw_right;
 	sample_.timestampNs = now_ns();
 	for (size_t i = 0; i < 2 && i < tracking.views.size(); ++i)
 	{
@@ -198,6 +210,14 @@ void NetworkSource::update_tracking(const wivrn::from_headset::tracking & tracki
 	{
 		live_logged_ = true;
 		log("link: tracking live");
+	}
+	// First grip/aim receipt: controller poses flow end to end from here
+	// (a missing line with awake controllers means the client ignores the
+	// grip pattern entries).
+	if (saw_grip && !grips_logged_)
+	{
+		grips_logged_ = true;
+		log("link: grips live (left=%d right=%d)", (int)saw_left, (int)saw_right);
 	}
 }
 
@@ -728,9 +748,15 @@ void HeadsetLink::send_tracking_control()
 		return;
 	try
 	{
-		// Minimal pattern: the client REQUIRES a HEAD entry.
+		// HEAD drives views/reprojection; grips + aims drive the app's
+		// controller poses (hello_xr's hand cubes). The client only sends
+		// devices the pattern asks for — HEAD-only meant no cubes, ever.
 		control_->send(wivrn::to_headset::tracking_control{
-		        .pattern = {{wivrn::device_id::HEAD, 11'000'000}},
+		        .pattern = {{wivrn::device_id::HEAD, 11'000'000},
+			            {wivrn::device_id::LEFT_GRIP, 11'000'000},
+			            {wivrn::device_id::RIGHT_GRIP, 11'000'000},
+			            {wivrn::device_id::LEFT_AIM, 11'000'000},
+			            {wivrn::device_id::RIGHT_AIM, 11'000'000}},
 		        .motions_to_photons = 22'000'000,
 		});
 	}
