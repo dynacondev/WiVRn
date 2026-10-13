@@ -240,7 +240,7 @@ private:
 		// targets (B, eblur) leave these null.
 		vk::raii::Image depth_image{nullptr};
 		vk::raii::DeviceMemory depth_memory{nullptr};
-		std::array<vk::raii::ImageView, 2> depth_views;
+		std::vector<vk::raii::ImageView> depth_views;
 		std::vector<vk::raii::Framebuffer> raster_depth_fbs;
 	};
 	blur_target target_a;
@@ -313,7 +313,7 @@ private:
 	{
 		vk::raii::Image image{nullptr};
 		vk::raii::DeviceMemory memory{nullptr};
-		std::array<vk::raii::ImageView, 2> views;
+		std::vector<vk::raii::ImageView> views;
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
 	vk::ImageView output_depth_view(vk::Extent2D extent, int eye);

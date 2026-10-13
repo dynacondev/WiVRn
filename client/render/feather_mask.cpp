@@ -387,8 +387,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .pViewportState = &viewport_state,
 		        .pRasterizationState = &rasterization,
 		        .pMultisampleState = &multisample,
-		        .pColorBlendState = &bl,
 		        .pDepthStencilState = &ds,
+		        .pColorBlendState = &bl,
 		        .pDynamicState = &dynamic,
 		        .layout = *pipeline_layout,
 		        .renderPass = *rp,
@@ -755,7 +755,7 @@ feather_mask_renderer::depth_entry feather_mask_renderer::make_depth_entry(vk::E
 		                .layerCount = 1,
 		        },
 		};
-		entry.views[layer] = vk::raii::ImageView(device, view_info);
+		entry.views.emplace_back(device, view_info);
 	}
 	return entry;
 }
@@ -798,7 +798,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 		// below destroys the old one). Blur-only target B never
 		// rasterizes, so it keeps no depth resources.
 		target->raster_depth_fbs.clear();
-		target->depth_views = {};
+		target->depth_views.clear();
 		bool needs_depth = (target == &target_a);
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
@@ -907,7 +907,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			// levels (never on the eblur workspaces), so only they keep
 			// depth resources.
 			target->raster_depth_fbs.clear();
-			target->depth_views = {};
+			target->depth_views.clear();
 			bool needs_depth = (target == &down_targets[li]);
 			target->image = vk::raii::Image(device, image_info);
 			auto requirements = target->image.getMemoryRequirements();
@@ -1187,7 +1187,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// cached submitted-size depth views (swapchain-independent, shared
 		// across groups submitting at this size). Positive-only targets
 		// stay lean (null framebuffers, has_depth false).
-		std::array<vk::raii::Framebuffer, 2> depth_framebuffers;
+		std::array<vk::raii::Framebuffer, 2> depth_framebuffers{{nullptr, nullptr}};
 		bool has_depth = false;
 		if (has_reversed)
 		{
@@ -1229,18 +1229,18 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	{
 		vk::Framebuffer color_fb;
 		vk::Framebuffer depth_fb;
-		vk::raii::Pipeline * pipe;
-		vk::raii::Pipeline * depth_pipe;
-		vk::raii::Pipeline * rev_pipe;
-		vk::raii::RenderPass * rp;
-		vk::raii::RenderPass * depth_rp;
+		vk::Pipeline pipe;
+		vk::Pipeline depth_pipe;
+		vk::Pipeline rev_pipe;
+		vk::RenderPass rp;
+		vk::RenderPass depth_rp;
 	};
 	auto raster_silhouette = [&](const raster_site & site, vk::Extent2D e, int eye, bool use_depth) {
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
 		clears[1].depthStencil = vk::ClearDepthStencilValue{1.f, 0};
 		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = use_depth ? *site.depth_rp : *site.rp,
+		        .renderPass = use_depth ? site.depth_rp : site.rp,
 		        .framebuffer = use_depth ? site.depth_fb : site.color_fb,
 		        .renderArea = {.offset = {0, 0}, .extent = e},
 		        .clearValueCount = use_depth ? 2u : 1u,
@@ -1256,7 +1256,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		for (int pass = 0; pass < (use_depth ? 2 : 1); ++pass)
 		{
 			bool rev_pass = use_depth && pass == 1;
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? *site.rev_pipe : (use_depth ? *site.depth_pipe : *site.pipe));
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_depth ? site.depth_pipe : site.pipe));
 			for (const auto & d: draws)
 			{
 				if (d.reverse != rev_pass)
@@ -1363,7 +1363,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// image. Exact, one raster pass per eye, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
 			for (int eye = 0; eye < 2; ++eye)
-				raster_silhouette({*it->second.framebuffers[eye], *it->second.depth_framebuffers[eye], &pipeline, &depth_pipeline, &reverse_pipeline, &renderpass, &depth_renderpass}, out_extent, eye, has_reversed);
+				raster_silhouette({*it->second.framebuffers[eye], *it->second.depth_framebuffers[eye], *pipeline, *depth_pipeline, *reverse_pipeline, *renderpass, *depth_renderpass}, out_extent, eye, has_reversed);
 		}
 		else if (tier == 1)
 		{
@@ -1382,7 +1382,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		{
 			{
 				section_clock raster_clk(&ms_raster);
-				raster_silhouette({*target_a.raster_fbs[eye], *target_a.raster_depth_fbs[eye], &raster_r8_pipeline, &raster_r8_depth_pipeline, &raster_r8_reverse_pipeline, &raster_r8_renderpass, &raster_r8_depth_renderpass}, half_extent, eye, has_reversed);
+				raster_silhouette({*target_a.raster_fbs[eye], *target_a.raster_depth_fbs[eye], *raster_r8_pipeline, *raster_r8_depth_pipeline, *raster_r8_reverse_pipeline, *raster_r8_renderpass, *raster_r8_depth_renderpass}, half_extent, eye, has_reversed);
 			}
 			make_readable(*target_a.image);
 			section_clock blur_clk(&ms_blur);
@@ -1454,7 +1454,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			{
 				{
 					section_clock raster_clk(&ms_raster);
-					raster_silhouette({*down_targets[seed_level - 1].blur_fbs[eye], *down_targets[seed_level - 1].raster_depth_fbs[eye], &raster_r8_pipeline, &raster_r8_depth_pipeline, &raster_r8_reverse_pipeline, &raster_r8_renderpass, &raster_r8_depth_renderpass}, de_seed, eye, has_reversed);
+					raster_silhouette({*down_targets[seed_level - 1].blur_fbs[eye], *down_targets[seed_level - 1].raster_depth_fbs[eye], *raster_r8_pipeline, *raster_r8_depth_pipeline, *raster_r8_reverse_pipeline, *raster_r8_renderpass, *raster_r8_depth_renderpass}, de_seed, eye, has_reversed);
 				}
 				make_readable(*down_targets[seed_level - 1].image);
 				section_clock blur_clk(&ms_blur);
