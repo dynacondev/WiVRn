@@ -1502,6 +1502,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						cutouts.push_back({v0, v1, v2, v0, v2, v3});
 					}
 				}
+				// Fresh cutouts punch camera with no geometry to map it
+				// onto: the flat feed must stay submitted (see submit).
+				fp.cutouts_punched = !cutouts.empty();
 				// Claim groups + sync member soups (upload on hash change).
 				// Reversed objects (3d-passthrough-reversed) never claim a
 				// group (no feather parameter): they upload into every live
@@ -1966,17 +1969,42 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		// Mask-blend stacks, one per feather group, submitted in feather
 		// order (deterministic): video (opaque, above) was already added,
-		// then each group's mask, then a single fullscreen passthrough on
-		// top, then the surface-projected layer when instances are live.
-		// The first mask replaces destination alpha; the rest add
-		// (saturating union); passthrough multiplies by it: reality inside
-		// any silhouette, game outside, gradients across feather bands.
-		// Group swapchains acquired above (never the shared pool).
+		// then each group's mask, then exactly one camera layer, then
+		// debug/GUI. The first mask replaces destination alpha; the rest
+		// add (saturating union). Group swapchains acquired above (never
+		// the shared pool).
+		//
+		// EITHER/OR camera layers: co-submitting flat reconstruction and
+		// projected mapping breaks video compositing on current runtimes
+		// (video goes black; instantly reversible), so exactly one camera
+		// layer submits per frame. Flat wins whenever anything needs it:
+		// unflagged windows, debug cutouts (camera with no geometry to
+		// map it onto), or a still-ramping global fade. Otherwise the
+		// projected layer alone carries every flagged window; its band
+		// shows video until the internal-only gaussian lands.
+		XrTime fade_done_at = fp.fade_start + XrTime(fp.fade_in_ms * 1e6);
+		bool fade_done = fp.fade_in_ms <= 0 || (fp.fade_start != 0 && frame_state.predictedDisplayTime >= fade_done_at);
+		bool need_flat = not fade_done;
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+				continue;
+			if (not surface_projected_effective(oid, ost))
+			{
+				need_flat = true;
+				break;
+			}
+		}
+		if (fp.cutouts_punched)
+			need_flat = true;
+		bool have_projected = session.has_projected_instances();
 		bool first_group = true;
 		for (auto & [f, g]: fp.mask_groups)
 		{
 			(void)f;
-			if (not g.active)
+			// Projected-only frames skip mask submits too (nothing reads
+			// dstA there); acquire/release pairing below is untouched.
+			if (not g.active or not need_flat)
 				continue;
 			std::array<XrCompositionLayerProjectionView, view_count> mask_views;
 			for (uint32_t view = 0; view < view_count; ++view)
@@ -2008,20 +2036,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
 			first_group = false;
 		}
-		add_passthrough_layer();
-		set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
-		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-		// Surface-projected interiors (mask path only): camera mapped onto
-		// flagged objects' meshes as an opaque overlay (binary-fallback
-		// semantics: camera on geometry, transparent elsewhere), layered
-		// over the flat feed so the feather band keeps flat quality.
-		// Deliberately NO alpha blend chained here: chaining one onto a
-		// PROJECTED layer breaks video compositing on current runtime
-		// builds (video goes black while the object stays camera;
-		// instantly reversible). Revisit if that changes. Skipped when no
-		// instance is live, keeping flag-off frames pixel-identical.
-		if (session.has_projected_instances())
+		if (need_flat)
+		{
+			add_passthrough_layer();
+			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+		}
+		else if (have_projected)
+		{
+			// Projected-only frame (see above): mapped interiors over
+			// video, opaque overlay, no blend chain (a chained blend on a
+			// PROJECTED layer breaks video compositing on current runtimes;
+			// instantly reversible). Mixed frames keep flat only, so
+			// flagged interiors there fall back to flat for the frame.
 			add_projected_passthrough_layer();
+		}
 	}
 
 		// Debug line overlay: ONE transparent projection layer for all debug

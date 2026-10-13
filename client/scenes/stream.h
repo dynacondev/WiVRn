@@ -388,6 +388,10 @@ private:
 		// the passthrough mask (-1 = disabled). Gated on the master
 		// toggle; mask path only.
 		int debug_window_mm = 50;
+		// Set when the record phase built fresh marker-window cutouts this
+		// frame (they punch camera with no geometry to map it onto, so the
+		// flat feed must stay submitted). Read by the submit phase below.
+		bool cutouts_punched = false;
 		struct held_code
 		{
 			std::string payload; // truncated to 64 chars (QR data is unbounded)
