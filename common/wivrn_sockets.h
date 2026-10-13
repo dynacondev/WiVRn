@@ -28,7 +28,11 @@
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
+#ifdef __APPLE__
+#include <netinet/in.h>
+#else
 #include <netinet/ip.h>
+#endif
 #include <span>
 #include <utility>
 #include <vector>

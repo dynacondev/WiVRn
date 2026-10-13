@@ -25,7 +25,11 @@
 #include <cassert>
 #include <memory>
 #include <netdb.h>
+#ifdef __APPLE__
+#include <netinet/in.h>
+#else
 #include <netinet/ip.h>
+#endif
 #include <netinet/tcp.h>
 #include <string.h>
 #include <string>
@@ -34,6 +38,43 @@
 #include <sys/uio.h>
 #include <system_error>
 #include <unistd.h>
+
+#ifdef __APPLE__
+// Darwin has neither recvmmsg/sendmmsg nor MSG_NOSIGNAL/MSG_DONTWAIT.
+// Sockets are switched to non-blocking + SO_NOSIGPIPE at creation (see
+// set_darwin_socket_opts below), which makes flag 0 equivalent.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#ifndef MSG_DONTWAIT
+#define MSG_DONTWAIT 0
+#endif
+#ifndef IPV6_ADD_MEMBERSHIP
+#define IPV6_ADD_MEMBERSHIP IPV6_JOIN_GROUP
+#endif
+#ifndef IPV6_DROP_MEMBERSHIP
+#define IPV6_DROP_MEMBERSHIP IPV6_LEAVE_GROUP
+#endif
+
+namespace
+{
+void set_darwin_socket_opts(int fd)
+{
+	int nosigpipe = 1;
+	setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
+	int flags = fcntl(fd, F_GETFL, 0);
+	if (flags >= 0)
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+} // namespace
+#else
+namespace
+{
+void set_darwin_socket_opts(int)
+{
+}
+} // namespace
+#endif
 
 thread_local crypto::encrypt_context wivrn::UDP::encrypter{EVP_aes_128_ctr()};
 std::atomic<uint64_t> wivrn::UDP::iv_counter;
@@ -72,11 +113,13 @@ wivrn::UDP::UDP()
 	if (fd < 0)
 		throw std::system_error{errno, std::generic_category()};
 	fcntl(fd, F_SETFD, FD_CLOEXEC);
+	set_darwin_socket_opts(fd);
 }
 
 wivrn::UDP::UDP(int fd)
 {
 	this->fd = fd;
+	set_darwin_socket_opts(fd);
 }
 
 void wivrn::UDP::bind(sockaddr_in6 address)
@@ -160,6 +203,7 @@ wivrn::TCP::TCP(int fd)
 {
 	this->fd = fd;
 
+	set_darwin_socket_opts(fd);
 	init();
 }
 
@@ -176,6 +220,10 @@ wivrn::TCP::TCP(sockaddr_in6 sa)
 		throw std::system_error{errno, std::generic_category()};
 	}
 
+	// Non-blocking only after connect: a non-blocking connect() would
+	// return EINPROGRESS and need a writability wait (Linux expects a
+	// blocking connect here, MSG_DONTWAIT is used per-call instead).
+	set_darwin_socket_opts(fd);
 	init();
 }
 
@@ -192,6 +240,8 @@ wivrn::TCP::TCP(sockaddr_in sa)
 		throw std::system_error{errno, std::generic_category()};
 	}
 
+	// See above: non-blocking only after connect.
+	set_darwin_socket_opts(fd);
 	init();
 }
 
@@ -291,14 +341,34 @@ wivrn::deserialization_packet wivrn::UDP::receive_raw()
 		buffer = std::make_shared_for_overwrite<uint8_t[]>(message_size * num_messages);
 	}
 	std::array<iovec, num_messages> iovecs;
-	std::array<mmsghdr, num_messages> mmsgs;
 	for (size_t i = 0; i < num_messages; ++i)
 	{
 		iovecs[i] = {
 		        .iov_base = buffer.get() + message_size * i,
 		        .iov_len = message_size,
 		};
+	}
 
+#ifdef __APPLE__
+	// Darwin has no recvmmsg: single recvmsg on the non-blocking fd
+	// (see set_darwin_socket_opts). The batch queue stays empty; the
+	// message is returned directly below.
+	std::array<size_t, num_messages> lens{};
+	msghdr hdr{};
+	hdr.msg_iov = &iovecs[0];
+	hdr.msg_iovlen = 1;
+	ssize_t n = ::recvmsg(fd, &hdr, 0);
+	if (n < 0)
+		throw std::system_error{errno, std::generic_category()};
+	if (n == 0)
+		return {};
+	lens[0] = (size_t)n;
+	int received = 1;
+	auto message_len = [&lens](int i) -> size_t { return lens[i]; };
+#else
+	std::array<mmsghdr, num_messages> mmsgs;
+	for (size_t i = 0; i < num_messages; ++i)
+	{
 		mmsgs[i] = {
 		        .msg_hdr = {
 		                .msg_iov = &iovecs[i],
@@ -313,12 +383,14 @@ wivrn::deserialization_packet wivrn::UDP::receive_raw()
 		throw std::system_error{errno, std::generic_category()};
 	if (received == 0)
 		throw socket_shutdown();
+	auto message_len = [&mmsgs](int i) -> size_t { return mmsgs[i].msg_len; };
+#endif
 
 	messages.reserve(received);
 
 	for (int i = received - 1; i >= 0; --i)
 	{
-		std::span<uint8_t> message{(uint8_t *)iovecs[i].iov_base, mmsgs[i].msg_len};
+		std::span<uint8_t> message{(uint8_t *)iovecs[i].iov_base, message_len(i)};
 		assert(message.data() != nullptr);
 
 		if (encrypted)
@@ -379,17 +451,24 @@ size_t wivrn::UDP::send_raw(serialization_packet && packet)
 size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 {
 	thread_local std::vector<iovec> iovecs;
+#ifndef __APPLE__
 	thread_local std::vector<mmsghdr> mmsgs;
+#endif
 	thread_local std::vector<uint64_t> iv_counters;
+	thread_local std::vector<size_t> counts;
 
 	if (packets.empty())
 		return 0;
 
 	iovecs.clear();
+#ifndef __APPLE__
 	mmsgs.clear();
+#endif
 	iv_counters.clear();
+	counts.clear();
 
 	iv_counters.reserve(packets.size());
+	counts.reserve(packets.size());
 
 	size_t sent = 0;
 	for (serialization_packet & packet: packets)
@@ -417,11 +496,18 @@ size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 		}
 
 		if (encrypted)
+			counts.push_back(data.size() + 1);
+		else
+			counts.push_back(data.size());
+#ifndef __APPLE__
+		if (encrypted)
 			mmsgs.push_back({.msg_hdr = {.msg_iovlen = data.size() + 1}});
 		else
 			mmsgs.push_back({.msg_hdr = {.msg_iovlen = data.size()}});
+#endif
 	}
 
+#ifndef __APPLE__
 	for (size_t i = 0, j = 0; i < packets.size(); ++i)
 	{
 		mmsgs[i].msg_hdr.msg_iov = &iovecs[j];
@@ -431,6 +517,20 @@ size_t wivrn::UDP::send_many_raw(std::span<serialization_packet> packets)
 	// sendmmsg may not send all messages, just consider them as lost for UDP
 	if (sendmmsg(fd, mmsgs.data(), mmsgs.size(), 0) < 0)
 		throw std::system_error{errno, std::generic_category()};
+#else
+	// Darwin has no sendmmsg: one sendmsg per message. Loss-tolerant for
+	// UDP (a failed datagram throws like the Linux path; callers treat
+	// UDP loss as normal, see comment above).
+	for (size_t i = 0, j = 0; i < packets.size(); ++i)
+	{
+		msghdr hdr{};
+		hdr.msg_iov = &iovecs[j];
+		hdr.msg_iovlen = static_cast<decltype(hdr.msg_iovlen)>(counts[i]);
+		if (::sendmsg(fd, &hdr, 0) < 0)
+			throw std::system_error{errno, std::generic_category()};
+		j += counts[i];
+	}
+#endif
 	return sent;
 }
 
@@ -535,7 +635,7 @@ size_t wivrn::TCP::send_raw(serialization_packet && packet)
 	        .msg_name = nullptr,
 	        .msg_namelen = 0,
 	        .msg_iov = iovecs.data(),
-	        .msg_iovlen = iovecs.size(),
+	        .msg_iovlen = static_cast<decltype(msghdr::msg_iovlen)>(iovecs.size()),
 	        .msg_control = nullptr,
 	        .msg_controllen = 0,
 	        .msg_flags = 0,
@@ -609,7 +709,7 @@ size_t wivrn::TCP::send_many_raw(std::span<serialization_packet> packets)
 	        .msg_name = nullptr,
 	        .msg_namelen = 0,
 	        .msg_iov = iovecs.data(),
-	        .msg_iovlen = iovecs.size(),
+	        .msg_iovlen = static_cast<decltype(msghdr::msg_iovlen)>(iovecs.size()),
 	        .msg_control = nullptr,
 	        .msg_controllen = 0,
 	        .msg_flags = 0,

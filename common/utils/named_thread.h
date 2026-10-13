@@ -29,7 +29,15 @@ template <typename... Args>
 std::thread named_thread(const std::string & name, Args &&... args)
 {
 	std::thread t{std::forward<Args>(args)...};
+#ifdef __APPLE__
+	// macOS pthread_setname_np() only names the calling thread (no thread
+	// argument, 64-char limit). Naming the new thread from here is not
+	// possible, so this is intentionally a no-op on Apple; threads that
+	// need a name must call pthread_setname_np() themselves.
+	(void)name;
+#else
 	pthread_setname_np(t.native_handle(), name.substr(0, 15).c_str());
+#endif
 	return t;
 }
 } // namespace utils

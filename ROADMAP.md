@@ -257,30 +257,49 @@ Locked decisions (2026-10-13):
   TCP+UDP + `_wivrn._tcp` TXT keys, so Android client + Linux server
   stay in sync.
 
-## Phase 0 — Scaffolding [status: in progress]
+## Phase 0 — Scaffolding [status: done 2026-10-13]
 
-- [ ] `server/macos-runtime/` + `CMakeLists.txt` + `wivrn-server-macos`
+- [x] `server/macos-runtime/` + `CMakeLists.txt` + `wivrn-server-macos`
   target (own `main.cpp`, no `ipc_server_main_common`).
-- [ ] Preset `macos-server`: `WIVRN_BUILD_SERVER=OFF`,
+- [x] Preset `macos-server`: `WIVRN_BUILD_SERVER=OFF`,
   `WIVRN_BUILD_MACOS_SERVER=ON`, `NVENC/VAAPI/VULKAN_ENCODE/PIPEWIRE/
   WIVRNCTL/LH/SOLARXR=OFF`, `X264=ON`.
-- [ ] Top-level CMake `NOT APPLE` guards (AVAHI/glib-unix/libnotify/
-  LIBDRM/pipewire/systemd, systemd/firewalld installs) + MoltenVK
-  gate relax.
-- [ ] `mise.toml`: LunarG SDK pin + `PKG_CONFIG_PATH` docs.
+- [x] Top-level CMake: `WIVRN_BUILD_MACOS_SERVER` option, `NEED_COMMON`
+  coverage, MoltenVK gate warn-only on APPLE. (`NOT APPLE` guards on
+  the AVAHI/glib-unix/libnotify/LIBDRM/pipewire/systemd blocks
+  deferred: the macos-server preset keeps `WIVRN_BUILD_SERVER=OFF`
+  so they don't trigger; revisit if a unified preset ever enables
+  both.)
+- [x] `mise.toml`: LunarG SDK pin + `PKG_CONFIG_PATH` docs.
 
 Accept: `cmake --preset macos-server` configures on macOS arm64.
 
-## Phase 1 — common/ portability shims
+Verified: configures (Vulkan 1.4.363, Boost 1.92, OpenSSL 4.0.3 via
+brew), `wivrn-server-macos` scaffold builds + runs exit 0. Note:
+full LunarG SDK cannot be mise-pinned (no aqua package, installer-only
+upstream, brew has no pins) — hermetic path is CMake FetchContent
+(Vulkan-Headers + Vulkan-Loader + MoltenVK); `dns_sd.h` confirmed
+system-provided (libSystem, no dep).
 
-- [ ] `wivrn_sockets.cpp`: `recvmmsg/sendmmsg` → `recvmsg` loop,
+## Phase 1 — common/ portability shims [status: done 2026-10-13]
+
+- [x] `wivrn_sockets.cpp`: `recvmmsg/sendmmsg` → `recvmsg` loop,
   `MSG_NOSIGNAL` → `SO_NOSIGPIPE`, `MSG_DONTWAIT` → `O_NONBLOCK`,
   `<netinet/in.h>`.
-- [ ] `named_thread.h`: `__APPLE__` → `pthread_setname_np(name)` branch.
-- [ ] Homebrew OpenSSL 3 (`OPENSSL_ROOT_DIR`); Boost/Eigen/CLI11
+- [x] `named_thread.h`: `__APPLE__` → `pthread_setname_np(name)` branch.
+- [x] Homebrew OpenSSL 3 (`OPENSSL_ROOT_DIR`); Boost/Eigen/CLI11
   hermetic-or-brew.
 
 Accept: `wivrn-common` builds on macOS arm64.
+
+Verified: `libwivrn-common.a` builds; loopback smoke test passes
+(TCP `send_raw`+`send_many_raw`, UDP `send_raw`+`send_many_raw`+
+`receive_raw` via the Darwin fallbacks). Incidental fixes found by
+the macOS build, all Linux-neutral: `IPV6_JOIN/GROUP` aliases,
+`msg_iovlen` `static_cast` (Linux `size_t` vs Darwin `int`),
+`sprintf`→`snprintf` in `hexdump`, preset `CMAKE_CXX_FLAGS=
+-Wno-error=undef` (LunarG `vulkan.hpp` `#if (VULKAN_HPP_ASSERT ==
+assert)` trips Clang `-Wundef`; per AGENTS.md host-config advice).
 
 ## Phase 2 — Runtime skeleton
 

@@ -99,11 +99,11 @@ class deserialization_error : public std::runtime_error
 
 		for (int i = 0; i < raw_data.size(); i += 16)
 		{
-			sprintf(buf, "%04x ", i);
+			snprintf(buf, sizeof(buf), "%04x ", i);
 			s += buf;
 			for (int j = i; j < std::min<int>(raw_data.size(), i + 16); j++)
 			{
-				sprintf(buf, "%02x ", (int)raw_data[j]);
+				snprintf(buf, sizeof(buf), "%02x ", (int)raw_data[j]);
 				s += buf;
 			}
 			s += "\n";
