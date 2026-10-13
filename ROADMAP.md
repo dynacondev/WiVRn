@@ -523,6 +523,15 @@ HUD-fixed with flat stereo (demo rendered NDC-direct). Fixed with per-eye
 view-projection (FOV + runtime pose per eye; cube at LOCAL (0,1,-2)):
 world-fixed + real disparity, math verified numerically. Awaiting retest.
 Headset run 10 (next): patched hello_xr cross-check (below).
+hello_xr cross-validation: stock hello_xr cannot render on this MoltenVK
+(ClearAttachments yields driver fill; BACK+CW cubes fully culled — both
+proven in isolation). `patches/hello_xr/` carries two MoltenVK workarounds
+applied at fetch time via the same apply.sh helper as patches/monado:
+0001 loadOp-CLEAR + CULL_NONE in vulkan_utils.h, 0002 drops the
+vkCmdClearAttachments block in graphicsplugin_vulkan.cpp (loadOp-CLEAR
+cover it via clearValues). Clean-fetch verified (wiped prefix rebuilds
+patched from the pinned tarball). Awaiting patched-hello_xr headset run
+(static colored cubes + grip cubes = independent-app proof).
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

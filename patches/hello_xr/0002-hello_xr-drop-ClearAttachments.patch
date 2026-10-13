@@ -1,0 +1,20 @@
+--- a/src/tests/hello_xr/graphicsplugin_vulkan.cpp
++++ b/src/tests/hello_xr/graphicsplugin_vulkan.cpp
+@@ -866,15 +866,9 @@
+         clearValues[1].depthStencil.stencil = 0;
+         renderPassBeginInfo.clearValueCount = (uint32_t)clearValues.size();
+         renderPassBeginInfo.pClearValues = clearValues.data();
+-
+-        std::array<VkClearAttachment, 2> clearAttachments{{
+-            {VK_IMAGE_ASPECT_COLOR_BIT, 0, clearValues[0]},
+-            {secondAttachmentAspect, 0, clearValues[1]},
+-        }};
+ 
+-        // imageArrayIndex already included in the VkImageView
+-        VkClearRect clearRect{renderArea, 0, 1};
+-        vkCmdClearAttachments(m_cmdBuffer.buf, 2, &clearAttachments[0], 1, &clearRect);
++        // WiVRn macOS: no vkCmdClearAttachments (writes driver fill on
++        // MoltenVK); the loadOp-CLEAR above already clears.
+ 
+         // Bind index and vertex buffers
+         vkCmdBindIndexBuffer(m_cmdBuffer.buf, m_drawBuffer.idx.buf, 0, VK_INDEX_TYPE_UINT16);

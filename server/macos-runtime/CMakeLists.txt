@@ -160,9 +160,15 @@ endif()
 option(WIVRN_BUILD_MACOS_HELLO_XR "Build stock hello_xr for headset testing" OFF)
 if(WIVRN_BUILD_MACOS_HELLO_XR)
 	include(ExternalProject)
+	# MoltenVK workarounds (see ROADMAP run 8): loadOp-CLEAR instead of
+	# LOAD+ClearAttachments (ClearAttachments yields driver fill), CULL_NONE
+	# instead of BACK+CW (hello_xr's cubes are fully culled otherwise).
+	# Applied at fetch time like patches/monado (same apply.sh helper).
+	file(GLOB HELLO_XR_PATCHES CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/../../patches/hello_xr/*)
 	ExternalProject_Add(hello_xr_external
 		URL https://github.com/KhronosGroup/OpenXR-SDK-Source/archive/refs/tags/release-1.1.59.tar.gz
 		URL_HASH SHA256=3b241897f93e2cf7e833d27f8ec3c3433cf5cf064e13724af026984acede02e7
+		PATCH_COMMAND ${CMAKE_CURRENT_LIST_DIR}/../../patches/apply.sh ${HELLO_XR_PATCHES}
 		CMAKE_ARGS
 			-DBUILD_TESTS=ON
 			-DBUILD_CONFORMANCE_TESTS=OFF

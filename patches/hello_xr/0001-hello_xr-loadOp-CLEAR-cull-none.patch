@@ -1,0 +1,29 @@
+--- a/src/tests/hello_xr/vulkan_utils.h
++++ b/src/tests/hello_xr/vulkan_utils.h
+@@ -747,7 +747,7 @@
+ 
+             at[colorRef.attachment].format = colorFmt;
+             at[colorRef.attachment].samples = sampleCount;
+-            at[colorRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++            at[colorRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; // WiVRn macOS: LOAD restores driver fill on MoltenVK
+             at[colorRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+             at[colorRef.attachment].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+             at[colorRef.attachment].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+@@ -763,7 +763,7 @@
+ 
+             at[depthRef.attachment].format = depthFmt;
+             at[depthRef.attachment].samples = sampleCount;
+-            at[depthRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
++            at[depthRef.attachment].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; // WiVRn macOS: same (depth never clears otherwise)
+             at[depthRef.attachment].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+             at[depthRef.attachment].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+             at[depthRef.attachment].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+@@ -1045,7 +1045,7 @@
+ 
+         VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+         rs.polygonMode = VK_POLYGON_MODE_FILL;
+-        rs.cullMode = VK_CULL_MODE_BACK_BIT;
++        rs.cullMode = VK_CULL_MODE_NONE; // WiVRn macOS: BACK+CW culls all hello_xr cubes on MoltenVK
+         rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+         rs.depthClampEnable = VK_FALSE;
+         rs.rasterizerDiscardEnable = VK_FALSE;
