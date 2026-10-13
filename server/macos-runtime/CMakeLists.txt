@@ -27,6 +27,9 @@ add_library(wivrn-macos-runtime MODULE
 	system.cpp
 	views.cpp
 	session.cpp
+	tracking.cpp
+	spaces.cpp
+	actions.cpp
 )
 target_include_directories(wivrn-macos-runtime PRIVATE
 	${openxr_loader_SOURCE_DIR}/include

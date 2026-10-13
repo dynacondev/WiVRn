@@ -323,17 +323,32 @@ pre-filters unknown extensions/versions and rejects simultaneous
 instances, so negative CreateInstance checks run solo. Runtime links
 headers only, never the loader lib.
 
-## Phase 3 — Poses + simple-controller input
+## Phase 3 — Poses + simple-controller input [status: done 2026-10-13]
 
-- [ ] `spaces.cpp` (`LOCAL/LOCAL_FLOOR/STAGE`, `LocateViews/Space`
-  from `from_headset::tracking`).
-- [ ] `actions.cpp` (simple-controller + Vive/Index→touch aliases,
+- [x] `spaces.cpp` (`LOCAL`/`LOCAL_FLOOR`/`STAGE`/`VIEW`, `LocateViews/
+  Space` from `from_headset::tracking`).
+- [x] `actions.cpp` (simple-controller + Vive/Index→touch aliases,
   `SyncActions/GetActionState*`; haptics forward or no-op).
-- [ ] `wivrn_connection` adapter (drop `wivrn_ipc_socket_monado`
+- [x] `wivrn_connection` adapter (drop `wivrn_ipc_socket_monado`
   pollfd); `configuration.cpp` JSON merge reuse.
 
 Accept: headset tracking drives view poses; controller buttons/sticks
 visible to app.
+
+Verified: injectable `TrackingSource` (`tracking.h/cpp`) with a
+deterministic synthetic source (HMD at y=1.6 ±10° yaw/8 s, static
+controllers, right-hand pressed demo state); `wivrn-macos-runtime-test`
+covers path atoms roundtrip, action sets/actions, batched bindings +
+vive `trigger/click` alias, attach (double-attach refused), sync,
+boolean/float/vector2/pose states with both polarities, bound
+sources, reference + grip action spaces (grip locates at exactly
+(0.2, -0.3, -0.3) in LOCAL), stereo `LocateViews` with ±32 mm eye
+split — PASS. Findings: component matching must use the `/input/`
+suffix (paths carry the `/user/hand/...` prefix); `suggest` is
+most-recent-wins per profile so tests batch one call per profile;
+`receive_pending()` must be drained before `receive_raw()` (pre-existing
+upstream reassembly behavior). `configuration.cpp` merge deferred to
+Phase 5 (needed with networking, not before).
 
 ## Phase 4 — Vulkan swapchains + frame loop
 

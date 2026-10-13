@@ -29,6 +29,28 @@ extern "C"
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_ResultToString(XrInstance, XrResult, char[XR_MAX_RESULT_STRING_SIZE]);
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EnumerateInstanceExtensionProperties(const char *, uint32_t, uint32_t *, XrExtensionProperties *);
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EnumerateApiLayerProperties(uint32_t, uint32_t *, XrApiLayerProperties *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_StringToPath(XrInstance, const char *, XrPath *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_PathToString(XrInstance, XrPath, uint32_t, uint32_t *, char *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateActionSet(XrInstance, const XrActionSetCreateInfo *, XrActionSet *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_DestroyActionSet(XrActionSet);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateAction(XrActionSet, const XrActionCreateInfo *, XrAction *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_DestroyAction(XrAction);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SuggestInteractionProfileBindings(XrInstance, const XrInteractionProfileSuggestedBinding *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_AttachSessionActionSets(XrSession, const XrSessionActionSetsAttachInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SyncActions(XrSession, const XrActionsSyncInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EnumerateBoundSourcesForAction(XrSession, const XrBoundSourcesForActionEnumerateInfo *, uint32_t, uint32_t *, XrPath *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetActionStateBoolean(XrSession, const XrActionStateGetInfo *, XrActionStateBoolean *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetActionStateFloat(XrSession, const XrActionStateGetInfo *, XrActionStateFloat *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetActionStateVector2f(XrSession, const XrActionStateGetInfo *, XrActionStateVector2f *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetActionStatePose(XrSession, const XrActionStateGetInfo *, XrActionStatePose *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_ApplyHapticFeedback(XrSession, const XrHapticActionInfo *, const XrHapticBaseHeader *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_StopHapticFeedback(XrSession, const XrHapticActionInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EnumerateReferenceSpaces(XrSession, uint32_t, uint32_t *, XrReferenceSpaceType *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateReferenceSpace(XrSession, const XrReferenceSpaceCreateInfo *, XrSpace *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateActionSpace(XrSession, const XrActionSpaceCreateInfo *, XrSpace *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_DestroySpace(XrSpace);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_LocateSpace(XrSpace, XrSpace, XrTime, XrSpaceLocation *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_LocateViews(XrSession, const XrViewLocateInfo *, XrViewState *, uint32_t, uint32_t *, XrView *);
 }
 
 namespace
@@ -71,6 +93,28 @@ const FunctionEntry functions[] = {
         ENTRY(RequestExitSession),
         ENTRY(PollEvent),
         ENTRY(ResultToString),
+        ENTRY(StringToPath),
+        ENTRY(PathToString),
+        ENTRY(CreateActionSet),
+        ENTRY(DestroyActionSet),
+        ENTRY(CreateAction),
+        ENTRY(DestroyAction),
+        ENTRY(SuggestInteractionProfileBindings),
+        ENTRY(AttachSessionActionSets),
+        ENTRY(SyncActions),
+        ENTRY(EnumerateBoundSourcesForAction),
+        ENTRY(GetActionStateBoolean),
+        ENTRY(GetActionStateFloat),
+        ENTRY(GetActionStateVector2f),
+        ENTRY(GetActionStatePose),
+        ENTRY(ApplyHapticFeedback),
+        ENTRY(StopHapticFeedback),
+        ENTRY(EnumerateReferenceSpaces),
+        ENTRY(CreateReferenceSpace),
+        ENTRY(CreateActionSpace),
+        ENTRY(DestroySpace),
+        ENTRY(LocateSpace),
+        ENTRY(LocateViews),
 };
 
 } // namespace
