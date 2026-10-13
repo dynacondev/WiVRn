@@ -179,7 +179,7 @@ static void log_config_search_once(const std::vector<config_candidate> & candida
 		if (status == "invalid")
 			status += " (see error above)";
 		else if (status == "skipped")
-			status += " (HOST_XDG_CONFIG_HOME unset)";
+			status += " (HOST_XDG_CONFIG_HOME and HOME unset)";
 		else if (status == "missing" and candidate.local.empty())
 			status = "missing or unreadable";
 		U_LOG_I("Config search: %s: %s: %s",
@@ -214,9 +214,18 @@ static std::vector<config_candidate> collect_config_candidates()
 		candidates.push_back(std::move(candidate));
 	};
 	bool flatpak = wivrn::is_flatpak();
-	const char * host_xdg = flatpak ? std::getenv("HOST_XDG_CONFIG_HOME") : nullptr;
-	if (host_xdg and not *host_xdg)
-		host_xdg = nullptr;
+	// HOST_XDG_CONFIG_HOME only exists when the host exports XDG_CONFIG_HOME.
+	// Otherwise the host uses the XDG default, and $HOME inside the sandbox
+	// names the same location as on the host, so $HOME/.config is a valid
+	// host path even though it is invisible from here.
+	std::string host_config_home;
+	if (flatpak)
+	{
+		if (const char * host_xdg = std::getenv("HOST_XDG_CONFIG_HOME"); host_xdg and *host_xdg)
+			host_config_home = host_xdg;
+		else if (const char * home = std::getenv("HOME"); home and *home)
+			host_config_home = (std::filesystem::path(home) / ".config").string();
+	}
 	// Bundled defaults first, then host files, then sandbox files, so
 	// dashboard edits (sandbox per-app config) win. Host paths are
 	// invisible from inside the flatpak sandbox: /run/host/* is
@@ -239,12 +248,12 @@ static std::vector<config_candidate> collect_config_candidates()
 		           std::filesystem::path("/run/host/etc") / "wivrn" / "config.json",
 		           "/etc/wivrn/config.json",
 		           "host");
-		if (host_xdg)
+		if (not host_config_home.empty())
 		{
 			config_candidate candidate;
 			candidate.id = "host-xdg";
 			candidate.role = "host user config";
-			candidate.path = (std::filesystem::path(host_xdg) / "wivrn" / "config.json").string();
+			candidate.path = (std::filesystem::path(host_config_home) / "wivrn" / "config.json").string();
 			candidate.location = "host";
 			if (auto data = wivrn::read_file_via_host(candidate.path, config_file_max_size))
 				candidate.content = std::string(reinterpret_cast<const char *>(data->data()), data->size());
