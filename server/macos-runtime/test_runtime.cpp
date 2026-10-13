@@ -13,6 +13,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -345,9 +346,6 @@ int main()
 
 	// Views: stereo pair around the synthetic HMD. In LOCAL coords the
 	// eyes sit near y=0 (head height cancels), split ±32 mm in x.
-
-	// Views: stereo pair around the synthetic HMD. In LOCAL coords the
-	// eyes sit near y=0 (head height cancels), split ±32 mm in x.
 	XrViewLocateInfo viewInfo{
 	        .type = XR_TYPE_VIEW_LOCATE_INFO,
 	        .next = nullptr,
@@ -370,7 +368,20 @@ int main()
 		        located[i].pose.position.y,
 		        located[i].pose.position.z);
 		CHECK(located[i].pose.position.y > -0.05f && located[i].pose.position.y < 0.05f);
-		CHECK(located[i].fov.angleLeft > 0.8f && located[i].fov.angleLeft < 0.9f);
+		// FOV uses OpenXR signs (left/down negative). A degenerate
+		// frustum (equal edges) divides by zero in every projection
+		// builder, yielding INF and clipping all geometry — assert the
+		// frustum is valid and finite here so it can never regress.
+		CHECK(located[i].fov.angleLeft < -0.8f && located[i].fov.angleLeft > -0.9f);
+		CHECK(located[i].fov.angleRight > 0.8f && located[i].fov.angleRight < 0.9f);
+		CHECK(located[i].fov.angleUp > 0.8f && located[i].fov.angleUp < 0.9f);
+		CHECK(located[i].fov.angleDown < -0.8f && located[i].fov.angleDown > -0.9f);
+		float tanL = std::tan(located[i].fov.angleLeft);
+		float tanR = std::tan(located[i].fov.angleRight);
+		float tanU = std::tan(located[i].fov.angleUp);
+		float tanD = std::tan(located[i].fov.angleDown);
+		CHECK(std::isfinite(2.0f / (tanR - tanL)) && (tanR - tanL) > 0.5f);
+		CHECK(std::isfinite(2.0f / (tanU - tanD)) && (tanU - tanD) > 0.5f);
 	}
 	CHECK(located[0].pose.position.x < -0.01f);
 	CHECK(located[1].pose.position.x > 0.01f);

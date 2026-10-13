@@ -522,7 +522,22 @@ drop=0, sparse NACKs recovered) — v1 motion proof closed. Image is
 HUD-fixed with flat stereo (demo rendered NDC-direct). Fixed with per-eye
 view-projection (FOV + runtime pose per eye; cube at LOCAL (0,1,-2)):
 world-fixed + real disparity, math verified numerically. Awaiting retest.
-Headset run 10 (next): patched hello_xr cross-check (below).
+Headset run 10: demo showed cycling bg only (pink), hello_xr flat
+SlateGrey — both clears working, zero geometry. Root cause (code-read,
+not driver): LocateViews reported FOV {+0.86 x4} — equal edges divide
+by zero in every projection builder → INF matrices → all draws clip
+in BOTH apps (the run-8 cull/clear quirks were real but secondary).
+Fix: live client-sent FOV when valid (validated at ingest,
+`sane_fov`), signed-symmetric {-0.86,+0.86,+0.86,-0.86} fallback
+otherwise; streamer sanitizes pre-connect app FOVs the same way
+(shared `fallback_fov`/`sane_fov` in runtime.h). Demo also fixed:
+explicit viewport/scissor, LOAD→CLEAR, Vulkan Y-negation in
+projFromFov (upright through the snapshot pipeline); invertRigid
+re-derived elementwise — already correct R^T, untouched. Headless
+pixel proof (`WIVRN_MACOS_VERIFY_PIXELS=1`, EyeSnapshot readback at
+frame 30): diff=20563 (1.96%) gTop=2562818 gBot=0 → cube draws
+upright. test_runtime now asserts FOV signs + finite projection.
+Awaiting retest of both apps on headset.
 hello_xr cross-validation: stock hello_xr cannot render on this MoltenVK
 (ClearAttachments yields driver fill; BACK+CW cubes fully culled — both
 proven in isolation). `patches/hello_xr/` carries two MoltenVK workarounds

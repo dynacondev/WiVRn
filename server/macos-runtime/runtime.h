@@ -12,6 +12,8 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+#include <array>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -87,7 +89,26 @@ struct TrackingSample
 	XrPosef hmd{{0, 0, 0, 1}, {0, 0, 0}};
 	ControllerSample left;
 	ControllerSample right;
+	// Per-eye optics echoed by the headset (OpenXR sign convention:
+	// angleLeft/angleDown negative). has_fov=false (synthetic/headless)
+	// means no live optics: LocateViews uses the signed fallback.
+	std::array<XrFovf, 2> fov{};
+	bool has_fov = false;
 };
+
+// Signed-symmetric fallback optics (~49deg half-angle). Used
+// pre-connect/headless and to sanitize degenerate app-submitted FOVs:
+// equal frustum edges divide by zero in every projection builder,
+// yielding INF and clipping all geometry.
+constexpr XrFovf fallback_fov{-0.86f, 0.86f, 0.86f, -0.86f};
+
+// A frustum is usable only if every edge is finite and strictly
+// ordered (this is the regression guard for the all-+0.86 outage).
+inline bool sane_fov(const XrFovf & fov)
+{
+	return std::isfinite(fov.angleLeft) && std::isfinite(fov.angleRight) && std::isfinite(fov.angleUp) &&
+	       std::isfinite(fov.angleDown) && fov.angleLeft < fov.angleRight && fov.angleDown < fov.angleUp;
+}
 
 struct ActionSet
 {

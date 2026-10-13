@@ -395,8 +395,11 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 				eye.job_fov = views_echo.fov;
 			else
 			{
+				// Pre-connect: forward the app's FOVs, sanitizing any
+				// degenerate frustum to the signed fallback (equal edges
+				// divide by zero in the client's timewarp math too).
 				for (uint32_t v = 0; v < 2 && v < proj->viewCount; ++v)
-					eye.job_fov[v] = proj->views[v].fov;
+					eye.job_fov[v] = sane_fov(proj->views[v].fov) ? proj->views[v].fov : fallback_fov;
 			}
 			eye.job_display_time = display_headset;
 			eye.job_snap_ns = now_ns() - snap_begin;

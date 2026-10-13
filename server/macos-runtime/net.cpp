@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <cmath>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -201,6 +202,13 @@ void NetworkSource::update_tracking(const wivrn::from_headset::tracking & tracki
 	{
 		echo_.pose[i] = tracking.views[i].pose;
 		echo_.fov[i] = tracking.views[i].fov;
+		// Live optics for LocateViews (accept only a usable frustum;
+		// anything else keeps the signed fallback: has_fov stays false).
+		if (sane_fov(tracking.views[i].fov))
+		{
+			sample_.fov[i] = tracking.views[i].fov;
+			sample_.has_fov = true;
+		}
 	}
 	echo_.valid = true;
 	// First live sample: view_info poses + the runtime's HEAD tracking

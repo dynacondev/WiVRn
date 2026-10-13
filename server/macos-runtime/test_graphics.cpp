@@ -468,7 +468,7 @@ int main()
 			projViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 			projViews[eye].next = nullptr;
 			projViews[eye].pose = {.orientation = {0, 0, 0, 1}, .position = {0, 0, 0}};
-			projViews[eye].fov = {0.86f, 0.86f, 0.86f, 0.86f};
+			projViews[eye].fov = {-0.86f, 0.86f, 0.86f, -0.86f}; // OpenXR signs: left/down negative
 			projViews[eye].subImage = {
 			        .swapchain = swapchains[eye],
 			        .imageRect = {.offset = {0, 0}, .extent = {512, 512}},

@@ -421,7 +421,9 @@ extern "C"
 		XrPosef stageInBase = pinv(baseInStage);
 
 		static constexpr float eyeX[wivrn_macos::SystemInfo::viewCount] = {-0.032f, 0.032f};
-		static constexpr float fovAngle = 0.86f; // ~49deg symmetric (v1 default)
+		// Live headset optics win (validated usable at ingest);
+		// headless/pre-connect falls back to the signed-symmetric default
+		// (see runtime.h: equal edges divide by zero downstream).
 		for (uint32_t i = 0; i < wivrn_macos::SystemInfo::viewCount; ++i)
 		{
 			XrPosef eyeInHead{{0, 0, 0, 1}, {eyeX[i], 0, 0}};
@@ -429,7 +431,7 @@ extern "C"
 			views[i].type = XR_TYPE_VIEW;
 			views[i].next = nullptr;
 			views[i].pose = pmul(stageInBase, eyeInStage);
-			views[i].fov = {fovAngle, fovAngle, fovAngle, fovAngle};
+			views[i].fov = sample.has_fov ? sample.fov[i] : wivrn_macos::fallback_fov;
 		}
 		*viewCountOutput = wivrn_macos::SystemInfo::viewCount;
 		viewState->type = XR_TYPE_VIEW_STATE;

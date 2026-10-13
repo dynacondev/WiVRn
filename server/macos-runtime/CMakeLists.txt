@@ -141,6 +141,7 @@ if(GLSLANG_VALIDATOR)
 	)
 	add_executable(wivrn-macos-demo
 		demo.cpp
+		snapshot.cpp
 		${CMAKE_CURRENT_BINARY_DIR}/cubec.vert.spv
 		${CMAKE_CURRENT_BINARY_DIR}/cubec.frag.spv
 	)

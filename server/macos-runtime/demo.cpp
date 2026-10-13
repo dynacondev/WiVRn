@@ -15,6 +15,8 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr_platform.h>
 
+#include "snapshot.h" // WIVRN_MACOS_VERIFY_PIXELS headless pixel proof
+
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -210,7 +212,9 @@ std::vector<uint32_t> readSpv(const char * path)
 }
 
 // Minimal column-major matrix helpers (matches the pc.mvp shader input).
-// Projection mirrors XrMatrix4x4f_CreateProjectionFov(GRAPHICS_VULKAN).
+// Projection mirrors XrMatrix4x4f_CreateProjectionFov(GRAPHICS_VULKAN):
+// Y is negated for Vulkan (NDC +y is the framebuffer bottom row; without
+// the flip the image renders upside down through the snapshot pipeline).
 void projFromFov(const XrFovf & fov, float m[16])
 {
 	float tanL = std::tan(fov.angleLeft);
@@ -222,8 +226,8 @@ void projFromFov(const XrFovf & fov, float m[16])
 		m[i] = 0;
 	m[0] = 2.0f / (tanR - tanL);
 	m[8] = (tanR + tanL) / (tanR - tanL);
-	m[5] = 2.0f / (tanU - tanD);
-	m[9] = (tanU + tanD) / (tanU - tanD);
+	m[5] = -2.0f / (tanU - tanD);
+	m[9] = -(tanU + tanD) / (tanU - tanD);
 	m[10] = -farZ / (farZ - nearZ);
 	m[11] = -1.0f;
 	m[14] = -(farZ * nearZ) / (farZ - nearZ);
@@ -288,6 +292,9 @@ int main(int argc, char ** argv)
 	std::filesystem::path shaderDir = exe.parent_path();
 	auto vertPath = (shaderDir / "cubec.vert.spv").string();
 	auto fragPath = (shaderDir / "cubec.frag.spv").string();
+	// Headless pixel proof: snapshot eye 0 once and assert the cube
+	// drew. Documented at the capture site below.
+	bool verifyPixels = std::getenv("WIVRN_MACOS_VERIFY_PIXELS") != nullptr;
 
 	// ---- OpenXR instance/session through the real loader ----
 	const char * enabledExts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
@@ -367,7 +374,7 @@ int main(int argc, char ** argv)
 	XrSpace local = XR_NULL_HANDLE;
 	CHECK_XR(xrCreateReferenceSpace(session, &spaceInfo, &local), XR_SUCCESS);
 
-	// ---- Render setup: LOAD pass + hardcoded-color cube, no depth, no
+	// ---- Render setup: CLEAR pass + hardcoded-color cube, no depth, no
 	// culling, no ClearAttachments (all verified paths; see file header) ----
 	std::vector<uint32_t> vs = readSpv(vertPath.c_str());
 	std::vector<uint32_t> fs = readSpv(fragPath.c_str());
@@ -378,7 +385,7 @@ int main(int argc, char ** argv)
 	        .flags = 0,
 	        .format = (VkFormat)format,
 	        .samples = VK_SAMPLE_COUNT_1_BIT,
-	        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+	        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 	        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 	        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 	        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -731,6 +738,12 @@ int main(int argc, char ** argv)
 			};
 			vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+			// Explicit viewport/scissor (pipeline declares them dynamic;
+			// unset dynamic state is undefined — never rely on the default).
+			VkViewport viewport{0, 0, 1024, 1024, 0, 1};
+			vkCmdSetViewport(cmd, 0, 1, &viewport);
+			VkRect2D scissor{{0, 0}, {1024, 1024}};
+			vkCmdSetScissor(cmd, 0, 1, &scissor);
 			VkDeviceSize off = 0;
 			vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
 			// Per-eye view-projection (world-fixed stereo): projection from
@@ -760,6 +773,54 @@ int main(int argc, char ** argv)
 			CHECK_VK(vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 10'000'000'000ull));
 			vkFreeCommandBuffers(dev.device, pool, 1, &cmd);
 			vkDestroyFramebuffer(dev.device, fb, nullptr);
+
+			// Headless pixel proof (WIVRN_MACOS_VERIFY_PIXELS=1, checked
+			// once at frame 30): snapshot eye 0 through the same path the
+			// encoder uses and assert the cube drew upright. Regression
+			// guard for the degenerate-FOV outage (an INF projection clips
+			// everything → zero non-clear pixels) and the Vulkan Y-flip
+			// (the green +Y face must read back in the upper half).
+			if (verifyPixels && eye == 0 && frame == 30)
+			{
+				static wivrn_macos::EyeSnapshot snap;
+				static bool snapInit = false;
+				if (!snapInit)
+				{
+					CHECK(snap.init(dev.phys, dev.device, dev.queue, dev.family, 1024, 1024));
+					snapInit = true;
+				}
+				const uint8_t * px = snap.capture(eyes[eye].images[index]);
+				CHECK(px != nullptr);
+				// Corner pixel = background (the cube renders centered).
+				uint8_t bb = px[0], bg = px[1], br = px[2];
+				size_t diff = 0;
+				uint64_t gTop = 0, gBot = 0;
+				for (uint32_t y = 0; y < 1024; ++y)
+				{
+					for (uint32_t x = 0; x < 1024; ++x)
+					{
+						const uint8_t * p = px + ((size_t)y * 1024 + x) * 4;
+						int d = std::abs((int)p[0] - bb) + std::abs((int)p[1] - bg) + std::abs((int)p[2] - br);
+						if (d > 12)
+						{
+							++diff;
+							if (y < 512)
+								gTop += p[1];
+							else
+								gBot += p[1];
+						}
+					}
+				}
+				std::printf(
+				        "demo pixels: diff=%zu (%.3f%%) gTop=%llu gBot=%llu\n",
+				        diff,
+				        100.0 * (double)diff / (1024.0 * 1024.0),
+				        (unsigned long long)gTop,
+				        (unsigned long long)gBot);
+				bool ok = diff > 1024 && gTop > gBot * 6 / 5;
+				std::printf("demo pixels: %s\n", ok ? "PASS" : "FAIL");
+				std::exit(ok ? 0 : 1);
+			}
 
 			projViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 			projViews[eye].pose = views[eye].pose;
