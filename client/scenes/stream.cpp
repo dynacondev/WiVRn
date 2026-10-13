@@ -1998,6 +1998,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (fp.cutouts_punched)
 			need_flat = true;
 		bool have_projected = session.has_projected_instances();
+		// Forensic submit decisions (change-triggered): which camera layer
+		// submits and why. Permanent: coexistence bugs read as wrong output
+		// with no error, so the decision itself must be in the log.
+		{
+			static bool last_need_flat = true;
+			static bool last_have_projected = false;
+			if (need_flat != last_need_flat or have_projected != last_have_projected)
+			{
+				last_need_flat = need_flat;
+				last_have_projected = have_projected;
+				spdlog::info("Camera submit: {} (need_flat={} have_projected={} fade_done={} cutouts={})",
+				             need_flat ? "flat" : (have_projected ? "projected" : "video-only"), need_flat,
+				             have_projected, fade_done, fp.cutouts_punched);
+			}
+		}
 		bool first_group = true;
 		for (auto & [f, g]: fp.mask_groups)
 		{

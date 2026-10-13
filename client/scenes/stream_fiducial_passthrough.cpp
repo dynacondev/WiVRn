@@ -993,10 +993,29 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				}
 			}
 			else if (have and not want)
+			{
 				session.remove_projected_instance(oid);
+				spdlog::info("Projected instance \"{}\" removed", oid);
+			}
 			if (want and session.has_projected_instance(oid))
-				session.update_projected_instance_transform(oid, world_space, predicted_display_time,
-				                                            ost.fused.world_pose, ost.fused.world_scale);
+			{
+				try
+				{
+					session.update_projected_instance_transform(oid, world_space, predicted_display_time,
+					                                            ost.fused.world_pose, ost.fused.world_scale);
+				}
+				catch (std::exception & e)
+				{
+					// Throttled: a persistently bad transform keeps last
+					// good state instead of spamming every frame.
+					static XrTime last_transform_warn = 0;
+					if (now - last_transform_warn > 5'000'000'000LL)
+					{
+						last_transform_warn = now;
+						spdlog::warn("Projected instance \"{}\": transform update failed: {}", oid, e.what());
+					}
+				}
+			}
 		}
 	}
 
@@ -1157,7 +1176,10 @@ void scenes::stream::gui_passthrough()
 		bool b = surface_projected_effective(oid, ost);
 		std::string title = label + "##projected_" + oid;
 		if (ImGui::Checkbox(title.c_str(), &b))
+		{
 			projected_overrides[oid] = b;
+			spdlog::info("Projected override \"{}\" {}", oid, b ? "on" : "off");
+		}
 		ImGui::SameLine();
 		ImGui::TextDisabled("%s", ost.def.surface_projected ? "(config on)" : "(config off)");
 	}
