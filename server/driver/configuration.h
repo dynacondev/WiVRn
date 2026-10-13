@@ -103,9 +103,11 @@ struct configuration
 	struct passthrough_object
 	{
 		// Behavior type. "3d-passthrough" renders the model as a
-		// surface-projected passthrough cutout. Unknown types are
-		// skipped with a warning (forward-compat for
-		// 3d-passthrough-reversed, 3d-boundary(-reversed), 3d-depth).
+		// surface-projected passthrough cutout. "3d-passthrough-reversed"
+		// reverse-cuts the model from every mask layer instead (game video
+		// shows through the silhouette, depth-tested against the windows
+		// covering each pixel). Unknown types are skipped with a warning
+		// (forward-compat for 3d-boundary(-reversed), 3d-depth).
 		std::string type = "3d-passthrough";
 		std::string id;
 		std::string tag;
@@ -119,7 +121,9 @@ struct configuration
 		float scale = 1;
 		// Passthrough window feather width in screen pixels (render-only,
 		// applied live). Mask stacks group by this value so each object
-		// feathers independently.
+		// feathers independently. Not accepted for
+		// 3d-passthrough-reversed (warned + ignored): negatives cut every
+		// layer and inherit each layer's feathering through its blur.
 		float feather_px = 24;
 		// Alpha fade-in at first acquisition, milliseconds (0 = instant,
 		// render-only, applied live).

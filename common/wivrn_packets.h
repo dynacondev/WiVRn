@@ -1016,8 +1016,10 @@ struct fiducial_entry
 struct passthrough_object
 {
 	// Behavior type. "3d-passthrough" renders the model as a
-	// surface-projected passthrough cutout; unknown types are skipped
-	// client-side (forward-compat).
+	// surface-projected passthrough cutout; "3d-passthrough-reversed"
+	// reverse-cuts the model from every mask layer instead (game video
+	// shows through, depth-tested against covering windows). Unknown
+	// types are skipped client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
 	std::string tag;

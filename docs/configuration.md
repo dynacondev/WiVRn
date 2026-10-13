@@ -248,9 +248,17 @@ Each `fiducials` entry has:
 Each `passthrough` entry (behavior object) has:
 
 - `type`: behavior type. `"3d-passthrough"` renders the model as a
-  surface-projected passthrough cutout. Unknown types are skipped with a
-  warning (forward-compat for `3d-passthrough-reversed`, `3d-boundary`,
-  `3d-boundary-reversed`, `3d-depth`).
+  surface-projected passthrough cutout. `"3d-passthrough-reversed"`
+  reverse-cuts the model from the mask instead: game video shows through
+  the silhouette (e.g. a virtual screen floating in front of a real-desk
+  window). Reversed objects cut every mask layer and inherit each
+  layer's feathering through its blur; a negative cuts only where it is
+  nearer than the windows covering that pixel (depth-tested per layer),
+  so a distant reversed object behind a nearer window never cuts it.
+  Reversed objects need the mask path (they stay inactive on the binary
+  projected fallback) and do not accept `feather-px` (warned + ignored).
+  Unknown types are skipped with a warning (forward-compat for
+  `3d-boundary`, `3d-boundary-reversed`, `3d-depth`).
 - `id`: stable identifier (required, must be unique); `tag`: display-only
   label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required; dangling
@@ -270,7 +278,9 @@ Each `passthrough` entry (behavior object) has:
   (default `1`, objects only, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
   (alpha-gradient blend band around the mesh silhouette, default `24`;
-  `0` disables feathering). Mask stacks group by this value so each
+  `0` disables feathering). Not accepted for `3d-passthrough-reversed`
+  (warned + ignored): negatives cut every layer and inherit each
+  layer's feathering. Mask stacks group by this value so each
   object feathers independently; applied live. The client selects a blur
    tier automatically (0 hard edge, 1 half-res, 2/4 quarter, 8 eighth
    with exact spread mapping, clamped to 128px), so tap density and cost
@@ -330,6 +340,16 @@ Passthrough tab (red) to help you copy it verbatim into the config.
 			"orientation": [0, 0, 0],
 			"scale": 1.0,
 			"feather-px": 24
+		},
+		{
+			"type": "3d-passthrough-reversed",
+			"id": "press-screen",
+			"tag": "Virtual screen (game content)",
+			"fiducial": ["press"],
+			"model-path": "/usr/share/wivrn/meshes/screen.glb",
+			"position": [0, 0.3, 0.2],
+			"orientation": [0, 0, 0],
+			"scale": 1.0
 		}
 	]
 }

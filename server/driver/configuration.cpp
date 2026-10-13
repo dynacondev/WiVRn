@@ -508,7 +508,7 @@ configuration::configuration()
 				passthrough_object o;
 				if (item.contains("type"))
 					o.type = item["type"];
-				if (o.type != "3d-passthrough")
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed")
 				{
 					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
 					        item.value("id", o.type).c_str(), o.type.c_str());
@@ -560,7 +560,12 @@ configuration::configuration()
 						o.scale = item["scale"].at(0);
 				}
 				if (item.contains("feather-px"))
-					o.feather_px = item["feather-px"];
+				{
+					if (o.type == "3d-passthrough-reversed")
+						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for 3d-passthrough-reversed, ignoring", o.id.c_str());
+					else
+						o.feather_px = item["feather-px"];
+				}
 				if (item.contains("fade-in-ms"))
 					o.fade_in_ms = item["fade-in-ms"];
 				if (std::ranges::any_of(passthrough_objects, [&](const passthrough_object & p) { return p.id == o.id; }))
