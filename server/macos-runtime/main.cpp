@@ -89,6 +89,13 @@ int main(int argc, char ** argv)
 		manifest = manifest_storage.c_str();
 	}
 	::setenv("XR_RUNTIME_JSON", manifest, 1);
+	// Exactly one MoltenVK in the child: macOS hosts commonly ship two
+	// (Homebrew + LunarG), and mapping both prints duplicate-class
+	// warnings and leaves driver selection to loader order. Pin Homebrew's
+	// (matches our loader/headers era) unless overridden.
+	if (::getenv("VK_ICD_FILENAMES") == nullptr &&
+	    ::access("/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json", R_OK) == 0)
+		::setenv("VK_ICD_FILENAMES", "/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json", 1);
 	std::printf("wivrn-server-macos: launching %s (runtime %s, port %s)\n", argv[app_at], manifest, port);
 
 	pid_t pid = 0;

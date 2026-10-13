@@ -504,6 +504,19 @@ frame-free); one-shot logs for the latched origin + first sent view
 poses. Loopback stream test updated to the latch semantics
 (VIEW-in-LOCAL (0,5,0) for fake HEAD (4,5,6)). All suites PASS.
 Awaiting retest — static cubes + grip cubes should both be in view.
+Headset run 8 (same day): view panel tracks, still no cubes. Forensics
+closed it: staged pixels are uniformly (151,151,119) even though the app
+records 38k draws into OUR images (api_dump: framebuffers wrap our views,
+layouts match, single queue/thread/driver FIFO). Isolated replication in
+loopback tests proved (a) LOAD preserves, transfer copies are exact, draws
++ push constants + indexed + culling all behave, but (b) hello_xr's exact
+vkCmdClearAttachments writes X instead of slate (fullscreen and sub-rect,
+fresh images too), and (c) hello_xr's exact cube draw (its SPV + verts +
+BACK+CW) is fully culled while CULL_NONE shows it. So on this MoltenVK,
+hello_xr as-is can never display (ClearAttachments-X bg + culled cubes) —
+app/driver quirks, not the runtime. New `wivrn-macos-demo` vehicle instead
+(animated bg via loadOp-CLEAR + spinning cube, no depth/culling/
+ClearAttachments — only verified paths). Awaiting demo headset retest.
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

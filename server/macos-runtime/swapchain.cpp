@@ -35,9 +35,12 @@ extern "C"
 			return XR_ERROR_HANDLE_INVALID;
 		// BGRA first: the v1 x264 path consumes BGRA with zero swizzle
 		// (X264_CSP_BGRA); RGBA apps take a CPU swizzle in Phase 5.
+		// D32_SFLOAT last: depth for apps that need it (hello_xr takes
+		// it over its fallback textures, which never clear on Metal).
 		static constexpr int64_t supported[] = {
 		        VK_FORMAT_B8G8R8A8_SRGB,
 		        VK_FORMAT_R8G8B8A8_SRGB,
+		        VK_FORMAT_D32_SFLOAT,
 		};
 		static constexpr uint32_t count = sizeof(supported) / sizeof(supported[0]);
 		if (formatCapacityInput == 0)
@@ -69,7 +72,8 @@ extern "C"
 			return XR_ERROR_HANDLE_INVALID;
 		if (!session->data.hasGraphicsBinding)
 			return XR_ERROR_GRAPHICS_DEVICE_INVALID;
-		bool knownFormat = createInfo->format == VK_FORMAT_R8G8B8A8_SRGB || createInfo->format == VK_FORMAT_B8G8R8A8_SRGB;
+		bool knownFormat = createInfo->format == VK_FORMAT_R8G8B8A8_SRGB || createInfo->format == VK_FORMAT_B8G8R8A8_SRGB ||
+		                   createInfo->format == VK_FORMAT_D32_SFLOAT;
 		if (!knownFormat)
 			return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
 

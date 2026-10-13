@@ -125,6 +125,34 @@ target_include_directories(wivrn-macos-stream-test PRIVATE
 )
 target_link_libraries(wivrn-macos-stream-test PRIVATE openxr_loader Vulkan::Vulkan wivrn-common)
 
+# Minimal animated demo app (v1 headset proof vehicle): cycling background
+# + spinning cube through our swapchains. Uses only verified paths
+# (loadOp-CLEAR, no depth/culling/ClearAttachments); hello_xr cannot serve
+# as the proof (its ClearAttachments yields driver fill + its BACK+CW
+# cubes are culled on MoltenVK — see ROADMAP run 8).
+find_program(GLSLANG_VALIDATOR glslangValidator)
+if(GLSLANG_VALIDATOR)
+	add_custom_command(
+		OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/cubec.vert.spv ${CMAKE_CURRENT_BINARY_DIR}/cubec.frag.spv
+		COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cubec.vert -o ${CMAKE_CURRENT_BINARY_DIR}/cubec.vert.spv
+		COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cubec.frag -o ${CMAKE_CURRENT_BINARY_DIR}/cubec.frag.spv
+		DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cubec.vert ${CMAKE_CURRENT_SOURCE_DIR}/shaders/cubec.frag
+		COMMENT "Compiling demo shaders"
+	)
+	add_executable(wivrn-macos-demo
+		demo.cpp
+		${CMAKE_CURRENT_BINARY_DIR}/cubec.vert.spv
+		${CMAKE_CURRENT_BINARY_DIR}/cubec.frag.spv
+	)
+	target_include_directories(wivrn-macos-demo PRIVATE
+		${openxr_loader_SOURCE_DIR}/include
+		.
+	)
+	target_link_libraries(wivrn-macos-demo PRIVATE openxr_loader Vulkan::Vulkan)
+else()
+	message(STATUS "glslangValidator not found, skipping wivrn-macos-demo")
+endif()
+
 # Phase 6: stock hello_xr from OpenXR-SDK-Source, built isolated via
 # ExternalProject (its loader target would collide with ours in one
 # scope). Trimmed to samples only; default graphics overridden on the

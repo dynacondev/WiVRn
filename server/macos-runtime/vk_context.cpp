@@ -24,6 +24,15 @@ bool format_ok(VkPhysicalDevice phys, VkFormat format)
 	return (props.optimalTilingFeatures & needed) == needed;
 }
 
+bool depth_format_ok(VkPhysicalDevice phys, VkFormat format)
+{
+	VkFormatProperties props{};
+	vkGetPhysicalDeviceFormatProperties(phys, format, &props);
+	constexpr VkFormatFeatureFlags needed =
+	        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+	return (props.optimalTilingFeatures & needed) == needed;
+}
+
 uint32_t memory_type(VkPhysicalDevice phys, uint32_t bits, bool deviceLocal)
 {
 	VkPhysicalDeviceMemoryProperties mem{};
@@ -66,14 +75,20 @@ XrResult validate_swapchain_config(
 	}
 	if (mipCount != 1 || faceCount != 1)
 		return XR_ERROR_VALIDATION_FAILURE;
-	if ((usage & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0)
+	bool depth = (usage & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+	if (depth && format != VK_FORMAT_D32_SFLOAT)
 	{
-		log("swapchain: depth/stencil unsupported in v1");
+		log("swapchain: only D32_SFLOAT depth in v1 (format %d)", (int)format);
 		return XR_ERROR_FEATURE_UNSUPPORTED;
 	}
-	if (!format_ok(phys, static_cast<VkFormat>(format)))
+	if (!depth && !format_ok(phys, static_cast<VkFormat>(format)))
 	{
 		log("swapchain: format %d lacks color/transfer support on this device", (int)format);
+		return XR_ERROR_FEATURE_UNSUPPORTED;
+	}
+	if (depth && !depth_format_ok(phys, static_cast<VkFormat>(format)))
+	{
+		log("swapchain: format %d lacks depth support on this device", (int)format);
 		return XR_ERROR_FEATURE_UNSUPPORTED;
 	}
 	return XR_SUCCESS;
@@ -83,8 +98,13 @@ XrResult create_swapchain_images(Swapchain & swap)
 {
 	VkPhysicalDevice phys = swap.session->vkPhysicalDevice;
 	VkFormat format = static_cast<VkFormat>(swap.format);
+	bool depth = (swap.usage & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
 
-	VkImageUsageFlags imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+	VkImageUsageFlags imageUsage;
+	if (depth)
+		imageUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	else
+		imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 	VkImageCreateFlags imageFlags = 0;
 	if ((swap.usage & XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT) != 0)
 		imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;

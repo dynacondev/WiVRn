@@ -698,6 +698,19 @@ extern "C"
 		fill_active(session, act, active, when);
 		(void)when;
 		state->isActive = active && binding != nullptr;
+		// One-shot: hello_xr gates hand cubes on this (false = no cubes).
+		{
+			static bool logged = false;
+			if (!logged)
+			{
+				logged = true;
+				wivrn_macos::log(
+				        "actions: GetActionStatePose isActive=%d (everSynced=%d bound=%d)",
+				        (int)state->isActive,
+				        (int)active,
+				        binding != nullptr);
+			}
+		}
 		return XR_SUCCESS;
 	}
 
