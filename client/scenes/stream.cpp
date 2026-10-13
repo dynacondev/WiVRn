@@ -1072,6 +1072,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		++blit_handle->feedback.times_displayed;
 		blit_handle->feedback.displayed = frame_state.predictedDisplayTime;
 
+		// TEMP-DEBUG (macos-v1 bring-up, revert): log when a NEW frame is
+		// presented per eye (answers "what is the user actually seeing").
+		static uint64_t dbg_shown[2] = {uint64_t(-1), uint64_t(-1)};
+		if (i < 2 && blit_handle->feedback.frame_index != dbg_shown[i])
+		{
+			dbg_shown[i] = blit_handle->feedback.frame_index;
+			spdlog::info("stream-dbg: presenting eye {} frame {}", i, (unsigned long long)dbg_shown[i]);
+		}
+
 		use_alpha = blit_handle->view_info.alpha;
 
 #if WIVRN_USE_V4L2

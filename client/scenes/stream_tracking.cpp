@@ -611,6 +611,23 @@ void scenes::stream::tracking()
 
 			network_session->send_stream(std::span(packets.data(), packet_count));
 
+			// TEMP-DEBUG (macos-v1 bring-up, revert): prove the requested
+			// pattern yields grip/aim poses — device list + positions
+			// every ~3s (200Hz loop).
+			static uint64_t dbg_tracking_packets = 0;
+			if (++dbg_tracking_packets % 600 == 0)
+			{
+				spdlog::info("stream-dbg: tracking {} devices", tracking.device_poses.size());
+				for (const auto & p: tracking.device_poses)
+				{
+					spdlog::info("stream-dbg: dev {} at ({:.2f},{:.2f},{:.2f})",
+					             magic_enum::enum_name(p.device),
+					             (double)p.pose.position.x,
+					             (double)p.pose.position.y,
+					             (double)p.pose.position.z);
+				}
+			}
+
 			XrTime old = scheduled_derived_pose;
 			if (old and now > old)
 			{

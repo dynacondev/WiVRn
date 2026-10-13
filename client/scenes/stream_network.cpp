@@ -146,6 +146,10 @@ void scenes::stream::operator()(audio_data && data)
 
 void scenes::stream::send_feedback(const wivrn::from_headset::feedback & feedback)
 {
+	// TEMP-DEBUG (macos-v1 bring-up, revert): NACKs (genuine loss) only;
+	// completion/display receipts are healthy traffic.
+	if (feedback.times_displayed == 0 && !feedback.sent_to_decoder)
+		spdlog::info("stream-dbg: NACK stream {} frame {}", feedback.stream_index, (unsigned long long)feedback.frame_index);
 	try
 	{
 		network_session->send_control(wivrn::from_headset::feedback{feedback});
