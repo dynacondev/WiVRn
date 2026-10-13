@@ -153,6 +153,18 @@ Mixed = 2 groups (f=12+f=24 or 23+24).
 - **Spread continuity** (divisor 12k: f/24,f/48,f/48,f/96): tier-1's
   slope was ~2× the 2/4/8 family (~40% pop at f=16→17); band is now
   √2·f/6 at every tier, exact at all boundaries.
+- **Internal-only feather** (erode-then-blur): a box-min erosion pass
+  (3x3 ≈ 1 texel, 5x5 ≈ 2) runs on the blur input so the blur band
+  lands inside the silhouette instead of straddling it (tier-0 hard
+  edges skip it; reversed cuts erode consistently — coverage erosion
+  grows holes, shrinks fills). E derives from the blur spread itself
+  (self-calibrating across tiers), skipped for sub-pixel bands, always
+  rounded outward (inset beats halo for mapped windows). No new
+  targets: tier-1 swaps A/B roles, tiered borrows eblur/down
+  framebuffers; +1 descriptor set pair + 2 pipelines (no new
+  renderpasses — min pipes reuse the R8 blur pass). Tune exactness
+  from photos (formula within a texel by construction; past ~2 texels
+  the single min5 pass under-erodes huge feathers).
 - Dead ends: SDF/Jump-Flood replacement (reverted, 5.1× solo cost);
   intermediate shrinking; punch scissor (debug-only); descriptor
   aliasing/DVFS/marker-flicker/mesh-size theories ruled out.
