@@ -451,6 +451,18 @@ Loopback test converted to closed-loop framing (fixed 12-frame burst
 was overwritten faster than the worker drained — 1-in-4 flake — now
 frames until 4 reassembled or 400 cap): 10/10 PASS (6–26 stream
 frames, NACK→IDR every run). Awaiting retest.
+Headset run 3 (same day): worker healthy (180+ encodes/eye, both first
+frames decoded 2064x2208) but client frozen on first frame 29s, then
+control died. Prime suspect: display_time in the wrong clock domain —
+offset is 0 until the first timesync response, but the first query went
+out only after ~120 encodes (~10s+), so the client holds future-dated
+frames. Fixes: timesync burst x4 over reliable control at connect
+(first sample snaps the offset), UDP send failure no longer latches
+disconnect (drop frame, keep streaming; only control-path failure
+drops the link — the latch once froze a live session behind healthy
+encode logs), first-sample/first-tracking/NACK/settings/pin-addr logs
++ sent/drop counters in the periodic line as permanent alibis.
+Loopback 5/5 PASS. Awaiting retest.
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

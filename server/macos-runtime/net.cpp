@@ -22,6 +22,22 @@ namespace
 
 using FromPackets = wivrn::from_headset::packets;
 
+// Dual-stack peer formatting (the UDP socket is v6 with v4-mapped).
+std::string format_peer(const sockaddr_in6 & addr)
+{
+	char host[INET6_ADDRSTRLEN] = {};
+	uint16_t port = ntohs(addr.sin6_port);
+	if (IN6_IS_ADDR_V4MAPPED(&addr.sin6_addr))
+	{
+		::inet_ntop(AF_INET, addr.sin6_addr.s6_addr + 12, host, sizeof(host));
+	}
+	else
+	{
+		::inet_ntop(AF_INET6, &addr.sin6_addr, host, sizeof(host));
+	}
+	return std::string(host) + ":" + std::to_string(port);
+}
+
 // Poll-then-receive with a total timeout, sliced for stop checks.
 // Returns nullopt on timeout; throws on HUP/ERR or stop.
 template <typename Socket>
@@ -116,9 +132,18 @@ void HeadsetClock::observe(int64_t query_sent_ns, int64_t response_headset_ns, i
 {
 	int64_t rtt = received_ns - query_sent_ns;
 	int64_t sample = response_headset_ns - received_ns + rtt / 2;
-	std::lock_guard lock(mutex_);
-	offset_ = have_sample_ ? offset_ * 0.875 + sample * 0.125 : (double)sample;
-	have_sample_ = true;
+	bool first = false;
+	{
+		std::lock_guard lock(mutex_);
+		first = !have_sample_;
+		offset_ = have_sample_ ? offset_ * 0.875 + sample * 0.125 : (double)sample;
+		have_sample_ = true;
+	}
+	// The first sample snaps the offset: until it lands every frame's
+	// display_time is in the wrong clock domain (log it — a missing
+	// line means timesync responses never arrive).
+	if (first)
+		log("link: timesync converged, offset=%lldms", (long long)(sample / 1'000'000));
 }
 
 int64_t HeadsetClock::to_headset(int64_t server_ns) const
@@ -166,6 +191,14 @@ void NetworkSource::update_tracking(const wivrn::from_headset::tracking & tracki
 		echo_.fov[i] = tracking.views[i].fov;
 	}
 	echo_.valid = true;
+	// First live sample: view_info poses + the runtime's HEAD tracking
+	// start flowing from here (a missing line means client->server UDP
+	// never arrives).
+	if (!live_logged_)
+	{
+		live_logged_ = true;
+		log("link: tracking live");
+	}
 }
 
 void NetworkSource::update_inputs(const wivrn::from_headset::inputs & inputs)
@@ -491,6 +524,7 @@ bool HeadsetLink::accept_and_handshake(std::stop_token stop)
 						udp->connect(addr);
 						int sndbuf = 5 * 1024 * 1024;
 						::setsockopt(udp->get_fd(), SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+						log("link: stream pinned to %s", format_peer(addr).c_str());
 						stream = std::move(udp);
 						pinned = true;
 						break;
@@ -561,6 +595,7 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 				// NACK (never displayed) forces an IDR like the Linux path.
 				if (feedback->times_displayed == 0 && events_.need_idr)
 				{
+					log("link: NACK, forcing IDR");
 					try
 					{
 						events_.need_idr();
@@ -574,6 +609,9 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 			{
 				if (events_.settings_changed && settings->bitrate_bps > 0)
 				{
+					log("link: settings bitrate=%u refresh=%.0f",
+					    settings->bitrate_bps,
+					    (double)settings->preferred_refresh_rate);
 					try
 					{
 						float fps = settings->preferred_refresh_rate / (float)(settings->fps_divider != 0 ? settings->fps_divider : 1);
@@ -686,6 +724,26 @@ void HeadsetLink::send_timesync_query()
 	}
 	catch (...)
 	{
+		// UDP loss is normal (dropped query, next one follows); only a
+		// control-path failure means the headset is gone.
+		if (!stream_)
+			connected_ = false;
+	}
+}
+
+void HeadsetLink::send_timesync_burst()
+{
+	std::lock_guard lock(mutex_);
+	if (!connected_ || !control_)
+		return;
+	try
+	{
+		for (int i = 0; i < 4; ++i)
+			control_->send(wivrn::to_headset::timesync_query{.query = now_ns()});
+	}
+	catch (const std::exception & e)
+	{
+		log("link: timesync burst failed: %s", e.what());
 		connected_ = false;
 	}
 }
@@ -724,11 +782,25 @@ void HeadsetLink::send_frame(OutgoingFrame frame)
 				control_->send(wivrn::to_headset::video_stream_data_shard{shard});
 			++shard.shard_idx;
 		}
+		++sent_frames_;
 	}
 	catch (const std::exception & e)
 	{
-		log("link: frame send failed: %s", e.what());
-		connected_ = false;
+		// The control path is fate-sharing with the connection, but UDP
+		// loss is normal (burst EAGAIN on a full send buffer): drop the
+		// frame and keep streaming. Latching disconnect here once froze
+		// a live session with the worker still "encoding" behind it.
+		if (frame.reliable || !use_stream)
+		{
+			log("link: frame send failed: %s", e.what());
+			connected_ = false;
+		}
+		else
+		{
+			uint64_t dropped = ++dropped_frames_;
+			if (dropped == 1 || dropped % 60 == 0)
+				log("link: stream send dropped frame %llu (%s)", (unsigned long long)dropped, e.what());
+		}
 	}
 }
 

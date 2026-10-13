@@ -154,6 +154,11 @@ void Streamer::on_connected(const wivrn::from_headset::headset_info_packet & inf
 	for (Eye & eye: eyes_)
 		eye.force_idr = true;
 	lastConnected_ = true;
+	// Converge the headset clock NOW, not after ~120 encodes: the first
+	// sample snaps the offset, and every frame's display_time is in the
+	// wrong clock domain until it lands (client holds future-dated
+	// frames). Reliable socket: handshake proved TCP works.
+	link_.send_timesync_burst();
 }
 
 void Streamer::on_disconnected()
@@ -479,9 +484,11 @@ void Streamer::encode_eye(uint32_t eye_index)
 	link_.send_frame(std::move(out));
 
 	if (++eye.encoded_count % 60 == 0)
-		log("streamer: eye %u encoded=%llu snap=%.1fms enc=%.1fms",
+		log("streamer: eye %u encoded=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms",
 		    eye_index,
 		    (unsigned long long)eye.encoded_count,
+		    (unsigned long long)link_.sent_frames(),
+		    (unsigned long long)link_.dropped_frames(),
 		    snap_ns / 1e6,
 		    (encode_end - encode_begin) / 1e6);
 

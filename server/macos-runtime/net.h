@@ -71,6 +71,7 @@ private:
 	mutable std::mutex mutex_;
 	TrackingSample sample_{};
 	ViewsEcho echo_{};
+	bool live_logged_ = false;
 };
 
 // Outgoing video shard batch for one eye frame (built by the streamer,
@@ -122,7 +123,21 @@ public:
 	void send_video_stream_description(uint16_t width, uint16_t height, float fps);
 	void send_tracking_control();
 	void send_timesync_query();
+	// First-seconds burst over the reliable control socket: the first
+	// sample snaps the clock offset, and every frame's display_time is
+	// unusable until it lands.
+	void send_timesync_burst();
 	void send_frame(OutgoingFrame frame);
+	// Lifetime counters for the streaming log line (atomic: the worker
+	// bumps them under no lock discipline of its own).
+	uint64_t sent_frames() const
+	{
+		return sent_frames_.load();
+	}
+	uint64_t dropped_frames() const
+	{
+		return dropped_frames_.load();
+	}
 
 private:
 	using ControlSocket = wivrn::typed_socket<wivrn::TCP, wivrn::from_headset::packets, wivrn::to_headset::packets>;
@@ -150,6 +165,8 @@ private:
 	std::jthread control_thread_;
 	std::jthread stream_thread_;
 	std::atomic<bool> running_ = false;
+	std::atomic<uint64_t> sent_frames_{0};
+	std::atomic<uint64_t> dropped_frames_{0};
 };
 
 } // namespace wivrn_macos
