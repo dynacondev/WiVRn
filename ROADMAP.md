@@ -401,6 +401,16 @@ ever bites.
   zerolatency/main/ABR/Annex-B, CPU BT.709 full-range BGRA→NV12 —
   x264 has no RGB→420 main-profile path) + `shard_frame` (≤1400 B,
   IDR/config reliable). `wivrn-macos-encode-test` headless PASS.
+- [x] Slice B (done 2026-10-13): `net` (TCP accept + 9-step handshake
+  with `encryption_disabled`, UDP stream pinning, control/stream RX
+  threads, TX on EndFrame thread) + `NetworkSource` tracking/inputs
+  feed + `HeadsetClock` timesync EWMA. `wivrn-macos-net-test`
+  loopback fake-headset PASS (handshake, info, tracking→sample,
+  +80 ms timesync convergence, NACK→IDR, settings event).
+  Findings: `receive_from_raw` MSG_PEEK|null is empty on Darwin
+  (dedicated 64 KB heap recvfrom instead); received packets borrow
+  socket buffers (validate inline, copy scalars only); shutdown
+  ordering must be accept-joins-RX-then-teardown (else UAF/deadlock).
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

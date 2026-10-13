@@ -39,6 +39,7 @@ add_library(wivrn-macos-runtime MODULE
 	frame.cpp
 	snapshot.cpp
 	encode.cpp
+	net.cpp
 )
 target_include_directories(wivrn-macos-runtime PRIVATE
 	${openxr_loader_SOURCE_DIR}/include
@@ -95,3 +96,17 @@ target_include_directories(wivrn-macos-encode-test PRIVATE
 	.
 )
 target_link_libraries(wivrn-macos-encode-test PRIVATE Vulkan::Vulkan PkgConfig::X264)
+
+# Phase 5b proof: full handshake + steady-state exchange against a
+# loopback fake headset (no real hardware).
+add_executable(wivrn-macos-net-test
+	test_net.cpp
+	runtime.cpp
+	net.cpp
+	vk_context.cpp
+)
+target_include_directories(wivrn-macos-net-test PRIVATE
+	${openxr_loader_SOURCE_DIR}/include
+	.
+)
+target_link_libraries(wivrn-macos-net-test PRIVATE Vulkan::Vulkan wivrn-common)

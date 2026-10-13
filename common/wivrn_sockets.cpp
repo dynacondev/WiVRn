@@ -285,6 +285,16 @@ std::pair<wivrn::deserialization_packet, sockaddr_in6> wivrn::UDP::receive_from_
 	sockaddr_in6 addr;
 	socklen_t addrlen = sizeof(addr);
 
+#ifdef __APPLE__
+	// Darwin: recvfrom with a null buffer does not report the datagram
+	// size (the Linux MSG_PEEK|null idiom yields 0/empty here), so read
+	// straight into a max-datagram heap buffer. Only used for rare
+	// unconnected receives (stream handshake), never the hot path.
+	auto buffer = std::make_shared_for_overwrite<uint8_t[]>(65535);
+	ssize_t received = recvfrom(fd, buffer.get(), 65535, 0, (sockaddr *)&addr, &addrlen);
+	if (received < 0)
+		throw std::system_error{errno, std::generic_category()};
+#else
 	ssize_t peeked = recvfrom(fd, nullptr, 0, MSG_PEEK | MSG_TRUNC, (sockaddr *)&addr, &addrlen);
 	if (peeked < 0)
 		throw std::system_error{errno, std::generic_category()};
@@ -293,6 +303,7 @@ std::pair<wivrn::deserialization_packet, sockaddr_in6> wivrn::UDP::receive_from_
 	ssize_t received = recvfrom(fd, buffer.get(), peeked, 0, (sockaddr *)&addr, &addrlen);
 	if (received < 0)
 		throw std::system_error{errno, std::generic_category()};
+#endif
 
 	std::span message{buffer.get(), (size_t)received};
 
