@@ -1,0 +1,7 @@
+{
+	"file_format_version": "1.0.0",
+	"runtime": {
+		"name": "WiVRn-macOS (v1 MVP)",
+		"library_path": "@WIVRN_MACOS_RUNTIME_PATH@"
+	}
+}

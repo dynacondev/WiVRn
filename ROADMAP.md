@@ -301,15 +301,27 @@ the macOS build, all Linux-neutral: `IPV6_JOIN/GROUP` aliases,
 -Wno-error=undef` (LunarG `vulkan.hpp` `#if (VULKAN_HPP_ASSERT ==
 assert)` trips Clang `-Wundef`; per AGENTS.md host-config advice).
 
-## Phase 2 — Runtime skeleton
+## Phase 2 — Runtime skeleton [status: done 2026-10-13]
 
-- [ ] `loader_entry.cpp` (`xrNegotiateLoaderRuntimeInterface` +
+- [x] `loader_entry.cpp` (`xrNegotiateLoaderRuntimeInterface` +
   dispatch + `wivrn-macos.json`), `runtime.*` (singleton
   instance/system), `session.cpp` (single-session state machine),
-  `views.cpp` (stereo/OPAQUE, extents from headset `info` packet).
+  `views.cpp` (stereo/opaque, extents from headset `info` packet).
 
 Accept: loader resolves via `XR_RUNTIME_JSON`, `xrCreateInstance/
 GetSystem` succeed.
+
+Verified: `wivrn-macos-runtime.dylib` + hermetic FetchContent loader
+(`release-1.1.59`, same as client) + `wivrn-macos-runtime-test`
+PASSes end to end through the real loader: negotiate, instance
+(good/bad-ext/bad-version), props, HMD system, stereo views
+(2x2064x2208), OPAQUE blend, session IDLE<->SYNCHRONIZED lifecycle,
+Vulkan-bound session refused (Phase 4), singleton
+create-destroy-create. Findings: `xrCreateInstance` must be
+NULL-instance retrievable (loader jumps to 0 otherwise); the loader
+pre-filters unknown extensions/versions and rejects simultaneous
+instances, so negative CreateInstance checks run solo. Runtime links
+headers only, never the loader lib.
 
 ## Phase 3 — Poses + simple-controller input
 
