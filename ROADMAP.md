@@ -230,3 +230,131 @@ Example config fragment (Phase 1):
 `position/orientation/scale` compose per
 `fiducialPose = observedMarkerPose * markerToFiducialOffset` then
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
+
+---
+
+# Roadmap: macOS Server v1 MVP (bespoke minimal OpenXR runtime)
+
+Goal: `wivrn-server-macos` executable on Apple Silicon macOS that runs
+macOS-native OpenXR apps (proof: `hello_xr` cube) and streams to the
+unmodified Android client over the existing WiVRn wire protocol.
+
+Locked decisions (2026-10-13):
+
+- Bespoke clean-room runtime in `server/macos-runtime/` (NOT a Monado
+  fork, NOT VDXR/OXRSys/DisplayXR/MetalXR/ox code). Pattern borrowed
+  from VDXR/OXRSys frame-flow discipline only.
+- x264-only encode; no audio; no D-Bus in v1; Bonjour (`dns_sd.h`)
+  discovery; hermetic deps via CMake FetchContent + mise-pinned LunarG
+  SDK; MoltenVK version gate relaxed (warn, don't fatal).
+- Apple Silicon only; stereo-only; Vulkan-only binding (MoltenVK);
+  OPAQUE-only; single instance/system/session; simple-controller input
+  only (no hands/eye/face/body/gamepad-mirroring/haptics-hardware).
+- Isolation: Linux `server/`, `patches/monado/`, `monado-rev` untouched
+  except `if(NOT APPLE)` CMake guards. Reuse `common/` by link with
+  thin adapters in the new folder (never refactor Linux files).
+- Wire compat sacred: `common/wivrn_packets.h` bit-identical, 9757
+  TCP+UDP + `_wivrn._tcp` TXT keys, so Android client + Linux server
+  stay in sync.
+
+## Phase 0 — Scaffolding [status: in progress]
+
+- [ ] `server/macos-runtime/` + `CMakeLists.txt` + `wivrn-server-macos`
+  target (own `main.cpp`, no `ipc_server_main_common`).
+- [ ] Preset `macos-server`: `WIVRN_BUILD_SERVER=OFF`,
+  `WIVRN_BUILD_MACOS_SERVER=ON`, `NVENC/VAAPI/VULKAN_ENCODE/PIPEWIRE/
+  WIVRNCTL/LH/SOLARXR=OFF`, `X264=ON`.
+- [ ] Top-level CMake `NOT APPLE` guards (AVAHI/glib-unix/libnotify/
+  LIBDRM/pipewire/systemd, systemd/firewalld installs) + MoltenVK
+  gate relax.
+- [ ] `mise.toml`: LunarG SDK pin + `PKG_CONFIG_PATH` docs.
+
+Accept: `cmake --preset macos-server` configures on macOS arm64.
+
+## Phase 1 — common/ portability shims
+
+- [ ] `wivrn_sockets.cpp`: `recvmmsg/sendmmsg` → `recvmsg` loop,
+  `MSG_NOSIGNAL` → `SO_NOSIGPIPE`, `MSG_DONTWAIT` → `O_NONBLOCK`,
+  `<netinet/in.h>`.
+- [ ] `named_thread.h`: `__APPLE__` → `pthread_setname_np(name)` branch.
+- [ ] Homebrew OpenSSL 3 (`OPENSSL_ROOT_DIR`); Boost/Eigen/CLI11
+  hermetic-or-brew.
+
+Accept: `wivrn-common` builds on macOS arm64.
+
+## Phase 2 — Runtime skeleton
+
+- [ ] `loader_entry.cpp` (`xrNegotiateLoaderRuntimeInterface` +
+  dispatch + `wivrn-macos.json`), `runtime.*` (singleton
+  instance/system), `session.cpp` (single-session state machine),
+  `views.cpp` (stereo/OPAQUE, extents from headset `info` packet).
+
+Accept: loader resolves via `XR_RUNTIME_JSON`, `xrCreateInstance/
+GetSystem` succeed.
+
+## Phase 3 — Poses + simple-controller input
+
+- [ ] `spaces.cpp` (`LOCAL/LOCAL_FLOOR/STAGE`, `LocateViews/Space`
+  from `from_headset::tracking`).
+- [ ] `actions.cpp` (simple-controller + Vive/Index→touch aliases,
+  `SyncActions/GetActionState*`; haptics forward or no-op).
+- [ ] `wivrn_connection` adapter (drop `wivrn_ipc_socket_monado`
+  pollfd); `configuration.cpp` JSON merge reuse.
+
+Accept: headset tracking drives view poses; controller buttons/sticks
+visible to app.
+
+## Phase 4 — Vulkan swapchains + frame loop
+
+- [ ] Trimmed `vk_bundle` subset (drop `*_FD/VIDEO/DMA_BUF/
+  encode_queues/share()`, single MoltenVK queue + own mutex).
+- [ ] Vulkan-only binding; `Acquire/Wait/Release` over app `VkImage`s.
+- [ ] Port `pacer` math, `foveation` (`Xr*` types, same `.comp`),
+  new minimal squasher over `XrCompositionLayerProjection` (+`Quad`
+  if cheap).
+
+Accept: app renders stereo frames into runtime swapchains at display
+rate without validation-layer errors.
+
+## Phase 5 — Encode + network + discovery
+
+- [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
+  host-visible copy verified modifier-free on MoltenVK.
+- [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR
+  handler unchanged.
+- [ ] `bonjour_publisher.cpp` (`dns_sd.h`, same TXT keys).
+
+Accept: `xrEndFrame` → squash → x264 → 9757 → client → poses back →
+`xrWaitFrame` prediction loop closes.
+
+## Phase 6 — Bring-up + proof
+
+- [ ] `hello_xr` (Vulkan/MoltenVK) via `XR_RUNTIME_JSON` streams live
+  cube to headset.
+
+Accept: live cube, pose-tracked views. No real-game compat, no CTS.
+
+## Phase 7 — Executable MVP packaging
+
+- [ ] CLI + config (`~/Library/Application Support/wivrn/` candidate,
+  XDG kept); `launchd` plist sample. No `.app`, no
+  signing/notarization.
+
+Accept: `./wivrn-server-macos` runs headless, reconnects cleanly.
+
+## v2 backlog (explicitly deferred, do not build in v1)
+
+- VideoToolbox HW encode (H.264/HEVC/Main10 + Rosetta-helper
+  question) + BT.709 color contract + ABR/FEC hardening.
+- CoreAudio input/output.
+- D-Bus control plane (keep `io.github.wivrn.Server.xml` names;
+  decide brew `dbus-daemon` vs new transport) + `wivrnctl` port.
+- Gamepad/HID mirroring (`CGEvent`/virtual-HID + entitlements) +
+  full haptics.
+- Hands/eye/face/body tracking.
+- Dashboard (Qt/Kirigami bundling; `avahi/firewall/steam` →
+  Bonjour/`pf`/Steam.app rewrites).
+- `.app` bundle + signing/notarization + Homebrew formula.
+- Intel/universal builds.
+- Real-game compat + CTS lane.
+- `xrizer`/OpenComposite glue for OpenVR-API games.

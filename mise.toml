@@ -11,6 +11,14 @@ ANDROID_BUILD_TOOLS = "36.0.0"
 "vfox:mise-plugins/vfox-android-sdk" = "23.0"  # Used for aquiring android sdk tools, which install the sdk using the mise postinstall script
 
 #* Android client build deps (Arch: git pkgconf glslang cmake jdk17-openjdk librsvg cli11 ktx-software-bin, see docs/building.md)
+#* macOS server v1 (bespoke runtime, Apple Silicon): Vulkan SDK cannot be mise-pinned
+# (no aqua package; LunarG ships only a sudo installer, no GitHub releases; brew has
+# no version pins and mise has no brew backend). Hermetic path is CMake FetchContent
+# (Vulkan-Headers + Vulkan-Loader + MoltenVK, pinned to the same vulkan-sdk-x.y.z tag —
+# see ROADMAP.md Phase 0/4). For local macOS dev today EITHER install
+# vulkansdk-macos-<ver>.zip manually from https://vulkan.lunarg.com/sdk/home
+# (sets VULKAN_SDK) OR `brew install vulkan-headers vulkan-loader molten-vk`.
+# Bonjour needs no dep: dns_sd.h ships in the Xcode SDK (libSystem, no -l flag).
 "github:KhronosGroup/glslang" = "16.6.0"       # glslangValidator for shaders (Arch glslang)
 "conda:git" = "2.56.0"                         # Arch git (find_package(Git) for version stamping)
 "conda:pkgconf" = "3.0.7"                      # Arch pkgconf (find_package(PkgConfig REQUIRED); note: provides pkgconf only, pkg-config comes from system brew/apt)

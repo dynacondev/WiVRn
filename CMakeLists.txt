@@ -44,6 +44,7 @@ option(WIVRN_BUILD_SERVER_LIBRARY "Build OpenXR library for WiVRn server" ${WIVR
 option(WIVRN_BUILD_DASHBOARD "Build WiVRn dashboard" OFF)
 option(WIVRN_BUILD_WIVRNCTL "Build wivrnctl" ON)
 option(WIVRN_BUILD_DISSECTOR "Build Wireshark dissector" OFF)
+option(WIVRN_BUILD_MACOS_SERVER "Build macOS bespoke server (v1 MVP, Apple Silicon)" OFF)
 option(WIVRN_BUILD_TEST "Build test binaries" OFF)
 option(WIVRN_WERROR "Treat warnings as errors" OFF)
 option(WIVRN_OPTIMIZE_SHADERS "Run spirv-opt on compiled shaders" ON)
@@ -99,7 +100,7 @@ option(ENABLE_COLOURED_OUTPUT "Always produce ANSI-coloured output (GNU/Clang on
 
 set(WIVRN_ENVIRONMENTS_URL "https://github.com/WiVRn/WiVRn-environments/releases/latest/download/index.json" CACHE STRING "URL hosting the custom environments json file")
 
-if (WIVRN_BUILD_CLIENT OR WIVRN_BUILD_SERVER OR WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_DISSECTOR)
+if (WIVRN_BUILD_CLIENT OR WIVRN_BUILD_SERVER OR WIVRN_BUILD_DASHBOARD OR WIVRN_BUILD_DISSECTOR OR WIVRN_BUILD_MACOS_SERVER)
     set(NEED_COMMON TRUE)
 else()
     set(NEED_COMMON FALSE)
@@ -136,7 +137,11 @@ endif()
 if (WIVRN_BUILD_SERVER)
     find_program(GDBUS_CODEGEN gdbus-codegen REQUIRED)
     if (Vulkan_VERSION  VERSION_LESS "1.4.304")
-        message(FATAL_ERROR "Vulkan version must be at least 1.4.304, found ${Vulkan_VERSION}")
+        if (APPLE)
+            message(WARNING "Vulkan version ${Vulkan_VERSION} is below 1.4.304; continuing on Apple (MoltenVK, warn-only)")
+        else()
+            message(FATAL_ERROR "Vulkan version must be at least 1.4.304, found ${Vulkan_VERSION}")
+        endif()
     endif()
 
     if (NOT WIVRN_USE_NVENC AND NOT WIVRN_USE_VAAPI AND NOT WIVRN_USE_X264 AND NOT WIVRN_USE_VULKAN_ENCODE)
@@ -343,6 +348,13 @@ if (WIVRN_BUILD_SERVER OR WIVRN_BUILD_SERVER_LIBRARY)
     endif()
 endif()
 
+if (WIVRN_BUILD_MACOS_SERVER)
+    if (NOT APPLE)
+        message(WARNING "WIVRN_BUILD_MACOS_SERVER is intended for macOS (Apple Silicon); continuing anyway")
+    endif()
+    add_subdirectory(server/macos-runtime)
+endif()
+
 if (WIVRN_BUILD_DASHBOARD)
     add_subdirectory(dashboard)
     set_target_properties(wivrn-dashboard PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/server)
@@ -350,7 +362,7 @@ endif()
 
 add_subdirectory(tools)
 
-foreach(TARGET_NAME wivrn wivrn-server wivrn-dashboard wivrn-common wivrn-dissector wivrnctl)
+foreach(TARGET_NAME wivrn wivrn-server wivrn-server-macos wivrn-dashboard wivrn-common wivrn-dissector wivrnctl)
     if(TARGET ${TARGET_NAME})
         target_compile_options(${TARGET_NAME} PRIVATE
             -fdiagnostics-color -Wall -Wextra -pedantic
