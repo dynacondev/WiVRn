@@ -682,7 +682,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			}
 			for (const auto & o: map.objects)
 			{
-				if (o.type != "3d-passthrough")
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed")
 					spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", o.id, o.type);
 			}
 			if (fp.ready)
@@ -840,7 +840,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	}
 	for (const auto & def: map.objects)
 	{
-		if (def.type != "3d-passthrough")
+		// Reversed objects place exactly like normal ones (fused board
+		// pose, mesh, fade); only the mask raster treats them as cuts.
+		// The binary projected fallback has no hole vocabulary, so the
+		// render shim below stays normal-only.
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed")
 			continue;
 		auto & ost = passthrough_objects[def.id];
 		ost.def = def;
@@ -1116,12 +1120,13 @@ void scenes::stream::gui_fiducial_status()
 	{
 		(void)oid;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
-		if (ost.def.type != "3d-passthrough")
+		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
 			continue;
 		}
+		bool reversed = ost.def.type == "3d-passthrough-reversed";
 		if (not ost.soup_ready)
 		{
 			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
@@ -1133,8 +1138,8 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
-		ImGui::Text("%s %.40s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		ImGui::Text("%s %.40s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", ost.triangle_count, _S("placed"), stale_s);
 		// Per-fiducial solve stats for placed objects.
 		for (const auto & fid: ost.def.fiducial)
 		{

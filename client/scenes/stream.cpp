@@ -1503,6 +1503,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				}
 				// Claim groups + sync member soups (upload on hash change).
+				// Reversed objects (3d-passthrough-reversed) never claim a
+				// group (no feather parameter): they upload into every live
+				// group below and inherit each group's feathering.
 				std::vector<float> live_feathers;
 				for (auto & [oid, ost]: passthrough_objects)
 				{
@@ -1520,6 +1523,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.renderer->set_mesh(oid, ost.soup);
 						g.mesh_hashes[oid] = ost.soup_hash;
+					}
+				}
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready)
+						continue;
+					for (float f: live_feathers)
+					{
+						if (f == fiducial_passthrough_state::kDebugCutoutFeather)
+							continue;
+						auto git = fp.mask_groups.find(f);
+						if (git == fp.mask_groups.end() or not git->second.renderer)
+							continue;
+						auto & g = git->second;
+						auto mh = g.mesh_hashes.find(oid);
+						if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
+						{
+							g.renderer->set_mesh(oid, ost.soup);
+							g.mesh_hashes[oid] = ost.soup_hash;
+						}
 					}
 				}
 				// Debug-only cutout group (no objects): lets the marker
@@ -1563,8 +1586,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
 					{
 						auto oit = passthrough_objects.find(hit->first);
-						if (oit == passthrough_objects.end() or oit->second.def.feather_px != g.feather_px or
-						    not oit->second.soup_ready)
+						// Reversed objects live in every group (no feather of
+						// their own): evict on removal/unready only, never on
+						// feather mismatch.
+						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
+						        (oit->second.def.type == "3d-passthrough-reversed" or
+						         oit->second.def.feather_px == g.feather_px);
+						if (not member)
 						{
 							g.renderer->remove_mesh(hit->first);
 							hit = g.mesh_hashes.erase(hit);
@@ -1652,13 +1680,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						return false;
 					};
-					for (auto & [oid, ost]: passthrough_objects)
-					{
-						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
-							continue;
+					// One draw per placed object: model matrix from the fused
+					// placement, per-eye MVPs, fade presence as opacity.
+					// Polarity rides the draw (false = fill, true = cut);
+					// the renderer interprets reversed opacity as (1 - fade).
+					auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed) {
 						const auto & fu = ost.fused;
 						if (not fu.placed)
-							continue;
+							return;
 						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
 						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
 						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
@@ -1671,10 +1700,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						        frame_state.predictedDisplayTime, fu.fade_start,
 						        std::max(0.f, ost.def.fade_in_ms));
 						if (not draw_visible(oid, mvp))
+							return;
+						draws.push_back({oid, mvp, op, reversed});
+					};
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
 							continue;
-						draws.push_back({oid, mvp, op});
+						append_draw(oid, ost, false);
 					}
-					if (draws.empty())
+					// Reversed objects (negatives) cut every layer: appended
+					// after all positives (the renderer resolves positives
+					// first, then depth-tested MIN cuts). Same fade/mvp/
+					// frustum path; opacity stays the fade presence (the
+					// renderer pushes 1 - fade as the cut strength).
+					if (f != fiducial_passthrough_state::kDebugCutoutFeather)
+					{
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready)
+								continue;
+							append_draw(oid, ost, true);
+						}
+					}
+					// Reversed-only draws rasterize to a provable no-op
+					// (record() clear-onlies them), so a group with no
+					// positive draws is skipped exactly like an empty one
+					// (the debug cutout group excepted, as before).
+					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
+					if (draws.empty() or not any_positive)
 					{
 						// Debug cutout group carries no draws; its cutouts
 						// still punch (record() early-outs only when meshes
