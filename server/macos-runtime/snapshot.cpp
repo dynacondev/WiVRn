@@ -132,7 +132,7 @@ void EyeSnapshot::shutdown()
 	fence_ = VK_NULL_HANDLE;
 }
 
-const uint8_t * EyeSnapshot::capture(VkImage image, bool virgin)
+const uint8_t * EyeSnapshot::capture(VkImage image)
 {
 	if (device_ == VK_NULL_HANDLE || image == VK_NULL_HANDLE)
 		return nullptr;
@@ -148,23 +148,20 @@ const uint8_t * EyeSnapshot::capture(VkImage image, bool virgin)
 	if (vkBeginCommandBuffer(cmd_, &beginInfo) != VK_SUCCESS)
 		return nullptr;
 
-	// App-rendered images arrive COLOR_ATTACHMENT_OPTIMAL (see header);
-	// virgin images come from UNDEFINED.
+	// App-rendered images arrive COLOR_ATTACHMENT_OPTIMAL (see header).
 	VkImageMemoryBarrier toTransfer{
 	        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
 	        .pNext = nullptr,
-	        .srcAccessMask = virgin ? VkAccessFlags(0) : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	        .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-	        .oldLayout = virgin ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	        .oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 	        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .image = image,
 	        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
 	};
-	VkPipelineStageFlags srcStage =
-	        virgin ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	vkCmdPipelineBarrier(cmd_, srcStage, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+	vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toTransfer);
 
 	VkBufferImageCopy region{
 	        .bufferOffset = 0,

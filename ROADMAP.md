@@ -439,6 +439,18 @@ fine, but the client crashed in `xrCreateSwapchain` — our
 defoveated size on the client. Fixed the same day: send identity
 single-segment params (`{w}`/`{h}`, ratio 1) decoding to the full
 stream size; loopback test now asserts the decode. Awaiting retest.
+Headset run 2 (same day): one light-blue frame then stall with client
+`Drop shard for old frame` — EndFrame-thread feed (~30 ms/eye at
+2064x2208) blocked the app loop behind slow frames. Fixed with
+worker-thread encode: EndFrame only snapshots + stages into a
+latest-only mailbox, a worker thread opens/feeds/sends (eye lock
+released across the slow feed; `feeding` flag + `dead` checks guard
+session teardown mid-feed; worker_loop try/catch so one bad frame
+can never silently kill the stream; open-fail resets `feeding`).
+Loopback test converted to closed-loop framing (fixed 12-frame burst
+was overwritten faster than the worker drained — 1-in-4 flake — now
+frames until 4 reassembled or 400 cap): 10/10 PASS (6–26 stream
+frames, NACK→IDR every run). Awaiting retest.
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

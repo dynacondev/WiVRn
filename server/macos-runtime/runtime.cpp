@@ -5,6 +5,8 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include <chrono>
+
 namespace wivrn_macos
 {
 
@@ -16,7 +18,9 @@ Runtime & runtime_singleton()
 
 void log(const char * fmt, ...)
 {
-	std::fputs("WIVRN_MACOS ", stderr);
+	static const auto start = std::chrono::steady_clock::now();
+	auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+	std::fprintf(stderr, "[%8lld] WIVRN_MACOS ", (long long)ms);
 	va_list args;
 	va_start(args, fmt);
 	std::vfprintf(stderr, fmt, args);

@@ -8,7 +8,9 @@
 
 #include <vulkan/vulkan.h>
 
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 static int failures = 0;
@@ -37,8 +39,21 @@ static int failures = 0;
 namespace
 {
 
-constexpr uint32_t kWidth = 320;
-constexpr uint32_t kHeight = 240;
+uint32_t env_dim(const char * name, uint32_t fallback)
+{
+	if (const char * value = std::getenv(name))
+	{
+		unsigned long parsed = std::strtoul(value, nullptr, 10);
+		if (parsed >= 16 && parsed <= 8192 && (parsed & 1) == 0)
+			return (uint32_t)parsed;
+	}
+	return fallback;
+}
+
+// Set WIVRN_ENCODE_TEST_DIMS=WxH (e.g. 2064x2208) to measure full-res
+// cost; also prints per-stage milliseconds.
+uint32_t kWidth = env_dim("WIVRN_ENCODE_TEST_W", 320);
+uint32_t kHeight = env_dim("WIVRN_ENCODE_TEST_H", 240);
 
 struct Device
 {
@@ -278,11 +293,17 @@ int main()
 
 	size_t totalBytes = 0;
 	bool sawConfig = false, sawIdr = false;
+	int64_t snap_ns = 0, feed_ns = 0;
+	auto clock_ns = [] {
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	};
 	for (int frame = 0; frame < 10; ++frame)
 	{
 		// Alternate solid colors so P-frames carry real deltas.
 		CHECK(clear_image(dev, image, pool, frame % 2 == 0 ? 0.2f : 0.8f, 0.3f, 0.9f));
-		const uint8_t * bgra = snapshot.capture(image, false);
+		int64_t t0 = clock_ns();
+		const uint8_t * bgra = snapshot.capture(image);
+		int64_t t1 = clock_ns();
 		CHECK(bgra != nullptr);
 		// Spot-check the snapshot saw the clear color: B=0.9 stays high;
 		// R alternates 0.2/0.8 per frame (threshold straddles both the
@@ -295,6 +316,9 @@ int main()
 
 		bool forceIdr = frame == 0 || frame == 5;
 		std::vector<EncodedNal> nals = encoder.feed(bgra, false, forceIdr);
+		int64_t t2 = clock_ns();
+		snap_ns += t1 - t0;
+		feed_ns += t2 - t1;
 		CHECK(!nals.empty());
 		CHECK(nals.back().is_last);
 		for (const EncodedNal & nal: nals)
@@ -332,6 +356,7 @@ int main()
 		CHECK(reliable == (forceIdr || frame == 0));
 	}
 	std::printf("encoded 10 frames, %zu total bytes\n", totalBytes);
+	std::printf("snapshot %.1f ms/frame, feed %.1f ms/frame\n", snap_ns / 10.0 / 1e6, feed_ns / 10.0 / 1e6);
 	CHECK(totalBytes > 1000);
 	CHECK(sawConfig && sawIdr);
 
@@ -339,7 +364,7 @@ int main()
 	encoder.reconfig(10'000'000, 72);
 	{
 		CHECK(clear_image(dev, image, pool, 0.5f, 0.5f, 0.5f));
-		const uint8_t * bgra = snapshot.capture(image, false);
+		const uint8_t * bgra = snapshot.capture(image);
 		CHECK(bgra != nullptr);
 		std::vector<EncodedNal> nals = encoder.feed(bgra, false, true);
 		CHECK(!nals.empty());

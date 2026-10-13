@@ -18,29 +18,6 @@ XrPath path_right();
 namespace
 {
 
-wivrn_macos::Instance * lookup(XrInstance instance)
-{
-	if (instance == nullptr)
-		return nullptr;
-	wivrn_macos::Runtime & runtime = wivrn_macos::runtime_singleton();
-	std::lock_guard lock(runtime.mutex);
-	if (runtime.instance != &instance->data)
-		return nullptr;
-	return &instance->data;
-}
-
-wivrn_macos::Space * lookup_space(wivrn_macos::Instance * self, XrSpace space)
-{
-	if (self == nullptr || space == nullptr)
-		return nullptr;
-	for (const auto & owned: self->ownedSpaces)
-	{
-		if (owned.get() == space)
-			return &owned->data;
-	}
-	return nullptr;
-}
-
 XrQuaternionf qmul(const XrQuaternionf & a, const XrQuaternionf & b)
 {
 	return {

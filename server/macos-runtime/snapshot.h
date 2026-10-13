@@ -30,10 +30,10 @@ public:
 	void shutdown();
 
 	// Copy image -> host buffer, return pointer to w*h*4 BGRA bytes.
-	// virgin selects the source layout (UNDEFINED for never-rendered
-	// images, COLOR_ATTACHMENT_OPTIMAL otherwise). Returns nullptr on
-	// Vulkan failure.
-	const uint8_t * capture(VkImage image, bool virgin);
+	// The image must arrive in COLOR_ATTACHMENT_OPTIMAL (the standard
+	// post-render layout; apps leave it there) and is restored to it.
+	// Returns nullptr on Vulkan failure.
+	const uint8_t * capture(VkImage image);
 
 	uint32_t width() const
 	{

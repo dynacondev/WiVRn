@@ -202,14 +202,11 @@ struct Swapchain
 	// Release apply to the front; single flight in v1.
 	std::vector<uint32_t> outstanding;
 	uint32_t nextIndex = 0;
-	// Most recently acquired image (-1 when nothing outstanding).
+	// Most recently acquired (-1 when nothing outstanding) and released
+	// images. EndFrame encodes the released one (release-after-EndFrame
+	// apps cost one frame).
 	int32_t lastAcquired = -1;
-	// Most recently released image (what EndFrame encodes; -1 until the
-	// first release, so release-after-EndFrame apps cost one frame).
 	int32_t lastReleased = -1;
-	// Per-image virgin flag (never rendered/acquired-quiesced): the first
-	// snapshot transitions from UNDEFINED instead of COLOR_ATTACHMENT.
-	std::vector<bool> virgin;
 };
 
 // Process-wide singleton: v1 supports exactly one instance at a time

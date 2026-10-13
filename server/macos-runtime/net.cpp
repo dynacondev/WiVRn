@@ -11,6 +11,7 @@
 #include <arpa/inet.h>
 #include <chrono>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 
@@ -27,12 +28,18 @@ template <typename Socket>
 std::optional<FromPackets> receive_one(Socket & socket, int timeout_ms, std::stop_token stop)
 {
 	int waited = 0;
+	// Consecutive HUP-without-data observations (resets on any received
+	// packet; bounds teardown latency on real half-open death).
+	thread_local int empty_hups = 0;
 	while (waited < timeout_ms)
 	{
 		if (stop.stop_requested())
 			throw std::runtime_error("link stopping");
 		if (auto pending = socket.receive_pending())
+		{
+			empty_hups = 0;
 			return pending;
+		}
 		pollfd pfd{.fd = socket.get_fd(), .events = POLLIN, .revents = 0};
 		int step = std::min(100, timeout_ms - waited);
 		int r = ::poll(&pfd, 1, step);
@@ -40,8 +47,46 @@ std::optional<FromPackets> receive_one(Socket & socket, int timeout_ms, std::sto
 		if (r < 0)
 			throw std::system_error(errno, std::generic_category());
 		if (pfd.revents & (POLLHUP | POLLERR))
-			throw std::runtime_error("socket hup/err");
+		{
+			// HUP is advisory: verify with a peek before tearing down.
+			// EOF (0) means a real close; data means drain first; EAGAIN
+			// with HUP set is a transient edge (observed on Darwin with
+			// IPv4-mapped peers) — keep polling, bounded, so a real
+			// half-open death still surfaces within seconds.
+			char probe = 0;
+			ssize_t n = ::recv(socket.get_fd(), &probe, 1, MSG_PEEK);
+			if (n == 0)
+				throw std::runtime_error("socket hup/err (eof)");
+			if (n < 0 && errno != EAGAIN)
+				throw std::system_error(errno, std::generic_category());
+			if (n < 0)
+			{
+				if (++empty_hups > 50)
+				{
+					empty_hups = 0;
+					throw std::runtime_error("socket hup/err (persistent)");
+				}
+				continue;
+			}
+			// Data pending alongside HUP: fall through to POLLIN below.
+		}
 		if (pfd.revents & POLLIN)
+		{
+			try
+			{
+				if (auto packet = socket.receive())
+				{
+					empty_hups = 0;
+					return packet;
+				}
+			}
+			catch (const std::system_error & e)
+			{
+				if (e.code().value() != EAGAIN)
+					throw;
+				// Raced with the poll: keep waiting.
+			}
+		}
 		{
 			try
 			{
@@ -554,7 +599,6 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 
 void HeadsetLink::stream_rx_loop(std::stop_token stop)
 {
-	log("link: stream rx start (tmp-debug)");
 	while (!stop.stop_requested())
 	{
 		try
@@ -567,12 +611,8 @@ void HeadsetLink::stream_rx_loop(std::stop_token stop)
 			auto packet = receive_one(*stream_, 100, stop);
 			if (!packet.has_value())
 				continue;
-			log("link: stream rx variant %zu (tmp-debug)", packet->index());
 			if (auto * tracking = get_as<wivrn::from_headset::tracking>(*packet))
-			{
-				log("link: stream rx tracking fd=%d (tmp-debug)", stream_->get_fd());
 				source_->update_tracking(*tracking);
-			}
 			else if (auto * inputs = get_as<wivrn::from_headset::inputs>(*packet))
 				source_->update_inputs(*inputs);
 			else if (auto * response = get_as<wivrn::from_headset::timesync_response>(*packet))

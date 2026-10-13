@@ -36,6 +36,16 @@
 
 static int failures = 0;
 
+// Milliseconds since process start (matches the WIVRN_MACOS clock,
+// which uses the same steady epoch).
+static long long test_ms()
+{
+	static const auto start = std::chrono::steady_clock::now();
+	return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
+#define TLOG(fmt, ...) std::fprintf(stderr, "[%8lld] fake: " fmt "\n", test_ms() __VA_OPT__(, ) __VA_ARGS__)
+
 #define CHECK(cond)                                                                          \
 	do                                                                                   \
 	{                                                                                    \
@@ -335,6 +345,8 @@ void fake_headset(FakeState & state)
 			while (!state.stop)
 			{
 				wivrn::from_headset::tracking tracking{};
+				if (++n % 20 == 1)
+					TLOG("tracking send #%d", n);
 				tracking.timestamp = n * 100'000'000;
 				tracking.views[0] = {{{0, 0, 0, 1}, {0, 0, 0}}, {0.8f, 0.8f, 0.8f, 0.8f}};
 				tracking.views[1] = {{{0, 0, 0, 1}, {0, 0, 0}}, {0.8f, 0.8f, 0.8f, 0.8f}};
@@ -348,20 +360,44 @@ void fake_headset(FakeState & state)
 				}
 				catch (const std::exception & e)
 				{
-					std::fprintf(stderr, "fake: tracking send failed: %s\n", e.what());
+					TLOG("tracking send failed: %s", e.what());
 					return;
 				}
 				++n;
 				std::this_thread::sleep_for(std::chrono::milliseconds(100));
 			}
+			TLOG("tracking loop exiting (stop=%d n=%d)", (int)state.stop, n);
 		};
 		std::thread tracker(tracking_loop);
+		TLOG("handshake complete, loops running");
+		{
+			sockaddr_in6 local{}, peer{};
+			socklen_t len = sizeof(local);
+			::getsockname(control->get_fd(), (sockaddr *)&local, &len);
+			len = sizeof(peer);
+			::getpeername(control->get_fd(), (sockaddr *)&peer, &len);
+			char lh[INET6_ADDRSTRLEN] = {}, ph[INET6_ADDRSTRLEN] = {};
+			inet_ntop(AF_INET6, &local.sin6_addr, lh, sizeof(lh));
+			inet_ntop(AF_INET6, &peer.sin6_addr, ph, sizeof(ph));
+			std::fprintf(
+			        stderr,
+			        "fake: control fd=%d local=[%s]:%u peer=[%s]:%u\n",
+			        control->get_fd(),
+			        lh,
+			        (unsigned)ntohs(local.sin6_port),
+			        ph,
+			        (unsigned)ntohs(peer.sin6_port));
+		}
 
 		// Main fake loop: shards in, timesync answers + one NACK out.
 		bool nacked = false;
 		int stream_frames_seen = 0;
+		int loop_count = 0;
 		while (!state.stop)
 		{
+			auto iter_begin = std::chrono::steady_clock::now();
+			if (++loop_count % 20 == 0)
+				TLOG("loop alive (%d)", loop_count);
 			// Stream shards.
 			for (;;)
 			{
@@ -412,11 +448,17 @@ void fake_headset(FakeState & state)
 						pollfd pfd{.fd = control->get_fd(), .events = POLLIN, .revents = 0};
 						if (::poll(&pfd, 1, 20) <= 0 || (pfd.revents & POLLIN) == 0)
 							break;
+						if (pfd.revents & (POLLHUP | POLLERR))
+						{
+							TLOG("control hup/err");
+							break;
+						}
 						packet = control->receive();
 					}
 				}
-				catch (...)
+				catch (const std::exception & e)
 				{
+					TLOG("control recv: %s", e.what());
 					break;
 				}
 				if (!packet.has_value())
@@ -444,12 +486,21 @@ void fake_headset(FakeState & state)
 				}
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			auto iter_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - iter_begin).count();
+			if (iter_ms > 100)
+				TLOG("slow iter %lldms (n=%d)", (long long)iter_ms, loop_count);
 		}
+		TLOG("main loop exiting (stop=%d n=%d)", (int)state.stop, loop_count);
 		tracker.join();
+		TLOG("thread returning normally");
 	}
 	catch (const std::exception & e)
 	{
 		std::fprintf(stderr, "fake headset ended: %s\n", e.what());
+	}
+	catch (...)
+	{
+		std::fprintf(stderr, "fake headset ended: unknown\n");
 	}
 }
 
@@ -630,8 +681,17 @@ int main()
 	XrSwapchainImageReleaseInfo releaseInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, .next = nullptr};
 	XrFrameWaitInfo frameWaitInfo{.type = XR_TYPE_FRAME_WAIT_INFO, .next = nullptr};
 	XrFrameBeginInfo frameBeginInfo{.type = XR_TYPE_FRAME_BEGIN_INFO, .next = nullptr};
-	for (int frame = 0; frame < 12; ++frame)
+	// Closed-loop framing: the streamer mailbox is latest-only, so a fixed
+	// burst is overwritten faster than the worker drains it (the two first
+	// x264 opens alone take ~100ms+). Frame until the fake reassembles
+	// enough; the cap still fails loudly on a real stall.
+	for (int frame = 0; frame < 400; ++frame)
 	{
+		{
+			std::lock_guard lock(fake.mutex);
+			if (fake.stream_done.size() >= 4)
+				break;
+		}
 		XrFrameState frameState{.type = XR_TYPE_FRAME_STATE, .next = nullptr};
 		CHECK_XR(xrWaitFrame(session, &frameWaitInfo, &frameState), XR_SUCCESS);
 		for (int eye = 0; eye < 2; ++eye)
@@ -672,10 +732,12 @@ int main()
 	}
 
 	// ---- Assertions on the loop ----
+	// (The fake keeps running throughout: it must stay alive to receive
+	// shards and send tracking/NACKs. fake.stop is set only after the
+	// assertions below, just before teardown.)
 	{
-		// Let stragglers land, then stop the fake.
+		// Let stragglers land.
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
-		fake.stop = true;
 		// NACK should have produced a reliable IDR on control by now.
 		bool streamFrames = false, idrControl = false, viewInfoOk = false, fovOk = true;
 		for (int i = 0; i < 100; ++i)
@@ -743,6 +805,7 @@ int main()
 	CHECK_XR(xrEndSession(session), XR_SUCCESS);
 	CHECK_XR(xrDestroySession(session), XR_SUCCESS);
 	CHECK_XR(xrDestroyInstance(instance), XR_SUCCESS);
+	fake.stop = true;
 	headset.join();
 	vkDestroyDevice(dev.device, nullptr);
 	vkDestroyInstance(dev.instance, nullptr);

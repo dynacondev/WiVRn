@@ -9,17 +9,6 @@
 namespace
 {
 
-wivrn_macos::Instance * lookup(XrInstance instance)
-{
-	if (instance == nullptr)
-		return nullptr;
-	wivrn_macos::Runtime & runtime = wivrn_macos::runtime_singleton();
-	std::lock_guard lock(runtime.mutex);
-	if (runtime.instance != &instance->data)
-		return nullptr;
-	return &instance->data;
-}
-
 wivrn_macos::Swapchain * lookup_swapchain(wivrn_macos::Instance * self, XrSwapchain swapchain)
 {
 	if (self == nullptr || swapchain == nullptr)
