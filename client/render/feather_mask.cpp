@@ -370,12 +370,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	vk::PipelineDepthStencilStateCreateInfo depth_write{
 	        .depthTestEnable = VK_TRUE,
 	        .depthWriteEnable = VK_TRUE,
-	        .depthCompareOp = vk::CompareOp::eLess,
+	        // GREATER, not LESS: scene::projection_matrix is reversed-Z
+	        // (near = 1, far = 0), matching scene_renderer. LESS here
+	        // inverts the interference (behind cuts, front doesn't).
+	        .depthCompareOp = vk::CompareOp::eGreater,
 	};
 	vk::PipelineDepthStencilStateCreateInfo depth_test{
 	        .depthTestEnable = VK_TRUE,
 	        .depthWriteEnable = VK_FALSE,
-	        .depthCompareOp = vk::CompareOp::eLess,
+	        .depthCompareOp = vk::CompareOp::eGreater,
 	};
 	auto make_raster_variant = [&](vk::raii::RenderPass & rp, vk::PipelineColorBlendStateCreateInfo & bl,
 	                               vk::PipelineDepthStencilStateCreateInfo & ds) {
@@ -1238,7 +1241,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	auto raster_silhouette = [&](const raster_site & site, vk::Extent2D e, int eye, bool use_depth) {
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
-		clears[1].depthStencil = vk::ClearDepthStencilValue{1.f, 0};
+		// 0 = far plane under the reversed-Z projection (near = 1).
+		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
 		vk::RenderPassBeginInfo begin_info{
 		        .renderPass = use_depth ? site.depth_rp : site.rp,
 		        .framebuffer = use_depth ? site.depth_fb : site.color_fb,

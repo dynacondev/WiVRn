@@ -181,8 +181,9 @@ private:
 
 	// Depth-tested raster variants for reversed draws
 	// (3d-passthrough-reversed): same shaders/layout, plus a D16 depth
-	// attachment. Positives write depth (LESS) and overwrite color as
-	// before; reversed draws test LESS without writing depth and MIN-blend
+	// attachment. Positives write depth (GREATER: the shared projection
+	// is reversed-Z, near = 1, far = 0) and overwrite color as
+	// before; reversed draws test GREATER without writing depth and MIN-blend
 	// (1 - fade) into color, so a negative cuts only where it is nearer
 	// than the positives covering that pixel. Two format variants like
 	// the plain raster path (RGBA8 submitted images, R8 intermediates).
