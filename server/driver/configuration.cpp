@@ -27,10 +27,13 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <random>
 #include <stdlib.h>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "util/u_logging.h"
 
@@ -140,29 +143,66 @@ static void log_effective_config_once(const nlohmann::json & merged)
 		U_LOG_I("Effective passthrough objects: %s", it->dump().c_str());
 }
 
+static void log_config_search_once(bool flatpak,
+                                   const char * host_xdg,
+                                   const std::vector<std::pair<std::string, std::string>> & results,
+                                   const std::map<std::string, std::string> & first_source,
+                                   const std::map<std::string, std::string> & final_source)
+{
+	// Process-once: like log_effective_config_once, read_configuration runs on
+	// every connection so only the first search is reported in full
+	static bool logged = false;
+	if (logged)
+		return;
+	logged = true;
+
+	U_LOG_I("Config search (flatpak: %s, HOST_XDG_CONFIG_HOME: %s)", flatpak ? "yes" : "no", host_xdg ? host_xdg : "(unset)");
+	for (const auto & [path, status]: results)
+		U_LOG_I("Config search: %s: %s", path.c_str(), status.c_str());
+	for (const auto & [key, winner]: final_source)
+	{
+		auto it = first_source.find(key);
+		if (it != first_source.end() and it->second != winner)
+			U_LOG_I("Config key '%s' from %s overridden by %s", key.c_str(), it->second.c_str(), winner.c_str());
+	}
+}
+
 nlohmann::json configuration::read_configuration()
 {
 	if (config_file.empty())
 	{
 		nlohmann::json merged;
-		auto merge_object = [&](const nlohmann::json & parsed) {
+		// Outcome of every candidate checked below, reported once by log_config_search_once
+		std::vector<std::pair<std::string, std::string>> search_results;
+		// First and winning source per top-level key, to spot a later file shadowing an earlier one
+		std::map<std::string, std::string> key_first_source;
+		std::map<std::string, std::string> key_final_source;
+		auto merge_object = [&](const nlohmann::json & parsed, const std::string & source) {
 			for (const auto & [key, value]: parsed.get<nlohmann::json::object_t>())
 			{
+				if (not key_first_source.contains(key))
+					key_first_source[key] = source;
+				key_final_source[key] = source;
 				merged[key] = value;
 			}
 		};
 		auto try_direct = [&](const std::filesystem::path & path) {
 			auto resolved = resolve_path(path);
 			if (not std::filesystem::exists(resolved))
+			{
+				search_results.emplace_back(resolved.string(), "missing");
 				return;
+			}
 			U_LOG_I("Using configuration file %s", resolved.c_str());
 			try
 			{
-				merge_object(nlohmann::json::parse(std::ifstream(resolved)));
+				merge_object(nlohmann::json::parse(std::ifstream(resolved)), resolved.string());
+				search_results.emplace_back(resolved.string(), "used");
 			}
 			catch (std::exception & e)
 			{
 				U_LOG_E("Invalid configuration file %s: %s", resolved.c_str(), e.what());
+				search_results.emplace_back(resolved.string(), "invalid (see error above)");
 			}
 		};
 		// Bundled defaults first, then host files, then sandbox files, so
@@ -170,31 +210,43 @@ nlohmann::json configuration::read_configuration()
 		// invisible from inside the flatpak sandbox: /run/host/* is
 		// bind-mounted (host-os/host-etc permissions) and the host XDG
 		// config is read from outside the sandbox like model files.
+		bool flatpak = wivrn::is_flatpak();
+		const char * host_xdg = flatpak ? std::getenv("HOST_XDG_CONFIG_HOME") : nullptr;
+		if (host_xdg and not *host_xdg)
+			host_xdg = nullptr;
 		try_direct(std::filesystem::path(WIVRN_INSTALL_PREFIX "/share") / "wivrn" / "config.json");
-		if (wivrn::is_flatpak())
+		if (flatpak)
 		{
 			try_direct(std::filesystem::path("/run/host/usr/share") / "wivrn" / "config.json");
 			try_direct(std::filesystem::path("/run/host/etc") / "wivrn" / "config.json");
-			if (const char * host_xdg = std::getenv("HOST_XDG_CONFIG_HOME"); host_xdg and *host_xdg)
+			if (host_xdg)
 			{
 				std::filesystem::path host_path = std::filesystem::path(host_xdg) / "wivrn" / "config.json";
+				std::string display = host_path.string() + " (via host)";
 				if (auto data = wivrn::read_file_via_host(host_path.string(), config_file_max_size))
 				{
 					U_LOG_I("Using configuration file %s (via host)", host_path.c_str());
 					try
 					{
 						std::string text(reinterpret_cast<const char *>(data->data()), data->size());
-						merge_object(nlohmann::json::parse(text));
+						merge_object(nlohmann::json::parse(text), display);
+						search_results.emplace_back(display, "used");
 					}
 					catch (std::exception & e)
 					{
 						U_LOG_E("Invalid configuration file %s (via host): %s", host_path.c_str(), e.what());
+						search_results.emplace_back(display, "invalid (see error above)");
 					}
 				}
+				else
+					search_results.emplace_back(display, "missing or unreadable");
 			}
+			else
+				search_results.emplace_back("<host $XDG_CONFIG_HOME>/wivrn/config.json (via host)", "skipped (HOST_XDG_CONFIG_HOME unset)");
 		}
 		try_direct(std::filesystem::path("/etc") / "wivrn" / "config.json");
 		try_direct(xdg_config_home() / "wivrn" / "config.json");
+		log_config_search_once(flatpak, host_xdg, search_results, key_first_source, key_final_source);
 		log_effective_config_once(merged);
 		return merged;
 	}
