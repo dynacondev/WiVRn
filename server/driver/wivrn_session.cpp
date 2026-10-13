@@ -998,100 +998,11 @@ std::optional<std::vector<std::byte>> read_model_file_direct(const std::string &
 
 // Flatpak fallback: the server runs sandboxed, so a host-absolute
 // model-path from the user's config is invisible to direct reads.
-// Re-read it from outside the sandbox via `flatpak-spawn --host cat`.
-// Argv-based spawn (no shell), output capped at fiducial_model_max_size.
+// Re-read it from outside the sandbox via `flatpak-spawn --host cat`
+// (shared helper, output capped at fiducial_model_max_size).
 std::optional<std::vector<std::byte>> read_model_file_via_host(const std::string & path)
 {
-	if (path.empty())
-		return std::nullopt;
-
-	if (not wivrn::is_flatpak())
-		return std::nullopt;
-
-	if (wivrn::flatpak_key(wivrn::flatpak::section::session_bus_policy, "org.freedesktop.Flatpak") != "talk")
-		return std::nullopt;
-
-	int pipefd[2] = {-1, -1};
-	if (pipe(pipefd) != 0)
-		return std::nullopt;
-
-	posix_spawn_file_actions_t actions;
-	if (posix_spawn_file_actions_init(&actions) != 0)
-	{
-		close(pipefd[0]);
-		close(pipefd[1]);
-		return std::nullopt;
-	}
-	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
-	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
-	posix_spawn_file_actions_addclose(&actions, pipefd[1]);
-
-	// posix_spawnp takes char *const[]; the "--" keeps paths starting
-	// with '-' (or containing spaces) from being parsed as options.
-	char arg0[] = "flatpak-spawn";
-	char arg1[] = "--host";
-	char arg2[] = "cat";
-	char arg3[] = "--";
-	char * const argv[] = {arg0, arg1, arg2, arg3, const_cast<char *>(path.c_str()), nullptr};
-
-	extern char ** environ;
-	pid_t pid = -1;
-	int spawn_rc = posix_spawnp(&pid, "flatpak-spawn", &actions, nullptr, argv, environ);
-	posix_spawn_file_actions_destroy(&actions);
-	close(pipefd[1]);
-	pipefd[1] = -1;
-
-	if (spawn_rc != 0)
-	{
-		close(pipefd[0]);
-		return std::nullopt;
-	}
-
-	std::vector<std::byte> data;
-	data.reserve(1 << 20);
-	char buf[65536];
-	bool oversize = false;
-	bool read_error = false;
-	size_t total = 0;
-	for (;;)
-	{
-		ssize_t n = read(pipefd[0], buf, sizeof(buf));
-		if (n < 0)
-		{
-			if (errno == EINTR)
-				continue;
-			read_error = true;
-			break;
-		}
-		if (n == 0)
-			break;
-		if (total + (size_t)n > fiducial_model_max_size)
-		{
-			oversize = true;
-			break;
-		}
-		size_t prev = data.size();
-		data.resize(prev + (size_t)n);
-		memcpy(data.data() + prev, buf, (size_t)n);
-		total += (size_t)n;
-	}
-	close(pipefd[0]);
-
-	// Reap the child in all cases. On oversize the child is likely
-	// blocked writing / killed by SIGPIPE once we closed the pipe.
-	int status = 0;
-	while (waitpid(pid, &status, 0) < 0 and errno == EINTR)
-	{
-	}
-
-	if (oversize or read_error)
-		return std::nullopt;
-	if (not WIFEXITED(status) or WEXITSTATUS(status) != 0)
-		return std::nullopt;
-	if (data.empty())
-		return std::nullopt;
-
-	return data;
+	return wivrn::read_file_via_host(path, fiducial_model_max_size);
 }
 
 struct model_file

@@ -8,7 +8,7 @@ Files are read from
 
 Files later in the list replace top-level values from previous ones.
 
-If you installed WiVRn from a flatpack, the config is in `$HOME/.var/app/io.github.wivrn.wivrn/config/wivrn/config.json`.
+If you installed WiVRn from a flatpack, host files are also searched: `/run/host/usr/share/wivrn/config.json`, `/run/host/etc/wivrn/config.json` and the host `$HOST_XDG_CONFIG_HOME/wivrn/config.json` (usually `~/.config/wivrn/config.json`, read from outside the sandbox like `model-path` files, logged with `(via host)`), all before the sandbox files. The sandbox per-app config in `$HOME/.var/app/io.github.wivrn.wivrn/config/wivrn/config.json` is read last, so dashboard edits win.
 Paths in the config (such as `model-path` below) may be regular host paths: the sandboxed server reads them from outside the sandbox when needed.
 
 All elements are optional and have default values.

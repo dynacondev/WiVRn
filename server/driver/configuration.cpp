@@ -34,8 +34,11 @@
 
 #include "util/u_logging.h"
 
+#include "utils/flatpak.h"
 #include "utils/xdg_base_directory.h"
 #include "wivrn_config.h"
+
+static constexpr size_t config_file_max_size = 256 * 1024;
 
 static auto resolve_path(std::filesystem::path path)
 {
@@ -142,29 +145,56 @@ nlohmann::json configuration::read_configuration()
 	if (config_file.empty())
 	{
 		nlohmann::json merged;
-		for (std::filesystem::path prefix: {
-		             std::filesystem::path(WIVRN_INSTALL_PREFIX "/share"),
-		             std::filesystem::path("/etc"),
-		             xdg_config_home(),
-		     })
-		{
-			auto path = resolve_path(prefix / "wivrn" / "config.json");
-			if (std::filesystem::exists(path))
+		auto merge_object = [&](const nlohmann::json & parsed) {
+			for (const auto & [key, value]: parsed.get<nlohmann::json::object_t>())
 			{
-				U_LOG_I("Using configuration file %s", path.c_str());
-				try
+				merged[key] = value;
+			}
+		};
+		auto try_direct = [&](const std::filesystem::path & path) {
+			auto resolved = resolve_path(path);
+			if (not std::filesystem::exists(resolved))
+				return;
+			U_LOG_I("Using configuration file %s", resolved.c_str());
+			try
+			{
+				merge_object(nlohmann::json::parse(std::ifstream(resolved)));
+			}
+			catch (std::exception & e)
+			{
+				U_LOG_E("Invalid configuration file %s: %s", resolved.c_str(), e.what());
+			}
+		};
+		// Bundled defaults first, then host files, then sandbox files, so
+		// dashboard edits (sandbox per-app config) win. Host paths are
+		// invisible from inside the flatpak sandbox: /run/host/* is
+		// bind-mounted (host-os/host-etc permissions) and the host XDG
+		// config is read from outside the sandbox like model files.
+		try_direct(std::filesystem::path(WIVRN_INSTALL_PREFIX "/share") / "wivrn" / "config.json");
+		if (wivrn::is_flatpak())
+		{
+			try_direct(std::filesystem::path("/run/host/usr/share") / "wivrn" / "config.json");
+			try_direct(std::filesystem::path("/run/host/etc") / "wivrn" / "config.json");
+			if (const char * host_xdg = std::getenv("HOST_XDG_CONFIG_HOME"); host_xdg and *host_xdg)
+			{
+				std::filesystem::path host_path = std::filesystem::path(host_xdg) / "wivrn" / "config.json";
+				if (auto data = wivrn::read_file_via_host(host_path.string(), config_file_max_size))
 				{
-					for (const auto & [key, value]: nlohmann::json::parse(std::ifstream(path)).get<nlohmann::json::object_t>())
+					U_LOG_I("Using configuration file %s (via host)", host_path.c_str());
+					try
 					{
-						merged[key] = value;
+						std::string text(reinterpret_cast<const char *>(data->data()), data->size());
+						merge_object(nlohmann::json::parse(text));
 					}
-				}
-				catch (std::exception & e)
-				{
-					U_LOG_E("Invalid configuration file %s: %s", path.c_str(), e.what());
+					catch (std::exception & e)
+					{
+						U_LOG_E("Invalid configuration file %s (via host): %s", host_path.c_str(), e.what());
+					}
 				}
 			}
 		}
+		try_direct(std::filesystem::path("/etc") / "wivrn" / "config.json");
+		try_direct(xdg_config_home() / "wivrn" / "config.json");
 		log_effective_config_once(merged);
 		return merged;
 	}
