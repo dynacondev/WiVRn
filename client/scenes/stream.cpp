@@ -841,13 +841,12 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
-// E2 DIAGNOSTIC, TEMPORARY — REVERT AFTER IT REPORTS. Forces submission of
-// the projected passthrough layer with zero geometry instances alongside
-// the normal stack, to isolate content-vs-submit toxicity: if video
-// survives, the submit itself is fine and instance content is suspect;
-// if video dies, any projected submit is toxic on this runtime. Test
-// with the surface-projected override OFF (no instances live).
-constexpr bool kDiagForceEmptyProjectedSubmit = true;
+// E3 DIAGNOSTIC, TEMPORARY — REVERT AFTER IT REPORTS. Disables the flat
+// reconstruction feed in the mask path so only reprojected geometry
+// persists (projected layer over opaque video), isolating mapped-camera
+// compositing on its own. Test with the override ON, head still past the
+// global fade: interiors should show mapped camera, video elsewhere.
+constexpr bool kDiagDisableFlatFeed = true;
 
 void scenes::stream::render(const XrFrameState & frame_state)
 {
@@ -1939,7 +1938,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		else
 			session.disable_passthrough();
 
-		render_start(mask_frame ? false : use_alpha, frame_state.predictedDisplayTime);
+		render_start((mask_frame || kDiagDisableFlatFeed) ? false : use_alpha, frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
 		std::array<XrCompositionLayerProjectionView, view_count> layer_view;
@@ -2006,18 +2005,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (fp.cutouts_punched)
 			need_flat = true;
 		bool have_projected = session.has_projected_instances();
+		// E3 DIAGNOSTIC (temporary): flat disabled above, so the want below
+		// never submits (the decision log still records it for forensics).
+		bool submit_flat = need_flat && !kDiagDisableFlatFeed;
 		// Forensic submit decisions (change-triggered): which camera layer
 		// submits and why. Permanent: coexistence bugs read as wrong output
 		// with no error, so the decision itself must be in the log.
 		{
-			static bool last_need_flat = true;
+			static bool last_submit_flat = true;
 			static bool last_have_projected = false;
-			if (need_flat != last_need_flat or have_projected != last_have_projected)
+			if (submit_flat != last_submit_flat or have_projected != last_have_projected)
 			{
-				last_need_flat = need_flat;
+				last_submit_flat = submit_flat;
 				last_have_projected = have_projected;
 				spdlog::info("Camera submit: {} (need_flat={} have_projected={} fade_done={} cutouts={})",
-				             need_flat ? "flat" : (have_projected ? "projected" : "video-only"), need_flat,
+				             submit_flat ? "flat" : (have_projected ? "projected" : "video-only"), need_flat,
 				             have_projected, fade_done, fp.cutouts_punched);
 			}
 		}
@@ -2059,7 +2061,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
 			first_group = false;
 		}
-		if (need_flat)
+		if (submit_flat)
 		{
 			add_passthrough_layer();
 			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
@@ -2073,19 +2075,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// instantly reversible). Mixed frames keep flat only, so
 			// flagged interiors there fall back to flat for the frame.
 			add_projected_passthrough_layer();
-		}
-		// E2 DIAGNOSTIC (temporary, revert with the flag above): empty
-		// projected submit alongside the normal stack (instances absent).
-		bool forcing_empty = kDiagForceEmptyProjectedSubmit && !have_projected;
-		if (forcing_empty)
-			add_projected_passthrough_layer();
-		{
-			static bool last_forcing = false;
-			if (forcing_empty != last_forcing)
-			{
-				last_forcing = forcing_empty;
-				spdlog::info("Camera submit: E2 diagnostic empty projected {}", forcing_empty ? "on" : "off");
-			}
 		}
 	}
 
