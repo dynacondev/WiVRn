@@ -965,16 +965,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	{
 		for (auto & [oid, ost]: passthrough_objects)
 		{
-			// Opaque interiors are fade-blind: hold instances until the
-			// global fade completes so windows never island-pop full
-			// camera inside a fading band (both-camera swap at completion
-			// instead). fade_start is stamped together with placed, so a
-			// placed object always has a nonzero seed.
-			XrTime fade_done_at = fp.fade_start + XrTime(fp.fade_in_ms * 1e6);
-			bool faded = fp.fade_in_ms <= 0 || (fp.fade_start != 0 && predicted_display_time >= fade_done_at);
+			// DST-blended interiors fade with the mask itself, so no
+			// fade-gating: instances live from placement and ramp with
+			// every other camera source.
 			bool want = ost.def.type == "3d-passthrough" and ost.soup_ready and ost.fused.placed and
 			        surface_projected_effective(oid, ost) and session.projected_passthrough_supported() and
-			        not projected_failed.contains(oid) and faded;
+			        not projected_failed.contains(oid);
 			bool have = session.has_projected_instance(oid);
 			if (want and not have)
 			{
@@ -1173,15 +1169,25 @@ void scenes::stream::gui_passthrough()
 		if (ost.def.type != "3d-passthrough")
 			continue;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
-		bool b = surface_projected_effective(oid, ost);
-		std::string title = label + "##projected_" + oid;
-		if (ImGui::Checkbox(title.c_str(), &b))
+		// Three-way state, cycled per click: as configured (no override
+		// stored) -> force on -> force off -> as configured ...
+		auto oit = projected_overrides.find(oid);
+		std::string mode = (oit == projected_overrides.end())
+		        ? (ost.def.surface_projected ? _S("As configured (on)") : _S("As configured (off)"))
+		        : (oit->second ? _S("Forced on") : _S("Forced off"));
+		std::string title = label + ": " + mode + "##projected_" + oid;
+		if (ImGui::Button(title.c_str()))
 		{
-			projected_overrides[oid] = b;
-			spdlog::info("Projected override \"{}\" {}", oid, b ? "on" : "off");
+			if (oit == projected_overrides.end())
+				projected_overrides[oid] = true;
+			else if (oit->second)
+				oit->second = false;
+			else
+				projected_overrides.erase(oit);
+			auto nit = projected_overrides.find(oid);
+			spdlog::info("Projected override \"{}\" {}", oid,
+			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
 		}
-		ImGui::SameLine();
-		ImGui::TextDisabled("%s", ost.def.surface_projected ? "(config on)" : "(config off)");
 	}
 }
 

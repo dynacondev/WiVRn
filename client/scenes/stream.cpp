@@ -1969,19 +1969,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		// Mask-blend stacks, one per feather group, submitted in feather
 		// order (deterministic): video (opaque, above) was already added,
-		// then each group's mask, then exactly one camera layer, then
-		// debug/GUI. The first mask replaces destination alpha; the rest
-		// add (saturating union). Group swapchains acquired above (never
-		// the shared pool).
+		// then each group's mask, then the camera layers, then debug/GUI.
+		// The first mask replaces destination alpha; the rest add
+		// (saturating union). Group swapchains acquired above (never the
+		// shared pool).
 		//
-		// EITHER/OR camera layers: co-submitting flat reconstruction and
-		// projected mapping breaks video compositing on current runtimes
-		// (video goes black; instantly reversible), so exactly one camera
-		// layer submits per frame. Flat wins whenever anything needs it:
-		// unflagged windows, debug cutouts (camera with no geometry to
-		// map it onto), or a still-ramping global fade. Otherwise the
-		// projected layer alone carries every flagged window; its band
-		// shows video until the internal-only gaussian lands.
+		// Flat reconstruction and surface-projected mapping compose
+		// through the same feathered mask: flat reads it always, mapped
+		// interiors read it too (DST blend), so edges feather identically
+		// on both and flagged windows need no own group. Flat wins
+		// whenever anything needs it: unflagged windows, debug cutouts
+		// (camera with no geometry to map it onto — a DST-blended
+		// projected layer would stamp black there), or a still-ramping
+		// global fade. Otherwise both submit: flat covers unmapped
+		// regions and the band, projected covers mapped interiors.
 		XrTime fade_done_at = fp.fade_start + XrTime(fp.fade_in_ms * 1e6);
 		bool fade_done = fp.fade_in_ms <= 0 || (fp.fade_start != 0 && frame_state.predictedDisplayTime >= fade_done_at);
 		bool need_flat = not fade_done;
@@ -2017,9 +2018,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		for (auto & [f, g]: fp.mask_groups)
 		{
 			(void)f;
-			// Projected-only frames skip mask submits too (nothing reads
-			// dstA there); acquire/release pairing below is untouched.
-			if (not g.active or not need_flat)
+			if (not g.active)
 				continue;
 			std::array<XrCompositionLayerProjectionView, view_count> mask_views;
 			for (uint32_t view = 0; view < view_count; ++view)
@@ -2057,14 +2056,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
 			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		}
-		else if (have_projected)
+		if (have_projected)
 		{
-			// Projected-only frame (see above): mapped interiors over
-			// video, opaque overlay, no blend chain (a chained blend on a
-			// PROJECTED layer breaks video compositing on current runtimes;
-			// instantly reversible). Mixed frames keep flat only, so
-			// flagged interiors there fall back to flat for the frame.
+			// Surface-projected interiors read the same feathered mask
+			// (DST blend, like flat): mapped where the mask is opaque,
+			// feathering through flat at the rim, video outside. Cutouts
+			// force need_flat above, so this never stamps black where
+			// marker windows punch camera with no geometry behind them.
 			add_projected_passthrough_layer();
+			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		}
 	}
 
