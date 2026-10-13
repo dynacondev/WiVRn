@@ -538,6 +538,27 @@ pixel proof (`WIVRN_MACOS_VERIFY_PIXELS=1`, EyeSnapshot readback at
 frame 30): diff=20563 (1.96%) gTop=2562818 gBot=0 → cube draws
 upright. test_runtime now asserts FOV signs + finite projection.
 Awaiting retest of both apps on headset.
+Headset run 11: geometry renders in both apps now. Two new findings,
+both diagnosed headless via server-side dumps of released eye images:
+(1) demo cube inside-out — no depth buffer + fixed draw order shows far
+(inner) faces through near ones for half of every spin. Fix: per-face
+far-to-near painter sort (exact for one convex cube, no depth buffer).
+The "moves with head" read is likely the same popping; retest holds
+still vs moves head to disambiguate any residual swim. (2) hello_xr
+right eye blank — left renders, right pure black every frame. Forensics:
+acquire/release cycle perfectly per swapchain, app binds the right
+images into valid framebuffers, passes submit and complete, no errors —
+but loadOp-CLEAR never lands on eye-1's images while explicit
+vkCmdClearAttachments does (green-fill proof), and disabling the depth
+test restores the full scene (depth test was discarding everything
+against the uncleared buffer). Fix: keep patch 0001 (loadOp-CLEAR +
+CULL_NONE), REVERT patch 0002 (stock explicit color+depth clears run
+after the loadOp clear — proven correct in this combination; under
+stock LOAD they produced driver fill, hence the original confusion).
+Both eyes verified rich headless (72-98% non-clear). Caveat for later:
+a single Metal-validation abort on garbage clear depth at startup
+(first Begin reads count=0/NULL via hello_xr's upstream
+set-clears-after-Begin ordering) — transient, harmless steady-state.
 hello_xr cross-validation: stock hello_xr cannot render on this MoltenVK
 (ClearAttachments yields driver fill; BACK+CW cubes fully culled — both
 proven in isolation). `patches/hello_xr/` carries two MoltenVK workarounds

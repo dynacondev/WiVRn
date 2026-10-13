@@ -143,6 +143,17 @@ bool bring_up_vulkan(VkDeviceSet & dev)
 	return dev.queue != VK_NULL_HANDLE;
 }
 
+// Cube face centers in model space, matching cubeVerts order below
+// (-X, +X, -Y, +Y, -Z, +Z). Used for the far-to-near painter sort.
+constexpr float faceCenters[6][3] = {
+        {-0.5f, 0, 0},
+        {0.5f, 0, 0},
+        {0, -0.5f, 0},
+        {0, 0.5f, 0},
+        {0, 0, -0.5f},
+        {0, 0, 0.5f},
+};
+
 // Cube corners (±0.5) and per-face colors; 36 non-indexed verts (2 tris
 // per face), positions + colors interleaved. CULL_NONE downstream, so
 // winding is irrelevant here.
@@ -754,7 +765,37 @@ int main(int argc, char ** argv)
 			mul44(proj, view, vp);
 			mul44(vp, model, mvp);
 			vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
-			vkCmdDraw(cmd, 36, 1, 0, 0);
+			// No depth buffer in v1 (depth-tested paths were unverified
+			// when this vehicle was built): occlusion comes from a
+			// far-to-near painter sort. Exact for a single convex cube;
+			// without it the fixed draw order shows far (inner) faces
+			// through near ones for half of every spin.
+			int order[6] = {0, 1, 2, 3, 4, 5};
+			float depth[6];
+			for (int f = 0; f < 6; ++f)
+			{
+				float wx = model[0] * faceCenters[f][0] + model[4] * faceCenters[f][1] +
+				           model[8] * faceCenters[f][2] + model[12];
+				float wy = model[1] * faceCenters[f][0] + model[5] * faceCenters[f][1] +
+				           model[9] * faceCenters[f][2] + model[13];
+				float wz = model[2] * faceCenters[f][0] + model[6] * faceCenters[f][1] +
+				           model[10] * faceCenters[f][2] + model[14];
+				depth[f] = view[2] * wx + view[6] * wy + view[10] * wz + view[14];
+			}
+			for (int i = 1; i < 6; ++i)
+			{
+				int o = order[i];
+				float d = depth[o];
+				int j = i - 1;
+				while (j >= 0 && depth[order[j]] > d)
+				{
+					order[j + 1] = order[j];
+					--j;
+				}
+				order[j + 1] = o;
+			}
+			for (int i = 0; i < 6; ++i)
+				vkCmdDraw(cmd, 6, 1, (uint32_t)order[i] * 6, 0);
 			vkCmdEndRenderPass(cmd);
 			CHECK_VK(vkEndCommandBuffer(cmd));
 			VkSubmitInfo submit{
