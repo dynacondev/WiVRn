@@ -184,6 +184,16 @@ Default value: unset
 
 If set, overrides the name displayed in the server list.
 
+## `fade-in-ms`
+Default value: `1000`
+
+Global passthrough fade-in at first acquisition, in milliseconds
+(`0` = appears instantly). Render-only; applied live. One clock for
+all objects: it starts on first placement per map and retriggers on
+reacquire jumps, so every window ramps together. Objects placing later
+appear instantly. Per-object `fade-in-ms` entries are warned + ignored
+(a single alpha channel admits exactly one clock).
+
 ## `fiducials` and `passthrough`
 Default value: unset (feature disabled)
 
@@ -288,10 +298,16 @@ Each `passthrough` entry (behavior object) has:
    tier-0 stays full (exact hard edge), tier-1 submits half-resolution,
    tiered submits quarter-resolution (the V pass writes the submitted
    size; the compositor expands to full).
-- `fade-in-ms`: alpha fade-in at first acquisition, in milliseconds
-  (default `1000`; `0` = appears instantly). Render-only; applied live.
-  During the fade the passthrough window ramps from fully transparent
-  (game video) to fully present.
+- `surface-projected`: project camera imagery onto this object's mesh
+  (surface-projected passthrough) instead of the flat reconstruction
+  feed (default `false`). Opt-in per object, starting with the
+  best-aligned: mismatched geometry causes conflicting depth cues and
+  wrong scale. The mapped interior is composited over the flat feed with
+  the same feathered mask, so edges keep today's flat quality while
+  interiors gain geometry-correct parallax. Not applicable to
+  `3d-passthrough-reversed` (warned + ignored). Applied live; a
+  per-object override in the headset Passthrough tab takes precedence
+  for the session.
 
 Poses compose as `fiducialPose = observedMarkerPose * inverse(markerOffset)` then
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
@@ -339,7 +355,8 @@ Passthrough tab (red) to help you copy it verbatim into the config.
 			"position": [0, 0.05, 0.1],
 			"orientation": [0, 0, 0],
 			"scale": 1.0,
-			"feather-px": 24
+			"feather-px": 24,
+			"surface-projected": true
 		},
 		{
 			"type": "3d-passthrough-reversed",

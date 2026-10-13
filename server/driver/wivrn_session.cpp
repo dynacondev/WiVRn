@@ -1041,6 +1041,7 @@ void wivrn_session::send_fiducial_map()
 	U_LOG_I("Fiducial map: sending %u fiducials, %u passthrough objects",
 	        (unsigned)config.fiducials.size(), (unsigned)config.passthrough_objects.size());
 	to_headset::fiducial_map msg;
+	msg.fade_in_ms = config.fade_in_ms;
 	for (const auto & entry: config.fiducials)
 	{
 		to_headset::fiducial_entry e{
@@ -1081,7 +1082,7 @@ void wivrn_session::send_fiducial_map()
 		        .orientation = entry.orientation,
 		        .scale = entry.scale,
 		        .feather_px = entry.feather_px,
-		        .fade_in_ms = entry.fade_in_ms,
+		        .surface_projected = entry.surface_projected,
 		};
 
 		// Display label: the tag, or the id when untagged.

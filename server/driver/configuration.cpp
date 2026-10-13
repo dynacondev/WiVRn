@@ -567,7 +567,14 @@ configuration::configuration()
 						o.feather_px = item["feather-px"];
 				}
 				if (item.contains("fade-in-ms"))
-					o.fade_in_ms = item["fade-in-ms"];
+					U_LOG_W("passthrough object \"%s\": fade-in-ms is top-level now, ignoring per-object value", o.id.c_str());
+				if (item.contains("surface-projected"))
+				{
+					if (o.type == "3d-passthrough-reversed")
+						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to 3d-passthrough-reversed, ignoring", o.id.c_str());
+					else
+						o.surface_projected = item["surface-projected"];
+				}
 				if (std::ranges::any_of(passthrough_objects, [&](const passthrough_object & p) { return p.id == o.id; }))
 				{
 					U_LOG_W("duplicate passthrough object id \"%s\", skipping", o.id.c_str());
@@ -596,6 +603,9 @@ configuration::configuration()
 
 		if (auto it = json.find("bit-depth"); it != json.end())
 			bit_depth = *it;
+
+		if (auto it = json.find("fade-in-ms"); it != json.end())
+			fade_in_ms = *it;
 
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;

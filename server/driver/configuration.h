@@ -125,12 +125,20 @@ struct configuration
 		// 3d-passthrough-reversed (warned + ignored): negatives cut every
 		// layer and inherit each layer's feathering through its blur.
 		float feather_px = 24;
-		// Alpha fade-in at first acquisition, milliseconds (0 = instant,
-		// render-only, applied live).
-		float fade_in_ms = 1000;
+		// Surface-projected mapping: the headset projects camera imagery
+		// onto this object's mesh instead of the flat reconstruction feed.
+		// Opt-in per object (plus a live in-headset override). Ignored
+		// for 3d-passthrough-reversed (warned).
+		bool surface_projected = false;
 	};
 	std::vector<fiducial_entry> fiducials;
 	std::vector<passthrough_object> passthrough_objects;
+
+	// Global first-acquisition fade, milliseconds (0 = instant,
+	// render-only, applied live). One clock for all objects: per-object
+	// fade-in-ms entries are warned + ignored (a single alpha channel
+	// admits exactly one clock).
+	float fade_in_ms = 1000;
 
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;

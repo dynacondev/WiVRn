@@ -1038,15 +1038,26 @@ struct passthrough_object
 	// Passthrough window feather width in screen pixels (alpha-gradient
 	// blend band around the mesh silhouette). Mask stacks group by this
 	// value so each object feathers independently. 0 disables feathering.
+	// Not accepted for 3d-passthrough-reversed (warned + ignored on the
+	// server).
 	float feather_px = 24;
-	// Alpha fade-in at first acquisition, milliseconds (0 = instant).
-	float fade_in_ms = 1000;
+	// Surface-projected mapping: the headset projects camera imagery onto
+	// this object's mesh (geometry instance on the projected passthrough
+	// layer) instead of the flat reconstruction feed. Opt-in per object;
+	// ignored for 3d-passthrough-reversed (warned + ignored on the
+	// server). A live in-headset override exists per object.
+	bool surface_projected = false;
 };
 
 struct fiducial_map
 {
 	std::vector<fiducial_entry> fiducials;
 	std::vector<passthrough_object> objects;
+	// Global first-acquisition fade, milliseconds (0 = instant,
+	// render-only, applied live). One clock for all objects: the fade
+	// starts on first placement per map and retriggers on reacquire
+	// jumps. Objects placing later appear instantly.
+	float fade_in_ms = 1000;
 };
 
 struct fiducial_model_chunk
