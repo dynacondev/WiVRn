@@ -1471,10 +1471,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				int qh = std::max(64, mh / 4);
 				// View-only transforms: world_mvp computed once above (shared
 				// with the debug line overlays).
-				// Marker window cutouts: raw instant pose of every matched
-				// code (unfiltered, SLAM-held) expanded by the debug
-				// window, punched through the masks so true code locations
-				// stay visible even when meshes are offset. Fully-faded
+				// Marker window cutouts: raw instant pose of every reported
+				// code, matched or not (unfiltered, SLAM-held), expanded by
+				// the debug window and punched through the masks, so true
+				// code locations stay visible even when meshes are offset
+				// or when no map configures any payload. Fully-faded
 				// codes (stale past the overlay fade) are excluded, so the
 				// window closes as the quads fade out.
 				std::vector<std::array<glm::vec3, 6>> cutouts;
@@ -1484,7 +1485,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					for (const auto & [id, h]: fp.held_codes)
 					{
 						(void)id;
-						if (not h.matched or h.extents.width <= 0 or h.extents.height <= 0)
+						if (h.extents.width <= 0 or h.extents.height <= 0)
 							continue;
 						if (fiducial_passthrough_state::stale_hold(cut_now, h.last_seen) <= 0.01f)
 							continue;
@@ -1864,7 +1865,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			auto map = fiducial_map.lock();
 			have_fiducial_map = not map->fiducials.empty() or not map->objects.empty();
 		}
-		if (use_alpha or want_projected_mesh or have_fiducial_map)
+		// The debug window cutout needs a live passthrough to reveal, map
+		// or not (it punches every reported code, configured or only
+		// discovered).
+		bool want_debug_cutout = fp.debug_overlays and fp.debug_window_mm >= 0;
+		if (use_alpha or want_projected_mesh or have_fiducial_map or want_debug_cutout)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
