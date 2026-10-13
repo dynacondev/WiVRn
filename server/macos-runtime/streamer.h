@@ -99,6 +99,10 @@ private:
 		uint32_t enc_height = 0;
 		uint64_t frame_index = 0;
 		uint64_t encoded_count = 0;
+		// Last sent index + reliable count (for the streaming log line;
+		// lock-free: only the worker touches them, the log reads).
+		std::atomic<uint64_t> sent_index{0};
+		std::atomic<uint64_t> reliable_sent{0};
 		std::atomic<bool> force_idr{true};
 		// Latest-only mailbox (app -> worker). pending is lock-free so
 		// end_frame can drop without blocking; payload under mutex.

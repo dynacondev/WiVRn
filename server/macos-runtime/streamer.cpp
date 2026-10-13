@@ -481,12 +481,17 @@ void Streamer::encode_eye(uint32_t eye_index)
 	        [&](uint8_t, const std::vector<uint8_t> & bytes, bool, bool, bool) {
 		        out.shards.push_back(bytes);
 	        });
+	eye.sent_index = out.frame_idx;
+	if (out.reliable)
+		++eye.reliable_sent;
 	link_.send_frame(std::move(out));
 
 	if (++eye.encoded_count % 60 == 0)
-		log("streamer: eye %u encoded=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms",
+		log("streamer: eye %u encoded=%llu idx=%llu rel=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms",
 		    eye_index,
 		    (unsigned long long)eye.encoded_count,
+		    (unsigned long long)eye.sent_index.load(),
+		    (unsigned long long)eye.reliable_sent.load(),
 		    (unsigned long long)link_.sent_frames(),
 		    (unsigned long long)link_.dropped_frames(),
 		    snap_ns / 1e6,

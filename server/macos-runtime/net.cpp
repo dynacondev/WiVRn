@@ -592,10 +592,22 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 				continue;
 			if (auto * feedback = get_as<wivrn::from_headset::feedback>(*packet))
 			{
+				// Journey log: shows exactly how far each frame got on the
+				// client (shards received? completed to decoder? decoded?
+				// blitted? displayed?). Timestamps are client-clock ns.
+				log("link: fb stream=%u frame=%llu disp=%u recv=%lld/%lld todec=%lld fromdec=%lld blit=%lld displ=%lld",
+				    feedback->stream_index,
+				    (unsigned long long)feedback->frame_index,
+				    feedback->times_displayed,
+				    (long long)feedback->received_first_packet,
+				    (long long)feedback->received_last_packet,
+				    (long long)feedback->sent_to_decoder,
+				    (long long)feedback->received_from_decoder,
+				    (long long)feedback->blitted,
+				    (long long)feedback->displayed);
 				// NACK (never displayed) forces an IDR like the Linux path.
 				if (feedback->times_displayed == 0 && events_.need_idr)
 				{
-					log("link: NACK, forcing IDR");
 					try
 					{
 						events_.need_idr();
