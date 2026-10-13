@@ -138,6 +138,57 @@ void xr::passthrough_fb::update_projected_transform(XrSpace base_space, XrTime t
 		projected_geometry->set_transform(base_space, time, pose, scale);
 }
 
+void xr::passthrough_fb::set_projected_instance_mesh(const std::string & key,
+                                                     std::span<const XrVector3f> vertices,
+                                                     std::span<const uint32_t> indices,
+                                                     XrSpace base_space,
+                                                     const XrPosef & pose,
+                                                     const XrVector3f & scale)
+{
+	if (not projected_supported or not projected_layer)
+		throw std::runtime_error("Surface-projected passthrough not supported by the runtime");
+
+	auto & pin = projected_instances[key];
+	// Destroy the old geometry first: the instance references the mesh
+	pin.geometry.reset();
+	pin.mesh.reset();
+
+	pin.mesh.emplace(*inst, *sess, vertices, indices);
+	pin.geometry.emplace(*inst, *sess, *projected_layer, *pin.mesh, base_space, pose, scale);
+
+	spdlog::info("Projected passthrough instance \"{}\": {} vertices, {} triangles", key, vertices.size(), indices.size() / 3);
+}
+
+void xr::passthrough_fb::remove_projected_instance(const std::string & key)
+{
+	projected_instances.erase(key);
+}
+
+void xr::passthrough_fb::clear_projected_instances()
+{
+	projected_instances.clear();
+}
+
+bool xr::passthrough_fb::has_projected_instance(const std::string & key) const
+{
+	return projected_instances.contains(key);
+}
+
+bool xr::passthrough_fb::has_projected_instances() const
+{
+	return not projected_instances.empty();
+}
+
+void xr::passthrough_fb::update_projected_instance_transform(const std::string & key,
+                                                             XrSpace base_space,
+                                                             XrTime time,
+                                                             const XrPosef & pose,
+                                                             const XrVector3f & scale)
+{
+	if (auto it = projected_instances.find(key); it != projected_instances.end() and it->second.geometry)
+		it->second.geometry->set_transform(base_space, time, pose, scale);
+}
+
 xr::passthrough_htc::passthrough_htc(instance & inst, session & s) :
         handle(inst.get_proc<PFN_xrDestroyPassthroughHTC>("xrDestroyPassthroughHTC"))
 {

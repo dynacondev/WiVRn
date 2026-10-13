@@ -22,8 +22,10 @@
 #include "openxr/openxr.h"
 #include "triangle_mesh.h"
 #include "utils/handle.h"
+#include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <variant>
 
 namespace xr
@@ -77,6 +79,10 @@ public:
 	{
 		composition_layer.next = nullptr;
 	}
+	void reset_projected_chain()
+	{
+		projected_composition_layer.next = nullptr;
+	}
 
 	// True when the runtime supports surface-projected passthrough
 	bool projected_mesh_supported() const
@@ -105,6 +111,34 @@ public:
 	{
 		return (XrCompositionLayerBaseHeader *)&projected_composition_layer;
 	}
+
+	// Per-object geometry instances on the projected layer (mask-path
+	// surface projection: one mesh + instance per flagged object, all
+	// sharing the layer above). Managed per frame from placed objects;
+	// the single-mesh binary shim above stays untouched.
+	struct projected_instance
+	{
+		std::optional<triangle_mesh_fb> mesh;
+		std::optional<geometry_instance_fb> geometry;
+	};
+	void set_projected_instance_mesh(const std::string & key,
+	                                 std::span<const XrVector3f> vertices,
+	                                 std::span<const uint32_t> indices,
+	                                 XrSpace base_space,
+	                                 const XrPosef & pose,
+	                                 const XrVector3f & scale);
+	void remove_projected_instance(const std::string & key);
+	void clear_projected_instances();
+	bool has_projected_instance(const std::string & key) const;
+	bool has_projected_instances() const;
+	void update_projected_instance_transform(const std::string & key,
+	                                         XrSpace base_space,
+	                                         XrTime time,
+	                                         const XrPosef & pose,
+	                                         const XrVector3f & scale);
+
+private:
+	std::map<std::string, projected_instance> projected_instances;
 };
 
 class passthrough_htc : public utils::handle<XrPassthroughHTC>
