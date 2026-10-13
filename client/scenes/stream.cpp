@@ -861,7 +861,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Fiducial debug overlays (tinted quads at raw sighting poses). The
 	// white texture is acquired/filled here (command buffer still open)
 	// and released after submit, mirroring the mask swapchain pairing.
-	bool debug_acquired = false;
 
 	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
@@ -1281,6 +1280,165 @@ void scenes::stream::render(const XrFrameState & frame_state)
 #endif
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
+	
+	// Debug overlays (QR boxes, tripods, fused boxes): triangle geometry
+	// recorded into our own transparent swapchain, submitted as ONE
+	// projection layer (maxLayerCount unreachable). MVP shared with the
+	// cutouts below (computed once here).
+	std::array<glm::mat4, 2> world_mvp;
+	for (uint32_t view = 0; view < view_count; ++view)
+		world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+	fp.dbg_tris = 0;
+	fp.dbg_boxes = 0;
+	// -1 until the hook below acquires our debug image (submit + release
+	// it after the passthrough layer, before endFrame).
+	int dbg_image = -1;
+	if (gizmo_lines and fp.debug_overlays)
+	{
+		gizmo_lines->begin_frame();
+		using vtx = debug_lines_renderer::vertex;
+		std::vector<vtx> tris;
+		tris.reserve(512);
+		XrTime dbg_now = instance.now();
+		auto tri = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c, float r, float g, float bl, float al) {
+			tris.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
+			tris.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
+			tris.push_back({{c.x, c.y, c.z}, {r, g, bl, al}});
+		};
+		// Filled quad (double-sided: cull is off, so no facing math).
+		auto box_fill = [&](glm::vec3 c, glm::vec3 r, glm::vec3 u, float hw, float hh, float cr, float cg, float cb, float ca) {
+			glm::vec3 v0 = c - r * hw - u * hh, v1 = c + r * hw - u * hh;
+			glm::vec3 v2 = c + r * hw + u * hh, v3 = c - r * hw + u * hh;
+			tri(v0, v1, v2, cr, cg, cb, ca);
+			tri(v0, v2, v3, cr, cg, cb, ca);
+		};
+		// Shaft from o along dir, width across wdir (flat quad, 2 tris).
+		auto shaft = [&](glm::vec3 o, glm::vec3 dir, glm::vec3 wdir, float len, float wdt, float cr, float cg, float cb, float ca) {
+			glm::vec3 e = o + dir * len, s = wdir * (wdt * 0.5f);
+			tri(o - s, o + s, e + s, cr, cg, cb, ca);
+			tri(o - s, e + s, e - s, cr, cg, cb, ca);
+		};
+		auto tripod = [&](glm::vec3 o, glm::vec3 x, glm::vec3 y, glm::vec3 z, float len, float wdt, float a) {
+			shaft(o, x, y, len, wdt, 1.f, 0.f, 0.f, a);
+			shaft(o, y, x, len, wdt, 0.f, 1.f, 0.f, a);
+			shaft(o, z, x, len, wdt, 0.f, 0.f, 1.f, a);
+		};
+		auto tag_frame = [&](const XrPosef & p, glm::vec3 & o, glm::vec3 & x, glm::vec3 & y, glm::vec3 & z) {
+			glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+			o = glm::vec3(p.position.x, p.position.y, p.position.z);
+			x = q * glm::vec3(1, 0, 0);
+			y = q * glm::vec3(0, 1, 0);
+			z = q * glm::vec3(0, 0, 1);
+		};
+		for (const auto & [id, h]: fp.held_codes)
+		{
+			(void)id;
+			if (h.matched and not fp.debug_matched)
+				continue;
+			if (not h.matched and not fp.debug_unmatched)
+				continue;
+			if (h.extents.width <= 0 or h.extents.height <= 0)
+				continue;
+			float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+				fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen);
+			if (a <= 0.01f)
+				continue;
+			glm::vec3 c, x, y, z;
+			tag_frame(h.pose, c, x, y, z);
+			box_fill(c, x, y, h.extents.width * 0.5f, h.extents.height * 0.5f,
+				(h.matched ? 0.f : 1.f), (h.matched ? 1.f : 0.f), 0.f, a);
+			++fp.dbg_boxes;
+			if (fp.debug_axes and h.extents.width > 0)
+			tripod(c, x, y, z, h.extents.width, h.extents.width * 0.08f, a);
+		}
+		if (fp.debug_corrected)
+		{
+			for (const auto & [payload, co]: fp.corrected_tags)
+			{
+				(void)payload;
+				if (co.size_m <= 0)
+					continue;
+				float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+					fiducial_passthrough_state::stale_hold(dbg_now, co.last_seen);
+				if (a <= 0.01f)
+					continue;
+				glm::vec3 c, x, y, z;
+				tag_frame(co.pose, c, x, y, z);
+				box_fill(c, x, y, co.size_m * 0.5f, co.size_m * 0.5f, 1.f, 0.55f, 0.f, a);
+				++fp.dbg_boxes;
+			}
+		}
+		if (fp.debug_origin or fp.debug_smoothed)
+		{
+			for (const auto & [fid, bp]: board_poses)
+			{
+				(void)fid;
+				if (not bp.has_offset or bp.tag_size_m <= 0)
+					continue;
+				float a = std::clamp(fp.debug_opacity, 0.f, 1.f) *
+					fiducial_passthrough_state::stale_hold(dbg_now, bp.time);
+				if (a <= 0.01f)
+					continue;
+				if (fp.debug_origin)
+				{
+					// Raw origin tripod (pre-smoothing solve) + white square.
+					glm::vec3 o, x, y, z;
+					tag_frame(bp.raw_pose, o, x, y, z);
+					float len = bp.tag_size_m * 1.5f;
+					tripod(o, x, y, z, len, len * 0.05f, a);
+					// White center square (distinct from the tag tripod).
+					float d = len * 0.25f;
+					box_fill(o, x, y, d, d, 1.f, 1.f, 1.f, a);
+					++fp.dbg_boxes;
+				}
+				if (fp.debug_smoothed)
+				{
+					// Smoothed twin (smaller, cyan square): raw vs filtered
+					// disagree visibly exactly when the filter is working.
+					glm::vec3 o, x, y, z;
+					tag_frame(bp.pose, o, x, y, z);
+					float len = bp.tag_size_m * 1.0f;
+					tripod(o, x, y, z, len, len * 0.06f, a);
+					float d = len * 0.25f;
+					box_fill(o, x, y, d, d, 0.f, 1.f, 1.f, a);
+					++fp.dbg_boxes;
+				}
+			}
+		}
+		fp.dbg_tris = tris.size() / 3;
+		fp.dbg_have_ndc = false;
+		// Own swapchain: acquire once when gizmos will record. Skip the
+		// frame on timeout.
+		if (not tris.empty())
+		{
+			gizmo_lines->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+			dbg_image = gizmo_lines->acquire();
+		}
+		if (dbg_image >= 0 and not tris.empty())
+		{
+			std::array<vk::Extent2D, 2> eye_ext;
+			std::array<glm::mat4, 2> eye_mvp;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+				eye_mvp[view] = world_mvp[view];
+			}
+			gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
+			// Mapping readout: first vert through the eye-0 MVP on CPU.
+			// NDC inside [-1,1] exonerates the mapping chain.
+			glm::vec4 clip = eye_mvp[0] * glm::vec4(tris[0].pos[0], tris[0].pos[1], tris[0].pos[2], 1.f);
+			if (clip.w > 1e-9f)
+			{
+				fp.dbg_ndc[0] = clip.x / clip.w;
+				fp.dbg_ndc[1] = clip.y / clip.w;
+				fp.dbg_ndc[2] = clip.w;
+				fp.dbg_have_ndc = true;
+			}
+			fp.dbg_view_w = eye_ext[0].width;
+			fp.dbg_view_h = eye_ext[0].height;
+			fp.dbg_img = (uint32_t)dbg_image;
+		}
+	}
 
 
 		// Feathered mask record, one stack per feather group (independent
@@ -1311,21 +1469,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				int hh = std::max(64, mh / 2);
 				int qw = std::max(64, mw / 4);
 				int qh = std::max(64, mh / 4);
-				// View-only transforms shared by the cutouts.
-				std::array<glm::mat4, 2> world_mvp;
-				for (uint32_t view = 0; view < 2; ++view)
-					world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+				// View-only transforms: world_mvp computed once above (shared
+				// with the debug line overlays).
 				// Marker window cutouts: raw instant pose of every matched
 				// code (unfiltered, SLAM-held) expanded by the debug
 				// window, punched through the masks so true code locations
-				// stay visible even when meshes are offset.
+				// stay visible even when meshes are offset. Fully-faded
+				// codes (stale past the overlay fade) are excluded, so the
+				// window closes as the quads fade out.
 				std::vector<std::array<glm::vec3, 6>> cutouts;
 				if (fp.debug_overlays and fp.debug_window_mm >= 0)
 				{
+					XrTime cut_now = instance.now();
 					for (const auto & [id, h]: fp.held_codes)
 					{
 						(void)id;
 						if (not h.matched or h.extents.width <= 0 or h.extents.height <= 0)
+							continue;
+						if (fiducial_passthrough_state::stale_hold(cut_now, h.last_seen) <= 0.01f)
 							continue;
 						glm::quat mq(h.pose.orientation.w, h.pose.orientation.x, h.pose.orientation.y, h.pose.orientation.z);
 						glm::vec3 c(h.pose.position.x, h.pose.position.y, h.pose.position.z);
@@ -1359,6 +1520,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->set_mesh(oid, ost.soup);
 						g.mesh_hashes[oid] = ost.soup_hash;
 					}
+				}
+				// Debug-only cutout group (no objects): lets the marker
+				// window punch with a fiducials-only config. Reserved key
+				// (never an object feather); flows through eager setup,
+				// record (empty draws, cutouts punch), submit and stale
+				// drop like any group. Claimed only while fresh codes
+				// exist, so it reaps itself on loss.
+				if (live_feathers.empty() and not cutouts.empty())
+				{
+					const float df = fiducial_passthrough_state::kDebugCutoutFeather;
+					live_feathers.push_back(df);
+					auto & g = fp.mask_groups[df];
+					g.feather_px = df;
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
 				}
 				// Permanent record-order log: group costs are positional, so
 				// the per-group loop order below is load-bearing diagnostics.
@@ -1479,32 +1655,51 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
 							continue;
-						for (auto & [skey, inst]: ost.instances)
-						{
-							(void)skey;
-							if (not inst.anchored)
-								continue;
-							glm::quat q(inst.world_pose.orientation.w, inst.world_pose.orientation.x,
-							            inst.world_pose.orientation.y, inst.world_pose.orientation.z);
-							glm::vec3 t(inst.world_pose.position.x, inst.world_pose.position.y, inst.world_pose.position.z);
-							glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-							                  glm::scale(glm::mat4(1), glm::vec3(inst.world_scale.x, inst.world_scale.y, inst.world_scale.z));
-							std::array<glm::mat4, 2> mvp;
-							for (uint32_t view = 0; view < 2; ++view)
-								mvp[view] = world_mvp[view] * model;
-							float op = fiducial_passthrough_state::fade_factor(
-							        frame_state.predictedDisplayTime, inst.fade_start,
-							        std::max(0.f, ost.def.fade_in_ms));
-							if (not draw_visible(oid, mvp))
-								continue;
-							draws.push_back({oid, mvp, op});
-						}
+						const auto & fu = ost.fused;
+						if (not fu.placed)
+							continue;
+						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						std::array<glm::mat4, 2> mvp;
+						for (uint32_t view = 0; view < 2; ++view)
+							mvp[view] = world_mvp[view] * model;
+						float op = fiducial_passthrough_state::fade_factor(
+						        frame_state.predictedDisplayTime, fu.fade_start,
+						        std::max(0.f, ost.def.fade_in_ms));
+						if (not draw_visible(oid, mvp))
+							continue;
+						draws.push_back({oid, mvp, op});
 					}
 					if (draws.empty())
 					{
-						g.active = false;
-						continue;
+						// Debug cutout group carries no draws; its cutouts
+						// still punch (record() early-outs only when meshes
+						// AND cutouts are both absent).
+						if (f != fiducial_passthrough_state::kDebugCutoutFeather or cutouts.empty())
+						{
+							g.active = false;
+							// Mesh-pipeline edge forensics: draws present ->
+							// absent means the object stopped rasterizing
+							// (frustum-culled out of view vs state loss).
+							// Throttled: frame-edge flicker would spam.
+							if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+							{
+								g.last_draws_log = instance.now();
+								spdlog::info("Fiducial mask draws lost (feather {}px)", f);
+							}
+							g.had_draws = false;
+							continue;
+						}
 					}
+					if (not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+					{
+						g.last_draws_log = instance.now();
+						spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px)", draws.size(), f);
+					}
+					g.had_draws = true;
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release
 					// list immediately, so wait/record/stamp throws (outer
@@ -1600,130 +1795,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_frame = false;
 		}
 
-		// Debug overlay texture: 4x4 white, tinted per quad via
-		// colorScaleBias at submit (after draw_gui, so overlays sit on
-		// top of everything). Refilled every acquire (trivial cost, no
-		// per-image tracking). Command buffer still open here.
-		if (fp.debug_overlays and (fp.debug_matched or fp.debug_unmatched))
-		{
-			bool any = false;
-			for (const auto & [id, h]: fp.held_codes)
-			{
-				(void)id;
-				if (h.extents.width > 0 and h.extents.height > 0 and
-				    ((h.matched and fp.debug_matched) or (not h.matched and fp.debug_unmatched)))
-				{
-					any = true;
-					break;
-				}
-			}
-			if (any)
-			{
-				// Outstanding tracks the acquire so a mid-fill throw still
-				// releases (never break the acquire/release pairing).
-				bool outstanding = false;
-				try
-				{
-					if (not fp.debug_swapchain)
-					{
-						device.waitIdle();
-						fp.debug_swapchain = xr::swapchain(instance, session, device, swapchain_format, 4, 4);
-						// CLEAR-only pass mirroring the mask raster pass
-						// (UNDEFINED -> GENERAL); per-image framebuffers.
-						vk::AttachmentDescription dbg_attachment{
-						        .format = swapchain_format,
-						        .samples = vk::SampleCountFlagBits::e1,
-						        .loadOp = vk::AttachmentLoadOp::eClear,
-						        .storeOp = vk::AttachmentStoreOp::eStore,
-						        .initialLayout = vk::ImageLayout::eUndefined,
-						        .finalLayout = vk::ImageLayout::eGeneral,
-						};
-						vk::AttachmentReference dbg_ref{
-						        .attachment = 0,
-						        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-						};
-						vk::SubpassDescription dbg_subpass{
-						        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-						        .colorAttachmentCount = 1,
-						        .pColorAttachments = &dbg_ref,
-						};
-						vk::RenderPassCreateInfo dbg_rp_info{
-						        .attachmentCount = 1,
-						        .pAttachments = &dbg_attachment,
-						        .subpassCount = 1,
-						        .pSubpasses = &dbg_subpass,
-						};
-						fp.debug_pass = vk::raii::RenderPass(device, dbg_rp_info);
-						for (vk::Image img: fp.debug_swapchain.images())
-						{
-							vk::raii::ImageView view(device,
-							                        vk::ImageViewCreateInfo{
-							                                .image = img,
-							                                .viewType = vk::ImageViewType::e2D,
-							                                .format = swapchain_format,
-							                                .subresourceRange = {
-							                                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-							                                        .baseMipLevel = 0,
-							                                        .levelCount = 1,
-							                                        .baseArrayLayer = 0,
-							                                        .layerCount = 1,
-							                                },
-							                        });
-							vk::ImageView raw = *view;
-							vk::raii::Framebuffer fb(device,
-							                         vk::FramebufferCreateInfo{
-							                                 .renderPass = *fp.debug_pass,
-							                                 .attachmentCount = 1,
-							                                 .pAttachments = &raw,
-							                                 .width = 4,
-							                                 .height = 4,
-							                                 .layers = 1,
-							                         });
-							fp.debug_targets.push_back({img, std::move(view), std::move(fb)});
-						}
-						spdlog::info("Fiducial debug overlay swapchain: 4x4");
-					}
-					int debug_index = fp.debug_swapchain.acquire();
-					if (not fp.debug_swapchain.wait(100'000'000))
-					{
-						fp.debug_swapchain.release();
-					}
-					else
-					{
-						outstanding = true;
-						vk::ClearValue white{};
-						white.color.float32.fill(1);
-						vk::RenderPassBeginInfo begin_dbg{
-						        .renderPass = *fp.debug_pass,
-						        .framebuffer = *fp.debug_targets[debug_index].fb,
-						        .renderArea = {.offset = {0, 0}, .extent = {4, 4}},
-						        .clearValueCount = 1,
-						        .pClearValues = &white,
-						};
-						command_buffer.beginRenderPass(begin_dbg, vk::SubpassContents::eInline);
-						command_buffer.endRenderPass();
-						debug_acquired = true;
-						outstanding = false;
-					}
-				}
-				catch (std::exception & e)
-				{
-					spdlog::warn("Fiducial debug overlay acquire failed: {}", e.what());
-					if (outstanding)
-					{
-						outstanding = false;
-						try
-						{
-							fp.debug_swapchain.release();
-						}
-						catch (std::exception & e2)
-						{
-							spdlog::warn("Fiducial debug overlay release failed: {}", e2.what());
-						}
-					}
-				}
-			}
-		}
 
 		command_buffer.end();
 
@@ -1774,9 +1845,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			spdlog::debug("Fiducial mask release: feather {}px ({} outstanding)", g->feather_px, g->images_outstanding);
 		}
 		acquired_groups.clear();
-		// Paired with the debug overlay acquire above.
-		if (debug_acquired)
-			fp.debug_swapchain.release();
 
 		// Surface-projected passthrough needs the FB passthrough object
 		// alive even for opaque (non-alpha) server video
@@ -1885,6 +1953,38 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 	}
 
+		// Debug line overlay: ONE transparent projection layer for all debug
+		// geometry (standard alpha blend: no FB extensions, works wherever
+		// the old quads did). Always exactly one layer: maxLayerCount can
+		// never overflow. Above passthrough (it annotates real-world tags),
+		// below the GUI.
+		if (dbg_image >= 0)
+		{
+			std::array<XrCompositionLayerProjectionView, view_count> dbg_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				dbg_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = pose[view],
+				        .fov = fov[view],
+					.subImage = {
+					                .swapchain = gizmo_lines->swapchain(),
+					                .imageRect = {
+					                        .offset = {0, 0},
+					                        .extent = extents[view],
+					                },
+					                .imageArrayIndex = view,
+					                },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     dbg_views);
+			// Paired with the acquire in the hook above: the compositor
+			// takes the last released image; release after submit.
+			gizmo_lines->release();
+		}
+
 		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)
 			set_layer_settings(openxr_post_processing.sharpening | openxr_post_processing.super_sampling);
@@ -1893,11 +1993,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
 
-		// Fiducial debug overlays last: raw sighting quads (green matched,
-		// red unmatched, SLAM-held) on top of video, mask and passthrough.
-		// White texture from above, tint + opacity via colorScaleBias.
-		if (debug_acquired)
+		// Fiducial debug overlays record as world-space lines (zero
+		// composition layers); this heartbeat reports what was recorded.
+		static XrTime last_dbg_log = 0;
+		XrTime dbg_now = instance.now();
+		if (fp.debug_overlays and dbg_now - last_dbg_log > 5000000000LL)
 		{
+			last_dbg_log = dbg_now;
+			// Mapping readout (see record site): NDC inside [-1,1]
+			// exonerates the mapping chain; view/img identify the target.
+			if (fp.dbg_have_ndc)
+				spdlog::info("Fiducial debug lines: {} boxes, {} tris, ndc ({:.2f},{:.2f}) w {:.1f} view {}x{} img {}",
+				             fp.dbg_boxes, fp.dbg_tris, (double)fp.dbg_ndc[0], (double)fp.dbg_ndc[1],
+				             (double)fp.dbg_ndc[2], fp.dbg_view_w, fp.dbg_view_h, fp.dbg_img);
+			else
+				spdlog::info("Fiducial debug lines: {} boxes, {} tris (no ndc)", fp.dbg_boxes,
+				             fp.dbg_tris);
 			for (const auto & [id, h]: fp.held_codes)
 			{
 				(void)id;
@@ -1907,48 +2018,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					continue;
 				if (h.extents.width <= 0 or h.extents.height <= 0)
 					continue;
-				float a = std::clamp(fp.debug_opacity, 0.f, 1.f);
-				float r = h.matched ? 0.f : 1.f;
-				float g = h.matched ? 1.f : 0.f;
-				add_quad_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-				               application::space(xr::spaces::world),
-				               XrEyeVisibility::XR_EYE_VISIBILITY_BOTH,
-				               XrSwapchainSubImage{
-				                       .swapchain = fp.debug_swapchain,
-				                       .imageRect = {{0, 0}, {4, 4}},
-				                       .imageArrayIndex = 0,
-				               },
-				               h.pose,
-				               XrExtent2Df{h.extents.width, h.extents.height});
-				if (composition_layer_color_scale_bias_supported)
-					set_color_scale_bias({r * a, g * a, 0.f, a}, {});
+				if (fiducial_passthrough_state::stale_hold(dbg_now, h.last_seen) <= 0.01f)
+					continue;
+				spdlog::info("Fiducial debug box: {} {:.0f} x {:.0f}mm at ({:.2f},{:.2f},{:.2f}){}",
+					h.payload.substr(0, 32), (double)(h.extents.width * 1000),
+					(double)(h.extents.height * 1000), (double)h.pose.position.x,
+					(double)h.pose.position.y, (double)h.pose.position.z,
+					h.matched ? " (matched)" : " (unmatched)");
 			}
-			// Heartbeat inventory: which debug quads are actually submitted
-			// (poses distinguish marker quads from a stuck/ghost one).
-			static XrTime last_dbg_log = 0;
-			XrTime dbg_now = instance.now();
-			if (dbg_now - last_dbg_log > 5'000'000'000LL)
+			if (fp.debug_corrected)
 			{
-				last_dbg_log = dbg_now;
-				size_t n = 0;
-				for (const auto & [id, h]: fp.held_codes)
+				for (const auto & [payload, c]: fp.corrected_tags)
 				{
-					(void)id;
-					if (h.matched and not fp.debug_matched)
+					(void)payload;
+					if (c.size_m <= 0)
 						continue;
-					if (not h.matched and not fp.debug_unmatched)
+					if (fiducial_passthrough_state::stale_hold(dbg_now, c.last_seen) <= 0.01f)
 						continue;
-					if (h.extents.width <= 0 or h.extents.height <= 0)
-						continue;
-					++n;
-					spdlog::info("Fiducial debug quad: {} {:.0f} x {:.0f}mm at ({:.2f},{:.2f},{:.2f}){}",
-					             h.payload.substr(0, 32), (double)(h.extents.width * 1000),
-					             (double)(h.extents.height * 1000), (double)h.pose.position.x,
-					             (double)h.pose.position.y, (double)h.pose.position.z,
-					             h.matched ? " (matched)" : " (unmatched)");
+					spdlog::info("Fiducial corrected box: {} {:.0f}mm fid \"{}\" at ({:.2f},{:.2f},{:.2f})",
+						payload.substr(0, 32), (double)(c.size_m * 1000), c.fiducial_id,
+						(double)c.pose.position.x, (double)c.pose.position.y,
+						(double)c.pose.position.z);
 				}
-				spdlog::info("Fiducial debug quads: {} submitted", n);
-			}
+		}
 		}
 
 		// First frames of each mask activation are traced end to end: a hang
@@ -2138,6 +2230,10 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	        swapchain.images(),
 	        extent,
 	        swapchain.format());
+
+	// Debug line overlays own their swapchain (built lazily on first use
+	// in render(), not here).
+	gizmo_lines.emplace(device);
 }
 
 scene::meta & scenes::stream::get_meta_scene()

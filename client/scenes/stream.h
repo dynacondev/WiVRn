@@ -25,10 +25,12 @@
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
 #include "render/feather_mask.h"
+#include "render/debug_lines.h"
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
-#include "xr/fiducial_filter.h"
+#include "xr/board_solver.h"
+#include "xr/board_filter.h"
 #include "stream_defoveator.h"
 #include "utils/thread_safe.h"
 #include "wifi_lock.h"
@@ -37,6 +39,7 @@
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -104,6 +107,7 @@ private:
 	std::array<accumulator_images, decoder_count> decoders; // Locked by decoder_mutex
 
 	std::optional<stream_defoveator> defoveator;
+	std::optional<debug_lines_renderer> gizmo_lines; // rebuilt with the video swapchain
 
 	vk::raii::Fence fence = nullptr;
 	vk::raii::CommandBuffer command_buffer = nullptr;
@@ -251,36 +255,61 @@ private:
 	// Union of configured marker payloads (any fiducial). Green vs red.
 	std::set<std::string> configured_marker_payloads;
 
-	// Solved fiducial frame per (fiducial, entity): observed marker pose
-	// composed with the marker-to-fiducial offset. Single-marker resolve
-	// only; multi-marker averaging is future work (first marker used).
-	// Rebuilt every frame; render thread only.
-	struct fiducial_sighting
+	// One board hypothesis per (fiducial, marker, entity): observed tag
+	// pose composed with the marker-to-fiducial offset. ALL markers of a
+	// fiducial vote; board_solver fuses each fiducial's votes into one
+	// pose. Rebuilt every frame; render thread only.
+	struct fiducial_vote
 	{
 		std::string fiducial_id;
 		std::string payload;
-		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}};
-		XrExtent2Df extents{0, 0};
-		XrTime time = 0;
+		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}}; // raw tag pose (incidence/overlay)
+		float tag_size_m = 0;
+		std::array<float, 3> offset_pos{0, 0, 0}; // EFFECTIVE marker->board
+		std::array<float, 4> offset_quat{0, 0, 0, 1}; // (authored tag-in-board, inverted at load)
+		XrTime latch_time = 0; // track (re)latch time, 0 = unknown (settled)
 	};
-	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_sighting> fiducial_sightings;
+	std::vector<fiducial_vote> fiducial_votes;
 
-	// One placement per (object, fiducial, entity) sighting: the same QR
-	// seen twice places the object twice; one object over several
-	// fiducials places once per visible pairing (never fused).
-	struct object_instance
+	// Fused board pose per fiducial id: live solution when votes exist,
+	// held (frozen) otherwise. Render thread only.
+	struct board_fused
 	{
-		bool anchored = false; // auto-aligned on first sighting (only behavior)
-		XrTime anchored_at = 0;
-		XrTime last_seen = 0; // last live sighting; unseen 60s prunes (id recycling)
-		xr::fiducial_filter filter; // tuned from the fiducial (carried through)
+		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}}; // smoothed (displayed) board pose
+		XrPosef raw_pose{{0, 0, 0, 1}, {0, 0, 0}}; // pre-smoothing solve (raw origin gizmo)
+		XrTime time = 0; // last live solution (stale age = now - time)
+		bool live = false; // solved this frame
+		float rms_mm = 0, rms_deg = 0;
+		double solve_us = 0;
+		int lm_iters = 0;
+		int tags_visible = 0, tags_used = 0;
+		bool single = true;
+		std::vector<xr::board_tag_stat> tag_stats;
+		// True when any marker carries a non-trivial offset (position or
+		// orientation): the board origin then sits apart from the tags
+		// and earns its own origin tripod in the debug overlay.
+		bool has_offset = false;
+		float tag_size_m = 0; // max over voting markers (gizmo scale)
+	};
+	std::map<std::string /*fiducial id*/, board_fused> board_poses;
+	// Warm starts for the solver (fiducial id -> last fused pose).
+	// Solver init only, not output smoothing.
+	std::map<std::string, XrPosef> board_warm_start;
+	// Post-resolution smoothing state per fiducial (D-hybrid rigid filter;
+	// multi and single-tag flow through identically). Cleared with the map.
+	std::map<std::string, xr::board_filter> board_filters;
+
+	// Single fused placement per object. The per-(fiducial,entity)
+	// instance fan-out stays deleted; output smoothing is the D-hybrid
+	// rigid filter (board_filters above), not per-tag filtering.
+	struct fused_placement
+	{
+		bool placed = false; // any fused solution ever (hold-last on loss)
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
-		XrTime last_predicted = 0;
+		XrTime placed_at = 0;
 		XrTime fade_start = 0;
-		uint64_t samples_ingested = 0;
-		float target_render_err_mm = 0;
-		float target_render_err_deg = 0;
+		XrTime last_solve = 0; // last live frame (stale age)
 	};
 	struct passthrough_object_state
 	{
@@ -293,7 +322,7 @@ private:
 		size_t vertex_count = 0;
 		size_t triangle_count = 0;
 		std::string status = "waiting for fiducial map";
-		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, object_instance> instances; // key (fiducial, entity)
+		fused_placement fused;
 	};
 	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
 
@@ -315,9 +344,33 @@ private:
 		// (C0 diagnostics; one frame stale like the GPU readback).
 		double last_tracker_ms = 0;
 		double last_sync_ms = 0;
+		double last_solve_ms = 0; // board fusion cost (max over fiducials)
+		double last_horizon_ms = 0; // predicted - now: how far poses are extrapolated
+		size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts (heartbeat)
+		// TEMP diagnostic mapping readout (heartbeat): first-vert NDC +
+		// viewport + target indices. NDC inside [-1,1] exonerates mapping.
+		float dbg_ndc[3] = {0, 0, 0};
+		uint32_t dbg_view_w = 0, dbg_view_h = 0, dbg_img = 0;
+		bool dbg_have_ndc = false;
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
 
+		// Multi-code corrected tag poses (orange overlay): each board
+		// tag re-projected from the fused board pose with its authored
+		// offset, vs the raw green sightings. Refreshed on live frames;
+		// stale entries fade like the quads (last_seen) and prune past 10s.
+		struct corrected_tag
+		{
+			XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+			float size_m = 0;
+			std::string fiducial_id;
+			XrTime last_seen = 0;
+		};
+		std::map<std::string /*payload*/, corrected_tag> corrected_tags;
+		bool debug_corrected = true; // orange: fused-corrected tag boxes
+		bool debug_axes = true; // RGB XYZ tripod on sighted tags (orientation/polarity check)
+		bool debug_origin = true; // larger tripod + center square at fused board origins (offset check)
+		bool debug_smoothed = true; // twin tripod (smaller, cyan square) at the SMOOTHED pose; origin stays raw
 		// Fiducial marker debugging (Passthrough tab, session-scoped,
 		// render thread only). Raw instant poses while visible, frozen
 		// SLAM hold when lost; overlays submit even before calibration.
@@ -337,23 +390,11 @@ private:
 			XrTime last_seen = 0;
 			bool matched = false; // payload in some fiducial's markers
 		};
-		// Keyed by (payload, entity): same print seen twice holds twice.
+		// Keyed by (payload, entity); collapsed to one entry per payload
+		// at hold-store time (newest wins): the runtime recycles entity
+		// ids, and one payload is one identity, so ghosts never linger.
 		// Entity ids may collide across tracker contexts, payloads disambiguate.
 		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, held_code> held_codes;
-		// Shared white overlay texture (tinted per layer via
-		// colorScaleBias). Explicit acquire/fill/release pairing like the
-		// mask swapchain, never the shared pool. Filled with a CLEAR-only
-		// render pass: xr swapchain images carry no TRANSFER_DST usage,
-		// so clearColorImage is invalid on them (silently dropped).
-		xr::swapchain debug_swapchain;
-		vk::raii::RenderPass debug_pass{nullptr};
-		struct debug_target
-		{
-			vk::Image image{};
-			vk::raii::ImageView view{nullptr};
-			vk::raii::Framebuffer fb{nullptr};
-		};
-		std::vector<debug_target> debug_targets;
 
 		// First-acquisition alpha fade, per instance (mask-blend path only:
 		// the binary projected layer type has no opacity control). Each
@@ -369,6 +410,26 @@ private:
 			double t = std::clamp((predicted - start) * 1e-6 / dur_ms, 0.0, 1.0);
 			return t * t * (3 - 2 * t);
 		}
+
+		// Stale-hold multiplier for debug overlays (quads, orange, axes):
+		// full presence on fresh data, smooth 3s fade-out on SLAM hold.
+		// last_seen stamps in predicted-display-time base while now runs
+		// host base: the horizon (~30ms) rides along as a constant, moot
+		// against 3000ms. Returns 0 (gone) .. 1 (fresh).
+		static constexpr double kStaleFadeS = 3.0;
+		static float stale_hold(XrTime now, XrTime last_seen)
+		{
+			if (last_seen == 0)
+				return 0;
+			double t = std::clamp((now - last_seen) * 1e-9 / kStaleFadeS, 0.0, 1.0);
+			return (float)(1.0 - t * t * (3 - 2 * t));
+		}
+
+		// Reserved feather key for the debug-only cutout group (no
+		// objects): object feathers are >= 0, and tier_for_feather(-1)
+		// is tier 0 (full-res, crisp punch). Lets the marker window work
+		// with a fiducials-only config.
+		static constexpr float kDebugCutoutFeather = -1.0f;
 
 		// Mask stacks grouped by feather-px: objects sharing a feather
 		// value raster into one shared blur chain (independent feathering
@@ -390,6 +451,8 @@ private:
 			uint32_t images_outstanding = 0;
 			XrExtent2Di extent{0, 0};
 			bool active = false; // submitting this frame
+			bool had_draws = false; // draws present last frame (edge forensics)
+			XrTime last_draws_log = 0; // throttle for the edge log below
 			// Uploaded object soups by object id (hash compare avoids
 			// re-upload; renderer mirrors).
 			std::map<std::string, std::string> mesh_hashes;
@@ -416,6 +479,17 @@ private:
 	// marker payload, driven on the render thread from
 	// update_fiducial_passthrough(). Instances fan out per sighted entity.
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
+
+	// Board-fusion helpers (pure: all state via params/statics, no this).
+	// guard_k1_jump: residual-blind singletons hold last-good instead of
+	// displaying flips; true => skip the frame (occlusion-equivalent).
+	static bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
+	                          const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
+	// log_board_tuning: heartbeat + set-change + pop + flip + smooth lines.
+	static void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
+	                             const xr::board_solution & sol, const board_fused & bp, double horizon_ms,
+	                             XrTime now, double dt, const xr::board_filter_diag & fdiag, bool have_head,
+	                             glm::vec3 head_pos);
 
 	stream(std::string server_name, scene & parent_scene);
 

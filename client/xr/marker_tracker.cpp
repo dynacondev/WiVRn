@@ -21,6 +21,7 @@
 #include "xr/instance.h"
 #include "xr/system.h"
 #include <algorithm>
+#include <cmath>
 #include <spdlog/spdlog.h>
 
 namespace
@@ -71,9 +72,21 @@ xr::marker_tracker::marker_tracker(instance & inst_, session & sess_, system & s
 void xr::marker_tracker::fail(const std::string & reason)
 {
 	current_state = state::failed;
-	status_text = reason;
 	retry_at = last_now + retry_delay_ns;
 	spdlog::warn("marker_tracker: {}", reason);
+}
+
+// G1a finite-intake guard: drop runtime poses that are non-finite (or carry
+// a zero quaternion that Eigen would silently NaN on normalize downstream)
+// before they enter sightings. 0*NaN poisons every computation even at zero
+// weight, so this fires at the door; silent in release (debug level).
+bool xr::marker_tracker::pose_finite(const XrPosef & p)
+{
+	const auto & t = p.position;
+	const auto & q = p.orientation;
+	double n = (double)q.x * q.x + (double)q.y * q.y + (double)q.z * q.z + (double)q.w * q.w;
+	return std::isfinite(t.x) and std::isfinite(t.y) and std::isfinite(t.z) and std::isfinite(q.x) and
+	        std::isfinite(q.y) and std::isfinite(q.z) and std::isfinite(q.w) and n > 1e-12;
 }
 
 bool xr::marker_tracker::poll_ready(XrFutureEXT future, bool & ready)
@@ -127,12 +140,13 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	// Entity handles die with their context; discovery re-latches within
 	// a beat. Rate stats reset per configure.
 	spatial_entities.clear();
+	latch_times.clear();
+	tracked_last.clear();
 	all_sightings.clear();
 	update_ticks = 0;
 	first_tick_at = 0;
 	last_rate_log = 0;
 	current_state = state::idle;
-	status_text = "checking capabilities";
 
 	if (marker_payload.empty())
 	{
@@ -235,7 +249,6 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	}
 
 	current_state = state::creating_context;
-	status_text = "creating spatial context";
 	spdlog::info("marker_tracker: spatial context creating (pose component: {})",
 	             bounded_pose ? "BOUNDED_2D" : "none: markers carry no pose");
 }
@@ -321,7 +334,6 @@ void xr::marker_tracker::complete_context()
 	context_future = XR_NULL_FUTURE_EXT;
 	spatial_context = spatial_context_handle(completion.spatialContext, xrDestroySpatialContextEXT);
 	current_state = state::ready;
-	status_text = "seeking marker";
 	last_discovery_start = 0;
 	spdlog::info("marker_tracker: spatial context ready");
 }
@@ -392,7 +404,6 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			spdlog::warn("marker_tracker: QR capability exposes no pose component, markers cannot be located");
 		}
 		current.tracked = false;
-		status_text = "marker has no pose component";
 		return;
 	}
 
@@ -503,7 +514,13 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 					             payload->substr(0, 64));
 			}
 			XrSpatialEntityIdEXT eid = i < result.entityIdCountOutput ? entity_ids[i] : XR_NULL_SPATIAL_ENTITY_ID_EXT;
-			ensure_entity(eid);
+			ensure_entity(eid, predicted_time);
+			if (not pose_finite(bound_boxes[i].center))
+			{
+				spdlog::debug("marker_tracker: dropping non-finite pose (discovery)");
+				continue;
+			}
+			auto lit = latch_times.find(eid);
 			all_sightings.push_back(code_sighting{
 			        .payload = *payload,
 			        .pose = bound_boxes[i].center,
@@ -511,6 +528,7 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			        .entity_id = eid,
 			        .time = predicted_time,
 			        .matched = matched,
+			        .latch_time = lit != latch_times.end() ? lit->second : 0,
 			});
 			if (not matched)
 				continue;
@@ -526,7 +544,6 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			current.tracked = true;
 			current.pose = bound_boxes[i].center;
 			current.time = predicted_time;
-			status_text = "tracking marker";
 			found = true;
 		}
 		if (not found)
@@ -544,13 +561,12 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 			if (current.tracked)
 				spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
 			current.tracked = false;
-			status_text = "marker not in view";
 		}
 		return;
 	}
 }
 
-void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
+void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id, XrTime latch_time)
 {
 	if (id == XR_NULL_SPATIAL_ENTITY_ID_EXT)
 		return;
@@ -566,7 +582,10 @@ void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
 		spdlog::debug("marker_tracker: cannot create entity from id: {}", (int)res);
 		return;
 	}
-	spatial_entities.emplace(id, spatial_entity_handle(entity, xrDestroySpatialEntityEXT));
+	if (spatial_entities.emplace(id, spatial_entity_handle(entity, xrDestroySpatialEntityEXT)).second)
+		latch_times[id] = latch_time; // emplace-bool guards id reuse: a
+	// recycled id that never left still holds its original stamp; ids
+	// erased as unseen get a fresh stamp on re-latch, which is correct.
 }
 
 void xr::marker_tracker::log_rate(XrTime now)
@@ -618,6 +637,8 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 			// An id expired (runtime recycled ids): drop everything so
 			// the next discovery pass re-latches what is still around.
 			spatial_entities.clear();
+			latch_times.clear();
+			tracked_last.clear();
 		}
 		else
 			spdlog::debug("marker_tracker: update snapshot failed: {}", (int)res);
@@ -670,12 +691,12 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 	if (not bounded_pose)
 	{
 		current.tracked = false;
-		status_text = "marker has no pose component";
 		return;
 	}
 	// Rebuild sightings from this tick; ids the runtime no longer returns
 	// are stale (dropped, discovery re-latches survivors).
 	std::set<XrSpatialEntityIdEXT> seen;
+	std::set<XrSpatialEntityIdEXT> tracked_now;
 	all_sightings.clear();
 	bool matched_tick = false;
 	uint32_t out = std::min({result.entityIdCountOutput, (uint32_t)marker_data.size(), (uint32_t)bound_boxes.size()});
@@ -685,6 +706,16 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		seen.insert(eid);
 		if (i >= result.entityStateCountOutput or entity_states[i] != XR_SPATIAL_ENTITY_TRACKING_STATE_TRACKING_EXT)
 			continue;
+		// Update-path resumption: TRACKING now but absent before = fresh
+		// (same-handle state flap, the counterpart to discovery re-latch).
+		if (not tracked_last.contains(eid))
+			latch_times[eid] = now;
+		tracked_now.insert(eid);
+		if (not pose_finite(bound_boxes[i].center))
+		{
+			spdlog::debug("marker_tracker: dropping non-finite pose (update)");
+			continue;
+		}
 		auto payload = read_payload(snapshot, marker_data[i].data);
 		if (not payload)
 			continue;
@@ -703,6 +734,7 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		        .entity_id = eid,
 		        .time = predicted_time,
 		        .matched = matched,
+		        .latch_time = latch_times.contains(eid) ? latch_times[eid] : 0,
 		});
 		if (not matched)
 			continue;
@@ -711,7 +743,6 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		current.tracked = true;
 		current.pose = bound_boxes[i].center;
 		current.time = predicted_time;
-		status_text = "tracking marker";
 		matched_tick = true;
 	}
 	for (auto it = spatial_entities.begin(); it != spatial_entities.end();)
@@ -719,14 +750,17 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		if (seen.contains(it->first))
 			++it;
 		else
+		{
+			latch_times.erase(it->first);
 			it = spatial_entities.erase(it);
+		}
 	}
+	tracked_last = std::move(tracked_now);
 	if (not matched_tick)
 	{
 		if (current.tracked)
 			spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
 		current.tracked = false;
-		status_text = "marker not in view";
 	}
 	if (first_tick_at == 0)
 		first_tick_at = now;
