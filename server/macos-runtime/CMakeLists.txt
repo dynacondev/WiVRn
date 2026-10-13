@@ -124,3 +124,27 @@ target_include_directories(wivrn-macos-stream-test PRIVATE
 	.
 )
 target_link_libraries(wivrn-macos-stream-test PRIVATE openxr_loader Vulkan::Vulkan wivrn-common)
+
+# Phase 6: stock hello_xr from OpenXR-SDK-Source, built isolated via
+# ExternalProject (its loader target would collide with ours in one
+# scope). Trimmed to samples only; default graphics overridden on the
+# command line (--graphics Vulkan) at run time.
+option(WIVRN_BUILD_MACOS_HELLO_XR "Build stock hello_xr for headset testing" OFF)
+if(WIVRN_BUILD_MACOS_HELLO_XR)
+	include(ExternalProject)
+	ExternalProject_Add(hello_xr_external
+		URL https://github.com/KhronosGroup/OpenXR-SDK-Source/archive/refs/tags/release-1.1.59.tar.gz
+		URL_HASH SHA256=3b241897f93e2cf7e833d27f8ec3c3433cf5cf064e13724af026984acede02e7
+		CMAKE_ARGS
+			-DBUILD_TESTS=ON
+			-DBUILD_CONFORMANCE_TESTS=OFF
+			-DBUILD_API_LAYERS=OFF
+			-DBUILD_WITH_SYSTEM_JSONCPP=OFF
+			-DCMAKE_BUILD_TYPE=Release
+		BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target hello_xr --config Release
+		INSTALL_COMMAND ""
+		BUILD_BYPRODUCTS <BINARY_DIR>/src/tests/hello_xr/hello_xr
+	)
+	ExternalProject_Get_Property(hello_xr_external BINARY_DIR)
+	message(STATUS "hello_xr builds to: ${BINARY_DIR}/src/tests/hello_xr/hello_xr")
+endif()

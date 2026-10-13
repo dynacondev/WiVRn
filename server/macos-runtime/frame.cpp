@@ -120,6 +120,10 @@ extern "C"
 		}
 		session->data.lastLayerCount = projections;
 		session->data.lastCall = wivrn_macos::Session::FrameCall::End;
+		// Headless frame heartbeat (every 300 frames): the cheapest proof
+		// pixels flow, visible in headset-test logs.
+		if (session->data.frameIndex % 300 == 0)
+			wivrn_macos::log("frames=%llu layers=%u", (unsigned long long)session->data.frameIndex, projections);
 		// Pixels-to-wire (no-op without a headset; see streamer). Headless
 		// test runs opt out via WIVRN_MACOS_HEADLESS so they never bind
 		// ports or advertise Bonjour.

@@ -67,6 +67,20 @@ extern "C"
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanGraphicsRequirements2KHR(XrInstance, XrSystemId, XrGraphicsRequirementsVulkan2KHR *);
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateVulkanInstanceKHR(XrInstance, const XrVulkanInstanceCreateInfoKHR *, VkInstance *, VkResult *);
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateVulkanDeviceKHR(XrInstance, const XrVulkanDeviceCreateInfoKHR *, VkDevice *, VkResult *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanGraphicsDevice2KHR(XrInstance, const XrVulkanGraphicsDeviceGetInfoKHR *, VkPhysicalDevice *);
+	XRAPI_ATTR const char * XRAPI_CALL wivrn_macos_StructureTypeToString(XrInstance, XrStructureType);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateDebugUtilsMessengerEXT(XrInstance, const XrDebugUtilsMessengerCreateInfoEXT *, XrDebugUtilsMessengerEXT *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_DestroyDebugUtilsMessengerEXT(XrDebugUtilsMessengerEXT);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SubmitDebugUtilsMessageEXT(XrInstance, XrDebugUtilsMessageSeverityFlagsEXT, XrDebugUtilsMessageTypeFlagsEXT, const XrDebugUtilsMessengerCallbackDataEXT *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SetDebugUtilsObjectNameEXT(XrInstance, const XrDebugUtilsObjectNameInfoEXT *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SessionBeginDebugUtilsLabelRegionEXT(XrSession, const XrDebugUtilsLabelEXT *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SessionEndDebugUtilsLabelRegionEXT(XrSession);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_SessionInsertDebugUtilsLabelEXT(XrSession, const XrDebugUtilsLabelEXT *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetViewConfigurationProperties(XrInstance, XrSystemId, XrViewConfigurationType, XrViewConfigurationProperties *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_LocateSpaces(XrSession, const XrSpacesLocateInfo *, XrSpaceLocations *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetReferenceSpaceBoundsRect(XrSession, XrReferenceSpaceType, XrExtent2Df *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetCurrentInteractionProfile(XrSession, XrPath, XrInteractionProfileState *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetInputSourceLocalizedName(XrSession, const XrInputSourceLocalizedNameGetInfo *, uint32_t, uint32_t *, char *);
 }
 
 namespace
@@ -109,6 +123,14 @@ const FunctionEntry functions[] = {
         ENTRY(RequestExitSession),
         ENTRY(PollEvent),
         ENTRY(ResultToString),
+        ENTRY(StructureTypeToString),
+        ENTRY(CreateDebugUtilsMessengerEXT),
+        ENTRY(DestroyDebugUtilsMessengerEXT),
+        ENTRY(SubmitDebugUtilsMessageEXT),
+        ENTRY(SetDebugUtilsObjectNameEXT),
+        ENTRY(SessionBeginDebugUtilsLabelRegionEXT),
+        ENTRY(SessionEndDebugUtilsLabelRegionEXT),
+        ENTRY(SessionInsertDebugUtilsLabelEXT),
         ENTRY(StringToPath),
         ENTRY(PathToString),
         ENTRY(CreateActionSet),
@@ -147,6 +169,12 @@ const FunctionEntry functions[] = {
         ENTRY(GetVulkanGraphicsRequirements2KHR),
         ENTRY(CreateVulkanInstanceKHR),
         ENTRY(CreateVulkanDeviceKHR),
+        ENTRY(GetVulkanGraphicsDevice2KHR),
+        ENTRY(GetViewConfigurationProperties),
+        ENTRY(LocateSpaces),
+        ENTRY(GetReferenceSpaceBoundsRect),
+        ENTRY(GetCurrentInteractionProfile),
+        ENTRY(GetInputSourceLocalizedName),
 };
 
 } // namespace
@@ -168,6 +196,8 @@ extern "C"
 				return XR_SUCCESS;
 			}
 		}
+		// Loud about gaps (apps crash on null pointers, not on errors).
+		wivrn_macos::log("GetInstanceProcAddr: unsupported %s", name);
 		return XR_ERROR_FUNCTION_UNSUPPORTED;
 	}
 

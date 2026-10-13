@@ -128,4 +128,24 @@ extern "C"
 		return XR_SUCCESS;
 	}
 
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetViewConfigurationProperties(
+	        XrInstance instance,
+	        XrSystemId systemId,
+	        XrViewConfigurationType viewConfigurationType,
+	        XrViewConfigurationProperties * configurationProperties)
+	{
+		wivrn_macos::Instance * self = lookup(instance);
+		if (self == nullptr || configurationProperties == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		if (systemId != self->system.id)
+			return XR_ERROR_SYSTEM_INVALID;
+		if (viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+			return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+		if (configurationProperties->type != XR_TYPE_VIEW_CONFIGURATION_PROPERTIES)
+			return XR_ERROR_VALIDATION_FAILURE;
+		configurationProperties->viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		configurationProperties->fovMutable = XR_FALSE;
+		return XR_SUCCESS;
+	}
+
 } // extern "C"

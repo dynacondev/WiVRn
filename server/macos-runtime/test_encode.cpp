@@ -197,6 +197,24 @@ int main()
 {
 	using namespace wivrn_macos;
 
+	// Converter lane check (pure CPU): memory {B,G,R,A} = {0,0,255,255}
+	// is pure red -> Y~54; swapped lanes read it as blue -> Y~18.
+	{
+		uint8_t bgra[4 * 4 * 4] = {};
+		for (int i = 0; i < 16; ++i)
+		{
+			bgra[i * 4 + 0] = 0;
+			bgra[i * 4 + 1] = 0;
+			bgra[i * 4 + 2] = 255;
+			bgra[i * 4 + 3] = 255;
+		}
+		uint8_t yuv[4 * 4 * 3 / 2] = {};
+		convert_to_nv12(bgra, 4, 4, false, yuv);
+		CHECK(yuv[0] >= 50 && yuv[0] <= 58);
+		convert_to_nv12(bgra, 4, 4, true, yuv);
+		CHECK(yuv[0] >= 14 && yuv[0] <= 22);
+	}
+
 	Device dev{};
 	CHECK(bring_up(dev));
 
@@ -276,7 +294,7 @@ int main()
 			CHECK(bgra[2] > 150);
 
 		bool forceIdr = frame == 0 || frame == 5;
-		std::vector<EncodedNal> nals = encoder.feed(bgra, forceIdr);
+		std::vector<EncodedNal> nals = encoder.feed(bgra, false, forceIdr);
 		CHECK(!nals.empty());
 		CHECK(nals.back().is_last);
 		for (const EncodedNal & nal: nals)
@@ -323,7 +341,7 @@ int main()
 		CHECK(clear_image(dev, image, pool, 0.5f, 0.5f, 0.5f));
 		const uint8_t * bgra = snapshot.capture(image, false);
 		CHECK(bgra != nullptr);
-		std::vector<EncodedNal> nals = encoder.feed(bgra, true);
+		std::vector<EncodedNal> nals = encoder.feed(bgra, false, true);
 		CHECK(!nals.empty());
 	}
 

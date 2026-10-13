@@ -4,8 +4,10 @@
 
 #include "runtime.h"
 #include "streamer.h"
+#include "vk_context.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <new>
 
 namespace
@@ -85,8 +87,27 @@ extern "C"
 			wivrn_macos::Runtime & runtime = wivrn_macos::runtime_singleton();
 			std::lock_guard lock(runtime.mutex);
 			self->liveSessions += 1;
+			self->sessions.push_back(&handle->data);
 		}
 		*session = handle;
+		// Queue IDLE then READY: hello_xr waits for READY before beginning.
+		{
+			int64_t now = wivrn_macos::now_ns();
+			handle->data.events.push_back({
+			        .type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED,
+			        .next = nullptr,
+			        .session = *session,
+			        .state = XR_SESSION_STATE_IDLE,
+			        .time = now,
+			});
+			handle->data.events.push_back({
+			        .type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED,
+			        .next = nullptr,
+			        .session = *session,
+			        .state = XR_SESSION_STATE_READY,
+			        .time = now,
+			});
+		}
 		// Listen + advertise from session creation (not first frame), so a
 		// headset can connect while the app is still starting up. Headless
 		// runs opt out via WIVRN_MACOS_HEADLESS (see frame.cpp).
@@ -107,6 +128,7 @@ extern "C"
 			std::lock_guard lock(runtime.mutex);
 			if (self->liveSessions > 0)
 				self->liveSessions -= 1;
+			std::erase(self->sessions, &session->data);
 		}
 		wivrn_macos::streamer_session_destroyed(&session->data);
 		delete session;
@@ -122,6 +144,13 @@ extern "C"
 		if (session->data.state != XR_SESSION_STATE_IDLE)
 			return XR_ERROR_SESSION_NOT_READY;
 		session->data.state = XR_SESSION_STATE_SYNCHRONIZED;
+		session->data.events.push_back({
+		        .type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED,
+		        .next = nullptr,
+		        .session = session,
+		        .state = XR_SESSION_STATE_SYNCHRONIZED,
+		        .time = wivrn_macos::now_ns(),
+		});
 		return XR_SUCCESS;
 	}
 
@@ -132,6 +161,13 @@ extern "C"
 		if (session->data.state != XR_SESSION_STATE_SYNCHRONIZED)
 			return XR_ERROR_SESSION_NOT_RUNNING;
 		session->data.state = XR_SESSION_STATE_IDLE;
+		session->data.events.push_back({
+		        .type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED,
+		        .next = nullptr,
+		        .session = session,
+		        .state = XR_SESSION_STATE_IDLE,
+		        .time = wivrn_macos::now_ns(),
+		});
 		return XR_SUCCESS;
 	}
 
@@ -140,6 +176,13 @@ extern "C"
 		if (session == nullptr)
 			return XR_ERROR_HANDLE_INVALID;
 		session->data.state = XR_SESSION_STATE_EXITING;
+		session->data.events.push_back({
+		        .type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED,
+		        .next = nullptr,
+		        .session = session,
+		        .state = XR_SESSION_STATE_EXITING,
+		        .time = wivrn_macos::now_ns(),
+		});
 		return XR_SUCCESS;
 	}
 
@@ -148,8 +191,18 @@ extern "C"
 		wivrn_macos::Instance * self = lookup(instance);
 		if (self == nullptr || eventData == nullptr)
 			return XR_ERROR_HANDLE_INVALID;
-		// v1 posts no events (session-state changes arrive with Phase 5/6).
-		(void)self;
+		wivrn_macos::Runtime & runtime = wivrn_macos::runtime_singleton();
+		std::lock_guard lock(runtime.mutex);
+		for (wivrn_macos::Session * session: self->sessions)
+		{
+			if (!session->events.empty())
+			{
+				XrEventDataSessionStateChanged event = session->events.front();
+				session->events.pop_front();
+				std::memcpy(eventData, &event, sizeof(event));
+				return XR_SUCCESS;
+			}
+		}
 		return XR_EVENT_UNAVAILABLE;
 	}
 

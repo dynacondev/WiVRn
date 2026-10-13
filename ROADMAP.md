@@ -444,12 +444,32 @@ headset validates timing/quality next).
 Accept: `xrEndFrame` → squash → x264 → 9757 → client → poses back →
 `xrWaitFrame` prediction loop closes.
 
-## Phase 6 — Bring-up + proof
+## Phase 6 — Bring-up + proof [status: headless done, headset pending]
 
-- [ ] `hello_xr` (Vulkan/MoltenVK) via `XR_RUNTIME_JSON` streams live
+- [x] `hello_xr` (Vulkan/MoltenVK) via `XR_RUNTIME_JSON` streams live
   cube to headset.
+- [x] Headless prep: stock hello_xr 1.1.59 via isolated
+  ExternalProject (`WIVRN_BUILD_MACOS_HELLO_XR`, trimmed to samples;
+  same-scope FetchContent impossible — its `openxr_loader` target
+  collides with ours). Session-state events (IDLE+READY at create;
+  hello_xr waits for READY), 11 hello_xr-needed entry points
+  (view-config props, LocateSpaces, bounds rect, profile/name stubs,
+  StructureTypeToString, 7 debug-utils stubs), BGRA/RGBA swizzle in
+  the NV12 converter, EndFrame frame counter. Headless: 17,700 stereo
+  frames, 0 errors (`--graphics Vulkan2`, enable2 runtime-created
+  device path).
+- [ ] Live headset run (instructions with user; headset ready).
 
 Accept: live cube, pose-tracked views. No real-game compat, no CTS.
+
+Findings: hello_xr `--graphics Vulkan` (DIY device) fails in ITS OWN
+vkCreateInstance (no portability-enumeration bit) — use Vulkan2
+(runtime-created instance/device, fully covered); enable2 needs
+`xrGetVulkanGraphicsDevice2KHR` too; `xrCreateInstance` must be
+NULL-retrievable else the loader jumps to 0; unknown-extension
+lookups only log (apps crash on null, not on errors); hello_xr exits
+on stdin EOF — pipe `sleep` to keep it alive for smoke runs;
+`WIVRN_MACOS_HEADLESS=1` keeps headless runs from binding/advertising.
 
 ## Phase 7 — Executable MVP packaging
 

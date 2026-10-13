@@ -278,7 +278,10 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 				swap->virgin[image_idx] = false;
 			bool force_idr = eye.force_idr;
 			eye.force_idr = false;
-			std::vector<EncodedNal> nals = eye.encoder.feed(bgra, force_idr);
+			// Snapshot bytes follow the swapchain format; RGBA needs an
+			// R/B lane swap for the NV12 conversion.
+			bool swap_rb = swap->format == (int64_t)VK_FORMAT_R8G8B8A8_SRGB;
+			std::vector<EncodedNal> nals = eye.encoder.feed(bgra, swap_rb, force_idr);
 			int64_t encode_end = now_ns();
 			if (nals.empty())
 				continue;

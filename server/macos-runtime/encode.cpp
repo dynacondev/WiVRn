@@ -16,22 +16,22 @@
 namespace wivrn_macos
 {
 
-// Packed-BGRA (memory order B,G,R,A) to NV12, integer BT.709 full-range
-// with 2x2 chroma box average. v1 deliberately CPU-side (matches the
-// Linux contract; a GPU conversion shader is the later optimization).
-void convert_bgra_to_nv12(const uint8_t * bgra, uint32_t width, uint32_t height, uint8_t * yuv)
+void convert_to_nv12(const uint8_t * rgba, uint32_t width, uint32_t height, bool swap_rb, uint8_t * yuv)
 {
 	uint8_t * y = yuv;
 	uint8_t * uv = yuv + width * height;
+	// Byte lane of R and B in memory order.
+	const uint32_t r_lane = swap_rb ? 0 : 2;
+	const uint32_t b_lane = swap_rb ? 2 : 0;
 	for (uint32_t row = 0; row < height; ++row)
 	{
-		const uint8_t * src = bgra + row * width * 4;
+		const uint8_t * src = rgba + row * width * 4;
 		uint8_t * dstY = y + row * width;
 		for (uint32_t col = 0; col < width; ++col)
 		{
-			int b = src[col * 4 + 0];
+			int b = src[col * 4 + b_lane];
 			int g = src[col * 4 + 1];
-			int r = src[col * 4 + 2];
+			int r = src[col * 4 + r_lane];
 			int yy = (54 * r + 183 * g + 18 * b + 128) >> 8;
 			dstY[col] = (uint8_t)(yy < 0 ? 0 : (yy > 255 ? 255 : yy));
 		}
@@ -43,10 +43,10 @@ void convert_bgra_to_nv12(const uint8_t * bgra, uint32_t width, uint32_t height,
 				int r = 0, g = 0, b = 0;
 				for (uint32_t dy = 0; dy < 2; ++dy)
 				{
-					const uint8_t * s = bgra + (row - 1 + dy) * width * 4 + col * 4;
-					b += s[0] + s[4];
+					const uint8_t * s = rgba + (row - 1 + dy) * width * 4 + col * 4;
+					b += s[b_lane] + s[4 + b_lane];
 					g += s[1] + s[5];
-					r += s[2] + s[6];
+					r += s[r_lane] + s[4 + r_lane];
 				}
 				// Sums over 4 pixels: coefficients are x256/4 (>> 10).
 				int cb = ((-29 * r - 99 * g + 128 * b) >> 10) + 128;
@@ -175,14 +175,14 @@ void X264Encoder::on_nal(x264_nal_t * nal)
 	pending_.push_back(std::move(out));
 }
 
-std::vector<EncodedNal> X264Encoder::feed(const uint8_t * bgra, bool force_idr)
+std::vector<EncodedNal> X264Encoder::feed(const uint8_t * rgba, bool swap_rb, bool force_idr)
 {
 	std::vector<EncodedNal> empty;
-	if (encoder_ == nullptr || picture_ == nullptr || bgra == nullptr)
+	if (encoder_ == nullptr || picture_ == nullptr || rgba == nullptr)
 		return empty;
 	pending_.clear();
 	failed_ = false;
-	convert_bgra_to_nv12(bgra, params_.width, params_.height, yuv_.data());
+	convert_to_nv12(rgba, params_.width, params_.height, swap_rb, yuv_.data());
 	picture_->i_pts = (int64_t)frame_index_;
 	picture_->i_type = force_idr ? X264_TYPE_IDR : X264_TYPE_AUTO;
 	// The nalu_process opaque is the INPUT picture's opaque (not the

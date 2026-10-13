@@ -135,6 +135,17 @@ XrPosef stage_pose(const wivrn_macos::Space * space, const wivrn_macos::Tracking
 	}
 }
 
+// Pose of `space` relative to `base` (both via STAGE). Reference-space
+// creation offsets compose under the space origin.
+XrPosef locate_pose(const wivrn_macos::Space * space, const wivrn_macos::Space * base, const wivrn_macos::TrackingSample & sample)
+{
+	XrPosef baseInStage = stage_pose(base, sample);
+	XrPosef spaceInStage = stage_pose(space, sample);
+	if (space->kind == wivrn_macos::Space::Kind::Reference)
+		spaceInStage = pmul(spaceInStage, space->offset);
+	return pmul(pinv(baseInStage), spaceInStage);
+}
+
 } // namespace
 
 extern "C"
@@ -303,14 +314,69 @@ extern "C"
 		if (self == nullptr || baseSpace->data.owner != self)
 			return XR_ERROR_HANDLE_INVALID;
 		wivrn_macos::TrackingSample sample = wivrn_macos::current_sample();
-		XrPosef baseInStage = stage_pose(&baseSpace->data, sample);
-		XrPosef spaceInStage = stage_pose(&space->data, sample);
-		// Reference-space creation offsets compose under the space origin.
-		if (space->data.kind == wivrn_macos::Space::Kind::Reference)
-			spaceInStage = pmul(spaceInStage, space->data.offset);
 		location->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT |
 		                          XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
-		location->pose = pmul(pinv(baseInStage), spaceInStage);
+		location->pose = locate_pose(&space->data, &baseSpace->data, sample);
+		return XR_SUCCESS;
+	}
+
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_LocateSpaces(
+	        XrSession session,
+	        const XrSpacesLocateInfo * locateInfo,
+	        XrSpaceLocations * spaceLocations)
+	{
+		if (session == nullptr || locateInfo == nullptr || spaceLocations == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		if (locateInfo->type != XR_TYPE_SPACES_LOCATE_INFO)
+			return XR_ERROR_VALIDATION_FAILURE;
+		if (locateInfo->next != nullptr)
+			return XR_ERROR_VALIDATION_FAILURE;
+		if (spaceLocations->type != XR_TYPE_SPACE_LOCATIONS)
+			return XR_ERROR_VALIDATION_FAILURE;
+		if (locateInfo->baseSpace == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		wivrn_macos::Instance * self = session->data.instance;
+		if (self == nullptr || locateInfo->baseSpace->data.owner != self)
+			return XR_ERROR_HANDLE_INVALID;
+		if (spaceLocations->locationCount != locateInfo->spaceCount)
+			return XR_ERROR_VALIDATION_FAILURE;
+		if (locateInfo->time <= 0)
+			return XR_ERROR_TIME_INVALID;
+		wivrn_macos::TrackingSample sample = wivrn_macos::current_sample();
+		for (uint32_t i = 0; i < locateInfo->spaceCount; ++i)
+		{
+			XrSpace space = locateInfo->spaces[i];
+			if (space == nullptr || space->data.owner != self)
+				return XR_ERROR_HANDLE_INVALID;
+			spaceLocations->locations[i].locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+			                                             XR_SPACE_LOCATION_POSITION_VALID_BIT |
+			                                             XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT |
+			                                             XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
+			spaceLocations->locations[i].pose = locate_pose(&space->data, &locateInfo->baseSpace->data, sample);
+		}
+		return XR_SUCCESS;
+	}
+
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetReferenceSpaceBoundsRect(
+	        XrSession session,
+	        XrReferenceSpaceType referenceSpaceType,
+	        XrExtent2Df * bounds)
+	{
+		if (session == nullptr || bounds == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		switch (referenceSpaceType)
+		{
+			case XR_REFERENCE_SPACE_TYPE_LOCAL:
+			case XR_REFERENCE_SPACE_TYPE_VIEW:
+			case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR:
+			case XR_REFERENCE_SPACE_TYPE_STAGE:
+				break;
+			default:
+				return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+		}
+		// v1 reports an unbounded play space (zeros).
+		bounds->width = 0;
+		bounds->height = 0;
 		return XR_SUCCESS;
 	}
 

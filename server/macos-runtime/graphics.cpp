@@ -241,4 +241,48 @@ extern "C"
 		return XR_SUCCESS;
 	}
 
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanGraphicsDevice2KHR(
+	        XrInstance instance,
+	        const XrVulkanGraphicsDeviceGetInfoKHR * getInfo,
+	        VkPhysicalDevice * vulkanPhysicalDevice)
+	{
+		wivrn_macos::Instance * self = lookup(instance);
+		if (self == nullptr || getInfo == nullptr || vulkanPhysicalDevice == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		if (getInfo->type != XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR)
+			return XR_ERROR_VALIDATION_FAILURE;
+		if (getInfo->next != nullptr)
+			return XR_ERROR_VALIDATION_FAILURE;
+		XrResult res = check_system(self, getInfo->systemId);
+		if (res != XR_SUCCESS)
+			return res;
+		if (getInfo->vulkanInstance == VK_NULL_HANDLE)
+			return XR_ERROR_HANDLE_INVALID;
+		uint32_t count = 0;
+		if (vkEnumeratePhysicalDevices(getInfo->vulkanInstance, &count, nullptr) != VK_SUCCESS || count == 0)
+			return XR_ERROR_RUNTIME_FAILURE;
+		std::vector<VkPhysicalDevice> devices(count);
+		if (vkEnumeratePhysicalDevices(getInfo->vulkanInstance, &count, devices.data()) != VK_SUCCESS)
+			return XR_ERROR_RUNTIME_FAILURE;
+		// First device with a graphics queue (single-GPU MoltenVK hosts have
+		// exactly one; multi-GPU selection heuristics arrive if ever needed).
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			uint32_t familyCount = 0;
+			vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &familyCount, nullptr);
+			std::vector<VkQueueFamilyProperties> families(familyCount);
+			vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &familyCount, families.data());
+			for (uint32_t f = 0; f < familyCount; ++f)
+			{
+				if ((families[f].queueFlags & VK_QUEUE_GRAPHICS_BIT) != 0)
+				{
+					*vulkanPhysicalDevice = devices[i];
+					return XR_SUCCESS;
+				}
+			}
+		}
+		wivrn_macos::log("GetVulkanGraphicsDevice: no graphics device");
+		return XR_ERROR_RUNTIME_FAILURE;
+	}
+
 } // extern "C"

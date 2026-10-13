@@ -762,4 +762,36 @@ extern "C"
 		return XR_SUCCESS;
 	}
 
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetCurrentInteractionProfile(
+	        XrSession session,
+	        XrPath topLevelUserPath,
+	        XrInteractionProfileState * interactionProfile)
+	{
+		if (session == nullptr || interactionProfile == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		if (interactionProfile->type != XR_TYPE_INTERACTION_PROFILE_STATE)
+			return XR_ERROR_VALIDATION_FAILURE;
+		(void)topLevelUserPath;
+		// v1 tracks no live profile switching (single suggested set resolves
+		// everything); report none rather than invent one.
+		return XR_ERROR_PATH_UNSUPPORTED;
+	}
+
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetInputSourceLocalizedName(
+	        XrSession session,
+	        const XrInputSourceLocalizedNameGetInfo * getInfo,
+	        uint32_t bufferCapacityInput,
+	        uint32_t * bufferCountOutput,
+	        char * buffer)
+	{
+		if (session == nullptr || getInfo == nullptr || bufferCountOutput == nullptr)
+			return XR_ERROR_HANDLE_INVALID;
+		if (getInfo->type != XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO)
+			return XR_ERROR_VALIDATION_FAILURE;
+		(void)bufferCapacityInput;
+		(void)buffer;
+		// v1 synthesizes no display names (see GetCurrentInteractionProfile).
+		return XR_ERROR_PATH_UNSUPPORTED;
+	}
+
 } // extern "C"

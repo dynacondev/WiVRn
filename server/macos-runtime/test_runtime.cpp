@@ -158,6 +158,16 @@ int main()
 	CHECK(session != XR_NULL_HANDLE);
 
 	XrEventDataBuffer event{.type = XR_TYPE_EVENT_DATA_BUFFER, .next = nullptr};
+	// Creation queued IDLE then READY; the queue drains to empty.
+	XrEventDataSessionStateChanged session_event{};
+	for (int i = 0; i < 2; ++i)
+	{
+		XrEventDataBuffer buffer{.type = XR_TYPE_EVENT_DATA_BUFFER, .next = nullptr};
+		CHECK_XR(xrPollEvent(instance, &buffer), XR_SUCCESS);
+		std::memcpy(&session_event, &buffer, sizeof(session_event));
+		CHECK(session_event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED);
+	}
+	CHECK(session_event.state == XR_SESSION_STATE_READY);
 	CHECK_XR(xrPollEvent(instance, &event), XR_EVENT_UNAVAILABLE);
 
 	XrSessionBeginInfo beginInfo{.type = XR_TYPE_SESSION_BEGIN_INFO, .next = nullptr, .primaryViewConfigurationType = config};

@@ -13,6 +13,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -54,6 +55,8 @@ struct Instance
 	XrVersion apiVersion = XR_CURRENT_API_VERSION;
 	SystemInfo system;
 	size_t liveSessions = 0;
+	// Live sessions for event polling (raw; removed on destroy).
+	std::vector<struct Session *> sessions;
 	// Owned action/socket graph (freed on DestroyInstance).
 	std::vector<std::unique_ptr<XrActionSet_T>> ownedSets;
 	std::vector<std::unique_ptr<XrAction_T>> ownedActions;
@@ -169,6 +172,10 @@ struct Session
 	// Retained projection-layer count from the last EndFrame (Phase 5
 	// composites from this intake).
 	uint32_t lastLayerCount = 0;
+	// Queued session-state events (IDLE+READY at creation, SYNCHRONIZED
+	// at begin, IDLE at end, EXITING at request-exit). hello_xr waits
+	// for READY before beginning, so these are load-bearing.
+	std::deque<XrEventDataSessionStateChanged> events;
 };
 
 // Runtime-owned swapchain images on the application device (Phase 4).
