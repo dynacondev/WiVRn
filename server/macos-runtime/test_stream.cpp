@@ -90,6 +90,10 @@ struct GotFrame
 	bool has_view_info = false;
 	XrTime display_time = 0;
 	bool reliable = false; // arrived on control
+	// Identity foveation must decode to the stream dims (client sizes
+	// its swapchain from these; zeros crash it — see headset run 1).
+	uint32_t fov_w = 0;
+	uint32_t fov_h = 0;
 };
 
 struct ShardBin
@@ -97,6 +101,8 @@ struct ShardBin
 	std::vector<std::vector<uint8_t>> parts; // indexed by shard_idx (gaps empty)
 	bool has_view_info = false;
 	XrTime display_time = 0;
+	uint32_t fov_w = 0;
+	uint32_t fov_h = 0;
 	bool complete = false;
 };
 
@@ -115,6 +121,19 @@ void ingest(
 	{
 		bin.has_view_info = true;
 		bin.display_time = shard.view_info->display_time;
+		// Mirror the client's defoveated_size math (count_pixels):
+		// single ratio-1 segment must yield the segment length.
+		auto encoded_size = [](const std::vector<uint16_t> & param) -> uint32_t {
+			if (param.empty())
+				return 0;
+			uint32_t res = 0;
+			int n_ratio = ((int)param.size() - 1) / 2;
+			for (size_t i = 0; i < param.size(); ++i)
+				res += (uint32_t)(abs(n_ratio - (int)i) + 1) * param[i];
+			return res;
+		};
+		bin.fov_w = encoded_size(shard.view_info->foveation[0].x);
+		bin.fov_h = encoded_size(shard.view_info->foveation[0].y);
 	}
 	if (shard.timing_info.has_value())
 	{
@@ -124,6 +143,8 @@ void ingest(
 			frame.bytes.insert(frame.bytes.end(), part.begin(), part.end());
 		frame.has_view_info = bin.has_view_info;
 		frame.display_time = bin.display_time;
+		frame.fov_w = bin.fov_w;
+		frame.fov_h = bin.fov_h;
 		frame.reliable = reliable;
 		done[key] = std::move(frame);
 		bins.erase(key);
@@ -656,7 +677,7 @@ int main()
 		std::this_thread::sleep_for(std::chrono::milliseconds(500));
 		fake.stop = true;
 		// NACK should have produced a reliable IDR on control by now.
-		bool streamFrames = false, idrControl = false, viewInfoOk = false;
+		bool streamFrames = false, idrControl = false, viewInfoOk = false, fovOk = true;
 		for (int i = 0; i < 100; ++i)
 		{
 			{
@@ -667,6 +688,10 @@ int main()
 					(void)key;
 					if (frame.has_view_info && frame.display_time > 0 && has_annexb_start(frame.bytes))
 						viewInfoOk = true;
+					// Foveation must decode to the stream dims (256x256
+					// here); zeros crashed the real client (run 1).
+					if (frame.has_view_info && (frame.fov_w != 256 || frame.fov_h != 256))
+						fovOk = false;
 				}
 				for (const auto & [key, frame]: fake.control_done)
 				{
@@ -675,7 +700,7 @@ int main()
 						idrControl = true;
 				}
 			}
-			if (streamFrames && idrControl && viewInfoOk)
+			if (streamFrames && idrControl && viewInfoOk && fovOk)
 				break;
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 		}
@@ -689,6 +714,7 @@ int main()
 		}
 		CHECK(streamFrames);
 		CHECK(viewInfoOk);
+		CHECK(fovOk);
 		CHECK(idrControl);
 	}
 

@@ -432,6 +432,13 @@ ever bites.
 Accept: `xrEndFrame` → squash → x264 → 9757 → client → poses back →
 `xrWaitFrame` prediction loop closes. **CLOSED on loopback** (real
 headset validates timing/quality next).
+
+Headset run 1 (2026-10-13, Quest, hello_xr): handshake + tracking
+fine, but the client crashed in `xrCreateSwapchain` — our
+`view_info.foveation` went out EMPTY, which decodes to a 0x0
+defoveated size on the client. Fixed the same day: send identity
+single-segment params (`{w}`/`{h}`, ratio 1) decoding to the full
+stream size; loopback test now asserts the decode. Awaiting retest.
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

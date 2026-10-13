@@ -298,6 +298,15 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 				out.view_info.pose = views_echo.pose;
 				out.view_info.fov = views_echo.fov;
 			}
+			// Identity (1:1, no-foveation) params: a single segment of
+			// ratio 1 decodes to the full stream size on the client.
+			// Empty vectors decode to 0x0 and crash its swapchain
+			// creation — never send those. (GPU foveation is fast-follow;
+			// the client 1:1-blits these.)
+			out.view_info.foveation[0].x = {(uint16_t)swap->width};
+			out.view_info.foveation[0].y = {(uint16_t)swap->height};
+			out.view_info.foveation[1].x = {(uint16_t)swap->width};
+			out.view_info.foveation[1].y = {(uint16_t)swap->height};
 			out.view_info.alpha = false;
 			out.timing_info.encode_begin = encode_begin;
 			out.timing_info.encode_end = encode_end;
