@@ -48,22 +48,29 @@
 #include "b_system.h"
 #include "target_builder_helpers.h"
 #include "util/u_logging.h"
+#include "utils/flatpak.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_session.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <magic_enum.hpp>
 #include <multi/comp_multi_interface.h>
+#include <spawn.h>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include <utility>
+#include <vector>
 #include <vulkan/vulkan.h>
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
@@ -971,7 +978,7 @@ std::string hash_hex(uint64_t hash)
 }
 
 // Reads the whole file, returns nullopt when missing/unreadable/oversize
-std::optional<std::vector<std::byte>> read_model_file(const std::string & path)
+std::optional<std::vector<std::byte>> read_model_file_direct(const std::string & path)
 {
 	std::error_code ec;
 	uint64_t size = std::filesystem::file_size(path, ec);
@@ -987,6 +994,127 @@ std::optional<std::vector<std::byte>> read_model_file(const std::string & path)
 		return std::nullopt;
 
 	return data;
+}
+
+// Flatpak fallback: the server runs sandboxed, so a host-absolute
+// model-path from the user's config is invisible to direct reads.
+// Re-read it from outside the sandbox via `flatpak-spawn --host cat`.
+// Argv-based spawn (no shell), output capped at fiducial_model_max_size.
+std::optional<std::vector<std::byte>> read_model_file_via_host(const std::string & path)
+{
+	if (path.empty())
+		return std::nullopt;
+
+	if (not wivrn::is_flatpak())
+		return std::nullopt;
+
+	if (wivrn::flatpak_key(wivrn::flatpak::section::session_bus_policy, "org.freedesktop.Flatpak") != "talk")
+		return std::nullopt;
+
+	int pipefd[2] = {-1, -1};
+	if (pipe(pipefd) != 0)
+		return std::nullopt;
+
+	posix_spawn_file_actions_t actions;
+	if (posix_spawn_file_actions_init(&actions) != 0)
+	{
+		close(pipefd[0]);
+		close(pipefd[1]);
+		return std::nullopt;
+	}
+	posix_spawn_file_actions_adddup2(&actions, pipefd[1], STDOUT_FILENO);
+	posix_spawn_file_actions_addclose(&actions, pipefd[0]);
+	posix_spawn_file_actions_addclose(&actions, pipefd[1]);
+
+	// posix_spawnp takes char *const[]; the "--" keeps paths starting
+	// with '-' (or containing spaces) from being parsed as options.
+	char arg0[] = "flatpak-spawn";
+	char arg1[] = "--host";
+	char arg2[] = "cat";
+	char arg3[] = "--";
+	char * const argv[] = {arg0, arg1, arg2, arg3, const_cast<char *>(path.c_str()), nullptr};
+
+	extern char ** environ;
+	pid_t pid = -1;
+	int spawn_rc = posix_spawnp(&pid, "flatpak-spawn", &actions, nullptr, argv, environ);
+	posix_spawn_file_actions_destroy(&actions);
+	close(pipefd[1]);
+	pipefd[1] = -1;
+
+	if (spawn_rc != 0)
+	{
+		close(pipefd[0]);
+		return std::nullopt;
+	}
+
+	std::vector<std::byte> data;
+	data.reserve(1 << 20);
+	char buf[65536];
+	bool oversize = false;
+	bool read_error = false;
+	size_t total = 0;
+	for (;;)
+	{
+		ssize_t n = read(pipefd[0], buf, sizeof(buf));
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			read_error = true;
+			break;
+		}
+		if (n == 0)
+			break;
+		if (total + (size_t)n > fiducial_model_max_size)
+		{
+			oversize = true;
+			break;
+		}
+		size_t prev = data.size();
+		data.resize(prev + (size_t)n);
+		memcpy(data.data() + prev, buf, (size_t)n);
+		total += (size_t)n;
+	}
+	close(pipefd[0]);
+
+	// Reap the child in all cases. On oversize the child is likely
+	// blocked writing / killed by SIGPIPE once we closed the pipe.
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 and errno == EINTR)
+	{
+	}
+
+	if (oversize or read_error)
+		return std::nullopt;
+	if (not WIFEXITED(status) or WEXITSTATUS(status) != 0)
+		return std::nullopt;
+	if (data.empty())
+		return std::nullopt;
+
+	return data;
+}
+
+struct model_file
+{
+	std::vector<std::byte> data;
+	// True when the bytes came from outside the sandbox via
+	// flatpak-spawn --host (log-only, same content semantics).
+	bool via_host = false;
+};
+
+// Reads the whole file, returns nullopt when missing/unreadable/oversize.
+// Inside a flatpak sandbox, falls back to reading the host path via
+// `flatpak-spawn --host cat` so hand-edited host-absolute model-paths keep
+// working without widening sandbox filesystem permissions.
+std::optional<model_file> read_model_file(const std::string & path)
+{
+	if (auto direct = read_model_file_direct(path))
+		return model_file{std::move(*direct), false};
+
+	if (auto host = read_model_file_via_host(path))
+		return model_file{std::move(*host), true};
+
+	return std::nullopt;
 }
 } // namespace
 
@@ -1049,15 +1177,16 @@ void wivrn_session::send_fiducial_map()
 		const char * label = entry.tag.empty() ? entry.id.c_str() : entry.tag.c_str();
 		if (not entry.model_path.empty())
 		{
-			if (auto data = read_model_file(entry.model_path))
-			{
-				o.model_hash = hash_hex(fnv1a64(*data));
-				o.model_size = data->size();
-				U_LOG_I("Passthrough object \"%s\" (%s): model %s (%llu bytes) from %s",
-				        label, o.type.c_str(),
-				        o.model_hash.c_str(), (unsigned long long)o.model_size,
-				        entry.model_path.c_str());
-			}
+		if (auto model = read_model_file(entry.model_path))
+		{
+			o.model_hash = hash_hex(fnv1a64(model->data));
+			o.model_size = model->data.size();
+			U_LOG_I("Passthrough object \"%s\" (%s): model %s (%llu bytes) from %s%s",
+			        label, o.type.c_str(),
+			        o.model_hash.c_str(), (unsigned long long)o.model_size,
+			        entry.model_path.c_str(),
+			        model->via_host ? " (via host)" : "");
+		}
 			else
 			{
 				U_LOG_W("Passthrough object \"%s\": cannot serve model %s, entry will have no model",
@@ -1084,22 +1213,23 @@ void wivrn_session::operator()(from_headset::fiducial_model_request && request)
 		if (entry.model_path.empty())
 			continue;
 
-		auto data = read_model_file(entry.model_path);
-		if (not data or hash_hex(fnv1a64(*data)) != request.model_hash)
+		auto model = read_model_file(entry.model_path);
+		if (not model or hash_hex(fnv1a64(model->data)) != request.model_hash)
 			continue;
 
-		uint32_t chunk_count = (data->size() + fiducial_model_chunk_size - 1) / fiducial_model_chunk_size;
+		const auto & data = model->data;
+		uint32_t chunk_count = (data.size() + fiducial_model_chunk_size - 1) / fiducial_model_chunk_size;
 		U_LOG_I("Fiducial model %s: sending %u chunks (%llu bytes)",
-		        request.model_hash.c_str(), chunk_count, (unsigned long long)data->size());
+		        request.model_hash.c_str(), chunk_count, (unsigned long long)data.size());
 		for (uint32_t i = 0; i < chunk_count; ++i)
 		{
 			size_t begin = size_t(i) * fiducial_model_chunk_size;
-			size_t end = std::min(begin + fiducial_model_chunk_size, data->size());
+			size_t end = std::min(begin + fiducial_model_chunk_size, data.size());
 			send_control(to_headset::fiducial_model_chunk{
 			        .model_hash = request.model_hash,
 			        .chunk_index = i,
 			        .chunk_count = chunk_count,
-			        .data = {data->data() + begin, data->data() + end},
+			        .data = {data.data() + begin, data.data() + end},
 			});
 		}
 		return;

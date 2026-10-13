@@ -9,6 +9,7 @@ Files are read from
 Files later in the list replace top-level values from previous ones.
 
 If you installed WiVRn from a flatpack, the config is in `$HOME/.var/app/io.github.wivrn.wivrn/config/wivrn/config.json`.
+Paths in the config (such as `model-path` below) may be regular host paths: the sandboxed server reads them from outside the sandbox when needed.
 
 All elements are optional and have default values.
 
@@ -249,7 +250,9 @@ Each `passthrough` entry (behavior object) has:
   fiducial, and one object may reference several fiducials (one live
   instance per visible pairing, never fused).
 - `model-path`: path to a `.glb`/`.gltf` file on the server (optional,
-  models larger than 64MB are skipped)
+  models larger than 64MB are skipped). Under flatpak this may be a host
+  absolute path (e.g. `/home/user/models/widget.glb`); the server reads it
+  from outside the sandbox, and the server log shows `(via host)` when it does.
 - `position`: `[x, y, z]` fiducial-to-object offset in meters
   (default `[0,0,0]`)
 - `orientation`: `[rx, ry, rz]` fiducial-to-object rotation in degrees
