@@ -28,7 +28,8 @@ class instance;
 class session;
 
 // RAII wrapper for XrTriangleMeshFB (XR_FB_triangle_mesh).
-// The mesh holds baked world-space vertices; the per-frame pose is applied
+// The mesh holds baked hierarchy-space (model-space) vertices — glTF node
+// transforms only, never world placement; the per-frame pose is applied
 // through the geometry instance, not by updating the mesh.
 class triangle_mesh_fb : public utils::handle<XrTriangleMeshFB>
 {

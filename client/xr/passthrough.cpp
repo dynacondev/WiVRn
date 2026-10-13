@@ -61,6 +61,7 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 	xrPassthroughPauseFB = inst.get_proc<PFN_xrPassthroughPauseFB>("xrPassthroughPauseFB");
 	xrPassthroughLayerPauseFB = inst.get_proc<PFN_xrPassthroughLayerPauseFB>("xrPassthroughLayerPauseFB");
 	xrPassthroughLayerResumeFB = inst.get_proc<PFN_xrPassthroughLayerResumeFB>("xrPassthroughLayerResumeFB");
+	xrPassthroughLayerSetStyleFB = inst.get_proc<PFN_xrPassthroughLayerSetStyleFB>("xrPassthroughLayerSetStyleFB");
 
 	composition_layer = XrCompositionLayerPassthroughFB{
 	        .type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
@@ -79,10 +80,25 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 		                                });
 		projected_composition_layer = XrCompositionLayerPassthroughFB{
 		        .type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
-		        .flags = 0,
+		        // Non-zero flags are required by the composition-layer VUID
+		        // (unlike the layer-create struct, where 0 is legal), and
+		        // signal that the layer carries meaningful alpha: without
+		        // it the compositor may treat the layer as opaque, hiding
+		        // video behind off-geometry pixels. The flat layer keeps
+		        // flags=0 (proven tolerated); do not "harmonize" this.
+		        .flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 		        .space = XR_NULL_HANDLE,
 		        .layerHandle = *projected_layer,
 		};
+		// Explicit style: the spec states no default, so pin full opacity
+		// with edge rendering disabled (alpha 0) rather than relying on
+		// whatever the runtime assumes for an unstyled layer.
+		XrPassthroughStyleFB projected_style{
+		        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
+		        .textureOpacityFactor = 1.0f,
+		        .edgeColor = {0.f, 0.f, 0.f, 0.f},
+		};
+		CHECK_XR(xrPassthroughLayerSetStyleFB(*projected_layer, &projected_style));
 	}
 	else
 		spdlog::info("XR_FB_triangle_mesh not available, surface-projected passthrough disabled");
