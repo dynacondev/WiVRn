@@ -209,6 +209,71 @@ std::vector<uint32_t> readSpv(const char * path)
 	return out;
 }
 
+// Minimal column-major matrix helpers (matches the pc.mvp shader input).
+// Projection mirrors XrMatrix4x4f_CreateProjectionFov(GRAPHICS_VULKAN).
+void projFromFov(const XrFovf & fov, float m[16])
+{
+	float tanL = std::tan(fov.angleLeft);
+	float tanR = std::tan(fov.angleRight);
+	float tanU = std::tan(fov.angleUp);
+	float tanD = std::tan(fov.angleDown);
+	const float nearZ = 0.05f, farZ = 100.0f;
+	for (int i = 0; i < 16; ++i)
+		m[i] = 0;
+	m[0] = 2.0f / (tanR - tanL);
+	m[8] = (tanR + tanL) / (tanR - tanL);
+	m[5] = 2.0f / (tanU - tanD);
+	m[9] = (tanU + tanD) / (tanU - tanD);
+	m[10] = -farZ / (farZ - nearZ);
+	m[11] = -1.0f;
+	m[14] = -(farZ * nearZ) / (farZ - nearZ);
+}
+
+void invertRigid(const XrPosef & p, float m[16])
+{
+	// Rotation transpose + -R^T t (unit quaternion assumed).
+	float x = p.orientation.x, y = p.orientation.y, z = p.orientation.z, w = p.orientation.w;
+	float r[9] = {
+	        1 - 2 * (y * y + z * z),
+	        2 * (x * y + z * w),
+	        2 * (x * z - y * w),
+	        2 * (x * y - z * w),
+	        1 - 2 * (x * x + z * z),
+	        2 * (y * z + x * w),
+	        2 * (x * z + y * w),
+	        2 * (y * z - x * w),
+	        1 - 2 * (x * x + y * y),
+	};
+	// Column-major transpose = row-major original; translation = -R^T t.
+	for (int i = 0; i < 16; ++i)
+		m[i] = 0;
+	m[0] = r[0];
+	m[1] = r[3];
+	m[2] = r[6];
+	m[4] = r[1];
+	m[5] = r[4];
+	m[6] = r[7];
+	m[8] = r[2];
+	m[9] = r[5];
+	m[10] = r[8];
+	m[12] = -(r[0] * p.position.x + r[3] * p.position.y + r[6] * p.position.z);
+	m[13] = -(r[1] * p.position.x + r[4] * p.position.y + r[7] * p.position.z);
+	m[14] = -(r[2] * p.position.x + r[5] * p.position.y + r[8] * p.position.z);
+	m[15] = 1;
+}
+
+void mul44(const float a[16], const float b[16], float out[16])
+{
+	float tmp[16] = {};
+	for (int c = 0; c < 4; ++c)
+	{
+		for (int r = 0; r < 4; ++r)
+			tmp[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+	}
+	for (int i = 0; i < 16; ++i)
+		out[i] = tmp[i];
+}
+
 } // namespace
 
 int main(int argc, char ** argv)
@@ -584,11 +649,14 @@ int main(int argc, char ** argv)
 		CHECK_XR(xrWaitFrame(session, &frameWaitInfo, &frameState), XR_SUCCESS);
 		CHECK_XR(xrBeginFrame(session, &frameBeginInfo), XR_SUCCESS);
 
-		// Animated background (cycles red/blue) + spinning cube.
+		// Animated background (cycles red/blue) + spinning cube at a fixed
+		// LOCAL spot (0,1,-2). Per-eye view-projection makes it world-fixed
+		// with real stereo disparity (previously NDC-direct: head-locked).
 		float t = (float)((frame * 3) % 240) / 240.0f;
 		float a = (float)frame * 0.05f;
 		float c = std::cos(a), s = std::sin(a);
-		float mvp[16] = {0.5f * c, 0, -0.5f * s, 0, 0, 0.5f, 0, 0, 0.5f * s, 0, 0.5f * c, 0, 0, 0, 0, 1};
+		// Model: spin about Y in place, scale 0.5, then translate.
+		float model[16] = {0.5f * c, 0, -0.5f * s, 0, 0, 0.5f, 0, 0, 0.5f * s, 0, 0.5f * c, 0, 0, 1.0f, -2.0f, 1};
 
 		XrCompositionLayerProjectionView projViews[2] = {};
 		XrCompositionLayerProjection proj{
@@ -665,6 +733,13 @@ int main(int argc, char ** argv)
 			vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
 			VkDeviceSize off = 0;
 			vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &off);
+			// Per-eye view-projection (world-fixed stereo): projection from
+			// this eye's FOV, view from this eye's runtime pose.
+			float proj[16], view[16], vp[16], mvp[16];
+			projFromFov(views[eye].fov, proj);
+			invertRigid(views[eye].pose, view);
+			mul44(proj, view, vp);
+			mul44(vp, model, mvp);
 			vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
 			vkCmdDraw(cmd, 36, 1, 0, 0);
 			vkCmdEndRenderPass(cmd);

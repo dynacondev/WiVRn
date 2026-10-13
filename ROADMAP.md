@@ -517,6 +517,12 @@ hello_xr as-is can never display (ClearAttachments-X bg + culled cubes) —
 app/driver quirks, not the runtime. New `wivrn-macos-demo` vehicle instead
 (animated bg via loadOp-CLEAR + spinning cube, no depth/culling/
 ClearAttachments — only verified paths). Awaiting demo headset retest.
+Headset run 9 (demo): animated frames stream end to end (26fps/eye @1024,
+drop=0, sparse NACKs recovered) — v1 motion proof closed. Image is
+HUD-fixed with flat stereo (demo rendered NDC-direct). Fixed with per-eye
+view-projection (FOV + runtime pose per eye; cube at LOCAL (0,1,-2)):
+world-fixed + real disparity, math verified numerically. Awaiting retest.
+Headset run 10 (next): patched hello_xr cross-check (below).
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR
