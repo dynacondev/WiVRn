@@ -132,6 +132,12 @@ void effective_offset(const std::array<float, 3> & p, const std::array<float, 4>
 	op = {ti.x, ti.y, ti.z};
 	oq = {ri.x, ri.y, ri.z, ri.w};
 }
+
+// No-config discovery vehicle payload: a sentinel no real QR payload will
+// equal (leading control char), so every sighting through the vehicle
+// reports unmatched (red). Keyed separately from configured payloads and
+// never inserted into configured_marker_payloads.
+const std::string kDiscoveryVehiclePayload = "\x01__wivrn_discovery__";
 } // namespace
 
 // K==1 jump guard: the passthrough path is residual-blind (a lone vote fits
@@ -410,6 +416,17 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 	for (const auto & [payload, _]: uni)
 		configured_marker_payloads.insert(payload);
 
+	// No-config discovery vehicle: with an empty map there is nothing to
+	// match against, yet the debug overlays/cutouts report raw sightings
+	// (all unmatched/red) whenever the debug toggle is on. One discovering
+	// context suffices: every tracker already reports all codes in view,
+	// and with configured trackers present this is redundant, so the
+	// vehicle exists only while the union is empty. Folded into the
+	// fingerprint so toggle/map transitions re-sync deterministically.
+	bool want_vehicle = uni.empty() and fp.debug_overlays;
+	if (want_vehicle)
+		key += "V;";
+
 	if (key != last_tracker_key)
 	{
 		last_tracker_key = key;
@@ -437,6 +454,16 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 		auto [it, _] = fiducial_trackers.try_emplace(payload, instance, session, system);
 		auto & [size, is_static, tag] = ss;
 		it->second.configure(size, payload, tag, is_static);
+	}
+	if (want_vehicle)
+	{
+		// Discovery vehicle only (see above): size unspecified so no
+		// fixed-size hint is chained (the runtime measures codes itself),
+		// not static so no static-marker assumption either. The sentinel
+		// never matches: every sighting stays unmatched (red), and the
+		// resolver below finds no fiducials, so no fusion engages.
+		auto [it, _] = fiducial_trackers.try_emplace(kDiscoveryVehiclePayload, instance, session, system);
+		it->second.configure(0.f, kDiscoveryVehiclePayload, "discovery", false);
 	}
 }
 
@@ -1058,6 +1085,10 @@ void scenes::stream::gui_fiducial_status()
 	{
 		ImGui::Text("%s", _S("No fiducial map from server"));
 	}
+	if (fiducial_trackers.contains(kDiscoveryVehiclePayload))
+	{
+		ImGui::Text("%s", _S("Discovering QR codes (no map: all codes unmatched)"));
+	}
 	for (const auto & f: map->fiducials)
 	{
 		std::string label = f.tag.empty() ? f.id : f.tag;
@@ -1138,7 +1169,7 @@ void scenes::stream::gui_fiducial_status()
 		// extensions. On Quest that means the manifest permissions (fixed) and
 		// the USE_SCENE runtime grant; extensions enumerate at instance
 		// creation, so a late grant needs an app restart to take effect.
-		if (not scene_permission_granted and (not map->fiducials.empty() or not map->objects.empty()))
+		if (not scene_permission_granted and (not map->fiducials.empty() or not map->objects.empty() or fiducial_passthrough.debug_overlays))
 			ImGui::Text("%s", _S("On Quest, grant the Scene permission, then restart the app"));
 #endif
 	}
