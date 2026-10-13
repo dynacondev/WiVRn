@@ -841,6 +841,14 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
+// E2 DIAGNOSTIC, TEMPORARY — REVERT AFTER IT REPORTS. Forces submission of
+// the projected passthrough layer with zero geometry instances alongside
+// the normal stack, to isolate content-vs-submit toxicity: if video
+// survives, the submit itself is fine and instance content is suspect;
+// if video dies, any projected submit is toxic on this runtime. Test
+// with the surface-projected override OFF (no instances live).
+constexpr bool kDiagForceEmptyProjectedSubmit = true;
+
 void scenes::stream::render(const XrFrameState & frame_state)
 {
 	if (state_ == state::shutdown)
@@ -2065,6 +2073,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// instantly reversible). Mixed frames keep flat only, so
 			// flagged interiors there fall back to flat for the frame.
 			add_projected_passthrough_layer();
+		}
+		// E2 DIAGNOSTIC (temporary, revert with the flag above): empty
+		// projected submit alongside the normal stack (instances absent).
+		bool forcing_empty = kDiagForceEmptyProjectedSubmit && !have_projected;
+		if (forcing_empty)
+			add_projected_passthrough_layer();
+		{
+			static bool last_forcing = false;
+			if (forcing_empty != last_forcing)
+			{
+				last_forcing = forcing_empty;
+				spdlog::info("Camera submit: E2 diagnostic empty projected {}", forcing_empty ? "on" : "off");
+			}
 		}
 	}
 
