@@ -17,6 +17,9 @@ if(NOT openxr_loader_POPULATED)
 	FetchContent_MakeAvailable(openxr_loader)
 endif()
 
+# x264 software encoder (brew x264; v1 hardware path is VideoToolbox in v2).
+pkg_check_modules(X264 REQUIRED IMPORTED_TARGET x264)
+
 # Runtime dylib, loaded by the Khronos loader via wivrn-macos.json.
 # Headers come straight from the SDK include dir; the runtime must NOT
 # link the loader itself (the loader dlopens the runtime, not vice versa).
@@ -34,12 +37,14 @@ add_library(wivrn-macos-runtime MODULE
 	graphics.cpp
 	swapchain.cpp
 	frame.cpp
+	snapshot.cpp
+	encode.cpp
 )
 target_include_directories(wivrn-macos-runtime PRIVATE
 	${openxr_loader_SOURCE_DIR}/include
 	.
 )
-target_link_libraries(wivrn-macos-runtime PRIVATE Vulkan::Vulkan)
+target_link_libraries(wivrn-macos-runtime PRIVATE Vulkan::Vulkan wivrn-common PkgConfig::X264)
 set_target_properties(wivrn-macos-runtime PROPERTIES
 	PREFIX ""
 	SUFFIX ".dylib"
@@ -77,3 +82,16 @@ target_include_directories(wivrn-macos-graphics-test PRIVATE
 	.
 )
 target_link_libraries(wivrn-macos-graphics-test PRIVATE openxr_loader Vulkan::Vulkan)
+
+# Phase 5a proof: clear-to-encode pixels-to-bits (no loader/headset).
+add_executable(wivrn-macos-encode-test
+	test_encode.cpp
+	runtime.cpp
+	snapshot.cpp
+	encode.cpp
+)
+target_include_directories(wivrn-macos-encode-test PRIVATE
+	${openxr_loader_SOURCE_DIR}/include
+	.
+)
+target_link_libraries(wivrn-macos-encode-test PRIVATE Vulkan::Vulkan PkgConfig::X264)

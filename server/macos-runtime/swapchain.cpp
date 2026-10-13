@@ -44,9 +44,11 @@ extern "C"
 	{
 		if (session == nullptr || formatCountOutput == nullptr)
 			return XR_ERROR_HANDLE_INVALID;
+		// BGRA first: the v1 x264 path consumes BGRA with zero swizzle
+		// (X264_CSP_BGRA); RGBA apps take a CPU swizzle in Phase 5.
 		static constexpr int64_t supported[] = {
-		        VK_FORMAT_R8G8B8A8_SRGB,
 		        VK_FORMAT_B8G8R8A8_SRGB,
+		        VK_FORMAT_R8G8B8A8_SRGB,
 		};
 		static constexpr uint32_t count = sizeof(supported) / sizeof(supported[0]);
 		if (formatCapacityInput == 0)

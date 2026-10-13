@@ -88,6 +88,9 @@
 			"displayName": "macOS bespoke server only (v1 MVP, Apple Silicon)",
 			"inherits": "base",
 			"binaryDir": "${sourceDir}/build-macos-server",
+			"environment": {
+				"PKG_CONFIG_PATH": "/opt/homebrew/lib/pkgconfig:/usr/local/lib/pkgconfig:$penv{PKG_CONFIG_PATH}"
+			},
 			"cacheVariables": {
 				"CMAKE_CXX_FLAGS": "-Wno-error=undef",
 				"WIVRN_BUILD_MACOS_SERVER": "ON",

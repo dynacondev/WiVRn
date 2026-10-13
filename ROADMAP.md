@@ -394,8 +394,13 @@ la OXRSys). Env note: duplicate `MVKBlockObserver` (brew + LunarG
 MoltenVK both load) warns but is benign; pin `VK_ICD_FILENAMES` if it
 ever bites.
 
-## Phase 5 — Encode + network + discovery
+## Phase 5 — Encode + network + discovery [status: in progress]
 
+- [x] Slice A (done 2026-10-13): `snapshot` (COLOR_ATTACHMENT_OPTIMAL
+  → TRANSFER_SRC → host BGRA, restored) + `X264Encoder` (ultrafast/
+  zerolatency/main/ABR/Annex-B, CPU BT.709 full-range BGRA→NV12 —
+  x264 has no RGB→420 main-profile path) + `shard_frame` (≤1400 B,
+  IDR/config reliable). `wivrn-macos-encode-test` headless PASS.
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR
