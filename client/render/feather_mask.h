@@ -66,12 +66,19 @@ public:
 	std::optional<std::pair<glm::vec3, glm::vec3>> mesh_bounds(const std::string & key) const;
 
 	// One silhouette draw: which uploaded mesh, per-eye transforms, and
-	// the first-acquisition fade opacity.
+	// the first-acquisition fade opacity (presence 0..1 for both
+	// polarities; the renderer pushes 1 - fade as the cut strength for
+	// reversed draws). Reversed draws (3d-passthrough-reversed) cut the
+	// mask instead of filling it, depth-tested against the positives so a
+	// distant negative behind a nearer window never cuts it. Callers must
+	// sort positives before reversed (the renderer resolves polarity in
+	// two passes, but within-polarity order is draw order as before).
 	struct instance_draw
 	{
 		std::string mesh;
 		std::array<glm::mat4, 2> mvp;
 		float opacity = 1;
+		bool reverse = false;
 	};
 
 	// Tier selection from feather-px, shared with the scene (which sizes
@@ -172,6 +179,22 @@ private:
 	vk::raii::RenderPass raster_r8_renderpass{nullptr};
 	vk::raii::Pipeline raster_r8_pipeline{nullptr};
 
+	// Depth-tested raster variants for reversed draws
+	// (3d-passthrough-reversed): same shaders/layout, plus a D16 depth
+	// attachment. Positives write depth (LESS) and overwrite color as
+	// before; reversed draws test LESS without writing depth and MIN-blend
+	// (1 - fade) into color, so a negative cuts only where it is nearer
+	// than the positives covering that pixel. Two format variants like
+	// the plain raster path (RGBA8 submitted images, R8 intermediates).
+	// Engaged per record() call only when a reversed draw exists;
+	// positive-only frames keep the legacy passes bit-identically.
+	vk::raii::RenderPass depth_renderpass{nullptr};
+	vk::raii::Pipeline depth_pipeline{nullptr};
+	vk::raii::Pipeline reverse_pipeline{nullptr};
+	vk::raii::RenderPass raster_r8_depth_renderpass{nullptr};
+	vk::raii::Pipeline raster_r8_depth_pipeline{nullptr};
+	vk::raii::Pipeline raster_r8_reverse_pipeline{nullptr};
+
 	// LOAD variant of the raster pass for the marker window cutout: same
 	// single-attachment shape (framebuffer-compatible with the above), so
 	// the finished blurred image can be re-begun and stamped with a crisp
@@ -210,6 +233,15 @@ private:
 		std::vector<vk::raii::ImageView> views;
 		std::vector<vk::raii::Framebuffer> raster_fbs;
 		std::vector<vk::raii::Framebuffer> blur_fbs;
+		// Depth-tested raster companions (D16, same extent as the color
+		// target above): depth image + views shared by both eyes' layers,
+		// plus one color+depth framebuffer per eye for the seed raster.
+		// Built for raster sources only (A, down levels); blur-only
+		// targets (B, eblur) leave these null.
+		vk::raii::Image depth_image{nullptr};
+		vk::raii::DeviceMemory depth_memory{nullptr};
+		std::array<vk::raii::ImageView, 2> depth_views;
+		std::vector<vk::raii::Framebuffer> raster_depth_fbs;
 	};
 	blur_target target_a;
 	blur_target target_b;
@@ -253,14 +285,40 @@ private:
 		vk::Extent2D extent;
 		std::array<vk::raii::ImageView, 2> views;
 		std::array<vk::raii::Framebuffer, 2> framebuffers;
+		// Depth-tested raster companions for tier-0 direct raster (color +
+		// depth, under depth_renderpass): same color views as above plus a
+		// cached submitted-size depth view (see output_depth below). Built
+		// lazily on first reversed use (has_depth); positive-only targets
+		// stay lean.
+		std::array<vk::raii::Framebuffer, 2> depth_framebuffers;
+		bool has_depth = false;
 		frame_targets(vk::Extent2D extent_,
 		              std::array<vk::raii::ImageView, 2> views_,
-		              std::array<vk::raii::Framebuffer, 2> framebuffers_) :
+		              std::array<vk::raii::Framebuffer, 2> framebuffers_,
+		              std::array<vk::raii::Framebuffer, 2> depth_framebuffers_,
+		              bool has_depth_) :
 		        extent(extent_),
 		        views(std::move(views_)),
-		        framebuffers(std::move(framebuffers_))
+		        framebuffers(std::move(framebuffers_)),
+		        depth_framebuffers(std::move(depth_framebuffers_)),
+		        has_depth(has_depth_)
 		{
 		}
 	};
 	std::unordered_map<VkImage, frame_targets> targets;
+	// Submitted-size D16 depth views for the tier-0 depth raster above:
+	// cached by extent (swapchain-independent, survives reset_targets();
+	// only a handful of quantized submit sizes ever exist).
+	struct depth_entry
+	{
+		vk::raii::Image image{nullptr};
+		vk::raii::DeviceMemory memory{nullptr};
+		std::array<vk::raii::ImageView, 2> views;
+	};
+	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
+	vk::ImageView output_depth_view(vk::Extent2D extent, int eye);
+	// D16 depth image + per-eye views at an extent (depth-test-only
+	// raster: never sampled, device-local). Backs output_depth above and
+	// the intermediate raster companions in ensure_targets.
+	depth_entry make_depth_entry(vk::Extent2D extent);
 };
