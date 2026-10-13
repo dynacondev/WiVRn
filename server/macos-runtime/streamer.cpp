@@ -11,6 +11,7 @@
 #include "protocol_version.h"
 
 #include <chrono>
+#include <cmath>
 #include <random>
 #include <thread>
 
@@ -154,6 +155,9 @@ void Streamer::on_connected(const wivrn::from_headset::headset_info_packet & inf
 	for (Eye & eye: eyes_)
 		eye.force_idr = true;
 	lastConnected_ = true;
+	// A new headset means a new room frame: re-latch LOCAL from its first
+	// fresh HMD sample (see end_frame).
+	localLatched_ = false;
 	// Converge the headset clock NOW, not after ~120 encodes: the first
 	// sample snaps the offset, and every frame's display_time is in the
 	// wrong clock domain until it lands (client holds future-dated
@@ -181,6 +185,41 @@ std::optional<TrackingSample> Streamer::sample() const
 std::optional<TrackingSample> streamer_headset_sample()
 {
 	return Streamer::singleton().sample();
+}
+
+XrPosef Streamer::local_origin() const
+{
+	std::lock_guard lock(mutex_);
+	return localOrigin_;
+}
+
+namespace
+{
+// Rotate vector by unit quaternion (matches spaces.cpp).
+XrVector3f qrot_vec(const XrQuaternionf & q, const XrVector3f & v)
+{
+	XrVector3f qv{q.x, q.y, q.z};
+	XrVector3f t{
+	        2 * (qv.y * v.z - qv.z * v.y),
+	        2 * (qv.z * v.x - qv.x * v.z),
+	        2 * (qv.x * v.y - qv.y * v.x),
+	};
+	XrVector3f u{
+	        t.x + 2 * q.w * v.x,
+	        t.y + 2 * q.w * v.y,
+	        t.z + 2 * q.w * v.z,
+	};
+	return {
+	        v.x + (qv.y * u.z - qv.z * u.y),
+	        v.y + (qv.z * u.x - qv.x * u.z),
+	        v.z + (qv.x * u.y - qv.y * u.x),
+	};
+}
+} // namespace
+
+XrPosef streamer_local_origin()
+{
+	return Streamer::singleton().local_origin();
 }
 
 void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo, XrTime predictedDisplayTime)
@@ -223,6 +262,30 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 
 	auto views_echo = link_.source()->views_echo();
 	int64_t display_headset = link_.clock().to_headset(predictedDisplayTime);
+
+	// Latch LOCAL to the client's room frame (floor under the HMD + HMD
+	// yaw at connect, Quest-style). Until latched, spaces fall back to
+	// (0,1.6,0) — content sits wrong but the link still comes up.
+	{
+		std::lock_guard lock(mutex_);
+		if (!localLatched_)
+		{
+			TrackingSample sample = link_.source()->latest();
+			if (sample.timestampNs != 0 && now_ns() - sample.timestampNs < 500'000'000)
+			{
+				XrVector3f fwd = qrot_vec(sample.hmd.orientation, {0, 0, -1});
+				float yaw = std::atan2(-fwd.x, -fwd.z);
+				float half = yaw * 0.5f;
+				localOrigin_ = {{0, std::sin(half), 0, std::cos(half)},
+				                {sample.hmd.position.x, 0, sample.hmd.position.z}};
+				localLatched_ = true;
+				log("streamer: LOCAL latched at (%.2f,0,%.2f) yaw=%.1fdeg",
+				    (double)sample.hmd.position.x,
+				    (double)sample.hmd.position.z,
+				    (double)(yaw * 180 / 3.14159265));
+			}
+		}
+	}
 
 	uint32_t eye_index = 0;
 	for (uint32_t li = 0; li < frameEndInfo->layerCount && eye_index < 2; ++li)
@@ -321,10 +384,19 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 						eye.job_fps = (uint32_t)info->settings.preferred_refresh_rate;
 				}
 			}
+			// Forward the app's own layer poses for both views (Linux-style):
+			// they are already in the app space the client renders. (Never
+			// echo poses: the client's views[] live in its VIEW frame, which
+			// silently offsets every located object by the room displacement.
+			// FOV angles are frame-free, so the echo stays for those.)
+			for (uint32_t v = 0; v < 2 && v < proj->viewCount; ++v)
+				eye.job_pose[v] = proj->views[v].pose;
 			if (views_echo.valid)
-			{
-				eye.job_pose = views_echo.pose;
 				eye.job_fov = views_echo.fov;
+			else
+			{
+				for (uint32_t v = 0; v < 2 && v < proj->viewCount; ++v)
+					eye.job_fov[v] = proj->views[v].fov;
 			}
 			eye.job_display_time = display_headset;
 			eye.job_snap_ns = now_ns() - snap_begin;
@@ -476,6 +548,22 @@ void Streamer::encode_eye(uint32_t eye_index)
 	out.timing_info.encode_begin = encode_begin;
 	out.timing_info.encode_end = encode_end;
 	out.timing_info.send_begin = now_ns();
+	// One-shot: the exact app-space placements the client renders (frame
+	// bugs show up here, not in the transport counters below).
+	if (eye.encoded_count == 0)
+	{
+		const XrPosef & p0 = out.view_info.pose[0];
+		const XrPosef & p1 = out.view_info.pose[1];
+		log("streamer: eye %u first view poses L=(%.2f,%.2f,%.2f) R=(%.2f,%.2f,%.2f) display=%lld",
+		    eye_index,
+		    (double)p0.position.x,
+		    (double)p0.position.y,
+		    (double)p0.position.z,
+		    (double)p1.position.x,
+		    (double)p1.position.y,
+		    (double)p1.position.z,
+		    (long long)out.view_info.display_time);
+	}
 	FrameMeta meta{};
 	meta.frame_idx = out.frame_idx;
 	shard_frame(

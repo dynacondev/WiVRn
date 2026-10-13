@@ -13,6 +13,9 @@ namespace wivrn_macos
 {
 XrPath path_left();
 XrPath path_right();
+// LOCAL origin latched to the client room frame (streamer.cpp); the
+// (0,1.6,0) fallback below only applies before a headset connects.
+XrPosef streamer_local_origin();
 } // namespace wivrn_macos
 
 namespace
@@ -70,9 +73,9 @@ constexpr XrPosef identity_pose()
 	return {{0, 0, 0, 1}, {0, 0, 0}};
 }
 
-constexpr XrPosef local_origin()
+XrPosef local_origin()
 {
-	return {{0, 0, 0, 1}, {0, 1.6f, 0}};
+	return wivrn_macos::streamer_local_origin();
 }
 
 const wivrn_macos::ControllerSample & side_sample(const wivrn_macos::TrackingSample & sample, XrPath subaction, const char *& side)

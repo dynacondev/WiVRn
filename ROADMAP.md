@@ -491,6 +491,19 @@ Client TEMP-DEBUG logging added (separate revertable commit): tracking
 devices+positions every ~3s, per-eye presented-frame changes, genuine
 NACKs. Loopback PASS. Awaiting controller-wave retest (controllers
 awake: button press first).
+Headset run 7 (same day): grips flow end to end (`grips live`, client
+grip poses live and moving) but still no cubes. Root cause: coordinate
+frames — view_info echoed the client's VIEW-frame views (near-origin)
+while grips locate through OUR LOCAL (fixed (0,1.6,0) in the client
+room frame), stranding all located content ~room displacement away
+(hello_xr cubes at 5m+ off-axis). Linux sends the app's own layer poses
+instead. Fix: LOCAL latches to the room frame at connect (floor under
+HMD + HMD yaw, Quest-style, re-latched per connection); view_info poses
+come from the app's submitted layer views (FOV echo kept — angles are
+frame-free); one-shot logs for the latched origin + first sent view
+poses. Loopback stream test updated to the latch semantics
+(VIEW-in-LOCAL (0,5,0) for fake HEAD (4,5,6)). All suites PASS.
+Awaiting retest — static cubes + grip cubes should both be in view.
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

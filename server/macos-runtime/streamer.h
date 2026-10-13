@@ -57,6 +57,9 @@ public:
 	// stale — caller falls back to synthetic).
 	std::optional<TrackingSample> sample() const;
 
+	// LOCAL origin (latched to the client room frame, see localOrigin_).
+	XrPosef local_origin() const;
+
 	// Release per-eye GPU resources bound to a dying session (apps
 	// destroy sessions before tearing down their device; static-dtor
 	// cleanup would touch a dead device).
@@ -138,10 +141,19 @@ private:
 	// Reconfig requests from settings events (applied by the worker).
 	uint32_t pending_bitrate_ = 0;
 	uint32_t pending_fps_ = 0;
+	// LOCAL origin latched from the first fresh HMD sample after connect
+	// (floor under the headset + HMD yaw, Quest-style): the client's room
+	// frame, so app-space content lands in view. Guarded by mutex_.
+	XrPosef localOrigin_{{0, 0, 0, 1}, {0, 1.6f, 0}};
+	bool localLatched_ = false;
 };
 
 // Called by tracking.cpp: network sample when live, nullopt otherwise.
 std::optional<TrackingSample> streamer_headset_sample();
+
+// LOCAL origin for spaces.cpp (latched to the client room frame once a
+// headset connects; (0,1.6,0) fallback before that).
+XrPosef streamer_local_origin();
 
 // Called by DestroySession: release per-eye GPU resources bound to it.
 void streamer_session_destroyed(Session * session);

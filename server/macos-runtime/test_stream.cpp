@@ -780,7 +780,10 @@ int main()
 		CHECK(idrControl);
 	}
 
-	// Poses flow back: HEAD (4,5,6) in stage -> LOCAL (origin y=1.6).
+	// Poses flow back: HEAD (4,5,6) in stage -> LOCAL latches under the
+	// HMD at connect (floor (4,0,6) + yaw 0), so VIEW-in-LOCAL ~= (0,5,0).
+	// (A fixed (0,1.6,0) LOCAL would read (4,3.4,6) here — and strand all
+	// located content by the room displacement on a real headset.)
 	{
 		XrSpaceLocation loc{.type = XR_TYPE_SPACE_LOCATION, .next = nullptr};
 		// Locate the VIEW space (live HMD) in LOCAL.
@@ -794,8 +797,9 @@ int main()
 		CHECK_XR(xrCreateReferenceSpace(session, &viewInfo, &view), XR_SUCCESS);
 		CHECK_XR(xrLocateSpace(view, local, 1, &loc), XR_SUCCESS);
 		std::printf("view in local: (%.2f, %.2f, %.2f)\n", loc.pose.position.x, loc.pose.position.y, loc.pose.position.z);
-		CHECK(loc.pose.position.x > 3.5f && loc.pose.position.x < 4.5f);
-		CHECK(loc.pose.position.y > 3.0f && loc.pose.position.y < 4.0f);
+		CHECK(loc.pose.position.x > -0.5f && loc.pose.position.x < 0.5f);
+		CHECK(loc.pose.position.y > 4.5f && loc.pose.position.y < 5.5f);
+		CHECK(loc.pose.position.z > -0.5f && loc.pose.position.z < 0.5f);
 		CHECK_XR(xrDestroySpace(view), XR_SUCCESS);
 	}
 
