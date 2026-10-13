@@ -2012,16 +2012,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
 		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		// Surface-projected interiors (mask path only): camera mapped onto
-		// flagged objects' meshes, composited over the flat feed with the
-		// same feathered mask (DST_ALPHA), so edges keep flat quality
-		// while interiors gain geometry-correct parallax. Skipped when no
+		// flagged objects' meshes as an opaque overlay (binary-fallback
+		// semantics: camera on geometry, transparent elsewhere), layered
+		// over the flat feed so the feather band keeps flat quality.
+		// Deliberately NO alpha blend chained here: chaining one onto a
+		// PROJECTED layer breaks video compositing on current runtime
+		// builds (video goes black while the object stays camera;
+		// instantly reversible). Revisit if that changes. Skipped when no
 		// instance is live, keeping flag-off frames pixel-identical.
 		if (session.has_projected_instances())
-		{
 			add_projected_passthrough_layer();
-			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
-			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-		}
 	}
 
 		// Debug line overlay: ONE transparent projection layer for all debug

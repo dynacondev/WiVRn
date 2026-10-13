@@ -965,9 +965,16 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	{
 		for (auto & [oid, ost]: passthrough_objects)
 		{
+			// Opaque interiors are fade-blind: hold instances until the
+			// global fade completes so windows never island-pop full
+			// camera inside a fading band (both-camera swap at completion
+			// instead). fade_start is stamped together with placed, so a
+			// placed object always has a nonzero seed.
+			XrTime fade_done_at = fp.fade_start + XrTime(fp.fade_in_ms * 1e6);
+			bool faded = fp.fade_in_ms <= 0 || (fp.fade_start != 0 && predicted_display_time >= fade_done_at);
 			bool want = ost.def.type == "3d-passthrough" and ost.soup_ready and ost.fused.placed and
 			        surface_projected_effective(oid, ost) and session.projected_passthrough_supported() and
-			        not projected_failed.contains(oid);
+			        not projected_failed.contains(oid) and faded;
 			bool have = session.has_projected_instance(oid);
 			if (want and not have)
 			{
