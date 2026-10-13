@@ -281,6 +281,42 @@ void wivrn_server::open_server_logs()
 	QDesktopServices::openUrl(QUrl::fromLocalFile(path));
 }
 
+void wivrn_server::openConfigLocation(QString filePath, bool fileExists, bool openOnHost)
+{
+	if (filePath.isEmpty())
+		return;
+
+	if (wivrn::is_flatpak() && openOnHost)
+	{
+		// Host paths are invisible from the sandbox, so use pure path math:
+		// the parent directory when the file exists, else the grandparent
+		// (/etc and the host config home always exist on the host).
+		QString parent = QFileInfo(filePath).absolutePath();
+		QString target = fileExists ? parent : QFileInfo(parent).absolutePath();
+		qDebug() << "Opening" << target << "on host";
+		(void)QProcess::startDetached("flatpak-spawn", {"--host", "xdg-open", target});
+	}
+	else
+	{
+		// Locally visible: open the containing directory, or the nearest
+		// existing ancestor when the file (or its parent) is missing.
+		QString target = filePath;
+		if (QFileInfo(target).isFile())
+			target = QFileInfo(target).absolutePath();
+		for (;;)
+		{
+			if (QFileInfo::exists(target))
+				break;
+			QString parent = QFileInfo(target).absolutePath();
+			if (parent == target)
+				return;
+			target = parent;
+		}
+		qDebug() << "Opening" << target;
+		QDesktopServices::openUrl(QUrl::fromLocalFile(target));
+	}
+}
+
 void wivrn_server::refresh_server_properties()
 {
 	if (!server_properties_interface)
@@ -330,6 +366,11 @@ void wivrn_server::on_server_properties_changed(const QString & interface_name, 
 	if (changed_properties.contains("JsonConfiguration"))
 	{
 		jsonConfigurationChanged(m_jsonConfiguration = changed_properties["JsonConfiguration"].toString());
+	}
+
+	if (changed_properties.contains("ConfigFiles"))
+	{
+		configFilesChanged(m_configFiles = changed_properties["ConfigFiles"].toString());
 	}
 
 	if (changed_properties.contains("Pin"))
