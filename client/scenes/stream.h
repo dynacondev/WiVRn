@@ -307,8 +307,6 @@ private:
 		bool placed = false; // any fused solution ever (hold-last on loss)
 		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
 		XrVector3f world_scale{1, 1, 1};
-		XrTime placed_at = 0;
-		XrTime fade_start = 0;
 		XrTime last_solve = 0; // last live frame (stale age)
 	};
 	struct passthrough_object_state
@@ -325,6 +323,14 @@ private:
 		fused_placement fused;
 	};
 	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
+	// Live in-headset surface-projection overrides (Passthrough tab,
+	// session-scoped): presence wins over the map flag. Render thread
+	// only (GUI runs there too).
+	std::map<std::string /*object id*/, bool> projected_overrides;
+	// Object ids whose projected instance upload failed (runtime refused
+	// the mesh): skip retry so a persistent failure can't spam every
+	// frame. Cleared on map change with everything else.
+	std::set<std::string> projected_failed;
 
 	// Render state for the first live object instance (temporary shim:
 	// per-feather mask groups replace this with per-object rendering).
@@ -396,10 +402,14 @@ private:
 		// Entity ids may collide across tracker contexts, payloads disambiguate.
 		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, held_code> held_codes;
 
-		// First-acquisition alpha fade, per instance (mask-blend path only:
-		// the binary projected layer type has no opacity control). Each
-		// instance stamps its seed in predicted-time base; duration tracks
-		// its object live. 0 duration = instant.
+		// Global first-acquisition fade, predicted-time base (mask-blend
+		// path only: the binary projected layer type has no opacity
+		// control). One clock for all objects: stamped on first placement
+		// per map, retriggered on reacquire jumps. 0 duration or 0 seed =
+		// instant. Objects placing later appear instantly (a single alpha
+		// channel admits exactly one clock).
+		XrTime fade_start = 0;
+		float fade_in_ms = 1000; // top-level map value, live-applied
 		static float fade_factor(XrTime predicted, XrTime start, float dur_ms)
 		{
 			if (dur_ms <= 0 or start == 0)
@@ -469,6 +479,11 @@ private:
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	void gui_fiducial_status();
 	void gui_passthrough();
+
+	// Effective surface-projection state for an object: the live
+	// in-headset override wins when present, else the map flag. Render
+	// thread only.
+	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
 
 	// Eager USE_SCENE runtime-permission request (Android): manifest presence
 	// makes the spatial extensions enumerable, but tracking data needs the

@@ -1697,8 +1697,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						for (uint32_t view = 0; view < 2; ++view)
 							mvp[view] = world_mvp[view] * model;
 						float op = fiducial_passthrough_state::fade_factor(
-						        frame_state.predictedDisplayTime, fu.fade_start,
-						        std::max(0.f, ost.def.fade_in_ms));
+						        frame_state.predictedDisplayTime, fp.fade_start,
+						        std::max(0.f, fp.fade_in_ms));
 						if (not draw_visible(oid, mvp))
 							return;
 						draws.push_back({oid, mvp, op, reversed});
@@ -1967,7 +1967,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Mask-blend stacks, one per feather group, submitted in feather
 		// order (deterministic): video (opaque, above) was already added,
 		// then each group's mask, then a single fullscreen passthrough on
-		// top. The first mask replaces destination alpha; the rest add
+		// top, then the surface-projected layer when instances are live.
+		// The first mask replaces destination alpha; the rest add
 		// (saturating union); passthrough multiplies by it: reality inside
 		// any silhouette, game outside, gradients across feather bands.
 		// Group swapchains acquired above (never the shared pool).
@@ -2010,6 +2011,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		add_passthrough_layer();
 		set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
 		                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+		// Surface-projected interiors (mask path only): camera mapped onto
+		// flagged objects' meshes, composited over the flat feed with the
+		// same feathered mask (DST_ALPHA), so edges keep flat quality
+		// while interiors gain geometry-correct parallax. Skipped when no
+		// instance is live, keeping flag-off frames pixel-identical.
+		if (session.has_projected_instances())
+		{
+			add_projected_passthrough_layer();
+			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+		}
 	}
 
 		// Debug line overlay: ONE transparent projection layer for all debug

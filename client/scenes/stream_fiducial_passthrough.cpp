@@ -385,6 +385,13 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 	}
 }
 
+bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
+{
+	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
+		return it->second;
+	return ost.def.surface_projected;
+}
+
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
 {
 	auto & fp = fiducial_passthrough;
@@ -478,6 +485,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// Snapshot, never held across model file loads below: the network
 	// thread serves chunks through the same lock.
 	to_headset::fiducial_map map = *fiducial_map.lock();
+
+	// Global fade duration: top-level map value, live-applied (a single
+	// alpha channel admits exactly one clock, so no per-object durations).
+	fp.fade_in_ms = std::max(0.f, map.fade_in_ms);
 
 	// Fingerprint: tracking/render identity. Tags excluded (display-only);
 	// feather/fade excluded (live render-only). Any other change wipes
@@ -649,6 +660,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			board_warm_start.clear();
 			board_filters.clear();
 			fp.corrected_tags.clear();
+			// Global fade clock restarts with the map; projected
+			// instances are rebuilt from placements below (the per-frame
+			// sync destroys stale ones, the map wipe clears the rest).
+			fp.fade_start = 0;
+			projected_failed.clear();
+			session.clear_projected_instances();
 			// `board config:` makes every future log self-describing:
 			// authored tag-in-board offsets + sizes + object links, so
 			// tuning sessions never guess what geometry produced the data.
@@ -678,7 +695,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 					fids += fid;
 					fids += ',';
 				}
-				spdlog::info("board config: object \"{}\" type \"{}\" fids -> {}", o.id, o.type, fids);
+				spdlog::info("board config: object \"{}\" type \"{}\"{} fids -> {}", o.id, o.type,
+				             o.surface_projected ? " projected" : "", fids);
 			}
 			for (const auto & o: map.objects)
 			{
@@ -893,8 +911,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			if (not fu.placed)
 			{
 				fu.placed = true;
-				fu.placed_at = now;
-				fu.fade_start = predicted_display_time;
+				// Global fade clock: first placement per map starts the one
+				// ramp every window shares; later placements appear
+				// instantly (a single alpha channel admits one clock).
+				if (fp.fade_start == 0)
+					fp.fade_start = predicted_display_time;
 				spdlog::info("Passthrough object \"{}\" placed on fiducial \"{}\"", def.id, fid);
 			}
 			if (bpit->second.live)
@@ -907,7 +928,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 					// held pose still matches (the common case — smoothing
 					// already hid small jumps), fade only real
 					// discontinuities. Gates: 25mm / 3deg (below pop
-					// visibility, above hold drift which is zero).
+					// visibility, above hold drift which is zero). Global
+					// clock: one object's jump dips every window together.
 					float dx = fu.world_pose.position.x - prev_pose.position.x;
 					float dy = fu.world_pose.position.y - prev_pose.position.y;
 					float dz = fu.world_pose.position.z - prev_pose.position.z;
@@ -919,18 +941,55 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 					                     fu.world_pose.orientation.z * prev_pose.orientation.z);
 					float dang =
 					        2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
-					if (had_pose and (dpos > 25.f or dang > 3.f))
-					{
-						fu.fade_start = predicted_display_time;
-						spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s jump {:.1f}mm {:.2f}deg (fading)",
-						             def.id, gap_s, (double)dpos, (double)dang);
-					}
+				if (had_pose and (dpos > 25.f or dang > 3.f))
+				{
+					fp.fade_start = predicted_display_time;
+					spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s jump {:.1f}mm {:.2f}deg (fading)",
+					             def.id, gap_s, (double)dpos, (double)dang);
+				}
 					else
 						spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s continuous (no fade)",
 						             def.id, gap_s);
 				}
 			}
 			break;
+		}
+	}
+
+	// ---- surface-projected instances: one geometry instance per placed,
+	// flagged object on the shared projected layer (mask path only; the
+	// binary shim below stays single-mesh). Created on placement from the
+	// smoothed pose, updated every frame, destroyed on unselect/unplace.
+	// Reversed objects never qualify (they show game, not camera).
+	if (composition_layer_alpha_blend_supported)
+	{
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			bool want = ost.def.type == "3d-passthrough" and ost.soup_ready and ost.fused.placed and
+			        surface_projected_effective(oid, ost) and session.projected_passthrough_supported() and
+			        not projected_failed.contains(oid);
+			bool have = session.has_projected_instance(oid);
+			if (want and not have)
+			{
+				try
+				{
+					session.set_projected_instance_mesh(oid, ost.soup.vertices, ost.soup.indices, world_space,
+					                                    ost.fused.world_pose, ost.fused.world_scale);
+				}
+				catch (std::exception & e)
+				{
+					// Persistent per mesh (too big, runtime refused): skip
+					// retry so one bad mesh can't spam every frame. Cleared
+					// on map change with everything else.
+					projected_failed.insert(oid);
+					spdlog::warn("Projected instance \"{}\": upload failed (falling back to flat): {}", oid, e.what());
+				}
+			}
+			else if (have and not want)
+				session.remove_projected_instance(oid);
+			if (want and session.has_projected_instance(oid))
+				session.update_projected_instance_transform(oid, world_space, predicted_display_time,
+				                                            ost.fused.world_pose, ost.fused.world_scale);
 		}
 	}
 
@@ -1079,6 +1138,22 @@ void scenes::stream::gui_passthrough()
 		ImGui::EndChild();
 	}
 	ImGui::EndDisabled();
+
+	ImGui::SeparatorText(_S("Surface-projected mapping"));
+	if (not composition_layer_alpha_blend_supported)
+		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));
+	for (auto & [oid, ost]: passthrough_objects)
+	{
+		if (ost.def.type != "3d-passthrough")
+			continue;
+		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
+		bool b = surface_projected_effective(oid, ost);
+		std::string title = label + "##projected_" + oid;
+		if (ImGui::Checkbox(title.c_str(), &b))
+			projected_overrides[oid] = b;
+		ImGui::SameLine();
+		ImGui::TextDisabled("%s", ost.def.surface_projected ? "(config on)" : "(config off)");
+	}
 }
 
 void scenes::stream::gui_fiducial_status()
@@ -1138,8 +1213,9 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
-		ImGui::Text("%s %.40s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", ost.triangle_count, _S("placed"), stale_s);
+		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
+		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 		// Per-fiducial solve stats for placed objects.
 		for (const auto & fid: ost.def.fiducial)
 		{
