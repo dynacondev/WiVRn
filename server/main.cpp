@@ -1020,6 +1020,10 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 
 int main(int argc, char * argv[])
 {
+	// Show startup logging (including config search) at info level, like the
+	// forked session child does. Does not override an explicitly exported XRT_LOG.
+	setenv("XRT_LOG", "info", false);
+
 	CLI::App app;
 
 	std::string config_file;
