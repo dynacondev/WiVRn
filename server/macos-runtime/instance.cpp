@@ -16,11 +16,38 @@ extern "C"
 	{
 		if (propertyCountOutput == nullptr)
 			return XR_ERROR_VALIDATION_FAILURE;
-		// v1 advertises no extensions. A named layer query finds nothing either.
+		// v1 advertises exactly the two Vulkan extensions (DIY device via
+		// enable, runtime-created device via enable2). A named layer query
+		// finds nothing.
 		(void)layerName;
-		(void)properties;
-		(void)propertyCapacityInput;
-		*propertyCountOutput = 0;
+		struct Advertised
+		{
+			const char * name;
+			uint32_t version;
+		};
+		static constexpr Advertised advertised[] = {
+		        {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_vulkan_enable_SPEC_VERSION},
+		        {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION},
+		};
+		static constexpr uint32_t count = sizeof(advertised) / sizeof(advertised[0]);
+		if (propertyCapacityInput == 0)
+		{
+			*propertyCountOutput = count;
+			return XR_SUCCESS;
+		}
+		if (properties == nullptr)
+			return XR_ERROR_VALIDATION_FAILURE;
+		if (propertyCapacityInput < count)
+			return XR_ERROR_SIZE_INSUFFICIENT;
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			properties[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+			properties[i].next = nullptr;
+			std::strncpy(properties[i].extensionName, advertised[i].name, XR_MAX_EXTENSION_NAME_SIZE - 1);
+			properties[i].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
+			properties[i].extensionVersion = advertised[i].version;
+		}
+		*propertyCountOutput = count;
 		return XR_SUCCESS;
 	}
 
@@ -43,17 +70,29 @@ extern "C"
 			return XR_ERROR_VALIDATION_FAILURE;
 		if (createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO)
 			return XR_ERROR_VALIDATION_FAILURE;
-		if (createInfo->next != nullptr)
-		{
-			// v1 supports no instance extensions: any chained struct is either
-			// an extension we cannot honor or garbage. Refuse loudly.
-			wivrn_macos::log("CreateInstance: chained next structs unsupported in v1");
-			return XR_ERROR_VALIDATION_FAILURE;
-		}
+		wivrn_macos::log(
+		        "CreateInstance: enter next=%p exts=%u layers=%u api=%u.%u.%u",
+		        createInfo->next,
+		        createInfo->enabledExtensionCount,
+		        createInfo->enabledApiLayerCount,
+		        XR_VERSION_MAJOR(createInfo->applicationInfo.apiVersion),
+		        XR_VERSION_MINOR(createInfo->applicationInfo.apiVersion),
+		        XR_VERSION_PATCH(createInfo->applicationInfo.apiVersion));
 		if (createInfo->enabledExtensionCount > 0)
-			return XR_ERROR_EXTENSION_NOT_PRESENT;
-		if (createInfo->enabledApiLayerCount > 0)
-			return XR_ERROR_VALIDATION_FAILURE;
+		{
+			// v1 honors exactly the advertised Vulkan extensions.
+			for (uint32_t i = 0; i < createInfo->enabledExtensionCount; ++i)
+			{
+				const char * name = createInfo->enabledExtensionNames[i];
+				if (std::strcmp(name, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) != 0 &&
+				    std::strcmp(name, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) != 0)
+				{
+					wivrn_macos::log("CreateInstance: extension not present: %s", name != nullptr ? name : "(null)");
+					return XR_ERROR_EXTENSION_NOT_PRESENT;
+				}
+			}
+		}
+		// API layers are the loader's business (validated before chaining here).
 		XrVersion requested = createInfo->applicationInfo.apiVersion;
 		if (requested != 0 && (XR_VERSION_MAJOR(requested) != XR_VERSION_MAJOR(XR_CURRENT_API_VERSION) ||
 		                       XR_VERSION_MINOR(requested) > XR_VERSION_MINOR(XR_CURRENT_API_VERSION)))

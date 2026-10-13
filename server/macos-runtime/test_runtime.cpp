@@ -378,12 +378,13 @@ int main()
 	CHECK_XR(xrRequestExitSession(session), XR_SUCCESS);
 	CHECK_XR(xrDestroySession(session), XR_SUCCESS);
 
-	// Session WITH a graphics binding: refused loudly until Phase 4.
+	// Session WITH a null Vulkan binding struct: GRAPHICS_DEVICE_INVALID
+	// (empty handles; see test_graphics for the real-device path).
 	XrGraphicsBindingVulkanKHR vulkanBinding{.type = XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR, .next = nullptr};
 	XrSessionCreateInfo boundSessionInfo = sessionInfo;
 	boundSessionInfo.next = reinterpret_cast<const void *>(&vulkanBinding);
 	XrSession boundSession = XR_NULL_HANDLE;
-	CHECK_XR(xrCreateSession(instance, &boundSessionInfo, &boundSession), XR_ERROR_VALIDATION_FAILURE);
+	CHECK_XR(xrCreateSession(instance, &boundSessionInfo, &boundSession), XR_ERROR_GRAPHICS_DEVICE_INVALID);
 	CHECK(boundSession == XR_NULL_HANDLE);
 
 	CHECK_XR(xrDestroyInstance(instance), XR_SUCCESS);

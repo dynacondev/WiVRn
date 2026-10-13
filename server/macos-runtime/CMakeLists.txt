@@ -30,11 +30,16 @@ add_library(wivrn-macos-runtime MODULE
 	tracking.cpp
 	spaces.cpp
 	actions.cpp
+	vk_context.cpp
+	graphics.cpp
+	swapchain.cpp
+	frame.cpp
 )
 target_include_directories(wivrn-macos-runtime PRIVATE
 	${openxr_loader_SOURCE_DIR}/include
 	.
 )
+target_link_libraries(wivrn-macos-runtime PRIVATE Vulkan::Vulkan)
 set_target_properties(wivrn-macos-runtime PROPERTIES
 	PREFIX ""
 	SUFFIX ".dylib"
@@ -60,3 +65,15 @@ target_include_directories(wivrn-macos-runtime-test PRIVATE
 	.
 )
 target_link_libraries(wivrn-macos-runtime-test PRIVATE openxr_loader)
+
+# Phase 4 proof: headless MoltenVK frame-loop drive through the real
+# loader (instance extensions + device bring-up + swapchain cycles +
+# Wait/Begin/EndFrame), with validation layers when available.
+add_executable(wivrn-macos-graphics-test
+	test_graphics.cpp
+)
+target_include_directories(wivrn-macos-graphics-test PRIVATE
+	${openxr_loader_SOURCE_DIR}/include
+	.
+)
+target_link_libraries(wivrn-macos-graphics-test PRIVATE openxr_loader Vulkan::Vulkan)

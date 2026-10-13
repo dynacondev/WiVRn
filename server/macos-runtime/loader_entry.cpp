@@ -51,6 +51,22 @@ extern "C"
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_DestroySpace(XrSpace);
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_LocateSpace(XrSpace, XrSpace, XrTime, XrSpaceLocation *);
 	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_LocateViews(XrSession, const XrViewLocateInfo *, XrViewState *, uint32_t, uint32_t *, XrView *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EnumerateSwapchainFormats(XrSession, uint32_t, uint32_t *, int64_t *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateSwapchain(XrSession, const XrSwapchainCreateInfo *, XrSwapchain *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_DestroySwapchain(XrSwapchain);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EnumerateSwapchainImages(XrSwapchain, uint32_t, uint32_t *, XrSwapchainImageBaseHeader *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_AcquireSwapchainImage(XrSwapchain, const XrSwapchainImageAcquireInfo *, uint32_t *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_WaitSwapchainImage(XrSwapchain, const XrSwapchainImageWaitInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_ReleaseSwapchainImage(XrSwapchain, const XrSwapchainImageReleaseInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_WaitFrame(XrSession, const XrFrameWaitInfo *, XrFrameState *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_BeginFrame(XrSession, const XrFrameBeginInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_EndFrame(XrSession, const XrFrameEndInfo *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanInstanceExtensionsKHR(XrInstance, XrSystemId, uint32_t, uint32_t *, char *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanDeviceExtensionsKHR(XrInstance, XrSystemId, uint32_t, uint32_t *, char *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanGraphicsRequirementsKHR(XrInstance, XrSystemId, XrGraphicsRequirementsVulkanKHR *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_GetVulkanGraphicsRequirements2KHR(XrInstance, XrSystemId, XrGraphicsRequirementsVulkan2KHR *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateVulkanInstanceKHR(XrInstance, const XrVulkanInstanceCreateInfoKHR *, VkInstance *, VkResult *);
+	XRAPI_ATTR XrResult XRAPI_CALL wivrn_macos_CreateVulkanDeviceKHR(XrInstance, const XrVulkanDeviceCreateInfoKHR *, VkDevice *, VkResult *);
 }
 
 namespace
@@ -115,6 +131,22 @@ const FunctionEntry functions[] = {
         ENTRY(DestroySpace),
         ENTRY(LocateSpace),
         ENTRY(LocateViews),
+        ENTRY(EnumerateSwapchainFormats),
+        ENTRY(CreateSwapchain),
+        ENTRY(DestroySwapchain),
+        ENTRY(EnumerateSwapchainImages),
+        ENTRY(AcquireSwapchainImage),
+        ENTRY(WaitSwapchainImage),
+        ENTRY(ReleaseSwapchainImage),
+        ENTRY(WaitFrame),
+        ENTRY(BeginFrame),
+        ENTRY(EndFrame),
+        ENTRY(GetVulkanInstanceExtensionsKHR),
+        ENTRY(GetVulkanDeviceExtensionsKHR),
+        ENTRY(GetVulkanGraphicsRequirementsKHR),
+        ENTRY(GetVulkanGraphicsRequirements2KHR),
+        ENTRY(CreateVulkanInstanceKHR),
+        ENTRY(CreateVulkanDeviceKHR),
 };
 
 } // namespace

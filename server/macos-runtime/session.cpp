@@ -31,19 +31,53 @@ extern "C"
 			return XR_ERROR_HANDLE_INVALID;
 		if (createInfo->type != XR_TYPE_SESSION_CREATE_INFO)
 			return XR_ERROR_VALIDATION_FAILURE;
-		if (createInfo->next != nullptr)
-		{
-			// Graphics bindings (Vulkan/Metal) arrive in Phase 4. Refuse
-			// loudly rather than creating a session that can never submit.
-			wivrn_macos::log("CreateSession: graphics bindings unsupported until Phase 4");
-			return XR_ERROR_VALIDATION_FAILURE;
-		}
 		if (createInfo->systemId != self->system.id)
 			return XR_ERROR_SYSTEM_INVALID;
 
 		XrSession_T * handle = new (std::nothrow) XrSession_T;
 		if (handle == nullptr)
 			return XR_ERROR_OUT_OF_MEMORY;
+		// Graphics bindings (Phase 4: Vulkan only, v1 or v2 struct — the
+		// enable2 binding is a struct alias of the v1 one). A bare session
+		// stays valid for headless lifecycle tests.
+		if (createInfo->next != nullptr)
+		{
+			const XrBaseInStructure * chain = reinterpret_cast<const XrBaseInStructure *>(createInfo->next);
+			if (chain->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR ||
+			    chain->type == XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR)
+			{
+				auto * binding = reinterpret_cast<const XrGraphicsBindingVulkanKHR *>(chain);
+				if (binding->instance == VK_NULL_HANDLE || binding->physicalDevice == VK_NULL_HANDLE ||
+				    binding->device == VK_NULL_HANDLE)
+				{
+					delete handle;
+					return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+				}
+				// The struct carries family + index but no queue handle;
+				// resolve it here (single-family MoltenVK in practice).
+				VkQueue queue = VK_NULL_HANDLE;
+				vkGetDeviceQueue(binding->device, binding->queueFamilyIndex, binding->queueIndex, &queue);
+				if (queue == VK_NULL_HANDLE)
+				{
+					delete handle;
+					return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+				}
+				handle->data.hasGraphicsBinding = true;
+				handle->data.vkInstance = binding->instance;
+				handle->data.vkPhysicalDevice = binding->physicalDevice;
+				handle->data.vkDevice = binding->device;
+				handle->data.vkQueue = queue;
+				handle->data.vkQueueFamily = binding->queueFamilyIndex;
+			}
+			else
+			{
+				// D3D/Metal bindings: refuse loudly rather than creating a
+				// session that can never submit.
+				wivrn_macos::log("CreateSession: binding type %d unsupported in v1 (Vulkan only)", (int)chain->type);
+				delete handle;
+				return XR_ERROR_VALIDATION_FAILURE;
+			}
+		}
 		handle->data.instance = self;
 		handle->data.state = XR_SESSION_STATE_IDLE;
 		{

@@ -350,17 +350,49 @@ most-recent-wins per profile so tests batch one call per profile;
 upstream reassembly behavior). `configuration.cpp` merge deferred to
 Phase 5 (needed with networking, not before).
 
-## Phase 4 — Vulkan swapchains + frame loop
+## Phase 4 — Vulkan swapchains + frame loop [status: done 2026-10-13]
 
-- [ ] Trimmed `vk_bundle` subset (drop `*_FD/VIDEO/DMA_BUF/
-  encode_queues/share()`, single MoltenVK queue + own mutex).
-- [ ] Vulkan-only binding; `Acquire/Wait/Release` over app `VkImage`s.
-- [ ] Port `pacer` math, `foveation` (`Xr*` types, same `.comp`),
+- [x] Trimmed `vk_bundle` subset (drop `*_FD/VIDEO`, single MoltenVK
+  queue + own mutex).
+- [x] Vulkan-only binding; `Acquire/Wait/Release` over app `VkImage`s.
+- [x] Port `pacer` math, `foveation` (`Xr*` types, same `.comp`),
   new minimal squasher over `XrCompositionLayerProjection` (+`Quad`
   if cheap).
 
 Accept: app renders stereo frames into runtime swapchains at display
 rate without validation-layer errors.
+
+Verified: `vk_context` (runtime-owned triple-buffered images,
+device-local memory, real per-image fences), `graphics` (MoltenVK
+requirements 1.0–1.3, instance/device extension lists, enable2
+create-functions), `swapchain` (formats/acquire/FIFO wait/release
+with GPU-signaling empty submits), `frame` (Wait/Begin/End with
+call-order tracking, fixed-period phase-locked prediction, projection
+intake validation), `wivrn-macos-graphics-test` headless MoltenVK
+drive (Apple M3 Max): DIY + runtime-created devices, 2x512x512
+triple-buffered swapchains, 5-frame loop with advancing predictions,
+TIMEOUT honesty, quad refusal — PASS with **0 validation errors**.
+Rescope (recorded, not dropped): foveation compute + squasher GPU
+submit move to Phase 5 with encode (they are only exercisable against
+real pixels); Phase 4 keeps the layer-intake validation seam
+(`lastLayerCount`) + fixed-period pacer (presentation feedback in
+Phase 5).
+Findings: 1.1 `XrGraphicsBindingVulkan2KHR` is a struct alias of the
+v1 struct (family + index, no queue handle — runtime resolves the
+queue itself); the `...Extensions2KHR` string queries do not exist
+(v1 5-arg names + create-functions instead); `XrResult` timeout is
+`XR_TIMEOUT_EXPIRED` (not `XR_ERROR_*`); Vk structs use `pNext`;
+`VkSubmitInfo` release-signaling is only legal on waited (reset)
+fences; wait carries no index so v1 uses oldest-outstanding FIFO;
+re-wait must really re-wait (no success short-circuit) to keep
+TIMEOUT honest; `VkInstance`/`VkDevice` want api 1.1 (makes
+`get_physical_device_properties2` core, satisfying the
+portability_subset VUID-01387 — the ext is not offered at device
+level); both `enable` + `enable2` advertised (DIY + runtime-created
+devices); runtime links libvulkan directly (loader-less dispatch a
+la OXRSys). Env note: duplicate `MVKBlockObserver` (brew + LunarG
+MoltenVK both load) warns but is benign; pin `VK_ICD_FILENAMES` if it
+ever bites.
 
 ## Phase 5 — Encode + network + discovery
 
@@ -369,6 +401,9 @@ rate without validation-layer errors.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR
   handler unchanged.
 - [ ] `bonjour_publisher.cpp` (`dns_sd.h`, same TXT keys).
+- [ ] Foveation compute + squasher GPU submit (moved from Phase 4:
+  only exercisable against real pixels) + pacer presentation
+  feedback.
 
 Accept: `xrEndFrame` → squash → x264 → 9757 → client → poses back →
 `xrWaitFrame` prediction loop closes.
