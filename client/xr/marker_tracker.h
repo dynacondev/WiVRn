@@ -65,6 +65,9 @@ public:
 	// Payload is required: QR runtimes report markerId 0, so identity is
 	// the payload alone. Tag is display-only (UI/logs) and never gates:
 	// a rename updates the label live without restarting tracking.
+	// A non-positive size leaves the size unspecified: the fixed-size hint
+	// is not chained and the runtime measures markers itself (no-config
+	// discovery reports raw sightings at their measured bounds).
 	// is_static maps to optimizeForStaticMarker: toggling it recreates the
 	// spatial context (brief tracking hitch). Poses for all known codes
 	// refresh every frame via update snapshots (no timers); the runtime

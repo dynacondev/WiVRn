@@ -153,15 +153,13 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 		fail("fiducial map entry has no QR payload (marker-data)");
 		return;
 	}
-	spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\" ({})",
-	             label(), (double)(size_m * 1000), marker_payload.substr(0, 64),
-	             marker_static ? "static" : "moving");
-
-	if (marker_size_m <= 0)
-	{
-		fail("invalid marker size");
-		return;
-	}
+	if (marker_size_m > 0)
+		spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\" ({})",
+		             label(), (double)(size_m * 1000), marker_payload.substr(0, 64),
+		             marker_static ? "static" : "moving");
+	else
+		spdlog::info("marker_tracker: discovering QR codes (size unspecified, runtime measures) for \"{}\" ({})",
+		             label(), marker_static ? "static" : "moving");
 
 	// Require the QR capability before creating the context
 	uint32_t count = 0;
@@ -224,9 +222,14 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	// the context here (brief tracking hitch, by design).
 	XrSpatialMarkerStaticOptimizationEXT static_opt{
 	        .type = XR_TYPE_SPATIAL_MARKER_STATIC_OPTIMIZATION_EXT,
-	        .next = &size,
 	        .optimizeForStaticMarker = static_cast<XrBool32>(marker_static ? XR_TRUE : XR_FALSE),
 	};
+	// Fixed-size hint only when a size is actually known: with no size to
+	// assume the struct stays unchained and the runtime measures markers
+	// itself. A guessed size would be worse than none: the runtime assumes
+	// every detected code is that size.
+	if (marker_size_m > 0)
+		static_opt.next = &size;
 	XrSpatialCapabilityConfigurationQrCodeEXT qr_code{
 	        .type = XR_TYPE_SPATIAL_CAPABILITY_CONFIGURATION_QR_CODE_EXT,
 	        .next = &static_opt,
