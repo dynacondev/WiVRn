@@ -167,6 +167,9 @@ private:
 	std::atomic<bool> running_ = false;
 	std::atomic<uint64_t> sent_frames_{0};
 	std::atomic<uint64_t> dropped_frames_{0};
+	// Newest decoded frame per stream (from feedback received_from_decoder;
+	// gates NACK->IDR so stale skips don't force pointless IDRs).
+	std::atomic<uint64_t> last_ack_[2]{0, 0};
 };
 
 } // namespace wivrn_macos

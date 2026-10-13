@@ -463,6 +463,21 @@ drops the link — the latch once froze a live session behind healthy
 encode logs), first-sample/first-tracking/NACK/settings/pin-addr logs
 + sent/drop counters in the periodic line as permanent alibis.
 Loopback 5/5 PASS. Awaiting retest.
+Headset run 5 (same day, fb journey logging): stream FULLY LIVE —
+24 frames/eye in 3.6s, every one completed→decoded→displayed with dense
+per-eye indices; UDP pinning, tracking, timesync (-5.4d offset snapped
+in 9ms) all healthy. The "frozen" look is hello_xr's scene: its cubes
+use fixed rotations (openxr_program.cpp:74-83), so consecutive frames
+are pixel-identical and client reprojection (live poses) is the only
+visible motion. Run 4's "NACK storm" was completion receipts, not
+starvation. Real bug found via Linux idr_handler: our NACK gate
+(times_displayed==0) fired on every healthy completion receipt and
+forced ~100% IDRs (fat TCP frames ~= the 6.7 pairs/s ceiling). Now
+mirrors Linux: need_idr iff !sent_to_decoder and frame_index >=
+per-stream last_ack (newest received_from_decoder); fb journey logged
+on disp==0 only (per-display updates flooded 240/s); worker picks up
+the live force_idr flag at take (mailbox overwrites swallowed most
+NACK IDRs). Loopback PASS. Awaiting motion test (controller wave).
 - [ ] `video_encoder_x264` + `raw` via `encode(info, sink)` adapter;
   host-visible copy verified modifier-free on MoltenVK.
 - [ ] `accept_connection` adapter (9757), `send_shard` sink, IDR

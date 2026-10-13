@@ -592,28 +592,47 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 				continue;
 			if (auto * feedback = get_as<wivrn::from_headset::feedback>(*packet))
 			{
-				// Journey log: shows exactly how far each frame got on the
-				// client (shards received? completed to decoder? decoded?
-				// blitted? displayed?). Timestamps are client-clock ns.
-				log("link: fb stream=%u frame=%llu disp=%u recv=%lld/%lld todec=%lld fromdec=%lld blit=%lld displ=%lld",
-				    feedback->stream_index,
-				    (unsigned long long)feedback->frame_index,
-				    feedback->times_displayed,
-				    (long long)feedback->received_first_packet,
-				    (long long)feedback->received_last_packet,
-				    (long long)feedback->sent_to_decoder,
-				    (long long)feedback->received_from_decoder,
-				    (long long)feedback->blitted,
-				    (long long)feedback->displayed);
-				// NACK (never displayed) forces an IDR like the Linux path.
-				if (feedback->times_displayed == 0 && events_.need_idr)
+				// Genuine NACK = frame never completed to the decoder
+				// (mirrors Linux default_idr_handler: !sent_to_decoder).
+				// Completion receipts (sent_to_decoder set, displayed 0
+				// times yet) are healthy traffic: every frame produced one
+				// and the old times_displayed==0 gate forced ~100% IDRs.
+				// last_ack tracks the newest decoded index per stream so
+				// stale/duplicate skips don't force pointless IDRs.
+				uint8_t stream = feedback->stream_index;
+				if (stream < 2)
 				{
-					try
+					if (feedback->received_from_decoder != 0)
 					{
-						events_.need_idr();
+						uint64_t ack = last_ack_[stream].load();
+						while (ack < feedback->frame_index &&
+						       !last_ack_[stream].compare_exchange_weak(ack, feedback->frame_index))
+						{
+						}
 					}
-					catch (...)
+					// Journey log on completions/NACKs only: per-display
+					// updates (disp>=1) flood at 240 lines/s otherwise.
+					if (feedback->times_displayed == 0)
+						log("link: fb stream=%u frame=%llu recv=%lld/%lld todec=%lld fromdec=%lld blit=%lld displ=%lld",
+						    stream,
+						    (unsigned long long)feedback->frame_index,
+						    (long long)feedback->received_first_packet,
+						    (long long)feedback->received_last_packet,
+						    (long long)feedback->sent_to_decoder,
+						    (long long)feedback->received_from_decoder,
+						    (long long)feedback->blitted,
+						    (long long)feedback->displayed);
+					if (!feedback->sent_to_decoder && feedback->frame_index >= last_ack_[stream].load() &&
+					    events_.need_idr)
 					{
+						log("link: NACK stream=%u frame=%llu, forcing IDR", stream, (unsigned long long)feedback->frame_index);
+						try
+						{
+							events_.need_idr();
+						}
+						catch (...)
+						{
+						}
 					}
 				}
 			}

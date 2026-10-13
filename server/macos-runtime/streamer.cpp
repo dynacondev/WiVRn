@@ -378,6 +378,10 @@ void Streamer::encode_eye(uint32_t eye_index)
 	std::vector<uint8_t> pixels = std::move(eye.pixels);
 	uint32_t width = eye.job_width, height = eye.job_height;
 	bool swap_rb = eye.job_swap_rb, force_idr = eye.job_force_idr;
+	// NACKs landing between stage and take are swallowed by mailbox
+	// overwrites (the staged flag dies with the dropped job): pick the
+	// live flag up directly so a real loss always gets its IDR.
+	force_idr = eye.force_idr.exchange(false) || force_idr;
 	uint32_t bitrate = eye.job_bitrate, fps = eye.job_fps;
 	auto pose = eye.job_pose;
 	auto fov = eye.job_fov;
