@@ -27,6 +27,10 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+// Provided by the C runtime. Declared here at global scope: a block-scope
+// extern inside wivrn:: would bind to wivrn::environ and fail to link.
+extern char ** environ;
+
 static const std::filesystem::path info_path = "/.flatpak-info";
 static const bool is_flatpak_v = std::filesystem::exists(info_path);
 
@@ -87,7 +91,6 @@ std::optional<std::vector<std::byte>> wivrn::read_file_via_host(const std::strin
 	char arg3[] = "--";
 	char * const argv[] = {arg0, arg1, arg2, arg3, const_cast<char *>(path.c_str()), nullptr};
 
-	extern char ** environ;
 	pid_t pid = -1;
 	int spawn_rc = posix_spawnp(&pid, "flatpak-spawn", &actions, nullptr, argv, environ);
 	posix_spawn_file_actions_destroy(&actions);
