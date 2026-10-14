@@ -1549,6 +1549,45 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				}
+				// Coverage stencil claim (union of projection-mapped
+				// objects): renderer + meshes for soup-ready effective
+				// objects, placed or not (draws gate on placed at
+				// record). Reversed never qualify (game, not camera);
+				// unflagged objects stay flat-only. Skipped where the
+				// runtime can't project (no instances ever exist there).
+				if (session.projected_passthrough_supported())
+				{
+					auto & cg = fp.coverage_group;
+					cg.feather_px = 0;
+					if (not cg.renderer)
+						cg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or
+						    not surface_projected_effective(oid, ost))
+							continue;
+						auto mh = cg.mesh_hashes.find(oid);
+						if (mh == cg.mesh_hashes.end() or mh->second != ost.soup_hash)
+						{
+							cg.renderer->set_mesh(oid, ost.soup);
+							cg.mesh_hashes[oid] = ost.soup_hash;
+						}
+					}
+					for (auto hit = cg.mesh_hashes.begin(); hit != cg.mesh_hashes.end();)
+					{
+						auto oit = passthrough_objects.find(hit->first);
+						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
+						        oit->second.def.type == "3d-passthrough" and
+						        surface_projected_effective(oit->first, oit->second);
+						if (not member)
+						{
+							cg.renderer->remove_mesh(hit->first);
+							hit = cg.mesh_hashes.erase(hit);
+						}
+						else
+							++hit;
+					}
+				}
 				// Debug-only cutout group (no objects): lets the marker
 				// window punch with a fiducials-only config. Reserved key
 				// (never an object feather); flows through eager setup,
@@ -1829,6 +1868,133 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						mask_frame = true;
 					}
 				}
+				// Coverage stencil record: union silhouette of
+				// projection-mapped objects, hard full-res tier-0
+				// (feather 0: raster-direct, no erode/blur). Same fade
+				// opacity and MVPs as the mask draws; 1px frustum margin
+				// (pixel-exact, no bleed to preserve); no cutouts (no
+				// geometry behind them) and no reversed (game cuts, and
+				// the projected feed never shows them). Unmetered (no
+				// query slots): tier-0 raster cost is ~0.08ms by past
+				// measurement.
+				if (session.projected_passthrough_supported() and fp.coverage_group.renderer)
+				{
+					auto & cg = fp.coverage_group;
+					std::vector<feather_mask_renderer::instance_draw> cov_draws;
+					float cmx = 1.f / ((float)mw * 0.5f);
+					float cmy = 1.f / ((float)mh * 0.5f);
+					auto cov_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
+						auto bounds = cg.renderer->mesh_bounds(mesh);
+						if (not bounds)
+							return true;
+						for (uint32_t view = 0; view < 2; ++view)
+						{
+							bool any_front = false, any_behind = false, any_inside = false;
+							for (int corner = 0; corner < 8; ++corner)
+							{
+								glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
+								            (corner & 2) ? bounds->second.y : bounds->first.y,
+								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+								glm::vec4 c = draw_mvp[view] * q;
+								if (c.w < 0)
+								{
+									any_behind = true;
+									continue;
+								}
+								any_front = true;
+								if (glm::abs(c.x) <= c.w * (1.f + cmx) and
+								    glm::abs(c.y) <= c.w * (1.f + cmy) and c.z >= 0 and c.z <= c.w)
+									any_inside = true;
+							}
+							bool skip_eye = not any_front or (not any_behind and not any_inside);
+							if (not skip_eye)
+								return true;
+						}
+						return false;
+					};
+					auto cov_append = [&](const std::string & oid, const passthrough_object_state & ost) {
+						const auto & fu = ost.fused;
+						if (not fu.placed)
+							return;
+						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						std::array<glm::mat4, 2> mvp;
+						for (uint32_t view = 0; view < 2; ++view)
+							mvp[view] = world_mvp[view] * model;
+						float op = fiducial_passthrough_state::fade_factor(
+						        frame_state.predictedDisplayTime, fp.fade_start,
+						        std::max(0.f, fp.fade_in_ms));
+						if (not cov_visible(oid, mvp))
+							return;
+						cov_draws.push_back({oid, mvp, op, false});
+					};
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or
+						    not surface_projected_effective(oid, ost))
+							continue;
+						cov_append(oid, ost);
+					}
+					if (cov_draws.empty())
+					{
+						cg.active = false;
+						if (cg.had_draws and instance.now() - cg.last_draws_log > 1'000'000'000LL)
+						{
+							cg.last_draws_log = instance.now();
+							spdlog::info("Fiducial coverage draws lost");
+						}
+						cg.had_draws = false;
+					}
+					else
+					{
+						if (not cg.swapchain or cg.swapchain.width() != mw or cg.swapchain.height() != mh)
+						{
+							device.waitIdle();
+							cg.swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
+							cg.renderer->reset_targets();
+							cg.images_outstanding = 0;
+							spdlog::info("Fiducial coverage swapchain: {}x{} ({} images)", mw, mh, cg.swapchain.image_count());
+						}
+						cg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+						int cov_index = cg.swapchain.acquire();
+						++cg.images_outstanding;
+						acquired_groups.push_back(&cg);
+						bool cov_waited = cg.swapchain.wait(100'000'000);
+						if (not cov_waited)
+						{
+							cg.swapchain.release();
+							--cg.images_outstanding;
+							acquired_groups.pop_back();
+							cg.active = false;
+							if (not cg.wait_warned)
+							{
+								cg.wait_warned = true;
+								spdlog::warn("Fiducial coverage image wait timed out, skipping stencil");
+							}
+						}
+						else
+						{
+							cg.wait_warned = false;
+							cg.acquired = true;
+							cg.extent = {mw, mh};
+							feather_mask_renderer::mask_stage_cpu cov_cpu;
+							static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+							cg.renderer->record(
+							        command_buffer, cg.swapchain.image(cov_index), {(uint32_t)mw, (uint32_t)mh}, cov_draws,
+							        true, 0.f, no_cutouts, world_mvp, &cov_cpu, {(uint32_t)mw, (uint32_t)mh});
+							if (not cg.had_draws and instance.now() - cg.last_draws_log > 1'000'000'000LL)
+							{
+								cg.last_draws_log = instance.now();
+								spdlog::info("Fiducial coverage draws resumed with {} draws", cov_draws.size());
+							}
+							cg.had_draws = true;
+							cg.active = true;
+						}
+					}
+				}
 			}
 		}
 		catch (std::exception & e)
@@ -1976,14 +2142,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// shared pool).
 		//
 		// Flat reconstruction and surface-projected mapping compose
-		// through the same feathered mask: flat reads it always, mapped
-		// interiors read it too (DST blend), so edges feather identically
-		// on both and flagged windows need no own group. Flat wins
-		// whenever anything needs it: unflagged windows, debug cutouts
-		// (camera with no geometry to map it onto — a DST-blended
-		// projected layer would stamp black there), or a still-ramping
-		// global fade. Otherwise both submit: flat covers unmapped
-		// regions and the band, projected covers mapped interiors.
+		// through the same feathered mask: flat reads it always; the
+		// coverage stencil then multiplies the destination alpha by the
+		// projected-object silhouettes, and projected reads the product
+		// (DST blend over feather x coverage), so edges feather
+		// identically on both and flagged windows need no own group.
+		// Flat wins whenever anything needs it: unflagged windows, debug
+		// cutouts (camera with no geometry to map it onto — the stencil
+		// is 0 there, so projected correctly contributes nothing), or a
+		// still-ramping global fade. Otherwise both submit: flat covers
+		// unmapped regions and the band, projected covers mapped
+		// interiors.
 		XrTime fade_done_at = fp.fade_start + XrTime(fp.fade_in_ms * 1e6);
 		bool fade_done = fp.fade_in_ms <= 0 || (fp.fade_start != 0 && frame_state.predictedDisplayTime >= fade_done_at);
 		bool need_flat = not fade_done;
@@ -2000,19 +2169,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (fp.cutouts_punched)
 			need_flat = true;
 		bool have_projected = session.has_projected_instances();
+		// Coverage stencil submits with the projected feed (its gate):
+		// recorded above, decides here with fresh instance state.
+		bool submit_coverage = have_projected && fp.coverage_group.active;
 		// Forensic submit decisions (change-triggered): which camera layer
 		// submits and why. Permanent: coexistence bugs read as wrong output
 		// with no error, so the decision itself must be in the log.
 		{
 			static bool last_need_flat = true;
 			static bool last_have_projected = false;
-			if (need_flat != last_need_flat or have_projected != last_have_projected)
+			static bool last_submit_coverage = false;
+			if (need_flat != last_need_flat or have_projected != last_have_projected or
+			    submit_coverage != last_submit_coverage)
 			{
 				last_need_flat = need_flat;
 				last_have_projected = have_projected;
-				spdlog::info("Camera submit: {} (need_flat={} have_projected={} fade_done={} cutouts={})",
+				last_submit_coverage = submit_coverage;
+				spdlog::info("Camera submit: {} (need_flat={} have_projected={} coverage={} fade_done={} cutouts={})",
 				             need_flat ? "flat" : (have_projected ? "projected" : "video-only"), need_flat,
-				             have_projected, fade_done, fp.cutouts_punched);
+				             have_projected, submit_coverage, fade_done, fp.cutouts_punched);
 			}
 		}
 		bool first_group = true;
@@ -2057,16 +2232,48 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
 			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		}
+		if (submit_coverage)
+		{
+			// Coverage stencil: hard union silhouette of the projected
+			// objects, full-res. Multiplies the feather window into the
+			// destination alpha (color untouched, alpha dst := dst x
+			// src) so the projected DST read below sees feather x
+			// coverage: camera on geometry, flat/video elsewhere. Never
+			// stamps: where the stencil is 0 the layer contributes dst.
+			std::array<XrCompositionLayerProjectionView, view_count> cov_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				cov_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = pose[view],
+				        .fov = fov[view],
+					.subImage = {
+					                .swapchain = fp.coverage_group.swapchain,
+					                .imageRect = {
+					                        .offset = {0, 0},
+					                        .extent = fp.coverage_group.extent,
+					                },
+					                .imageArrayIndex = view,
+					                },
+				};
+			}
+			// imageIndex is implicit: the compositor uses the last released
+			// image, which record() acquired above.
+			add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     cov_views);
+			set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
+			                XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_SRC_ALPHA_FB);
+		}
 		if (have_projected)
 		{
-			// Surface-projected interiors read their own coverage alpha
-			// (SRC blend over the flat feed below): mapped camera where
-			// geometry covers, flat camera everywhere else (feather band,
-			// debug punches, unmapped rims). DST blend ignored that alpha
-			// and stamped black wherever the mask was opaque but geometry
-			// absent; SRC keeps flat's feathering exact everywhere.
+			// Surface-projected interiors read the coverage product
+			// (DST blend over feather x coverage): mapped camera where
+			// geometry covers, flat camera in the feather band and
+			// debug punches, video outside. The stencil above guarantees
+			// the off-geometry source color is always multiplied by 0.
 			add_projected_passthrough_layer();
-			set_alpha_blend(XR_BLEND_FACTOR_SRC_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA_FB,
+			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
 			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		}
 	}

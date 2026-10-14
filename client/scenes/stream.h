@@ -474,6 +474,15 @@ private:
 		// Exact float equality groups identical parsed values (24 and 24.0
 		// decode bitwise identically).
 		std::map<float, mask_group> mask_groups;
+		// Coverage stencil for the projected layer: union silhouette of
+		// all projection-mapped objects, hard full-res tier-0 raster (no
+		// erode/blur/cutouts). Submitted between flat and projected with
+		// (ZERO, SRC_ALPHA) alpha so the destination holds feather x
+		// coverage for the projected DST read. Reuses the mask_group
+		// machinery (dedicated swapchain, acquire/release pairing, soup
+		// sync) but lives outside the feather map: one stencil, always.
+		// Render thread only.
+		mask_group coverage_group;
 	};
 	fiducial_passthrough_state fiducial_passthrough;
 
