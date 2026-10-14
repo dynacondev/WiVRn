@@ -8,11 +8,33 @@
 //     ./wivrn-macos-stream-test
 // (The test sets WIVRN_PORT/WIVRN_HOSTNAME itself; never set
 // WIVRN_MACOS_HEADLESS here — streaming is the point.)
+//
+// WIVRN_MACOS_STREAM_PHASES selects harness phases (default "loop", the
+// proof above; "all" runs everything; comma-separated subset also works):
+//   tear — headless generation-tag snapshot race detector (no headset).
+//     Paints the frame sequence into a corner block of both eyes and
+//     captures through the real EyeSnapshot path on a worker thread
+//     while the app pipelines renders. Every capture must carry exactly
+//     one generation. FAILS on unfenced snapshots, PASSES once worker
+//     captures are ordered after the staged image's render completion.
+//   skew — eye-fairness soak: overload burst, then paced recovery, then
+//     assert the inter-eye encode completion lag re-converges (mean and
+//     p50 of eye1-minus-eye0 arrival times over display-time-matched
+//     pairs). FAILS on fixed-order sequential encodes, PASSES once both
+//     eyes complete within the bound (parallel or alternating service).
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+
+// White-box harness headers: the runtime dylib keeps its globals, but
+// the Swapchain record layout (staged_idx/active_idx handoff) is needed
+// to mimic the streamer's stage/worker protocol faithfully, and the real
+// EyeSnapshot implementation is compiled in so snapshot fixes are
+// tracked automatically (see run_tear).
+#include "runtime.h"
+#include "snapshot.cpp"
 
 #include "wivrn_packets.h"
 #include "wivrn_sockets.h"
@@ -23,6 +45,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -31,6 +54,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -104,6 +128,7 @@ struct GotFrame
 	// its swapchain from these; zeros crash it — see headset run 1).
 	uint32_t fov_w = 0;
 	uint32_t fov_h = 0;
+	long long arrival_ms = 0; // test_ms() at reassembly (skew soak)
 };
 
 struct ShardBin
@@ -156,6 +181,7 @@ void ingest(
 		frame.fov_w = bin.fov_w;
 		frame.fov_h = bin.fov_h;
 		frame.reliable = reliable;
+		frame.arrival_ms = test_ms();
 		done[key] = std::move(frame);
 		bins.erase(key);
 	}
@@ -190,6 +216,7 @@ struct FakeState
 	std::atomic<bool> stop{false};
 	std::atomic<bool> handshake_done{false};
 	std::atomic<bool> nack_sent{false};
+	uint16_t port = kPort;
 	std::map<std::pair<uint8_t, uint64_t>, ShardBin> stream_bins;
 	std::map<std::pair<uint8_t, uint64_t>, GotFrame> stream_done;
 	std::map<std::pair<uint8_t, uint64_t>, ShardBin> control_bins;
@@ -262,7 +289,7 @@ void fake_headset(FakeState & state)
 		{
 			try
 			{
-				control.emplace(loopback4(kPort));
+				control.emplace(loopback4(state.port));
 				break;
 			}
 			catch (const std::system_error &)
@@ -293,7 +320,7 @@ void fake_headset(FakeState & state)
 
 		FakeStream stream;
 		stream.bind(loopback6(0));
-		stream.connect(loopback6(kPort));
+		stream.connect(loopback6(state.port));
 		for (int i = 0; i < 40; ++i)
 		{
 			stream.send(wivrn::from_headset::handshake{});
@@ -580,7 +607,980 @@ bool bring_up_vulkan(VkDeviceSet & dev)
 
 } // namespace
 
-int main()
+// ---- Tear detector (headless, no headset) ----
+// The snapshot path can copy a mid-render image: the app stages each
+// presented image and the worker snapshots it later, but nothing orders
+// the worker's copy after the app's render on the shared queue — the
+// app thread's submits and the worker's capture submit race, so the copy
+// lands before the render (stale, previous generation) or between the
+// background and corner-block clears (torn: two generations in one
+// capture). This phase reproduces that topology exactly: the main thread
+// pipelines renders (two submits per eye per frame, no fence wait —
+// legal, the release fence-submit is meant to carry the dependency)
+// while a capturer thread claims staged images and runs the REAL
+// EyeSnapshot capture (compiled in above, so the fence fix is tracked).
+// Every capture must read back identical bytes in the background sample
+// and the corner-block sample: both submits paint one generation.
+//
+// Generation encoding: background clear color R=gen lo, G=gen hi,
+// B=0x80 marker; the 32x32 corner block repeats the SAME color in a
+// second submit. The block is deliberately not visually distinct: clear
+// values written into an sRGB attachment undergo the linear-to-sRGB
+// transfer on write, so an inverted corner would decode to different
+// bytes than the background even in a perfectly clean capture. Same
+// color in both submits keeps the compare warp-immune (same float ->
+// same byte, deterministically): any intra-capture byte difference
+// between the corner and background samples is two generations in one
+// capture. (demo.cpp's hook paints a visibly distinct corner instead and
+// inverts the sRGB curve back in its self-check.)
+
+namespace
+{
+
+constexpr uint32_t kTearDim = 256;
+constexpr uint32_t kTearBlock = 32;
+constexpr int kTearFrames = 1200;
+constexpr int kTearMinCaptures = 200;
+
+float tear_lo(uint64_t gen)
+{
+	return (float)(gen & 0xFF) / 255.0f;
+}
+
+float tear_hi(uint64_t gen)
+{
+	return (float)((gen >> 8) & 0xFF) / 255.0f;
+}
+
+struct TearEye
+{
+	XrSwapchain swap = XR_NULL_HANDLE;
+	std::vector<VkImage> images;
+	std::vector<VkImageView> views; // kept alive while framebuffers exist
+	std::vector<VkFramebuffer> framebuffers;
+	std::vector<VkCommandBuffer> bg_cmd;     // per image: fullscreen gen clear
+	std::vector<VkCommandBuffer> corner_cmd; // per image: 32x32 gen corner block
+	std::vector<VkFence> fences;             // per image: main-thread pipelining only
+	wivrn_macos::EyeSnapshot snap;
+	std::atomic<bool> done{false};
+	std::atomic<uint64_t> captured{0};
+	std::atomic<uint64_t> torn{0};
+	std::atomic<uint64_t> backpressure{0};
+};
+
+bool tear_record(VkDevice device, VkCommandBuffer cmd, VkRenderPass pass, VkFramebuffer fb, uint32_t dim, bool corner, uint64_t gen)
+{
+	VkCommandBufferBeginInfo begin{
+	        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+	        .pNext = nullptr,
+	        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+	        .pInheritanceInfo = nullptr,
+	};
+	if (vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS)
+		return false;
+	VkClearValue clear{};
+	clear.color.float32[0] = tear_lo(gen);
+	clear.color.float32[1] = tear_hi(gen);
+	clear.color.float32[2] = 0x80 / 255.0f;
+	clear.color.float32[3] = 1.0f;
+	VkRect2D area{{0, 0}, {dim, dim}};
+	if (corner)
+		area.extent = {kTearBlock, kTearBlock};
+	VkRenderPassBeginInfo rpBegin{
+	        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+	        .pNext = nullptr,
+	        .renderPass = pass,
+	        .framebuffer = fb,
+	        .renderArea = area,
+	        .clearValueCount = 1,
+	        .pClearValues = &clear,
+	};
+	vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdEndRenderPass(cmd);
+	return vkEndCommandBuffer(cmd) == VK_SUCCESS;
+}
+
+#define TFAIL(fails, fmt, ...) std::fprintf(stderr, "FAIL tear: " fmt "\n" __VA_OPT__(, ) __VA_ARGS__), ++(fails)
+
+int run_tear()
+{
+	int fails = 0;
+	::setenv("WIVRN_PORT", "19761", 1);
+	::setenv("WIVRN_HOSTNAME", "WiVRn-Tear", 1);
+	const char * manifest = std::getenv("XR_RUNTIME_JSON");
+	if (manifest == nullptr)
+	{
+		std::puts("set XR_RUNTIME_JSON to the generated wivrn-macos.json");
+		return 2;
+	}
+
+	const char * enabledExts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+	XrInstance instance = XR_NULL_HANDLE;
+	XrInstanceCreateInfo createInfo{
+	        .type = XR_TYPE_INSTANCE_CREATE_INFO,
+	        .next = nullptr,
+	        .createFlags = 0,
+	        .applicationInfo = {.applicationName = "tear-test", .applicationVersion = 1, .engineName = "none", .engineVersion = 0, .apiVersion = XR_CURRENT_API_VERSION},
+	        .enabledApiLayerCount = 0,
+	        .enabledApiLayerNames = nullptr,
+	        .enabledExtensionCount = 2,
+	        .enabledExtensionNames = enabledExts,
+	};
+	if (xrCreateInstance(&createInfo, &instance) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateInstance");
+		return fails;
+	}
+
+	VkDeviceSet dev{};
+	if (!bring_up_vulkan(dev))
+	{
+		TFAIL(fails, "bring_up_vulkan");
+		return fails;
+	}
+
+	XrSystemGetInfo sysInfo{.type = XR_TYPE_SYSTEM_GET_INFO, .next = nullptr, .formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
+	XrSystemId systemId = XR_NULL_SYSTEM_ID;
+	if (xrGetSystem(instance, &sysInfo, &systemId) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrGetSystem");
+		return fails;
+	}
+
+	XrGraphicsBindingVulkan2KHR binding{
+	        .type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
+	        .next = nullptr,
+	        .instance = dev.instance,
+	        .physicalDevice = dev.phys,
+	        .device = dev.device,
+	        .queueFamilyIndex = dev.family,
+	        .queueIndex = 0,
+	};
+	XrSession session = XR_NULL_HANDLE;
+	XrSessionCreateInfo sessionInfo{.type = XR_TYPE_SESSION_CREATE_INFO, .next = &binding, .createFlags = 0, .systemId = systemId};
+	if (xrCreateSession(instance, &sessionInfo, &session) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateSession");
+		return fails;
+	}
+	// No xrBeginSession and no EndFrame: without a headset the streamer
+	// idles, and staging is mimicked below through the real handoff.
+
+	uint32_t formatCount = 0;
+	if (xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr) != XR_SUCCESS || formatCount == 0)
+	{
+		TFAIL(fails, "xrEnumerateSwapchainFormats");
+		return fails;
+	}
+	std::fprintf(stderr, "tear: session up\n");
+	std::vector<int64_t> formats(formatCount);
+	if (xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrEnumerateSwapchainFormats fetch");
+		return fails;
+	}
+	int64_t format = formats[0];
+
+	// Clear-only render pass (no shaders): fullscreen background clear
+	// plus a 32x32 corner-block clear as two separate submits, so an
+	// unordered capture can land between them. UNDEFINED initial layout
+	// is legal every iteration (contents discarded by the clear).
+	VkAttachmentDescription att{
+	        .flags = 0,
+	        .format = (VkFormat)format,
+	        .samples = VK_SAMPLE_COUNT_1_BIT,
+	        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+	        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+	        .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+	        .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+	        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	        .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+	};
+	VkAttachmentReference colorRef{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+	VkSubpassDescription sub{
+	        .flags = 0,
+	        .pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+	        .inputAttachmentCount = 0,
+	        .pInputAttachments = nullptr,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &colorRef,
+	        .pResolveAttachments = nullptr,
+	        .pDepthStencilAttachment = nullptr,
+	        .preserveAttachmentCount = 0,
+	        .pPreserveAttachments = nullptr,
+	};
+	VkRenderPassCreateInfo rpInfo{
+	        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+	        .pNext = nullptr,
+	        .flags = 0,
+	        .attachmentCount = 1,
+	        .pAttachments = &att,
+	        .subpassCount = 1,
+	        .pSubpasses = &sub,
+	        .dependencyCount = 0,
+	        .pDependencies = nullptr,
+	};
+	VkRenderPass pass = VK_NULL_HANDLE;
+	if (vkCreateRenderPass(dev.device, &rpInfo, nullptr, &pass) != VK_SUCCESS)
+	{
+		TFAIL(fails, "vkCreateRenderPass");
+		return fails;
+	}
+	VkCommandPool pool = VK_NULL_HANDLE;
+	VkCommandPoolCreateInfo poolInfo{
+	        .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+	        .pNext = nullptr,
+	        .flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+	        .queueFamilyIndex = dev.family,
+	};
+	if (vkCreateCommandPool(dev.device, &poolInfo, nullptr, &pool) != VK_SUCCESS)
+	{
+		TFAIL(fails, "vkCreateCommandPool");
+		return fails;
+	}
+
+	TearEye eyes[2];
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		TearEye & e = eyes[eye];
+		XrSwapchainCreateInfo swapInfo{
+		        .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+		        .next = nullptr,
+		        .createFlags = 0,
+		        .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT,
+		        .format = format,
+		        .sampleCount = 1,
+		        .width = kTearDim,
+		        .height = kTearDim,
+		        .faceCount = 1,
+		        .arraySize = 1,
+		        .mipCount = 1,
+		};
+		if (xrCreateSwapchain(session, &swapInfo, &e.swap) != XR_SUCCESS)
+		{
+			TFAIL(fails, "eye %d xrCreateSwapchain", eye);
+			return fails;
+		}
+		uint32_t imageCount = 0;
+		if (xrEnumerateSwapchainImages(e.swap, 0, &imageCount, nullptr) != XR_SUCCESS || imageCount != 4)
+		{
+			TFAIL(fails, "eye %d imageCount != 4", eye);
+			return fails;
+		}
+		std::vector<XrSwapchainImageVulkan2KHR> imgs(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
+		uint32_t fetched = imageCount;
+		if (xrEnumerateSwapchainImages(
+		            e.swap, imageCount, &fetched, reinterpret_cast<XrSwapchainImageBaseHeader *>(imgs.data())) != XR_SUCCESS)
+		{
+			TFAIL(fails, "eye %d enumerate images", eye);
+			return fails;
+		}
+		for (const auto & im: imgs)
+			e.images.push_back(im.image);
+		for (VkImage image: e.images)
+		{
+			(void)image;
+			VkImageViewCreateInfo viewInfo{
+			        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			        .pNext = nullptr,
+			        .flags = 0,
+			        .image = image,
+			        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+			        .format = (VkFormat)format,
+			        .components = {},
+			        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+			};
+			VkImageView view = VK_NULL_HANDLE;
+			if (vkCreateImageView(dev.device, &viewInfo, nullptr, &view) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d vkCreateImageView", eye);
+				return fails;
+			}
+			e.views.push_back(view);
+			VkFramebufferCreateInfo fbInfo{
+			        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			        .pNext = nullptr,
+			        .flags = 0,
+			        .renderPass = pass,
+			        .attachmentCount = 1,
+			        .pAttachments = &view,
+			        .width = kTearDim,
+			        .height = kTearDim,
+			        .layers = 1,
+			};
+			VkFramebuffer fb = VK_NULL_HANDLE;
+			if (vkCreateFramebuffer(dev.device, &fbInfo, nullptr, &fb) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d vkCreateFramebuffer", eye);
+				return fails;
+			}
+			e.framebuffers.push_back(fb);
+			// Per-image command buffers + fence: the fence waits out the
+			// main thread's own previous render of the same image (safe
+			// reuse) without serializing against the capturer.
+			VkCommandBufferAllocateInfo cmdInfo{
+			        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+			        .pNext = nullptr,
+			        .commandPool = pool,
+			        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+			        .commandBufferCount = 1,
+			};
+			VkCommandBuffer bg = VK_NULL_HANDLE, corner = VK_NULL_HANDLE;
+			if (vkAllocateCommandBuffers(dev.device, &cmdInfo, &bg) != VK_SUCCESS ||
+			    vkAllocateCommandBuffers(dev.device, &cmdInfo, &corner) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d vkAllocateCommandBuffers", eye);
+				return fails;
+			}
+			e.bg_cmd.push_back(bg);
+			e.corner_cmd.push_back(corner);
+			VkFenceCreateInfo fenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = VK_FENCE_CREATE_SIGNALED_BIT};
+			VkFence fence = VK_NULL_HANDLE;
+			if (vkCreateFence(dev.device, &fenceInfo, nullptr, &fence) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d vkCreateFence", eye);
+				return fails;
+			}
+			e.fences.push_back(fence);
+		}
+		if (!e.snap.init(dev.phys, dev.device, dev.queue, dev.family, kTearDim, kTearDim))
+		{
+			TFAIL(fails, "eye %d snapshot init", eye);
+			return fails;
+		}
+		std::fprintf(stderr, "tear: eye %d ready (%zu images)\n", eye, e.images.size());
+	}
+
+	// Move every image out of UNDEFINED up front: a capture racing a
+	// render must observe ATTACHMENT_OPTIMAL with stale-or-new pixels
+	// (the torn/stale race under test), never a layout mismatch — the
+	// capture barriers assume ATTACHMENT_OPTIMAL and a wrong-oldLayout
+	// copy faults instead of tearing, masking the pixel evidence.
+	{
+		VkCommandBufferAllocateInfo layoutAlloc{
+		        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		        .pNext = nullptr,
+		        .commandPool = pool,
+		        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		        .commandBufferCount = 1,
+		};
+		VkCommandBuffer layoutCmd = VK_NULL_HANDLE;
+		VkFence layoutFence = VK_NULL_HANDLE;
+		VkFenceCreateInfo layoutFenceInfo{.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, .pNext = nullptr, .flags = 0};
+		bool layoutOk = vkAllocateCommandBuffers(dev.device, &layoutAlloc, &layoutCmd) == VK_SUCCESS &&
+		                vkCreateFence(dev.device, &layoutFenceInfo, nullptr, &layoutFence) == VK_SUCCESS;
+		for (int eye = 0; eye < 2 && layoutOk; ++eye)
+		{
+			for (VkImage image: eyes[eye].images)
+			{
+				VkCommandBufferBeginInfo layoutBegin{
+				        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+				        .pNext = nullptr,
+				        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+				        .pInheritanceInfo = nullptr,
+				};
+				layoutOk = vkBeginCommandBuffer(layoutCmd, &layoutBegin) == VK_SUCCESS;
+				if (!layoutOk)
+					break;
+				VkImageMemoryBarrier toAttach{
+				        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+				        .pNext = nullptr,
+				        .srcAccessMask = 0,
+				        .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+				        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				        .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+				        .image = image,
+				        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+				};
+				vkCmdPipelineBarrier(
+				        layoutCmd,
+				        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+				        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+				        0,
+				        0,
+				        nullptr,
+				        0,
+				        nullptr,
+				        1,
+				        &toAttach);
+				layoutOk = vkEndCommandBuffer(layoutCmd) == VK_SUCCESS;
+				if (!layoutOk)
+					break;
+				VkSubmitInfo layoutSubmit{
+				        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				        .pNext = nullptr,
+				        .waitSemaphoreCount = 0,
+				        .pWaitSemaphores = nullptr,
+				        .pWaitDstStageMask = nullptr,
+				        .commandBufferCount = 1,
+				        .pCommandBuffers = &layoutCmd,
+				        .signalSemaphoreCount = 0,
+				        .pSignalSemaphores = nullptr,
+				};
+				vkResetFences(dev.device, 1, &layoutFence);
+				layoutOk = vkQueueSubmit(dev.queue, 1, &layoutSubmit, layoutFence) == VK_SUCCESS &&
+				           vkWaitForFences(dev.device, 1, &layoutFence, VK_TRUE, 10'000'000'000ull) == VK_SUCCESS;
+				if (!layoutOk)
+					break;
+				vkResetCommandBuffer(layoutCmd, 0);
+			}
+		}
+		if (layoutCmd != VK_NULL_HANDLE)
+			vkFreeCommandBuffers(dev.device, pool, 1, &layoutCmd);
+		if (layoutFence != VK_NULL_HANDLE)
+			vkDestroyFence(dev.device, layoutFence, nullptr);
+		if (!layoutOk)
+		{
+			TFAIL(fails, "initial layout transition");
+			return fails;
+		}
+		std::fprintf(stderr, "tear: images in ATTACHMENT_OPTIMAL\n");
+	}
+
+	// Capturer threads: claim staged images exactly like the streamer
+	// worker take (staged claim, active pin across the copy) and verify
+	// every capture carries one generation.
+	std::thread helpers[2];
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		helpers[eye] = std::thread([&, eye] {
+			TearEye & e = eyes[eye];
+			XrSwapchain_T * handle = e.swap;
+			std::fprintf(stderr, "tear: capturer %d started\n", eye);
+			for (;;)
+			{
+				int32_t claimed = handle->data.staged_idx.exchange(-1, std::memory_order_acq_rel);
+				if (claimed < 0)
+				{
+					if (e.done.load(std::memory_order_acquire))
+						break;
+					std::this_thread::sleep_for(std::chrono::microseconds(100));
+					continue;
+				}
+				if (claimed >= (int32_t)e.images.size())
+					continue;
+				handle->data.active_idx.store(claimed, std::memory_order_release);
+				const uint8_t * px = e.snap.capture(e.images[(uint32_t)claimed]);
+				handle->data.active_idx.store(-1, std::memory_order_release);
+				if (px == nullptr)
+				{
+					e.torn.fetch_add(1);
+					continue;
+				}
+				const uint8_t * corner = px + ((size_t)kTearBlock / 2 * kTearDim + kTearBlock / 2) * 4;
+				const uint8_t * bg = px + ((size_t)(kTearDim - 8) * kTearDim + (kTearDim - 8)) * 4;
+				// Warp-immune compare: same painted float must read back
+				// as the same bytes in both samples (BGRA order).
+				bool same = corner[0] == bg[0] && corner[1] == bg[1] && corner[2] == bg[2];
+				e.captured.fetch_add(1);
+				if (!same)
+				{
+					uint64_t torn = e.torn.fetch_add(1) + 1;
+					if (torn <= 5)
+						std::fprintf(
+						        stderr,
+						        "tear: eye %d capture %llu corner(%u,%u,%u) != bg(%u,%u,%u)\n",
+						        eye,
+						        (unsigned long long)e.captured.load(),
+						        corner[2],
+						        corner[1],
+						        corner[0],
+						        bg[2],
+						        bg[1],
+						        bg[0]);
+				}
+			}
+		});
+	}
+
+	// Producer: acquire, pipeline two submits per eye (no fence wait —
+	// the release fence-submit carries the dependency, exactly like a
+	// display-driven app), release, stage latest-only.
+	XrSwapchainImageAcquireInfo acquireInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO, .next = nullptr};
+	XrSwapchainImageWaitInfo waitInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .next = nullptr, .timeout = XR_INFINITE_DURATION};
+	XrSwapchainImageReleaseInfo releaseInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, .next = nullptr};
+	for (uint64_t gen = 1; gen <= (uint64_t)kTearFrames; ++gen)
+	{
+		if (gen % 50 == 1)
+			std::fprintf(stderr, "tear: producing gen %llu\n", (unsigned long long)gen);
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			TearEye & e = eyes[eye];
+			uint32_t index = 0;
+			bool got = false;
+			for (int attempt = 0; attempt < 200 && !got; ++attempt)
+			{
+				if (xrAcquireSwapchainImage(e.swap, &acquireInfo, &index) == XR_SUCCESS)
+					got = true;
+				else
+				{
+					e.backpressure.fetch_add(1);
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				}
+			}
+			if (!got)
+				continue; // latest-only drop, like the streaming mailbox
+			if (xrWaitSwapchainImage(e.swap, &waitInfo) != XR_SUCCESS)
+			{
+				TFAIL(fails, "eye %d xrWaitSwapchainImage", eye);
+				break;
+			}
+			// Wait out our own previous render of this image (command
+			// buffer + content reuse), then re-record both submits.
+			if (vkWaitForFences(dev.device, 1, &e.fences[index], VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d app fence wait", eye);
+				break;
+			}
+			vkResetCommandBuffer(e.bg_cmd[index], 0);
+			vkResetCommandBuffer(e.corner_cmd[index], 0);
+			if (!tear_record(dev.device, e.bg_cmd[index], pass, e.framebuffers[index], kTearDim, false, gen) ||
+			    !tear_record(dev.device, e.corner_cmd[index], pass, e.framebuffers[index], kTearDim, true, gen))
+			{
+				TFAIL(fails, "eye %d record gen %llu", eye, (unsigned long long)gen);
+				break;
+			}
+			VkSubmitInfo bgSubmit{
+			        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+			        .pNext = nullptr,
+			        .waitSemaphoreCount = 0,
+			        .pWaitSemaphores = nullptr,
+			        .pWaitDstStageMask = nullptr,
+			        .commandBufferCount = 1,
+			        .pCommandBuffers = &e.bg_cmd[index],
+			        .signalSemaphoreCount = 0,
+			        .pSignalSemaphores = nullptr,
+			};
+			VkSubmitInfo cornerSubmit = bgSubmit;
+			cornerSubmit.pCommandBuffers = &e.corner_cmd[index];
+			vkResetFences(dev.device, 1, &e.fences[index]);
+			if (vkQueueSubmit(dev.queue, 1, &bgSubmit, VK_NULL_HANDLE) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d bg submit", eye);
+				break;
+			}
+			// Widen the race window: pause between the two submits so an
+			// unordered capturer submit can land between them (the
+			// misordered copy then carries both generations). An ordered
+			// snapshot (post-fix) still reads one generation.
+			std::this_thread::sleep_for(std::chrono::microseconds(250));
+			if (vkQueueSubmit(dev.queue, 1, &cornerSubmit, e.fences[index]) != VK_SUCCESS)
+			{
+				TFAIL(fails, "eye %d corner submit", eye);
+				break;
+			}
+			if (xrReleaseSwapchainImage(e.swap, &releaseInfo) != XR_SUCCESS)
+			{
+				TFAIL(fails, "eye %d xrReleaseSwapchainImage", eye);
+				break;
+			}
+			// Stage latest-only for the capturer (mirrors end_frame).
+			XrSwapchain_T * handle = e.swap;
+			handle->data.staged_idx.store((int32_t)index, std::memory_order_release);
+		}
+		// No pacing: burst staging keeps the capturer racing the
+		// producer's current renders (the overload regime where the
+		// race bites).
+	}
+
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		eyes[eye].done.store(true, std::memory_order_release);
+		helpers[eye].join();
+	}
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		TearEye & e = eyes[eye];
+		std::printf(
+		        "tear: eye %d captured %llu torn %llu backpressure %llu\n",
+		        eye,
+		        (unsigned long long)e.captured.load(),
+		        (unsigned long long)e.torn.load(),
+		        (unsigned long long)e.backpressure.load());
+		if (e.captured.load() < (uint64_t)kTearMinCaptures)
+		{
+			TFAIL(fails, "eye %d only %llu captures (need %d)", eye, (unsigned long long)e.captured.load(), kTearMinCaptures);
+		}
+		if (e.torn.load() != 0)
+		{
+			TFAIL(
+			        fails,
+			        "eye %d tore %llu/%llu captures (snapshot copied a mid-render image)",
+			        eye,
+			        (unsigned long long)e.torn.load(),
+			        (unsigned long long)e.captured.load());
+		}
+	}
+
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		for (VkFramebuffer fb: eyes[eye].framebuffers)
+			vkDestroyFramebuffer(dev.device, fb, nullptr);
+		for (VkImageView view: eyes[eye].views)
+			vkDestroyImageView(dev.device, view, nullptr);
+		for (VkFence fence: eyes[eye].fences)
+			vkDestroyFence(dev.device, fence, nullptr);
+		eyes[eye].snap.shutdown();
+		xrDestroySwapchain(eyes[eye].swap);
+	}
+	xrDestroySession(session);
+	xrDestroyInstance(instance);
+	vkDestroyCommandPool(dev.device, pool, nullptr);
+	vkDestroyRenderPass(dev.device, pass, nullptr);
+	vkDestroyDevice(dev.device, nullptr);
+	vkDestroyInstance(dev.instance, nullptr);
+
+	if (fails == 0)
+		std::puts("tear test PASS");
+	else
+		std::printf("tear test FAIL (%d)\n", fails);
+	return fails;
+}
+
+// ---- Eye-skew soak (fake headset + paced app loop) ----
+// Overload burst (unthrottled staging, latest-only drops), then paced
+// recovery, then match frames across eyes by display_time and measure
+// the eye1-minus-eye0 arrival lag. A fixed-order sequential worker
+// completes eye1 one encode after eye0 every pass, so the mean signed
+// lag sits at ~+one encode; fair service (parallel or alternating eyes)
+// re-converges it to ~0. WIVRN_MACOS_SKEW_BOUND_MS overrides the bound
+// (default 2.0); WIVRN_MACOS_VIDEO_ENCODER=x264 is forced here so the
+// encode cost (and the lag it induces) is deterministic.
+
+#undef TFAIL
+#define TFAIL(fails, fmt, ...) std::fprintf(stderr, "FAIL skew: " fmt "\n" __VA_OPT__(, ) __VA_ARGS__), ++(fails)
+
+int run_skew()
+{
+	int fails = 0;
+	::setenv("WIVRN_PORT", "19762", 1);
+	::setenv("WIVRN_HOSTNAME", "WiVRn-Skew", 1);
+	::setenv("WIVRN_MACOS_VIDEO_ENCODER", "x264", 1);
+	double bound_ms = 2.0;
+	if (const char * bound = std::getenv("WIVRN_MACOS_SKEW_BOUND_MS"))
+	{
+		double parsed = std::atof(bound);
+		if (parsed > 0.0 && parsed < 1000.0)
+			bound_ms = parsed;
+	}
+	const char * manifest = std::getenv("XR_RUNTIME_JSON");
+	if (manifest == nullptr)
+	{
+		std::puts("set XR_RUNTIME_JSON to the generated wivrn-macos.json");
+		return 2;
+	}
+
+	FakeState fake;
+	fake.port = 19762;
+	std::thread headset([&] { fake_headset(fake); });
+
+	const char * enabledExts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+	XrInstance instance = XR_NULL_HANDLE;
+	XrInstanceCreateInfo createInfo{
+	        .type = XR_TYPE_INSTANCE_CREATE_INFO,
+	        .next = nullptr,
+	        .createFlags = 0,
+	        .applicationInfo = {.applicationName = "skew-test", .applicationVersion = 1, .engineName = "none", .engineVersion = 0, .apiVersion = XR_CURRENT_API_VERSION},
+	        .enabledApiLayerCount = 0,
+	        .enabledApiLayerNames = nullptr,
+	        .enabledExtensionCount = 2,
+	        .enabledExtensionNames = enabledExts,
+	};
+	if (xrCreateInstance(&createInfo, &instance) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateInstance");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	VkDeviceSet dev{};
+	if (!bring_up_vulkan(dev))
+	{
+		TFAIL(fails, "bring_up_vulkan");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	XrSystemGetInfo sysInfo{.type = XR_TYPE_SYSTEM_GET_INFO, .next = nullptr, .formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
+	XrSystemId systemId = XR_NULL_SYSTEM_ID;
+	if (xrGetSystem(instance, &sysInfo, &systemId) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrGetSystem");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	XrGraphicsBindingVulkan2KHR binding{
+	        .type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
+	        .next = nullptr,
+	        .instance = dev.instance,
+	        .physicalDevice = dev.phys,
+	        .device = dev.device,
+	        .queueFamilyIndex = dev.family,
+	        .queueIndex = 0,
+	};
+	XrSession session = XR_NULL_HANDLE;
+	XrSessionCreateInfo sessionInfo{.type = XR_TYPE_SESSION_CREATE_INFO, .next = &binding, .createFlags = 0, .systemId = systemId};
+	if (xrCreateSession(instance, &sessionInfo, &session) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateSession");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	XrViewConfigurationType config = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	XrSessionBeginInfo beginInfo{.type = XR_TYPE_SESSION_BEGIN_INFO, .next = nullptr, .primaryViewConfigurationType = config};
+	if (xrBeginSession(session, &beginInfo) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrBeginSession");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	std::this_thread::sleep_for(std::chrono::seconds(3));
+
+	uint32_t formatCount = 0;
+	if (xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr) != XR_SUCCESS || formatCount == 0)
+	{
+		TFAIL(fails, "xrEnumerateSwapchainFormats");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+	std::vector<int64_t> formats(formatCount);
+	if (xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrEnumerateSwapchainFormats fetch");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+	int64_t format = formats[0];
+
+	XrSwapchain swapchains[2] = {};
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		XrSwapchainCreateInfo swapInfo{
+		        .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+		        .next = nullptr,
+		        .createFlags = 0,
+		        .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT,
+		        .format = format,
+		        .sampleCount = 1,
+		        .width = 1024,
+		        .height = 1024,
+		        .faceCount = 1,
+		        .arraySize = 1,
+		        .mipCount = 1,
+		};
+		if (xrCreateSwapchain(session, &swapInfo, &swapchains[eye]) != XR_SUCCESS)
+		{
+			TFAIL(fails, "eye %d xrCreateSwapchain", eye);
+			fake.stop = true;
+			headset.join();
+			return fails;
+		}
+	}
+
+	XrReferenceSpaceCreateInfo spaceInfo{
+	        .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
+	        .next = nullptr,
+	        .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL,
+	        .poseInReferenceSpace = {.orientation = {0, 0, 0, 1}, .position = {0, 0, 0}},
+	};
+	XrSpace local = XR_NULL_HANDLE;
+	if (xrCreateReferenceSpace(session, &spaceInfo, &local) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateReferenceSpace");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	// No rendering: virgin images keep the burst cheap; the metric is
+	// encode-completion timing, not pixels.
+	XrSwapchainImageAcquireInfo acquireInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO, .next = nullptr};
+	XrSwapchainImageWaitInfo waitInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .next = nullptr, .timeout = XR_INFINITE_DURATION};
+	XrSwapchainImageReleaseInfo releaseInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, .next = nullptr};
+	XrFrameWaitInfo frameWaitInfo{.type = XR_TYPE_FRAME_WAIT_INFO, .next = nullptr};
+	XrFrameBeginInfo frameBeginInfo{.type = XR_TYPE_FRAME_BEGIN_INFO, .next = nullptr};
+	auto pump = [&](int frames, int pace_ms) {
+		for (int frame = 0; frame < frames; ++frame)
+		{
+			XrFrameState frameState{.type = XR_TYPE_FRAME_STATE, .next = nullptr};
+			if (xrWaitFrame(session, &frameWaitInfo, &frameState) != XR_SUCCESS)
+			{
+				TFAIL(fails, "xrWaitFrame");
+				return;
+			}
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				uint32_t index = 0;
+				if (xrAcquireSwapchainImage(swapchains[eye], &acquireInfo, &index) != XR_SUCCESS)
+				{
+					// Quad-buffered pool is sized for single-flight apps;
+					// an all-held pool under burst is backpressure, not a
+					// bug: skip this eye this frame (latest-only).
+					continue;
+				}
+				if (xrWaitSwapchainImage(swapchains[eye], &waitInfo) != XR_SUCCESS)
+				{
+					TFAIL(fails, "xrWaitSwapchainImage");
+					return;
+				}
+			}
+			if (xrBeginFrame(session, &frameBeginInfo) != XR_SUCCESS)
+			{
+				TFAIL(fails, "xrBeginFrame");
+				return;
+			}
+			XrCompositionLayerProjectionView projViews[2] = {};
+			XrCompositionLayerProjection proj{
+			        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+			        .next = nullptr,
+			        .layerFlags = 0,
+			        .space = local,
+			        .viewCount = 2,
+			        .views = projViews,
+			};
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				projViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+				projViews[eye].pose = {.orientation = {0, 0, 0, 1}, .position = {0, 0, 0}};
+				projViews[eye].fov = {-0.86f, 0.86f, 0.86f, -0.86f};
+				projViews[eye].subImage = {.swapchain = swapchains[eye], .imageRect = {.offset = {0, 0}, .extent = {1024, 1024}}, .imageArrayIndex = 0};
+			}
+			const XrCompositionLayerBaseHeader * layers[1] = {reinterpret_cast<const XrCompositionLayerBaseHeader *>(&proj)};
+			XrFrameEndInfo endInfo{
+			        .type = XR_TYPE_FRAME_END_INFO,
+			        .next = nullptr,
+			        .displayTime = frameState.predictedDisplayTime,
+			        .environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+			        .layerCount = 1,
+			        .layers = layers,
+			};
+			if (xrEndFrame(session, &endInfo) != XR_SUCCESS)
+			{
+				TFAIL(fails, "xrEndFrame");
+				return;
+			}
+			for (int eye = 0; eye < 2; ++eye)
+				xrReleaseSwapchainImage(swapchains[eye], &releaseInfo);
+			if (pace_ms > 0)
+				std::this_thread::sleep_for(std::chrono::milliseconds(pace_ms));
+		}
+	};
+	pump(250, 0);  // overload burst: unthrottled staging, mailbox drops
+	pump(150, 25); // recovery: paced like a display-driven app
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	fake.stop = true;
+	headset.join();
+
+	// Match frames across eyes by display_time (both eyes share the
+	// EndFrame's predicted time) and measure eye1-minus-eye0 arrivals.
+	std::map<XrTime, long long> arrive[2];
+	{
+		std::lock_guard lock(fake.mutex);
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			for (const auto & maps = {&fake.stream_done, &fake.control_done}; auto * done: maps)
+			{
+				for (const auto & [key, frame]: *done)
+				{
+					if (key.first != (uint8_t)eye || !frame.has_view_info || frame.display_time == 0)
+						continue;
+					if (!arrive[eye].contains(frame.display_time))
+						arrive[eye][frame.display_time] = frame.arrival_ms;
+				}
+			}
+		}
+	}
+	std::vector<double> lags;
+	for (const auto & [display, ms0]: arrive[0])
+	{
+		auto it = arrive[1].find(display);
+		if (it != arrive[1].end())
+			lags.push_back((double)it->second - (double)ms0);
+	}
+	size_t pairs = lags.size();
+	double mean = 0, p50 = 0, maxabs = 0;
+	if (!lags.empty())
+	{
+		for (double lag: lags)
+		{
+			mean += lag;
+			maxabs = std::max(maxabs, std::fabs(lag));
+		}
+		mean /= (double)lags.size();
+		std::nth_element(lags.begin(), lags.begin() + (long long)(lags.size() / 2), lags.end());
+		p50 = lags[lags.size() / 2];
+	}
+	size_t count0 = arrive[0].size(), count1 = arrive[1].size();
+	std::printf(
+	        "skew: pairs=%zu mean=%+.2fms p50=%+.2fms maxabs=%.2fms counts=%zu/%zu (bound %.1fms)\n",
+	        pairs,
+	        mean,
+	        p50,
+	        maxabs,
+	        count0,
+	        count1,
+	        bound_ms);
+	if (pairs < 30)
+	{
+		TFAIL(fails, "only %zu matched pairs (need 30)", pairs);
+	}
+	else
+	{
+		if (std::fabs(mean) > bound_ms)
+		{
+			TFAIL(
+			        fails,
+			        "mean inter-eye lag %+.2fms exceeds %.1fms (eyes do not re-converge after burst)",
+			        mean,
+			        bound_ms);
+		}
+		if (std::fabs(p50) > bound_ms)
+		{
+			TFAIL(fails, "p50 inter-eye lag %+.2fms exceeds %.1fms", p50, bound_ms);
+		}
+	}
+	// Loose completion guard: both eyes must keep flowing (catches a
+	// stalled eye, not scheduling phase).
+	size_t total = count0 + count1;
+	if (total > 0 && (count0 + count1 > 0) &&
+	    (count0 > count1 ? count0 - count1 : count1 - count0) > 10 + total / 20)
+	{
+		TFAIL(fails, "eye completion counts diverged: %zu vs %zu", count0, count1);
+	}
+
+	::unsetenv("WIVRN_MACOS_VIDEO_ENCODER");
+	xrDestroySpace(local);
+	for (int eye = 0; eye < 2; ++eye)
+		xrDestroySwapchain(swapchains[eye]);
+	xrEndSession(session);
+	xrDestroySession(session);
+	xrDestroyInstance(instance);
+	vkDestroyDevice(dev.device, nullptr);
+	vkDestroyInstance(dev.instance, nullptr);
+
+	if (fails == 0)
+		std::puts("skew test PASS");
+	else
+		std::printf("skew test FAIL (%d)\n", fails);
+	return fails;
+}
+
+} // namespace
+
+int run_loopback()
 {
 	::setenv("WIVRN_PORT", "19758", 1);
 	::setenv("WIVRN_HOSTNAME", "WiVRn-Test", 1);
@@ -825,4 +1825,23 @@ int main()
 	else
 		std::printf("stream test FAIL (%d)\n", failures);
 	return failures == 0 ? 0 : 1;
+}
+
+int main()
+{
+	std::string phases = "loop";
+	if (const char * env = std::getenv("WIVRN_MACOS_STREAM_PHASES"))
+		phases = env;
+	bool all = phases == "all";
+	auto want = [&](const char * name) { return all || phases.find(name) != std::string::npos; };
+	int rc = 0;
+	if (want("tear"))
+		rc += run_tear();
+	if (want("skew"))
+		rc += run_skew();
+	if (want("loop"))
+		rc += run_loopback();
+	if (want("tear") || want("skew"))
+		std::printf("harness phases done: rc=%d\n", rc);
+	return rc == 0 ? 0 : 1;
 }
