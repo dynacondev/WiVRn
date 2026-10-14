@@ -792,6 +792,19 @@ void scenes::stream::gui_toasts()
 
 void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period)
 {
+	// Projected triangle-mesh instances miscomposite (head-locked drift)
+	// on frames carrying DepthTestFB chains: interactable menus normally
+	// submit depth buffers (controllers, rays) plus DepthTestFB chains
+	// (controllers, quads, rays), and the runtime misplaces the mesh on
+	// those frames even though every transform input is correct. Omit all
+	// depth while any projected instance is live. Menu rendering falls
+	// back to draw order for overlap (slightly off where controllers
+	// cross panels); sessions without projected meshes keep full depth
+	// behavior.
+	// TODO(upstream): re-enable once the runtime handles depth-chained
+	// layers alongside triangle-mesh instances.
+	const bool omit_depth_with_projected_mesh = session.has_projected_instances();
+
 	if (auto new_status = next_gui_status.load(); new_status != gui_status)
 	{
 		spdlog::info("Switch tab from {} to {}", magic_enum::enum_name(gui_status), magic_enum::enum_name(new_status));
@@ -1307,17 +1320,18 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			             views,
 			             width,
 			             height,
-			             true,
+			             not omit_depth_with_projected_mesh,
 			             layer_controllers,
 			             {});
-			set_depth_test(true, XR_COMPARE_OP_ALWAYS_FB);
+			if (not omit_depth_with_projected_mesh)
+				set_depth_test(true, XR_COMPARE_OP_ALWAYS_FB);
 		}
 	}
 
 	for (auto [_, layer]: layers)
 	{
 		add_quad_layer(layer.layerFlags, layer.space, layer.eyeVisibility, layer.subImage, layer.pose, layer.size);
-		if (composition_layer_depth_test_supported)
+		if (composition_layer_depth_test_supported and not omit_depth_with_projected_mesh)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);
 
 		else if (alpha < 1 and composition_layer_color_scale_bias_supported)
@@ -1332,10 +1346,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		             views,
 		             width,
 		             height,
-		             composition_layer_depth_test_supported,
+		             composition_layer_depth_test_supported and not omit_depth_with_projected_mesh,
 		             composition_layer_depth_test_supported ? layer_rays : layer_controllers | layer_rays,
 		             {});
-		if (composition_layer_depth_test_supported)
+		if (composition_layer_depth_test_supported and not omit_depth_with_projected_mesh)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);
 	}
 }

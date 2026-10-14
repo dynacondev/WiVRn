@@ -987,31 +987,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				session.remove_projected_instance(oid);
 				spdlog::info("Projected instance \"{}\" removed", oid);
 			}
-			// TEMP-DIAG head-lock experiment: while an interactable
-			// menu is up, freeze the instance at its last-good
-			// transform instead of pushing fresh per-frame updates.
-			// - Outline parks world-locked (stale but glued) => the
-			//   fresh updates are the corruption vector.
-			// - Outline still drifts head-locked => our updates are
-			//   irrelevant; the corruption is runtime-side layer
-			//   handling. Revert after the verdict, whichever way.
-			static std::set<std::string> freeze_logged;
 			if (want and session.has_projected_instance(oid))
 			{
-				if (is_gui_interactable())
-				{
-					if (freeze_logged.insert(oid).second)
-					{
-						spdlog::info("Projected instance \"{}\": freezing transform while menu open at ({:.3f},{:.3f},{:.3f})",
-						             oid,
-						             (double)ost.fused.world_pose.position.x,
-						             (double)ost.fused.world_pose.position.y,
-						             (double)ost.fused.world_pose.position.z);
-					}
-					continue;
-				}
-				if (freeze_logged.erase(oid) > 0)
-					spdlog::info("Projected instance \"{}\": resuming transform updates (menu closed)", oid);
 				try
 				{
 					session.update_projected_instance_transform(oid, world_space, predicted_display_time,
