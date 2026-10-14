@@ -1509,17 +1509,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Claim groups + sync member soups (upload on hash change).
 				// Reversed objects (3d-passthrough-reversed) never claim a
 				// group (no feather parameter): they upload into every live
-				// group below and inherit each group's feathering.
-				std::vector<float> live_feathers;
+				// group below and inherit each group's feathering. Depth
+				// testing is per-union: a negative only resolves against
+				// the positives in its own union (accepted: cross-union
+				// occlusion is rare and has no hole vocabulary anyway).
+				// Groups are keyed (feather, union): A (true) drives the
+				// projected layer, B (false) the flat layer. Record order
+				// is A ascending, then B ascending (submit matches).
+				std::set<float> live_a, live_b;
 				for (auto & [oid, ost]: passthrough_objects)
 				{
 					if (ost.def.type != "3d-passthrough" or not ost.soup_ready)
 						continue;
 					float f = ost.def.feather_px;
-					if (std::ranges::find(live_feathers, f) == live_feathers.end())
-						live_feathers.push_back(f);
-					auto & g = fp.mask_groups[f];
+					bool proj = surface_projected_effective(oid, ost);
+					(proj ? live_a : live_b).insert(f);
+					auto key = std::make_pair(f, proj);
+					auto & g = fp.mask_groups[key];
 					g.feather_px = f;
+					g.projected = proj;
 					if (not g.renderer)
 						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
 					auto mh = g.mesh_hashes.find(oid);
@@ -1529,15 +1537,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.mesh_hashes[oid] = ost.soup_hash;
 					}
 				}
+				// Record order: A ascending, then B ascending.
+				std::vector<std::pair<float, bool>> live_groups;
+				for (float f: live_a)
+					live_groups.emplace_back(f, true);
+				for (float f: live_b)
+					live_groups.emplace_back(f, false);
 				for (auto & [oid, ost]: passthrough_objects)
 				{
 					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready)
 						continue;
-					for (float f: live_feathers)
+					for (auto & key: live_groups)
 					{
-						if (f == fiducial_passthrough_state::kDebugCutoutFeather)
+						if (key.first == fiducial_passthrough_state::kDebugCutoutFeather)
 							continue;
-						auto git = fp.mask_groups.find(f);
+						auto git = fp.mask_groups.find(key);
 						if (git == fp.mask_groups.end() or not git->second.renderer)
 							continue;
 						auto & g = git->second;
@@ -1549,76 +1563,42 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				}
-				// Coverage stencil claim (union of projection-mapped
-				// objects): renderer + meshes for soup-ready effective
-				// objects, placed or not (draws gate on placed at
-				// record). Reversed never qualify (game, not camera);
-				// unflagged objects stay flat-only. Skipped where the
-				// runtime can't project (no instances ever exist there).
-				if (session.projected_passthrough_supported())
-				{
-					auto & cg = fp.coverage_group;
-					cg.feather_px = 0;
-					if (not cg.renderer)
-						cg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
-					for (auto & [oid, ost]: passthrough_objects)
-					{
-						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or
-						    not surface_projected_effective(oid, ost))
-							continue;
-						auto mh = cg.mesh_hashes.find(oid);
-						if (mh == cg.mesh_hashes.end() or mh->second != ost.soup_hash)
-						{
-							cg.renderer->set_mesh(oid, ost.soup);
-							cg.mesh_hashes[oid] = ost.soup_hash;
-						}
-					}
-					for (auto hit = cg.mesh_hashes.begin(); hit != cg.mesh_hashes.end();)
-					{
-						auto oit = passthrough_objects.find(hit->first);
-						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
-						        oit->second.def.type == "3d-passthrough" and
-						        surface_projected_effective(oit->first, oit->second);
-						if (not member)
-						{
-							cg.renderer->remove_mesh(hit->first);
-							hit = cg.mesh_hashes.erase(hit);
-						}
-						else
-							++hit;
-					}
-				}
 				// Debug-only cutout group (no objects): lets the marker
 				// window punch with a fiducials-only config. Reserved key
-				// (never an object feather); flows through eager setup,
-				// record (empty draws, cutouts punch), submit and stale
-				// drop like any group. Claimed only while fresh codes
-				// exist, so it reaps itself on loss.
-				if (live_feathers.empty() and not cutouts.empty())
+				// in union B (cutouts punch flat only: no geometry to map
+				// onto); flows through eager setup, record (empty draws,
+				// cutouts punch), submit and stale drop like any group.
+				// Claimed whenever fresh codes exist but no B group does
+				// (fiducials-only, or projected-only objects): real B
+				// groups punch cutouts themselves, so no extra group then.
+				// Reaps itself on loss via the stale-group sweep below.
+				if (live_b.empty() and not cutouts.empty())
 				{
 					const float df = fiducial_passthrough_state::kDebugCutoutFeather;
-					live_feathers.push_back(df);
-					auto & g = fp.mask_groups[df];
+					live_groups.emplace_back(df, false);
+					auto key = std::make_pair(df, false);
+					auto & g = fp.mask_groups[key];
 					g.feather_px = df;
+					g.projected = false;
 					if (not g.renderer)
 						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
 				}
 				// Permanent record-order log: group costs are positional, so
 				// the per-group loop order below is load-bearing diagnostics.
 				// Logged on change only (config/map edits, anchor flapping).
-				if (live_feathers != last_live_feathers)
+				if (live_groups != last_live_feathers)
 				{
-					last_live_feathers = live_feathers;
+					last_live_feathers = live_groups;
 					std::string order;
-					for (float of: live_feathers)
-						order += fmt::format("{:.1f} ", (double)of);
+					for (auto [f, proj]: live_groups)
+						order += fmt::format("{:.1f}{} ", (double)f, proj ? "A" : "B");
 					spdlog::info("Fiducial mask groups order: {}", order);
 				}
 				// Drop stale groups + stale member meshes. Use-then-advance:
 				// touching git->second after ++git reads past end().
 				for (auto git = fp.mask_groups.begin(); git != fp.mask_groups.end();)
 				{
-					if (std::ranges::find(live_feathers, git->first) == live_feathers.end())
+					if (std::ranges::find(live_groups, git->first) == live_groups.end())
 					{
 						// Rare path: swapchain images may be in flight.
 						device.waitIdle();
@@ -1631,10 +1611,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						auto oit = passthrough_objects.find(hit->first);
 						// Reversed objects live in every group (no feather of
 						// their own): evict on removal/unready only, never on
-						// feather mismatch.
+						// feather/union mismatch. Positives must match both
+						// feather and union: a flag flip evicts from the old
+						// union's group (remove_mesh) so no frame ever
+						// rasterizes the object in both unions (ghost).
 						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
 						        (oit->second.def.type == "3d-passthrough-reversed" or
-						         oit->second.def.feather_px == g.feather_px);
+						         (oit->second.def.feather_px == g.feather_px and
+						          surface_projected_effective(oit->first, oit->second) == g.projected));
 						if (not member)
 						{
 							g.renderer->remove_mesh(hit->first);
@@ -1646,10 +1630,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					++git;
 				}
 				// Record per group: draws from anchored instances of member
-				// objects, opacity from per-instance fade.
-				for (float f: live_feathers)
+				// objects (union-scoped), full opacity (TODO(fade-reintro)).
+				// Cutouts punch union B only (flat): no geometry exists to
+				// map them onto, so A must never see them.
+				static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+				for (auto [f, proj]: live_groups)
 				{
-					auto & g = fp.mask_groups[f];
+					auto & g = fp.mask_groups[{f, proj}];
 					// Eager setup (map arrival, not first visibility):
 					// member swapchain + intermediates ready before first
 					// draws, so first-visible frames pay record+submit only
@@ -1673,7 +1660,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.swapchain = xr::swapchain(instance, session, device, swapchain_format, gw, gh, 1, view_count);
 						g.renderer->reset_targets();
 						g.images_outstanding = 0;
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
 					}
 					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 					std::vector<feather_mask_renderer::instance_draw> draws;
@@ -1724,9 +1711,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						return false;
 					};
 					// One draw per placed object: model matrix from the fused
-					// placement, per-eye MVPs, fade presence as opacity.
-					// Polarity rides the draw (false = fill, true = cut);
-					// the renderer interprets reversed opacity as (1 - fade).
+					// placement, per-eye MVPs, full opacity
+					// (TODO(fade-reintro)). Polarity rides the draw
+					// (false = fill, true = cut); the renderer pushes
+					// 1 - opacity as the cut strength for reversed.
 					auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed) {
 						const auto & fu = ost.fused;
 						if (not fu.placed)
@@ -1739,24 +1727,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						std::array<glm::mat4, 2> mvp;
 						for (uint32_t view = 0; view < 2; ++view)
 							mvp[view] = world_mvp[view] * model;
-						float op = fiducial_passthrough_state::fade_factor(
-						        frame_state.predictedDisplayTime, fp.fade_start,
-						        std::max(0.f, fp.fade_in_ms));
+						constexpr float op = 1;
 						if (not draw_visible(oid, mvp))
 							return;
 						draws.push_back({oid, mvp, op, reversed});
 					};
 					for (auto & [oid, ost]: passthrough_objects)
 					{
-						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f)
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or ost.def.feather_px != f or
+						    surface_projected_effective(oid, ost) != proj)
 							continue;
 						append_draw(oid, ost, false);
 					}
-					// Reversed objects (negatives) cut every layer: appended
-					// after all positives (the renderer resolves positives
-					// first, then depth-tested MIN cuts). Same fade/mvp/
-					// frustum path; opacity stays the fade presence (the
-					// renderer pushes 1 - fade as the cut strength).
+					// Reversed objects (negatives) cut every group of both
+					// unions: appended after all positives (the renderer
+					// resolves positives first, then depth-tested MIN
+					// cuts). Same mvp/frustum path, full cut strength.
 					if (f != fiducial_passthrough_state::kDebugCutoutFeather)
 					{
 						for (auto & [oid, ost]: passthrough_objects)
@@ -1786,7 +1772,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
 							{
 								g.last_draws_log = instance.now();
-								spdlog::info("Fiducial mask draws lost (feather {}px)", f);
+								spdlog::info("Fiducial mask draws lost (feather {}px union {})", f, proj ? "A" : "B");
 							}
 							g.had_draws = false;
 							continue;
@@ -1795,7 +1781,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					if (not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
 					{
 						g.last_draws_log = instance.now();
-						spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px)", draws.size(), f);
+						spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px union {})", draws.size(), f, proj ? "A" : "B");
 					}
 					g.had_draws = true;
 					int mask_index = g.swapchain.acquire();
@@ -1806,7 +1792,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// frames, then acquires fail permanently).
 					++g.images_outstanding;
 					acquired_groups.push_back(&g);
-					spdlog::debug("Fiducial mask acquire: feather {}px image {} ({} of {} outstanding)", f, mask_index, g.images_outstanding, g.swapchain.image_count());
+					spdlog::debug("Fiducial mask acquire: feather {}px union {} image {} ({} of {} outstanding)", f, proj ? "A" : "B", mask_index, g.images_outstanding, g.swapchain.image_count());
 					XrTime group_wait_t0 = instance.now();
 					bool waited = g.swapchain.wait(100'000'000);
 					// Same host-wait bookkeeping as the video swapchain above.
@@ -1828,7 +1814,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (not g.wait_warned)
 						{
 							g.wait_warned = true;
-							spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px)", f);
+							spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px union {})", f, proj ? "A" : "B");
 						}
 					}
 					else
@@ -1850,149 +1836,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.renderer->record(
 						        command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						        true, f, cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
+						        true, f, proj ? no_cutouts : cutouts, world_mvp, &stage_cpu, {(uint32_t)gw, (uint32_t)gh});
 					}
 					catch (...)
 					{
 						if (metered)
 							command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
-						mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
+						mask_frame_samples.push_back({f, proj, 0, stage_cpu, group_wait_ms});
 						throw;
 					}
 					if (metered)
 					command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, mask_group_slot_first + 2 * stamp + 1);
 					else
 						++mask_frame_unmetered;
-					mask_frame_samples.push_back({f, 0, stage_cpu, group_wait_ms});
+					mask_frame_samples.push_back({f, proj, 0, stage_cpu, group_wait_ms});
 					g.active = true;
 						mask_frame = true;
-					}
-				}
-				// Coverage stencil record: union silhouette of
-				// projection-mapped objects, hard full-res tier-0
-				// (feather 0: raster-direct, no erode/blur). Same fade
-				// opacity and MVPs as the mask draws; 1px frustum margin
-				// (pixel-exact, no bleed to preserve); no cutouts (no
-				// geometry behind them) and no reversed (game cuts, and
-				// the projected feed never shows them). Unmetered (no
-				// query slots): tier-0 raster cost is ~0.08ms by past
-				// measurement.
-				if (session.projected_passthrough_supported() and fp.coverage_group.renderer)
-				{
-					auto & cg = fp.coverage_group;
-					std::vector<feather_mask_renderer::instance_draw> cov_draws;
-					float cmx = 1.f / ((float)mw * 0.5f);
-					float cmy = 1.f / ((float)mh * 0.5f);
-					auto cov_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
-						auto bounds = cg.renderer->mesh_bounds(mesh);
-						if (not bounds)
-							return true;
-						for (uint32_t view = 0; view < 2; ++view)
-						{
-							bool any_front = false, any_behind = false, any_inside = false;
-							for (int corner = 0; corner < 8; ++corner)
-							{
-								glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
-								            (corner & 2) ? bounds->second.y : bounds->first.y,
-								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
-								glm::vec4 c = draw_mvp[view] * q;
-								if (c.w < 0)
-								{
-									any_behind = true;
-									continue;
-								}
-								any_front = true;
-								if (glm::abs(c.x) <= c.w * (1.f + cmx) and
-								    glm::abs(c.y) <= c.w * (1.f + cmy) and c.z >= 0 and c.z <= c.w)
-									any_inside = true;
-							}
-							bool skip_eye = not any_front or (not any_behind and not any_inside);
-							if (not skip_eye)
-								return true;
-						}
-						return false;
-					};
-					auto cov_append = [&](const std::string & oid, const passthrough_object_state & ost) {
-						const auto & fu = ost.fused;
-						if (not fu.placed)
-							return;
-						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
-						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
-						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-						std::array<glm::mat4, 2> mvp;
-						for (uint32_t view = 0; view < 2; ++view)
-							mvp[view] = world_mvp[view] * model;
-						float op = fiducial_passthrough_state::fade_factor(
-						        frame_state.predictedDisplayTime, fp.fade_start,
-						        std::max(0.f, fp.fade_in_ms));
-						if (not cov_visible(oid, mvp))
-							return;
-						cov_draws.push_back({oid, mvp, op, false});
-					};
-					for (auto & [oid, ost]: passthrough_objects)
-					{
-						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or
-						    not surface_projected_effective(oid, ost))
-							continue;
-						cov_append(oid, ost);
-					}
-					if (cov_draws.empty())
-					{
-						cg.active = false;
-						if (cg.had_draws and instance.now() - cg.last_draws_log > 1'000'000'000LL)
-						{
-							cg.last_draws_log = instance.now();
-							spdlog::info("Fiducial coverage draws lost");
-						}
-						cg.had_draws = false;
-					}
-					else
-					{
-						if (not cg.swapchain or cg.swapchain.width() != mw or cg.swapchain.height() != mh)
-						{
-							device.waitIdle();
-							cg.swapchain = xr::swapchain(instance, session, device, swapchain_format, mw, mh, 1, view_count);
-							cg.renderer->reset_targets();
-							cg.images_outstanding = 0;
-							spdlog::info("Fiducial coverage swapchain: {}x{} ({} images)", mw, mh, cg.swapchain.image_count());
-						}
-						cg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
-						int cov_index = cg.swapchain.acquire();
-						++cg.images_outstanding;
-						acquired_groups.push_back(&cg);
-						bool cov_waited = cg.swapchain.wait(100'000'000);
-						if (not cov_waited)
-						{
-							cg.swapchain.release();
-							--cg.images_outstanding;
-							acquired_groups.pop_back();
-							cg.active = false;
-							if (not cg.wait_warned)
-							{
-								cg.wait_warned = true;
-								spdlog::warn("Fiducial coverage image wait timed out, skipping stencil");
-							}
-						}
-						else
-						{
-							cg.wait_warned = false;
-							cg.acquired = true;
-							cg.extent = {mw, mh};
-							feather_mask_renderer::mask_stage_cpu cov_cpu;
-							static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
-							cg.renderer->record(
-							        command_buffer, cg.swapchain.image(cov_index), {(uint32_t)mw, (uint32_t)mh}, cov_draws,
-							        true, 0.f, no_cutouts, world_mvp, &cov_cpu, {(uint32_t)mw, (uint32_t)mh});
-							if (not cg.had_draws and instance.now() - cg.last_draws_log > 1'000'000'000LL)
-							{
-								cg.last_draws_log = instance.now();
-								spdlog::info("Fiducial coverage draws resumed with {} draws", cov_draws.size());
-							}
-							cg.had_draws = true;
-							cg.active = true;
-						}
 					}
 				}
 			}
@@ -2067,7 +1926,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			g->acquired = false;
 			g->swapchain.release();
 			--g->images_outstanding;
-			spdlog::debug("Fiducial mask release: feather {}px ({} outstanding)", g->feather_px, g->images_outstanding);
+			spdlog::debug("Fiducial mask release: feather {}px union {} ({} outstanding)", g->feather_px, g->projected ? "A" : "B", g->images_outstanding);
 		}
 		acquired_groups.clear();
 
@@ -2134,28 +1993,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	if (mask_frame)
 	{
-		// Mask-blend stacks, one per feather group, submitted in feather
-		// order (deterministic): video (opaque, above) was already added,
-		// then each group's mask, then the camera layers, then debug/GUI.
-		// The first mask replaces destination alpha; the rest add
-		// (saturating union). Group swapchains acquired above (never the
-		// shared pool).
-		//
-		// Flat reconstruction and surface-projected mapping compose
-		// through the same feathered mask: flat reads it always; the
-		// coverage stencil then multiplies the destination alpha by the
-		// projected-object silhouettes, and projected reads the product
-		// (DST blend over feather x coverage), so edges feather
-		// identically on both and flagged windows need no own group.
-		// Flat wins whenever anything needs it: unflagged windows, debug
-		// cutouts (camera with no geometry to map it onto — the stencil
-		// is 0 there, so projected correctly contributes nothing), or a
-		// still-ramping global fade. Otherwise both submit: flat covers
-		// unmapped regions and the band, projected covers mapped
-		// interiors.
-		XrTime fade_done_at = fp.fade_start + XrTime(fp.fade_in_ms * 1e6);
-		bool fade_done = fp.fade_in_ms <= 0 || (fp.fade_start != 0 && frame_state.predictedDisplayTime >= fade_done_at);
-		bool need_flat = not fade_done;
+		// Split-union compositing: union A (projected-flagged groups)
+		// drives the projected layer, union B (the rest) drives the
+		// flat layer, composited projected-below-flat so flat wins
+		// overlaps. Video (opaque) was already added above, then each
+		// union's masks, then the camera layers, then debug/GUI. The
+		// single dst-alpha channel carries one union at a time: the
+		// first mask of each union REPLACEs destination alpha (color
+		// preserved), the rest ADD (saturating union). B's REPLACE
+		// resets the alpha the projected layer consumed, so flat reads
+		// only B. Group swapchains acquired above (never the shared
+		// pool). Bands feather against what's underneath
+		// (projected-to-video, flat-to-projected/video): this is the
+		// intended semantic change (flat no longer shows through
+		// projected interiors, projected no longer leaks onto flat
+		// windows — the old coverage stencil's job, now deleted).
+		bool need_flat = false;
 		for (auto & [oid, ost]: passthrough_objects)
 		{
 			if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
@@ -2166,36 +2019,63 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				break;
 			}
 		}
+		// Debug cutouts punch union B only (no geometry to map onto),
+		// so the flat feed must stay submitted.
 		if (fp.cutouts_punched)
 			need_flat = true;
 		bool have_projected = session.has_projected_instances();
-		// Coverage stencil submits with the projected feed (its gate):
-		// recorded above, decides here with fresh instance state.
-		bool submit_coverage = have_projected && fp.coverage_group.active;
+		// Each camera layer is gated on its own union having an active
+		// group: with no REPLACE the dst-alpha holds the other union's
+		// leftover (or opaque video's 1), which would scope the layer
+		// fullscreen instead of to its windows. Culled/timed-out unions
+		// are off-screen or one-frame holes either way, so skipping is
+		// the correct degradation (same class as a skipped group).
+		size_t a_active = 0, b_active = 0;
+		for (auto & [key, g]: fp.mask_groups)
+		{
+			if (not g.active)
+				continue;
+			if (key.second)
+				++a_active;
+			else
+				++b_active;
+		}
+		bool submit_projected = have_projected && a_active > 0;
+		bool submit_flat = need_flat && b_active > 0;
 		// Forensic submit decisions (change-triggered): which camera layer
 		// submits and why. Permanent: coexistence bugs read as wrong output
 		// with no error, so the decision itself must be in the log.
 		{
-			static bool last_need_flat = true;
-			static bool last_have_projected = false;
-			static bool last_submit_coverage = false;
-			if (need_flat != last_need_flat or have_projected != last_have_projected or
-			    submit_coverage != last_submit_coverage)
+			static bool last_submit_flat = true;
+			static bool last_submit_projected = false;
+			if (submit_flat != last_submit_flat or submit_projected != last_submit_projected)
 			{
-				last_need_flat = need_flat;
-				last_have_projected = have_projected;
-				last_submit_coverage = submit_coverage;
-				spdlog::info("Camera submit: {} (need_flat={} have_projected={} coverage={} fade_done={} cutouts={})",
-				             need_flat ? "flat" : (have_projected ? "projected" : "video-only"), need_flat,
-				             have_projected, submit_coverage, fade_done, fp.cutouts_punched);
+				last_submit_flat = submit_flat;
+				last_submit_projected = submit_projected;
+				spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={})",
+				             (submit_flat and submit_projected) ? "projected+flat"
+				             : submit_flat                     ? "flat"
+				             : submit_projected                ? "projected"
+				                                               : "video-only",
+				             need_flat,
+				             have_projected,
+				             a_active,
+				             b_active,
+				             fp.cutouts_punched);
 			}
 		}
-		bool first_group = true;
-		for (auto & [f, g]: fp.mask_groups)
+		// One mask submit pass per union (A then B): each union's first
+		// active group REPLACEs, the rest ADD. Skips (empty union, culled
+		// groups) consume no REPLACE role.
+		for (bool proj_union: {true, false})
 		{
-			(void)f;
-			if (not g.active)
-				continue;
+			bool first_group = true;
+			for (auto & [key, g]: fp.mask_groups)
+			{
+				if (key.second != proj_union)
+					continue;
+				if (not g.active)
+					continue;
 			std::array<XrCompositionLayerProjectionView, view_count> mask_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
@@ -2225,56 +2105,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
 				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
 			first_group = false;
-		}
-		if (need_flat)
-		{
-			add_passthrough_layer();
-			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
-			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-		}
-		if (submit_coverage)
-		{
-			// Coverage stencil: hard union silhouette of the projected
-			// objects, full-res. Multiplies the feather window into the
-			// destination alpha (color untouched, alpha dst := dst x
-			// src) so the projected DST read below sees feather x
-			// coverage: camera on geometry, flat/video elsewhere. Never
-			// stamps: where the stencil is 0 the layer contributes dst.
-			std::array<XrCompositionLayerProjectionView, view_count> cov_views;
-			for (uint32_t view = 0; view < view_count; ++view)
-			{
-				cov_views[view] = {
-				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-				        .pose = pose[view],
-				        .fov = fov[view],
-					.subImage = {
-					                .swapchain = fp.coverage_group.swapchain,
-					                .imageRect = {
-					                        .offset = {0, 0},
-					                        .extent = fp.coverage_group.extent,
-					                },
-					                .imageArrayIndex = view,
-					                },
-				};
 			}
-			// imageIndex is implicit: the compositor uses the last released
-			// image, which record() acquired above.
-			add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
-			                     application::space(xr::spaces::world),
-			                     cov_views);
-			set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
-			                XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_SRC_ALPHA_FB);
-		}
-		if (have_projected)
-		{
-			// Surface-projected interiors read the coverage product
-			// (DST blend over feather x coverage): mapped camera where
-			// geometry covers, flat camera in the feather band and
-			// debug punches, video outside. The stencil above guarantees
-			// the off-geometry source color is always multiplied by 0.
-			add_projected_passthrough_layer();
-			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
-			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+			// Each union's camera layer consumes its own alpha: A feeds
+			// projected, B feeds flat. B's REPLACE above already reset
+			// the channel, so flat reads only B and wins overlaps.
+			if (proj_union)
+			{
+				if (submit_projected)
+				{
+					// Union A is projected-scoped, so no coverage gate
+					// is needed: DST blend over A shows mapped camera on
+					// geometry, feathering to flat/video in the band and
+					// video outside.
+					add_projected_passthrough_layer();
+					set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+					                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+				}
+			}
+			else
+			{
+				if (submit_flat)
+				{
+					add_passthrough_layer();
+					set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+					                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+				}
+			}
 		}
 	}
 

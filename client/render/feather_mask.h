@@ -79,6 +79,10 @@ public:
 	// distant negative behind a nearer window never cuts it. Callers must
 	// sort positives before reversed (the renderer resolves polarity in
 	// two passes, but within-polarity order is draw order as before).
+	// Split-union note: depth testing is per-group (per union), so a
+	// reversed cut only resolves against the positives in its own union.
+	// Cross-union occlusion is accepted as rare (documented tradeoff:
+	// reversed meshes upload into every union but test independently).
 	struct instance_draw
 	{
 		std::string mesh;

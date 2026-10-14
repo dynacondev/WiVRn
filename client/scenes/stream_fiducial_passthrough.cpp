@@ -486,9 +486,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// thread serves chunks through the same lock.
 	to_headset::fiducial_map map = *fiducial_map.lock();
 
-	// Global fade duration: top-level map value, live-applied (a single
-	// alpha channel admits exactly one clock, so no per-object durations).
-	fp.fade_in_ms = std::max(0.f, map.fade_in_ms);
+	// TODO(fade-reintro): the map's fade_in_ms is currently ignored
+	// (split unions need per-union clocks). Parsed server-side still;
+	// the client applies full opacity from placement.
+	(void)map.fade_in_ms;
 
 	// Fingerprint: tracking/render identity. Tags excluded (display-only);
 	// feather/fade excluded (live render-only). Any other change wipes
@@ -660,10 +661,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			board_warm_start.clear();
 			board_filters.clear();
 			fp.corrected_tags.clear();
-			// Global fade clock restarts with the map; projected
-			// instances are rebuilt from placements below (the per-frame
-			// sync destroys stale ones, the map wipe clears the rest).
-			fp.fade_start = 0;
+			// Projected instances are rebuilt from placements below (the
+			// per-frame sync destroys stale ones, the map wipe clears the
+			// rest).
 			projected_failed.clear();
 			session.clear_projected_instances();
 			// `board config:` makes every future log self-describing:
@@ -911,11 +911,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			if (not fu.placed)
 			{
 				fu.placed = true;
-				// Global fade clock: first placement per map starts the one
-				// ramp every window shares; later placements appear
-				// instantly (a single alpha channel admits one clock).
-				if (fp.fade_start == 0)
-					fp.fade_start = predicted_display_time;
+				// TODO(fade-reintro): placements appear instantly; no
+				// fade clock until per-union clocks land.
 				spdlog::info("Passthrough object \"{}\" placed on fiducial \"{}\"", def.id, fid);
 			}
 			if (bpit->second.live)
@@ -924,12 +921,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				fu.last_solve = now;
 				if (gap)
 				{
-					// Jump-gated reacquire fade: resume instantly when the
-					// held pose still matches (the common case — smoothing
-					// already hid small jumps), fade only real
-					// discontinuities. Gates: 25mm / 3deg (below pop
-					// visibility, above hold drift which is zero). Global
-					// clock: one object's jump dips every window together.
+					// Jump-gated reacquire log (TODO(fade-reintro): no fade
+					// until per-union clocks land; jumps currently appear
+					// instantly). Gates: 25mm / 3deg (below pop
+					// visibility, above hold drift which is zero).
 					float dx = fu.world_pose.position.x - prev_pose.position.x;
 					float dy = fu.world_pose.position.y - prev_pose.position.y;
 					float dz = fu.world_pose.position.z - prev_pose.position.z;
@@ -943,12 +938,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 					        2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
 				if (had_pose and (dpos > 25.f or dang > 3.f))
 				{
-					fp.fade_start = predicted_display_time;
-					spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s jump {:.1f}mm {:.2f}deg (fading)",
+					spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s jump {:.1f}mm {:.2f}deg",
 					             def.id, gap_s, (double)dpos, (double)dang);
 				}
 					else
-						spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s continuous (no fade)",
+						spdlog::info("Passthrough object \"{}\": reacquire gap {:.2f}s continuous",
 						             def.id, gap_s);
 				}
 			}
@@ -993,8 +987,31 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				session.remove_projected_instance(oid);
 				spdlog::info("Projected instance \"{}\" removed", oid);
 			}
+			// TEMP-DIAG head-lock experiment: while an interactable
+			// menu is up, freeze the instance at its last-good
+			// transform instead of pushing fresh per-frame updates.
+			// - Outline parks world-locked (stale but glued) => the
+			//   fresh updates are the corruption vector.
+			// - Outline still drifts head-locked => our updates are
+			//   irrelevant; the corruption is runtime-side layer
+			//   handling. Revert after the verdict, whichever way.
+			static std::set<std::string> freeze_logged;
 			if (want and session.has_projected_instance(oid))
 			{
+				if (is_gui_interactable())
+				{
+					if (freeze_logged.insert(oid).second)
+					{
+						spdlog::info("Projected instance \"{}\": freezing transform while menu open at ({:.3f},{:.3f},{:.3f})",
+						             oid,
+						             (double)ost.fused.world_pose.position.x,
+						             (double)ost.fused.world_pose.position.y,
+						             (double)ost.fused.world_pose.position.z);
+					}
+					continue;
+				}
+				if (freeze_logged.erase(oid) > 0)
+					spdlog::info("Projected instance \"{}\": resuming transform updates (menu closed)", oid);
 				try
 				{
 					session.update_projected_instance_transform(oid, world_space, predicted_display_time,

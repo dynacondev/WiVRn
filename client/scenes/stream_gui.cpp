@@ -135,7 +135,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	{
 		mask_gpu_sum_ms += s.gpu_ms;
 		mask_cpu_sum_ms += s.cpu.total_ms;
-		auto & acc = mask_log_per_feather[s.feather_px];
+		auto & acc = mask_log_per_feather[{s.feather_px, s.projected}];
 		if (acc.frames == 0)
 			acc.min_gpu = s.gpu_ms;
 		else
@@ -201,7 +201,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		++mask_log_spikes;
 		std::string spike_groups;
 		for (auto & s: mask_ready_samples)
-			spike_groups += fmt::format("[f={:.1f} gpu={:.2f} wait={:.2f}] ", (double)s.feather_px, s.gpu_ms, s.wait_ms);
+			spike_groups += fmt::format("[f={:.1f}{} gpu={:.2f} wait={:.2f}] ", (double)s.feather_px, s.projected ? "A" : "B", s.gpu_ms, s.wait_ms);
 		spdlog::info("mask spike: seq {} video {:.2f}ms [blits {:.2f} defov {:.2f}] mask {:.2f}ms groups {}{}waits [video {:.2f}ms skipped {:.2f}ms] submit {:.2f}ms endframe {:.2f}ms cadence {} video {}",
 		             mask_ready_seq,
 		             spike_whole_ms,
@@ -277,12 +277,13 @@ void scenes::stream::log_mask_perf(XrTime now)
 		return;
 	last_mask_perf_log = now;
 	std::string detail;
-	for (auto & [f, a]: mask_log_per_feather)
+	for (auto & [key, a]: mask_log_per_feather)
 	{
 		if (a.frames == 0)
 			continue;
-		detail += fmt::format("[f={:.1f} n={} gpu={:.2f}/{:.2f}/{:.2f}ms cpu={:.2f}ms tier={} draws={}] ",
-		                      f,
+		detail += fmt::format("[f={:.1f}{} n={} gpu={:.2f}/{:.2f}/{:.2f}ms cpu={:.2f}ms tier={} draws={}] ",
+		                      (double)key.first,
+		                      key.second ? "A" : "B",
 		                      a.frames,
 		                      a.sum_gpu / (double)a.frames,
 		                      a.max_gpu,

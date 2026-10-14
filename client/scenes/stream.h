@@ -406,24 +406,9 @@ private:
 		// Entity ids may collide across tracker contexts, payloads disambiguate.
 		std::map<std::pair<std::string, XrSpatialEntityIdEXT>, held_code> held_codes;
 
-		// Global first-acquisition fade, predicted-time base (mask-blend
-		// path only: the binary projected layer type has no opacity
-		// control). One clock for all objects: stamped on first placement
-		// per map, retriggered on reacquire jumps. 0 duration or 0 seed =
-		// instant. Objects placing later appear instantly (a single alpha
-		// channel admits exactly one clock).
-		XrTime fade_start = 0;
-		float fade_in_ms = 1000; // top-level map value, live-applied
-		static float fade_factor(XrTime predicted, XrTime start, float dur_ms)
-		{
-			if (dur_ms <= 0 or start == 0)
-				return 1;
-			// Smoothstep ease-in-out (house idiom, cf. the follow-filter
-			// knees): zero slope at both ends, so the window neither pops
-			// in nor slams to full presence like a linear ramp does.
-			double t = std::clamp((predicted - start) * 1e-6 / dur_ms, 0.0, 1.0);
-			return t * t * (3 - 2 * t);
-		}
+		// TODO(fade-reintro): global first-acquisition fade was removed
+		// for the split-union rework (single clock cannot ramp two
+		// unions independently). Reintroduce per-union clocks here.
 
 		// Stale-hold multiplier for debug overlays (quads, orange, axes):
 		// full presence on fresh data, smooth 3s fade-out on SLAM hold.
@@ -445,12 +430,19 @@ private:
 		// with a fiducials-only config.
 		static constexpr float kDebugCutoutFeather = -1.0f;
 
-		// Mask stacks grouped by feather-px: objects sharing a feather
-		// value raster into one shared blur chain (independent feathering
-		// per object, one mask layer per group). Render thread only.
+		// Mask stacks grouped by (feather-px, union): union A holds the
+		// surface-projected objects (drives the projected layer), union
+		// B the rest (drives the flat layer). Same feather value with
+		// mixed flags is two groups (two swapchains/blur stacks). The
+		// single dst-alpha channel carries one union at a time: A is
+		// consumed by projected, then B REPLACEs the alpha (color
+		// preserved) and is consumed by flat, so flat wins overlaps.
+		// Render thread only.
 		struct mask_group
 		{
 			float feather_px = 24;
+			// True = union A (projected), false = union B (flat).
+			bool projected = false;
 			std::unique_ptr<feather_mask_renderer> renderer;
 			// Dedicated member swapchain (explicit acquire/release pairing
 			// like the old single mask swapchain, never the shared pool).
@@ -472,17 +464,10 @@ private:
 			std::map<std::string, std::string> mesh_hashes;
 		};
 		// Exact float equality groups identical parsed values (24 and 24.0
-		// decode bitwise identically).
-		std::map<float, mask_group> mask_groups;
-		// Coverage stencil for the projected layer: union silhouette of
-		// all projection-mapped objects, hard full-res tier-0 raster (no
-		// erode/blur/cutouts). Submitted between flat and projected with
-		// (ZERO, SRC_ALPHA) alpha so the destination holds feather x
-		// coverage for the projected DST read. Reuses the mask_group
-		// machinery (dedicated swapchain, acquire/release pairing, soup
-		// sync) but lives outside the feather map: one stencil, always.
-		// Render thread only.
-		mask_group coverage_group;
+		// decode bitwise identically); the bool splits projected (A)
+		// from flat (B). Iteration order is feather-ascending within
+		// each union; submit does one pass per union (A then B).
+		std::map<std::pair<float, bool>, mask_group> mask_groups;
 	};
 	fiducial_passthrough_state fiducial_passthrough;
 
@@ -686,6 +671,8 @@ private:
 	struct mask_group_sample
 	{
 		float feather_px = 0;
+		// Union tag: true = A (projected), false = B (flat).
+		bool projected = false;
 		double gpu_ms = 0;
 		feather_mask_renderer::mask_stage_cpu cpu;
 		// xrWaitSwapchainImage duration for this group's acquire (host
@@ -761,12 +748,13 @@ private:
 		int tier = -1;
 		size_t draws = 0;
 	};
-	std::map<float, mask_feather_acc> mask_log_per_feather;
+	std::map<std::pair<float, bool>, mask_feather_acc> mask_log_per_feather;
 	XrTime last_mask_perf_log = 0;
 	void log_mask_perf(XrTime now);
 
 	// Last record order, for the permanent slow-slot disambiguation log.
-	std::vector<float> last_live_feathers;
+	// (feather, union) pairs in submit order: A ascending, then B ascending.
+	std::vector<std::pair<float, bool>> last_live_feathers;
 
 	void accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> & blit_handles, const gpu_timestamps & timestamps);
 	void gui_performance_metrics();
