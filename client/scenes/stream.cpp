@@ -1802,6 +1802,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// (record() clear-onlies them), so a group with no
 					// positive draws is skipped exactly like an empty one
 					// (the debug cutout group excepted, as before).
+					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
 					bool is_floor = (f == fiducial_passthrough_state::kBoundaryFloorFeather);
 					// Veil floor + forced hold proceed with empty draws
 					// (clear-only record gives the submit bias a uniform
@@ -1809,7 +1810,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					bool hold = veil_hold and not proj and
 					        (is_floor or (have_first_b and f == first_b_key.first));
 					if ((draws.empty() or not any_positive) and not hold)
-				{
+					{
 						// Debug cutout group carries no draws; its cutouts
 						// still punch (record() early-outs only when meshes
 						// AND cutouts are both absent).
