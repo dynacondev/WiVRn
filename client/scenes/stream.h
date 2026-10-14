@@ -179,6 +179,13 @@ private:
 	// Tab that will be displayed on next render()
 	std::atomic<stream_tab> next_gui_status = stream_tab::hidden;
 	float dimming = 0;
+	// Report focused (don't downgrade to visible) while an interactable
+	// menu is open, so games keep rendering under the menu. Default off:
+	// with focus the game also keeps consuming controller input, so menu
+	// clicks (e.g. trigger pulls) reach gameplay too. Opt in only while
+	// monitoring (e.g. watching passthrough track while configuring).
+	// Session-scoped, render thread only (GUI runs there too).
+	bool report_focused_override = false;
 
 	thread_safe<std::optional<gui_toast>> gui_toast;
 	std::atomic<XrTime> gui_status_last_change;

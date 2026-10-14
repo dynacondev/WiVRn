@@ -1120,6 +1120,11 @@ void scenes::stream::gui_passthrough()
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR-anchored passthrough meshes, marker tracking and alignment."));
 	gui_fiducial_status();
 
+	if (ImGui::Checkbox(_S("Keep game rendering with menu open"), &report_focused_override))
+		spdlog::info("Report focused override {}", report_focused_override ? "on" : "off");
+	ImGui::SameLine();
+	ImGui::TextDisabled("%s", _S("games keep rendering but also keep reading controller input"));
+
 	auto & fp = fiducial_passthrough;
 	ImGui::SeparatorText(_S("Fiducial marker debugging"));
 	ImGui::Checkbox(_S("Marker debug overlays"), &fp.debug_overlays);
