@@ -22,6 +22,11 @@
 //     p50 of eye1-minus-eye0 arrival times over display-time-matched
 //     pairs). FAILS on fixed-order sequential encodes, PASSES once both
 //     eyes complete within the bound (parallel or alternating service).
+//   pose — pose round-trip diagnostics: loopback fake + distinctive
+//     per-view app poses (L (1,2,3) yaw+30deg, R (4,5,6) yaw-30deg)
+//     forwarded into every view_info. Asserts byte-equal poses per eye
+//     (catches any L/R cross), display_time > 0 and monotonic, and the
+//     LocateViews ±32 mm eye x-split. Diagnostics only.
 
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <vulkan/vulkan.h>
@@ -48,6 +53,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -126,7 +132,8 @@ struct GotFrame
 	std::vector<uint8_t> bytes;
 	bool has_view_info = false;
 	XrTime display_time = 0;
-	bool reliable = false; // arrived on control
+	std::array<XrPosef, 2> pose{}; // reassembled view_info poses (pose phase)
+	bool reliable = false;         // arrived on control
 	// Identity foveation must decode to the stream dims (client sizes
 	// its swapchain from these; zeros crash it — see headset run 1).
 	uint32_t fov_w = 0;
@@ -139,6 +146,7 @@ struct ShardBin
 	std::vector<std::vector<uint8_t>> parts; // indexed by shard_idx (gaps empty)
 	bool has_view_info = false;
 	XrTime display_time = 0;
+	std::array<XrPosef, 2> pose{}; // view_info poses (pose phase)
 	uint32_t fov_w = 0;
 	uint32_t fov_h = 0;
 	bool complete = false;
@@ -159,6 +167,7 @@ void ingest(
 	{
 		bin.has_view_info = true;
 		bin.display_time = shard.view_info->display_time;
+		bin.pose = shard.view_info->pose;
 		// Mirror the client's defoveated_size math (count_pixels):
 		// single ratio-1 segment must yield the segment length.
 		auto encoded_size = [](const std::vector<uint16_t> & param) -> uint32_t {
@@ -181,6 +190,7 @@ void ingest(
 			frame.bytes.insert(frame.bytes.end(), part.begin(), part.end());
 		frame.has_view_info = bin.has_view_info;
 		frame.display_time = bin.display_time;
+		frame.pose = bin.pose;
 		frame.fov_w = bin.fov_w;
 		frame.fov_h = bin.fov_h;
 		frame.reliable = reliable;
@@ -1606,6 +1616,390 @@ int run_skew()
 	return fails;
 }
 
+// ---- Pose round-trip (fake headset + distinctive app poses) ----
+// Drives the same loopback fake as run_loopback (HEAD at (4,5,6) in
+// stage, tracking at 10 Hz) but submits DISTINCTIVE per-view app poses
+// in every projection layer: L at (1,2,3) yaw +30deg, R at (4,5,6) yaw
+// -30deg. The streamer forwards the app's own layer poses verbatim
+// into each eye's view_info (Linux-style: never echo poses), so every
+// reassembled frame must carry pose[0]==L and pose[1]==R byte-for-byte
+// on BOTH stream items — any L/R cross shows here. Also asserts
+// display_time > 0 and monotonic per eye, and that LocateViews keeps
+// the ±32 mm eye x-split. Diagnostics only: a FAIL is reported with
+// evidence, nothing behavioral changes.
+
+#undef TFAIL
+#define TFAIL(fails, fmt, ...) std::fprintf(stderr, "FAIL pose: " fmt "\n" __VA_OPT__(, ) __VA_ARGS__), ++(fails)
+
+int run_pose()
+{
+	int fails = 0;
+	::setenv("WIVRN_PORT", "19763", 1);
+	::setenv("WIVRN_HOSTNAME", "WiVRn-Pose", 1);
+	const char * manifest = std::getenv("XR_RUNTIME_JSON");
+	if (manifest == nullptr)
+	{
+		std::puts("set XR_RUNTIME_JSON to the generated wivrn-macos.json");
+		return 2;
+	}
+
+	// Distinctive per-view app poses, constant across frames so every
+	// reassembled view_info must match exactly. Yaw quats about +Y:
+	// (0, +/-sin15deg, 0, cos15deg).
+	const XrPosef expect_l{.orientation = {0, 0.25881905f, 0, 0.96592583f}, .position = {1, 2, 3}};
+	const XrPosef expect_r{.orientation = {0, -0.25881905f, 0, 0.96592583f}, .position = {4, 5, 6}};
+	auto pose_equal = [](const XrPosef & a, const XrPosef & b) {
+		return a.orientation.x == b.orientation.x && a.orientation.y == b.orientation.y &&
+		       a.orientation.z == b.orientation.z && a.orientation.w == b.orientation.w &&
+		       a.position.x == b.position.x && a.position.y == b.position.y && a.position.z == b.position.z;
+	};
+
+	FakeState fake;
+	fake.port = 19763;
+	std::thread headset([&] { fake_headset(fake); });
+
+	const char * enabledExts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+	XrInstance instance = XR_NULL_HANDLE;
+	XrInstanceCreateInfo createInfo{
+	        .type = XR_TYPE_INSTANCE_CREATE_INFO,
+	        .next = nullptr,
+	        .createFlags = 0,
+	        .applicationInfo = {.applicationName = "pose-test", .applicationVersion = 1, .engineName = "none", .engineVersion = 0, .apiVersion = XR_CURRENT_API_VERSION},
+	        .enabledApiLayerCount = 0,
+	        .enabledApiLayerNames = nullptr,
+	        .enabledExtensionCount = 2,
+	        .enabledExtensionNames = enabledExts,
+	};
+	if (xrCreateInstance(&createInfo, &instance) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateInstance");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	VkDeviceSet dev{};
+	if (!bring_up_vulkan(dev))
+	{
+		TFAIL(fails, "bring_up_vulkan");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	XrSystemGetInfo sysInfo{.type = XR_TYPE_SYSTEM_GET_INFO, .next = nullptr, .formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY};
+	XrSystemId systemId = XR_NULL_SYSTEM_ID;
+	if (xrGetSystem(instance, &sysInfo, &systemId) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrGetSystem");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	XrGraphicsBindingVulkan2KHR binding{
+	        .type = XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR,
+	        .next = nullptr,
+	        .instance = dev.instance,
+	        .physicalDevice = dev.phys,
+	        .device = dev.device,
+	        .queueFamilyIndex = dev.family,
+	        .queueIndex = 0,
+	};
+	XrSession session = XR_NULL_HANDLE;
+	XrSessionCreateInfo sessionInfo{.type = XR_TYPE_SESSION_CREATE_INFO, .next = &binding, .createFlags = 0, .systemId = systemId};
+	if (xrCreateSession(instance, &sessionInfo, &session) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateSession");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	XrViewConfigurationType config = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	XrSessionBeginInfo beginInfo{.type = XR_TYPE_SESSION_BEGIN_INFO, .next = nullptr, .primaryViewConfigurationType = config};
+	if (xrBeginSession(session, &beginInfo) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrBeginSession");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	std::this_thread::sleep_for(std::chrono::seconds(3));
+
+	uint32_t formatCount = 0;
+	if (xrEnumerateSwapchainFormats(session, 0, &formatCount, nullptr) != XR_SUCCESS || formatCount == 0)
+	{
+		TFAIL(fails, "xrEnumerateSwapchainFormats");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+	std::vector<int64_t> formats(formatCount);
+	if (xrEnumerateSwapchainFormats(session, formatCount, &formatCount, formats.data()) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrEnumerateSwapchainFormats fetch");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+	int64_t format = formats[0];
+
+	XrSwapchain swapchains[2] = {};
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		XrSwapchainCreateInfo swapInfo{
+		        .type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+		        .next = nullptr,
+		        .createFlags = 0,
+		        .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT,
+		        .format = format,
+		        .sampleCount = 1,
+		        .width = 256,
+		        .height = 256,
+		        .faceCount = 1,
+		        .arraySize = 1,
+		        .mipCount = 1,
+		};
+		if (xrCreateSwapchain(session, &swapInfo, &swapchains[eye]) != XR_SUCCESS)
+		{
+			TFAIL(fails, "eye %d xrCreateSwapchain", eye);
+			fake.stop = true;
+			headset.join();
+			return fails;
+		}
+	}
+
+	XrReferenceSpaceCreateInfo spaceInfo{
+	        .type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO,
+	        .next = nullptr,
+	        .referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL,
+	        .poseInReferenceSpace = {.orientation = {0, 0, 0, 1}, .position = {0, 0, 0}},
+	};
+	XrSpace local = XR_NULL_HANDLE;
+	if (xrCreateReferenceSpace(session, &spaceInfo, &local) != XR_SUCCESS)
+	{
+		TFAIL(fails, "xrCreateReferenceSpace");
+		fake.stop = true;
+		headset.join();
+		return fails;
+	}
+
+	// No rendering: virgin UNDEFINED images exercise the snapshot path;
+	// the metric is view_info poses, not pixels.
+	XrSwapchainImageAcquireInfo acquireInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO, .next = nullptr};
+	XrSwapchainImageWaitInfo waitInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .next = nullptr, .timeout = XR_INFINITE_DURATION};
+	XrSwapchainImageReleaseInfo releaseInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, .next = nullptr};
+	XrFrameWaitInfo frameWaitInfo{.type = XR_TYPE_FRAME_WAIT_INFO, .next = nullptr};
+	XrFrameBeginInfo frameBeginInfo{.type = XR_TYPE_FRAME_BEGIN_INFO, .next = nullptr};
+	for (int frame = 0; frame < 400; ++frame)
+	{
+		{
+			std::lock_guard lock(fake.mutex);
+			size_t per_eye[2] = {0, 0};
+			for (const auto & maps = {&fake.stream_done, &fake.control_done}; auto * done: maps)
+			{
+				for (const auto & [key, got]: *done)
+				{
+					if (got.has_view_info && key.first < 2)
+						++per_eye[key.first];
+				}
+			}
+			if (per_eye[0] >= 6 && per_eye[1] >= 6)
+				break;
+		}
+		XrFrameState frameState{.type = XR_TYPE_FRAME_STATE, .next = nullptr};
+		if (xrWaitFrame(session, &frameWaitInfo, &frameState) != XR_SUCCESS)
+		{
+			TFAIL(fails, "xrWaitFrame");
+			break;
+		}
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			uint32_t index = 0;
+			if (xrAcquireSwapchainImage(swapchains[eye], &acquireInfo, &index) != XR_SUCCESS)
+				continue; // latest-only drop under burst, like the mailbox
+			if (xrWaitSwapchainImage(swapchains[eye], &waitInfo) != XR_SUCCESS)
+			{
+				TFAIL(fails, "xrWaitSwapchainImage");
+				break;
+			}
+		}
+		if (xrBeginFrame(session, &frameBeginInfo) != XR_SUCCESS)
+		{
+			TFAIL(fails, "xrBeginFrame");
+			break;
+		}
+		XrCompositionLayerProjectionView projViews[2] = {};
+		projViews[0].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+		projViews[0].pose = expect_l;
+		projViews[0].fov = {-0.86f, 0.86f, 0.86f, -0.86f};
+		projViews[0].subImage = {.swapchain = swapchains[0], .imageRect = {.offset = {0, 0}, .extent = {256, 256}}, .imageArrayIndex = 0};
+		projViews[1].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+		projViews[1].pose = expect_r;
+		projViews[1].fov = {-0.86f, 0.86f, 0.86f, -0.86f};
+		projViews[1].subImage = {.swapchain = swapchains[1], .imageRect = {.offset = {0, 0}, .extent = {256, 256}}, .imageArrayIndex = 0};
+		XrCompositionLayerProjection proj{
+		        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION,
+		        .next = nullptr,
+		        .layerFlags = 0,
+		        .space = local,
+		        .viewCount = 2,
+		        .views = projViews,
+		};
+		const XrCompositionLayerBaseHeader * layers[1] = {reinterpret_cast<const XrCompositionLayerBaseHeader *>(&proj)};
+		XrFrameEndInfo endInfo{
+		        .type = XR_TYPE_FRAME_END_INFO,
+		        .next = nullptr,
+		        .displayTime = frameState.predictedDisplayTime,
+		        .environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+		        .layerCount = 1,
+		        .layers = layers,
+		};
+		if (xrEndFrame(session, &endInfo) != XR_SUCCESS)
+		{
+			TFAIL(fails, "xrEndFrame");
+			break;
+		}
+		for (int eye = 0; eye < 2; ++eye)
+			xrReleaseSwapchainImage(swapchains[eye], &releaseInfo);
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
+	}
+
+	// Let stragglers land, then stop the fake before analyzing.
+	std::this_thread::sleep_for(std::chrono::milliseconds(500));
+	fake.stop = true;
+	headset.join();
+
+	struct PoseFrame
+	{
+		uint64_t frame_idx;
+		XrTime display_time;
+		std::array<XrPosef, 2> pose;
+	};
+	std::vector<PoseFrame> per_eye[2];
+	{
+		std::lock_guard lock(fake.mutex);
+		for (const auto & maps = {&fake.stream_done, &fake.control_done}; auto * done: maps)
+		{
+			for (const auto & [key, got]: *done)
+			{
+				if (!got.has_view_info || key.first > 1)
+					continue;
+				per_eye[key.first].push_back({key.second, got.display_time, got.pose});
+			}
+		}
+	}
+	for (int eye = 0; eye < 2; ++eye)
+		std::sort(per_eye[eye].begin(), per_eye[eye].end(), [](const PoseFrame & a, const PoseFrame & b) { return a.frame_idx < b.frame_idx; });
+
+	size_t mismatch = 0, swapped = 0, bad_time = 0, nonmono = 0;
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		std::printf("pose: eye %d view_info frames=%zu\n", eye, per_eye[eye].size());
+		if (per_eye[eye].size() < 4)
+			TFAIL(fails, "eye %d only %zu view_info frames (need 4)", eye, per_eye[eye].size());
+		for (size_t i = 0; i < per_eye[eye].size(); ++i)
+		{
+			const PoseFrame & pf = per_eye[eye][i];
+			if (pf.display_time <= 0)
+			{
+				if (bad_time++ == 0)
+					TFAIL(fails, "eye %d frame %llu display_time %lld not positive", eye, (unsigned long long)pf.frame_idx, (long long)pf.display_time);
+			}
+			if (i > 0 && pf.display_time <= per_eye[eye][i - 1].display_time)
+			{
+				if (nonmono++ == 0)
+					TFAIL(
+					        fails,
+					        "eye %d display_time not monotonic: frame %llu time %lld after %lld",
+					        eye,
+					        (unsigned long long)pf.frame_idx,
+					        (long long)pf.display_time,
+					        (long long)per_eye[eye][i - 1].display_time);
+			}
+			bool l_ok = pose_equal(pf.pose[0], expect_l);
+			bool r_ok = pose_equal(pf.pose[1], expect_r);
+			if (!l_ok || !r_ok)
+			{
+				++mismatch;
+				if (pose_equal(pf.pose[0], expect_r) && pose_equal(pf.pose[1], expect_l))
+					++swapped;
+				if (mismatch <= 3)
+					std::fprintf(
+					        stderr,
+					        "pose: eye %d frame %llu got L=(%.2f,%.2f,%.2f) R=(%.2f,%.2f,%.2f), want L=(1,2,3) R=(4,5,6)\n",
+					        eye,
+					        (unsigned long long)pf.frame_idx,
+					        (double)pf.pose[0].position.x,
+					        (double)pf.pose[0].position.y,
+					        (double)pf.pose[0].position.z,
+					        (double)pf.pose[1].position.x,
+					        (double)pf.pose[1].position.y,
+					        (double)pf.pose[1].position.z);
+			}
+		}
+	}
+	if (mismatch > 0)
+	{
+		TFAIL(fails, "%zu/%zu view_info poses differ from input (swapped=%zu)", mismatch, per_eye[0].size() + per_eye[1].size(), swapped);
+	}
+
+	// LocateViews keeps the ±32 mm eye x-split in LOCAL.
+	{
+		XrViewLocateInfo viewLocateInfo{
+		        .type = XR_TYPE_VIEW_LOCATE_INFO,
+		        .next = nullptr,
+		        .viewConfigurationType = config,
+		        .displayTime = 1,
+		        .space = local,
+		};
+		XrViewState viewState{.type = XR_TYPE_VIEW_STATE, .next = nullptr};
+		uint32_t viewCount = 0;
+		XrView views[2] = {};
+		if (xrLocateViews(session, &viewLocateInfo, &viewState, 2, &viewCount, views) != XR_SUCCESS)
+		{
+			TFAIL(fails, "xrLocateViews");
+		}
+		else
+		{
+			std::printf(
+			        "pose: views in local L=(%.3f,%.3f,%.3f) R=(%.3f,%.3f,%.3f)\n",
+			        views[0].pose.position.x,
+			        views[0].pose.position.y,
+			        views[0].pose.position.z,
+			        views[1].pose.position.x,
+			        views[1].pose.position.y,
+			        views[1].pose.position.z);
+			if (viewCount != 2)
+				TFAIL(fails, "xrLocateViews count %u != 2", viewCount);
+			if (!(views[0].pose.position.x > -0.042f && views[0].pose.position.x < -0.022f))
+				TFAIL(fails, "left eye x %.3f not ~= -0.032", (double)views[0].pose.position.x);
+			if (!(views[1].pose.position.x > 0.022f && views[1].pose.position.x < 0.042f))
+				TFAIL(fails, "right eye x %.3f not ~= +0.032", (double)views[1].pose.position.x);
+			float split = views[1].pose.position.x - views[0].pose.position.x;
+			if (!(split > 0.054f && split < 0.074f))
+				TFAIL(fails, "eye x-split %.3f not ~= 0.064", (double)split);
+		}
+	}
+
+	xrDestroySpace(local);
+	for (int eye = 0; eye < 2; ++eye)
+		xrDestroySwapchain(swapchains[eye]);
+	xrEndSession(session);
+	xrDestroySession(session);
+	xrDestroyInstance(instance);
+	vkDestroyDevice(dev.device, nullptr);
+	vkDestroyInstance(dev.instance, nullptr);
+
+	if (fails == 0)
+		std::puts("pose test PASS");
+	else
+		std::printf("pose test FAIL (%d)\n", fails);
+	return fails;
+}
+
 } // namespace
 
 int run_loopback()
@@ -1869,7 +2263,7 @@ int main(int argc, char ** argv)
 	if (all)
 	{
 		int rc = 0;
-		for (const char * phase: {"tear", "skew", "loop"})
+		for (const char * phase: {"tear", "skew", "loop", "pose"})
 		{
 			pid_t pid = ::fork();
 			if (pid < 0)
@@ -1903,5 +2297,7 @@ int main(int argc, char ** argv)
 		rc += run_skew();
 	if (want("loop"))
 		rc += run_loopback();
+	if (want("pose"))
+		rc += run_pose();
 	return rc == 0 ? 0 : 1;
 }
