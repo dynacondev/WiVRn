@@ -118,9 +118,9 @@ float sqdist_point_triangle(const vec3 & p, const vec3 & a, const vec3 & b, cons
 }
 
 // Möller–Trumbore, no culling (parity needs both faces). Parallel and
-// degenerate triangles miss; grazing edge/vertex hits may miscount,
-// which the 3-axis majority vote absorbs.
-bool ray_hits_triangle(const vec3 & o, const vec3 & d, const vec3 & a, const vec3 & b, const vec3 & c)
+// degenerate triangles miss. Shared edges/vertices produce identical hit
+// distances, merged by the caller, so quad diagonals count once.
+bool ray_hit_triangle(const vec3 & o, const vec3 & d, const vec3 & a, const vec3 & b, const vec3 & c, float * t_out)
 {
 	vec3 e1 = b - a;
 	vec3 e2 = c - a;
@@ -137,7 +137,24 @@ bool ray_hits_triangle(const vec3 & o, const vec3 & d, const vec3 & a, const vec
 	float v = dot(d, q) * inv;
 	if (v < 0 or u + v > 1)
 		return false;
-	return dot(e2, q) * inv > 1e-6f;
+	float tp = dot(e2, q) * inv;
+	if (tp <= 1e-6f)
+		return false;
+	*t_out = tp;
+	return true;
+}
+
+// Skewed parity-ray direction (deterministic, irrational-ish slopes):
+// axis rays systematically strike quad diagonals twice (identical hit
+// distance, but only when deduplicated) and graze box edges; the skew
+// keeps hits transversal on axis-aligned zone boxes.
+const vec3 & parity_ray_dir()
+{
+	static const vec3 d = [] {
+		vec3 u{1, 0.314159f, 0.720478f};
+		return u * (1 / std::sqrt(dot(u, u)));
+	}();
+	return d;
 }
 } // namespace
 
@@ -178,10 +195,13 @@ boundary_query boundary_signed_distance(
 		return out;
 
 	float best2 = HUGE_VALF;
-	size_t votes = 0; // bit i = odd parity along axis i (x=1, y=2, z=4)
 	size_t valid_tris = 0;
-	static const vec3 axes[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-	size_t hits[3] = {0, 0, 0};
+	// Hit distances along the parity ray, reused across calls (clear
+	// keeps capacity). Sorted + merged below: shared edges/vertices
+	// report the same geometric point, counted once.
+	thread_local std::vector<float> hits;
+	hits.clear();
+	const vec3 & dir = parity_ray_dir();
 	for (size_t i = 0; i + 2 < indices.size(); i += 3)
 	{
 		uint32_t ia = indices[i], ib = indices[i + 1], ic = indices[i + 2];
@@ -196,23 +216,27 @@ boundary_query boundary_signed_distance(
 		float d2 = sqdist_point_triangle(p, a, b, c);
 		if (d2 < best2)
 			best2 = d2;
-		for (int k = 0; k < 3; ++k)
-		{
-			if (ray_hits_triangle(p, axes[k], a, b, c))
-				++hits[k];
-		}
+		float th;
+		if (ray_hit_triangle(p, dir, a, b, c, &th))
+			hits.push_back(th);
 	}
 	if (valid_tris == 0 or best2 == HUGE_VALF)
 		return out;
-	for (int k = 0; k < 3; ++k)
+	// Odd crossing count = inside. Merge window 0.1mm (local units):
+	// shared-vertex float scatter sits far below it, while distinct
+	// zone surfaces never pack that tight.
+	std::sort(hits.begin(), hits.end());
+	size_t crossings = 0;
+	float last = 0;
+	for (float th: hits)
 	{
-		if (hits[k] % 2 == 1)
-			votes |= size_t(1) << k;
+		if (crossings == 0 or th - last > 1e-4f)
+		{
+			++crossings;
+			last = th;
+		}
 	}
-	// Majority vote: all three agree on closed meshes; one grazing
-	// miscount still loses 2-1.
-	int odd = (votes & 1 ? 1 : 0) + (votes & 2 ? 1 : 0) + (votes & 4 ? 1 : 0);
-	out.inside = odd >= 2;
+	out.inside = crossings % 2 == 1;
 	out.distance_m = std::sqrt(best2) * std::fabs(world_scale);
 	out.signed_m = out.inside ? out.distance_m : -out.distance_m;
 	out.valid = true;
@@ -251,16 +275,52 @@ bool boundary_selftest()
 {
 	// Unit cube, half-extent 1, centered on the origin.
 	std::vector<XrVector3f> v = {
-	        {-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
-	        {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1},
+	        {-1, -1, -1},
+	        {1, -1, -1},
+	        {1, 1, -1},
+	        {-1, 1, -1},
+	        {-1, -1, 1},
+	        {1, -1, 1},
+	        {1, 1, 1},
+	        {-1, 1, 1},
 	};
 	std::vector<uint32_t> idx = {
-	        0, 3, 7, 0, 7, 4, // -x
-	        1, 5, 6, 1, 6, 2, // +x
-	        0, 4, 5, 0, 5, 1, // -y
-	        3, 2, 6, 3, 6, 7, // +y
-	        0, 1, 2, 0, 2, 3, // -z
-	        4, 7, 6, 4, 6, 5, // +z
+	        0,
+	        3,
+	        7,
+	        0,
+	        7,
+	        4, // -x
+	        1,
+	        5,
+	        6,
+	        1,
+	        6,
+	        2, // +x
+	        0,
+	        4,
+	        5,
+	        0,
+	        5,
+	        1, // -y
+	        3,
+	        2,
+	        6,
+	        3,
+	        6,
+	        7, // +y
+	        0,
+	        1,
+	        2,
+	        0,
+	        2,
+	        3, // -z
+	        4,
+	        7,
+	        6,
+	        4,
+	        6,
+	        5, // +z
 	};
 	XrPosef identity{{0, 0, 0, 1}, {0, 0, 0}};
 

@@ -42,9 +42,10 @@ struct boundary_query
 
 // Signed distance from a world-space point to a placed uniform-scaled
 // rigid soup (world = pose * (scale * local)). Single pass over the
-// triangles: min point-triangle distance + 3-axis majority-vote parity.
-// Cost is linear in triangle count: room-size boxes are noise, document
-// a ~5k-triangle budget for detailed zones.
+// triangles: min point-triangle distance + single-ray parity (shared
+// edges/vertices deduplicated by hit distance, so quad diagonals count
+// once). Cost is linear in triangle count: room-size boxes are noise,
+// document a ~5k-triangle budget for detailed zones.
 boundary_query boundary_signed_distance(
         std::span<const XrVector3f> vertices,
         std::span<const uint32_t> indices,
