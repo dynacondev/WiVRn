@@ -73,9 +73,13 @@ struct erode_push
 // formula stays within a texel by construction everywhere else.
 int erode_select(float spread, float fullpx_per_texel)
 {
-	if (2.f * spread * fullpx_per_texel < 1.f)
-		return 0;
-	return (2.f * spread <= 1.f) ? 3 : 5;
+	// TEMPORARY back-to-basics bisect: erosion bypassed, blur reads the
+	// uneroded raster exactly as before internal-only feathering. Both
+	// call sites key off `erode > 0`, so returning 0 restores the old
+	// data flow (no A/B or target swaps) with no other changes.
+	(void)spread;
+	(void)fullpx_per_texel;
+	return 0;
 }
 
 // RAII section timer for the record() diagnostics (mask_stage_cpu): adds
