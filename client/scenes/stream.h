@@ -179,9 +179,6 @@ private:
 	// Tab that will be displayed on next render()
 	std::atomic<stream_tab> next_gui_status = stream_tab::hidden;
 	float dimming = 0;
-	// Last view-state flags from the GUI locate in draw_gui()
-	// (TEMPORARY blackout diagnostics: read by the pose-invalid dump).
-	XrViewStateFlags last_gui_view_flags = 0;
 
 	thread_safe<std::optional<gui_toast>> gui_toast;
 	std::atomic<XrTime> gui_status_last_change;
