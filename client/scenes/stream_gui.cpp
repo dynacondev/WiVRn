@@ -835,7 +835,24 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 	bool interactable = true;
 	XrSpace world_space = application::space(xr::spaces::world);
-	auto views = session.locate_views(viewconfig, predicted_display_time, world_space).second;
+	// TEMPORARY blackout diagnostics: keep the locate flags so the
+	// pose-invalid dump can tell locally-located GUI views apart from
+	// server-provided video views. Throttled: locate fails persistently
+	// while the bad composition does, not once.
+	auto [gui_view_flags, views] = session.locate_views(viewconfig, predicted_display_time, world_space);
+	last_gui_view_flags = gui_view_flags;
+	if ((gui_view_flags & (XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT)) !=
+	    (XR_VIEW_STATE_POSITION_VALID_BIT | XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+	{
+		static XrTime last_gui_view_warn = 0;
+		XrTime view_now = instance.now();
+		if (view_now - last_gui_view_warn > 2'000'000'000LL)
+		{
+			last_gui_view_warn = view_now;
+			spdlog::warn("GUI views not fully valid: flags=0x{:x} tab={}", (unsigned)gui_view_flags,
+			             magic_enum::enum_name(gui_status));
+		}
+	}
 
 	switch (gui_status)
 	{

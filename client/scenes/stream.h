@@ -186,6 +186,9 @@ private:
 	// monitoring (e.g. watching passthrough track while configuring).
 	// Session-scoped, render thread only (GUI runs there too).
 	bool report_focused_override = false;
+	// Last view-state flags from the GUI locate in draw_gui()
+	// (TEMPORARY blackout diagnostics: read by the pose-invalid dump).
+	XrViewStateFlags last_gui_view_flags = 0;
 
 	thread_safe<std::optional<gui_toast>> gui_toast;
 	std::atomic<XrTime> gui_status_last_change;

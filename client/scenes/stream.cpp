@@ -42,6 +42,7 @@
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -2178,10 +2179,89 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		catch (std::system_error & e)
 		{
-			if (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID)
-				spdlog::info("Invalid pose submitted");
-			else
-				throw;
+		if (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID)
+		{
+			spdlog::info("Invalid pose submitted");
+			// TEMPORARY blackout diagnostics: dump every layer's pose/space
+			// so the invalid one names itself. Throttled (this fires every
+			// frame while the bad composition persists): header carries the
+			// tab/mask/GUI-view/world-GUI state, one line per layer follows.
+			XrTime dump_now = instance.now();
+			static XrTime last_pose_dump = 0;
+			if (dump_now - last_pose_dump > 2'000'000'000LL)
+			{
+				last_pose_dump = dump_now;
+				auto quat_norm = [](const XrQuaternionf & q) {
+					return std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+				};
+				spdlog::warn("pose-invalid dump: tab={} mask_frame={} layers={} gui_views=0x{:x} world_gui=({:.2f},{:.2f},{:.2f}) q=({:.3f},{:.3f},{:.3f},{:.3f},n={:.3f})",
+				             magic_enum::enum_name(gui_status), mask_frame, layers.size(),
+				             (unsigned)last_gui_view_flags, world_gui_position.x, world_gui_position.y,
+				             world_gui_position.z, world_gui_orientation.x, world_gui_orientation.y,
+				             world_gui_orientation.z, world_gui_orientation.w,
+				             (double)quat_norm({world_gui_orientation.x, world_gui_orientation.y,
+				                                world_gui_orientation.z, world_gui_orientation.w}));
+				for (size_t li = 0; li < layers.size(); ++li)
+				{
+					auto & l = layers[li];
+					if (auto * proj = std::get_if<XrCompositionLayerProjection>(&l.composition_layer))
+					{
+						spdlog::warn("  layer {}: proj flags=0x{:x} space={} views={}", li,
+						             (unsigned long long)proj->layerFlags,
+						             (unsigned long long)proj->space, l.color_views.size());
+						for (size_t vi = 0; vi < l.color_views.size(); ++vi)
+						{
+							auto & v = l.color_views[vi];
+							float n = quat_norm(v.pose.orientation);
+							spdlog::warn("    view {}: pos=({:.3f},{:.3f},{:.3f}) q=({:.3f},{:.3f},{:.3f},{:.3f},n={:.3f}){} swapchain={} img={} rect={}+{} {}x{}",
+							             vi, (double)v.pose.position.x, (double)v.pose.position.y,
+							             (double)v.pose.position.z, (double)v.pose.orientation.x,
+							             (double)v.pose.orientation.y, (double)v.pose.orientation.z,
+							             (double)v.pose.orientation.w, (double)n,
+							             (std::isfinite(n) and n > 0.9f and n < 1.1f) ? "" : " BAD",
+							             (unsigned long long)v.subImage.swapchain,
+							             v.subImage.imageArrayIndex, v.subImage.imageRect.offset.x,
+							             v.subImage.imageRect.offset.y, v.subImage.imageRect.extent.width,
+							             v.subImage.imageRect.extent.height);
+						}
+					}
+					else if (auto * quad = std::get_if<XrCompositionLayerQuad>(&l.composition_layer))
+					{
+						float n = quat_norm(quad->pose.orientation);
+						spdlog::warn("  layer {}: quad flags=0x{:x} space={} eye={} pos=({:.3f},{:.3f},{:.3f}) q=({:.3f},{:.3f},{:.3f},{:.3f},n={:.3f}){} size={:.3f}x{:.3f} swapchain={}",
+						             li, (unsigned long long)quad->layerFlags,
+						             (unsigned long long)quad->space, (int)quad->eyeVisibility,
+						             (double)quad->pose.position.x, (double)quad->pose.position.y,
+						             (double)quad->pose.position.z, (double)quad->pose.orientation.x,
+						             (double)quad->pose.orientation.y, (double)quad->pose.orientation.z,
+						             (double)quad->pose.orientation.w, (double)n,
+						             (std::isfinite(n) and n > 0.9f and n < 1.1f) ? "" : " BAD",
+						             (double)quad->size.width, (double)quad->size.height,
+						             (unsigned long long)quad->subImage.swapchain);
+					}
+					else if (auto * base = std::get_if<XrCompositionLayerBaseHeader *>(&l.composition_layer))
+					{
+						if (*base == nullptr)
+						{
+							spdlog::warn("  layer {}: null header BAD", li);
+						}
+						else if ((*base)->type == XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB)
+						{
+							auto * p = reinterpret_cast<XrCompositionLayerPassthroughFB *>(*base);
+							spdlog::warn("  layer {}: pass_fb flags=0x{:x} space={} layer={}", li,
+							             (unsigned long long)p->flags, (unsigned long long)p->space,
+							             (unsigned long long)p->layerHandle);
+						}
+						else
+						{
+							spdlog::warn("  layer {}: header type={}", li, (int)(*base)->type);
+						}
+					}
+				}
+			}
+		}
+		else
+			throw;
 		}
 		if (trace_mask)
 		{
