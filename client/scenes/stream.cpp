@@ -1547,11 +1547,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready)
 						continue;
-			for (auto & key: live_groups)
-			{
-				if (key.first == fiducial_passthrough_state::kDebugCutoutFeather or
-				    key.first == fiducial_passthrough_state::kBoundaryFloorFeather)
-					continue;
+					for (auto & key: live_groups)
+					{
+						if (key.first == fiducial_passthrough_state::kDebugCutoutFeather or
+						    key.first == fiducial_passthrough_state::kBoundaryFloorFeather)
+							continue;
 						auto git = fp.mask_groups.find(key);
 						if (git == fp.mask_groups.end() or not git->second.renderer)
 							continue;
@@ -1564,45 +1564,45 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				}
-			// Debug-only cutout group (no objects): lets the marker
-			// window punch with a fiducials-only config. Reserved key
-			// in union B (cutouts punch flat only: no geometry to map
-			// onto); flows through eager setup, record (empty draws,
-			// cutouts punch), submit and stale drop like any group.
-			// Claimed whenever fresh codes exist but no B group does
-			// (fiducials-only, or projected-only objects): real B
-			// groups punch cutouts themselves, so no extra group then.
-			// Reaps itself on loss via the stale-group sweep below.
-			if (live_b.empty() and not cutouts.empty())
-			{
-				const float df = fiducial_passthrough_state::kDebugCutoutFeather;
-				live_groups.emplace_back(df, false);
-				auto key = std::make_pair(df, false);
-				auto & g = fp.mask_groups[key];
-				g.feather_px = df;
-				g.projected = false;
-				if (not g.renderer)
-					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
-			}
-			// Boundary-veil floor group: claimed only while the veil is
-			// active (stale flag: update_fiducial_passthrough runs after
-			// record, so this is last frame's verdict) and no flat-union
-			// group exists to carry its floor (boundary-only /
-			// projected-only configs). Empty draws (clear-only record);
-			// the submit-time bias lifts the cleared image to a uniform
-			// floor. Reaps itself on release via the sweep below.
-			bool have_b_group = std::ranges::any_of(live_groups, [](const auto & k) { return not k.second; });
-			if (fp.boundary_veil and not have_b_group)
-			{
-				const float bf = fiducial_passthrough_state::kBoundaryFloorFeather;
-				live_groups.emplace_back(bf, false);
-				auto bkey = std::make_pair(bf, false);
-				auto & g = fp.mask_groups[bkey];
-				g.feather_px = bf;
-				g.projected = false;
-				if (not g.renderer)
-					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
-			}
+				// Debug-only cutout group (no objects): lets the marker
+				// window punch with a fiducials-only config. Reserved key
+				// in union B (cutouts punch flat only: no geometry to map
+				// onto); flows through eager setup, record (empty draws,
+				// cutouts punch), submit and stale drop like any group.
+				// Claimed whenever fresh codes exist but no B group does
+				// (fiducials-only, or projected-only objects): real B
+				// groups punch cutouts themselves, so no extra group then.
+				// Reaps itself on loss via the stale-group sweep below.
+				if (live_b.empty() and not cutouts.empty())
+				{
+					const float df = fiducial_passthrough_state::kDebugCutoutFeather;
+					live_groups.emplace_back(df, false);
+					auto key = std::make_pair(df, false);
+					auto & g = fp.mask_groups[key];
+					g.feather_px = df;
+					g.projected = false;
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+				}
+				// Boundary-veil floor group: claimed only while the veil is
+				// active (stale flag: update_fiducial_passthrough runs after
+				// record, so this is last frame's verdict) and no flat-union
+				// group exists to carry its floor (boundary-only /
+				// projected-only configs). Empty draws (clear-only record);
+				// the submit-time bias lifts the cleared image to a uniform
+				// floor. Reaps itself on release via the sweep below.
+				bool have_b_group = std::ranges::any_of(live_groups, [](const auto & k) { return not k.second; });
+				if (fp.boundary_veil and not have_b_group)
+				{
+					const float bf = fiducial_passthrough_state::kBoundaryFloorFeather;
+					live_groups.emplace_back(bf, false);
+					auto bkey = std::make_pair(bf, false);
+					auto & g = fp.mask_groups[bkey];
+					g.feather_px = bf;
+					g.projected = false;
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+				}
 				// Permanent record-order log: group costs are positional, so
 				// the per-group loop order below is load-bearing diagnostics.
 				// Logged on change only (config/map edits, anchor flapping).
@@ -1685,6 +1685,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// intermediates at full. Sizing shares record()'s tier map
 					// (tier_for_feather): the two must agree.
 					int tier = feather_mask_renderer::tier_for_feather(f);
+					// Veil floor carries a uniform image (clear-only
+					// record): submit quarter, the compositor's upscale
+					// of a uniform floor is exact. record() never reads
+					// the tier for empty draws, so no agreement issue.
+					if (f == fiducial_passthrough_state::kBoundaryFloorFeather)
+						tier = 2;
 					int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
 					int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
 					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
@@ -1698,7 +1704,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.images_outstanding = 0;
 						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
 					}
-					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+					// Floor group needs no blur intermediates (clear-only
+					// record touches swapchain targets only, built lazily
+					// in record()).
+					if (f != fiducial_passthrough_state::kBoundaryFloorFeather)
+						g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for
@@ -1788,18 +1798,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							append_draw(oid, ost, true);
 						}
 					}
-				// Reversed-only draws rasterize to a provable no-op
-				// (record() clear-onlies them), so a group with no
-				// positive draws is skipped exactly like an empty one
-				// (the debug cutout group excepted, as before).
-				bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-				bool is_floor = (f == fiducial_passthrough_state::kBoundaryFloorFeather);
-				// Veil floor + forced hold proceed with empty draws
-				// (clear-only record gives the submit bias a uniform
-				// image to lift); everything else skips as before.
-				bool hold = veil_hold and not proj and
-				        (is_floor or (have_first_b and f == first_b_key.first));
-				if ((draws.empty() or not any_positive) and not hold)
+					// Reversed-only draws rasterize to a provable no-op
+					// (record() clear-onlies them), so a group with no
+					// positive draws is skipped exactly like an empty one
+					// (the debug cutout group excepted, as before).
+					bool is_floor = (f == fiducial_passthrough_state::kBoundaryFloorFeather);
+					// Veil floor + forced hold proceed with empty draws
+					// (clear-only record gives the submit bias a uniform
+					// image to lift); everything else skips as before.
+					bool hold = veil_hold and not proj and
+					        (is_floor or (have_first_b and f == first_b_key.first));
+					if ((draws.empty() or not any_positive) and not hold)
 				{
 						// Debug cutout group carries no draws; its cutouts
 						// still punch (record() early-outs only when meshes
@@ -1820,7 +1829,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							continue;
 						}
 					}
-				if (not is_floor and not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+					if (not is_floor and not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
 				{
 					g.last_draws_log = instance.now();
 					spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px union {})", draws.size(), f, proj ? "A" : "B");
@@ -2162,7 +2171,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
 			if (veil_lift and not proj_union)
 			{
-				// Coverage·s + (1−s): window interiors stay ~1, empty
+				// Coverage*s + (1-s): window interiors stay ~1, empty
 				// areas lift to the uniform veil floor, feather bands
 				// interpolate. RGB untouched (ignored downstream anyway).
 				if (first_group)

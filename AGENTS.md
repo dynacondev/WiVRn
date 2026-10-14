@@ -119,6 +119,26 @@ inert unless set; full flow in `docs/profiling.md`.
   strength-adaptive blend + soft deadzone + slew cap; multi and single-tag
   alike; `board smooth:` line carries innovation/alpha/strength/shaping).
   Displayed poses are smoothed; raw solves feed logs + the raw gizmo.
+- Boundary zones (`3d-boundary`/`3d-boundary-reversed`, `client/xr/boundary.*`):
+  closed-volume meshes place like windows (fused pose + soup) but never
+  join mask groups or projected instances. Per-frame scene opacity from
+  the headset distance (single scalar, both eyes): local-space
+  point-triangle + skewed-ray parity with hit-distance dedup (quad
+  diagonals count once), symmetric `smoothstep(-t,+t,s)` (`transition-
+  distance`, default 0.3m), union combine (inside ANY normal AND outside
+  ALL reversed; unplaced ignored, fail-open to game). Veil composites by
+  lifting the flat union's floor (`colorScaleBias` scale+lift on the
+  first submitted B mask, scale-only on the rest; identity at
+  full-inside so steady state is bit-identical): no new layers when B
+  groups exist; veil-floor group (`kBoundaryFloorFeather`, clear-only,
+  quarter submit, no intermediates) covers boundary-only configs;
+  forced hold covers all-culled B unions; hard-switch fallbacks without
+  colorScaleBias / without the mask path. Meta boundary visibility is
+  server-pushed (`suppress-meta-boundary`, default suppress, no
+  headset toggle). Log lines: `boundary veil:` (transitions),
+  `boundary fade:` (5s heartbeat: global s, head pos), `boundary zone:`
+  (per-zone in/out, signed mm, op), `board config:` carries zone type +
+  transition. Tri budget ~5k (linear per-frame CPU).
 - Debug overlays (`client/render/debug_lines.*`): all gizmos share ONE
   transparent projection layer (never per-quad layers — those blow
   `maxLayerCount`). Geometry is thin triangles (line topology never

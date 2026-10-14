@@ -440,8 +440,9 @@ private:
 		// Reserved feather key for the boundary-veil floor group: claimed
 		// only while the veil is active and no flat-union group exists to
 		// carry its floor (boundary-only / projected-only configs).
-		// Empty draws (clear-only record), tier 0 like the cutout group;
-		// the submit-time bias lifts the cleared image to a uniform floor.
+		// Empty draws (clear-only record, no blur intermediates); submits
+		// quarter (uniform floor upscales exactly) and the submit-time
+		// bias lifts the cleared image to the veil floor.
 		static constexpr float kBoundaryFloorFeather = -2.0f;
 
 		// Global boundary-veil state (3d-boundary(-reversed) zones):
@@ -452,10 +453,9 @@ private:
 		// zone: the submit lifts the flat union's floor by (1 - s).
 		// Render thread only; refreshed in update_fiducial_passthrough,
 		// consumed one frame stale by record/submit like the placements.
-	float boundary_s = 1;
-	bool boundary_veil = false;
-	bool boundary_any = false; // any boundary object placed
-	XrTime last_boundary_log = 0; // heartbeat throttle for the fade line
+		float boundary_s = 1;
+		bool boundary_veil = false;
+		XrTime last_boundary_log = 0; // heartbeat throttle for the fade line
 
 		// Mask stacks grouped by (feather-px, union): union A holds the
 		// surface-projected objects (drives the projected layer), union

@@ -416,10 +416,10 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 		if (not have_head)
 			continue;
 		float t = std::max(0.f, ost.def.transition_distance_m);
-		xr::boundary_query q = xr::boundary_signed_distance(
-		        ost.soup.vertices, ost.soup.indices,
-		        ost.fused.world_pose, ost.fused.world_scale.x,
-		        head_pos.x, head_pos.y, head_pos.z);
+		const auto & bsoup = ost.soup;
+		const auto & bpose = ost.fused.world_pose;
+		float bscale = ost.fused.world_scale.x;
+		xr::boundary_query q = xr::boundary_signed_distance(bsoup.vertices, bsoup.indices, bpose, bscale, head_pos.x, head_pos.y, head_pos.z);
 		if (not q.valid)
 			continue;
 		float op = xr::boundary_smoothstep(q.signed_m, t);
@@ -434,7 +434,6 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 	}
 	// No live zone: fail open to game video.
 	float s = any_valid ? mix.result() : 1;
-	fp.boundary_any = any_placed;
 	fp.boundary_s = s;
 	bool veil = any_valid and s < 0.999f;
 	// Transition edges always log (a swimming cutout is the felt

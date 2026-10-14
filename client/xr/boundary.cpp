@@ -117,7 +117,7 @@ float sqdist_point_triangle(const vec3 & p, const vec3 & a, const vec3 & b, cons
 	return dot(q, q); // face interior
 }
 
-// Möller–Trumbore, no culling (parity needs both faces). Parallel and
+// Moller-Trumbore, no culling (parity needs both faces). Parallel and
 // degenerate triangles miss. Shared edges/vertices produce identical hit
 // distances, merged by the caller, so quad diagonals count once.
 bool ray_hit_triangle(const vec3 & o, const vec3 & d, const vec3 & a, const vec3 & b, const vec3 & c, float * t_out)
