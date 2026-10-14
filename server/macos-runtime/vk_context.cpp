@@ -4,8 +4,10 @@
 #include "vk_context.h"
 
 #include "runtime.h"
+#include "snapshot.h" // release-note purge on teardown (A3)
 
 #include <chrono>
+#include <mutex>
 
 namespace wivrn_macos
 {
@@ -103,6 +105,18 @@ XrResult create_swapchain_images(Swapchain & swap)
 	VkFormat format = static_cast<VkFormat>(swap.format);
 	bool depth = (swap.usage & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
 
+	// Array swapchains carry per-eye layers (imageArrayIndex), but the
+	// EndFrame-to-worker staging forwards no layer/rect: the snapshot
+	// copies layer 0. Loud once so a stereo-on-one-swapchain app shows
+	// up immediately instead of duplicating one eye.
+	if (swap.arraySize > 1)
+	{
+		static std::once_flag arrayWarned;
+		std::call_once(arrayWarned, [] {
+			log("swapchain: arraySize 2 staged without per-eye layer plumbing: snapshot copies layer 0 for both eyes");
+		});
+	}
+
 	VkImageUsageFlags imageUsage;
 	if (depth)
 		imageUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -194,6 +208,8 @@ void destroy_swapchain_images(Swapchain & swap)
 {
 	if (swap.device != VK_NULL_HANDLE)
 		vkDeviceWaitIdle(swap.device);
+	for (VkImage image: swap.images)
+		drop_snapshot_release(image); // worker notes die with the images
 	for (VkFence fence: swap.fences)
 		vkDestroyFence(swap.device, fence, nullptr);
 	for (size_t i = 0; i < swap.images.size(); ++i)
