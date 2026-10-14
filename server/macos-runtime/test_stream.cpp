@@ -1062,7 +1062,11 @@ int run_tear()
 				if (claimed >= (int32_t)e.images.size())
 					continue;
 				handle->data.active_idx.store(claimed, std::memory_order_release);
-				const uint8_t * px = e.snap.capture(e.images[(uint32_t)claimed]);
+				// Explicit fence (not the note registry): this binary's
+				// #included snapshot copy has its own registry, invisible
+				// to the dylib's release notes. Same GPU edge either way.
+				VkFence edge = handle->data.fences[(uint32_t)claimed];
+				const uint8_t * px = e.snap.capture(e.images[(uint32_t)claimed], edge, dev.device);
 				handle->data.active_idx.store(-1, std::memory_order_release);
 				if (px == nullptr)
 				{
@@ -1071,9 +1075,17 @@ int run_tear()
 				}
 				const uint8_t * corner = px + ((size_t)kTearBlock / 2 * kTearDim + kTearBlock / 2) * 4;
 				const uint8_t * bg = px + ((size_t)(kTearDim - 8) * kTearDim + (kTearDim - 8)) * 4;
-				// Warp-immune compare: same painted float must read back
-				// as the same bytes in both samples (BGRA order).
-				bool same = corner[0] == bg[0] && corner[1] == bg[1] && corner[2] == bg[2];
+				// Warp-immune compare with dither tolerance: the bg and
+				// corner clears run as separate passes, and MoltenVK's
+				// full-screen vs scissored clear paths round identically
+				// painted floats apart by <=1 LSB (observed: R-only).
+				// Generations step by 37 with 4-image cycling, so any
+				// genuine cross-generation mix differs by a multiple of
+				// 4 LSB (148j mod 256) — never hidden by the ±2 window.
+				auto close = [](uint8_t a, uint8_t b) {
+					return a >= b ? a - b <= 2 : b - a <= 2;
+				};
+				bool same = close(corner[0], bg[0]) && close(corner[1], bg[1]) && close(corner[2], bg[2]);
 				e.captured.fetch_add(1);
 				if (!same)
 				{
@@ -1103,8 +1115,13 @@ int run_tear()
 	XrSwapchainImageReleaseInfo releaseInfo{.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO, .next = nullptr};
 	for (uint64_t gen = 1; gen <= (uint64_t)kTearFrames; ++gen)
 	{
+		// Generation step 37 (coprime-ish stride): with 4-image cycling
+		// any cross-generation mix lands a multiple of 4 LSB apart (see
+		// the compare above), so real races can never hide inside the
+		// ±2 clear-path rounding window.
+		uint64_t g = 1 + (gen - 1) * 37;
 		if (gen % 50 == 1)
-			std::fprintf(stderr, "tear: producing gen %llu\n", (unsigned long long)gen);
+			std::fprintf(stderr, "tear: producing gen %llu\n", (unsigned long long)g);
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			TearEye & e = eyes[eye];
@@ -1136,10 +1153,10 @@ int run_tear()
 			}
 			vkResetCommandBuffer(e.bg_cmd[index], 0);
 			vkResetCommandBuffer(e.corner_cmd[index], 0);
-			if (!tear_record(dev.device, e.bg_cmd[index], pass, e.framebuffers[index], kTearDim, false, gen) ||
-			    !tear_record(dev.device, e.corner_cmd[index], pass, e.framebuffers[index], kTearDim, true, gen))
+			if (!tear_record(dev.device, e.bg_cmd[index], pass, e.framebuffers[index], kTearDim, false, g) ||
+			    !tear_record(dev.device, e.corner_cmd[index], pass, e.framebuffers[index], kTearDim, true, g))
 			{
-				TFAIL(fails, "eye %d record gen %llu", eye, (unsigned long long)gen);
+				TFAIL(fails, "eye %d record gen %llu", eye, (unsigned long long)g);
 				break;
 			}
 			VkSubmitInfo bgSubmit{
