@@ -31,6 +31,7 @@
 #include "scenes/input_profile.h"
 #include "xr/board_solver.h"
 #include "xr/board_filter.h"
+#include "xr/boundary.h"
 #include "stream_defoveator.h"
 #include "utils/thread_safe.h"
 #include "wifi_lock.h"
@@ -321,6 +322,13 @@ private:
 		size_t triangle_count = 0;
 		std::string status = "waiting for fiducial map";
 		fused_placement fused;
+		// Boundary-zone display state (3d-boundary(-reversed) only):
+		// last per-frame signed distance / opacity / verdict. Render
+		// thread only, refreshed with the fused placements above.
+		bool boundary_valid = false;
+		bool boundary_inside = false;
+		float boundary_signed_m = 0;
+		float boundary_opacity = 1;
 	};
 	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
 	// Live in-headset surface-projection overrides (Passthrough tab,
@@ -429,6 +437,25 @@ private:
 		// is tier 0 (full-res, crisp punch). Lets the marker window work
 		// with a fiducials-only config.
 		static constexpr float kDebugCutoutFeather = -1.0f;
+		// Reserved feather key for the boundary-veil floor group: claimed
+		// only while the veil is active and no flat-union group exists to
+		// carry its floor (boundary-only / projected-only configs).
+		// Empty draws (clear-only record), tier 0 like the cutout group;
+		// the submit-time bias lifts the cleared image to a uniform floor.
+		static constexpr float kBoundaryFloorFeather = -2.0f;
+
+		// Global boundary-veil state (3d-boundary(-reversed) zones):
+		// scene opacity from the headset distance to placed zone meshes
+		// (union: inside ANY normal AND outside ALL reversed; unplaced
+		// zones ignored, fail-open to game). boundary_s = 1 means no
+		// effect (no zones, or fully inside). veil = s < ~1 with a placed
+		// zone: the submit lifts the flat union's floor by (1 - s).
+		// Render thread only; refreshed in update_fiducial_passthrough,
+		// consumed one frame stale by record/submit like the placements.
+	float boundary_s = 1;
+	bool boundary_veil = false;
+	bool boundary_any = false; // any boundary object placed
+	XrTime last_boundary_log = 0; // heartbeat throttle for the fade line
 
 		// Mask stacks grouped by (feather-px, union): union A holds the
 		// surface-projected objects (drives the projected layer), union
@@ -503,6 +530,10 @@ private:
 	                             const xr::board_solution & sol, const board_fused & bp, double horizon_ms,
 	                             XrTime now, double dt, const xr::board_filter_diag & fdiag, bool have_head,
 	                             glm::vec3 head_pos);
+	// update_boundary_fade: per-frame scene opacity from placed boundary
+	// zones (head point in world space). Writes fp.boundary_* plus the
+	// per-object display state; render thread only.
+	void update_boundary_fade(glm::vec3 head_pos, bool have_head, XrTime now);
 
 	stream(std::string server_name, scene & parent_scene);
 

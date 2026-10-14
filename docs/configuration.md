@@ -194,6 +194,15 @@ reacquire jumps, so every window ramps together. Objects placing later
 appear instantly. Per-object `fade-in-ms` entries are warned + ignored
 (a single alpha channel admits exactly one clock).
 
+## `suppress-meta-boundary`
+Default value: `true`
+
+Suppress the Meta (OS) boundary while WiVRn passthrough is shown.
+Pushed to the headset on connect (there is no in-headset toggle for
+this). This is a request: the runtime may refuse, and the boundary is
+always shown in opaque VR regardless. The headset logs which verdict
+the server sent on every map receipt.
+
 ## `fiducials` and `passthrough`
 Default value: unset (feature disabled)
 
@@ -267,8 +276,19 @@ Each `passthrough` entry (behavior object) has:
   so a distant reversed object behind a nearer window never cuts it.
   Reversed objects need the mask path (they stay inactive on the binary
   projected fallback) and do not accept `feather-px` (warned + ignored).
+  `"3d-boundary"` shows game video only *inside* the model volume and
+  passthrough outside it — a Quest-guardian-style zone with adjustable
+  size, shape and fade. `"3d-boundary-reversed"` inverts it (passthrough
+  inside, game outside: exclusion zones around e.g. a desk). Zones
+  combine as a union: game video shows iff the headset is inside ANY
+  normal zone (or no normal zone is placed) AND outside ALL reversed
+  zones; unplaced zones are ignored (fail-open to game, so tracking loss
+  never flashes passthrough). Boundary meshes must be **closed volumes**
+  (inside/outside comes from ray parity, undefined for open meshes);
+  keep them simple (room-size boxes are ideal, ~5k triangles budget).
+  Both eyes fade together from a single per-frame headset distance.
   Unknown types are skipped with a warning (forward-compat for
-  `3d-boundary`, `3d-boundary-reversed`, `3d-depth`).
+  `3d-depth`).
 - `id`: stable identifier (required, must be unique); `tag`: display-only
   label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required; dangling
@@ -289,8 +309,9 @@ Each `passthrough` entry (behavior object) has:
 - `feather-px`: passthrough window feather width in screen pixels
   (alpha-gradient blend band around the mesh silhouette, default `24`;
   `0` disables feathering). Not accepted for `3d-passthrough-reversed`
-  (warned + ignored): negatives cut every layer and inherit each
-  layer's feathering. Mask stacks group by this value so each
+  or `3d-boundary(-reversed)` (warned + ignored): negatives cut every
+  layer and inherit each layer's feathering, while zones fade by
+  distance instead (see `transition-distance`). Mask stacks group by this value so each
   object feathers independently; applied live. The client selects a blur
    tier automatically (0 hard edge, 1 half-res, 2/4 quarter, 8 eighth
    with exact spread mapping, clamped to 128px), so tap density and cost
@@ -298,14 +319,21 @@ Each `passthrough` entry (behavior object) has:
    tier-0 stays full (exact hard edge), tier-1 submits half-resolution,
    tiered submits quarter-resolution (the V pass writes the submitted
    size; the compositor expands to full).
+- `transition-distance`: boundary fade width in meters
+  (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
+  scene cross-fades over ± this distance around the zone surface
+  (symmetric smoothstep, 0.5 at the surface); `0` is a hard step.
+  Composited by lifting the flat union's mask floor, so no extra layers
+  or swapchains: exiting saturates the existing flat feed to fullscreen.
 - `surface-projected`: project camera imagery onto this object's mesh
   (surface-projected passthrough) instead of the flat reconstruction
   feed (default `true`; opt out per object with `false`). Prefer
   well-aligned objects: mismatched geometry causes conflicting depth
   cues and wrong scale. Mapped interiors feather through the same mask
   as the flat feed, so edges keep flat quality with geometry-correct
-  parallax inside. Not applicable to `3d-passthrough-reversed`
-  (warned + ignored). Applied live; a per-object override in the
+  parallax inside. Not applicable to `3d-passthrough-reversed` or
+  `3d-boundary(-reversed)` (warned + ignored): zones never map camera
+  onto geometry. Applied live; a per-object override in the
   headset Passthrough tab (as configured / force on / force off) takes
   precedence for the session.
 
@@ -366,6 +394,14 @@ Passthrough tab (red) to help you copy it verbatim into the config.
 			"position": [0, 0.3, 0.2],
 			"orientation": [0, 0, 0],
 			"scale": 1.0
+		},
+		{
+			"type": "3d-boundary",
+			"id": "press-room",
+			"tag": "Play area around the press",
+			"fiducial": ["press"],
+			"model-path": "/usr/share/wivrn/meshes/room.glb",
+			"transition-distance": 0.3
 		}
 	]
 }

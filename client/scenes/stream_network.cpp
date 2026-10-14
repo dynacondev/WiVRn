@@ -195,6 +195,27 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 	}
 	*fiducial_map.lock() = std::move(map);
 
+	// Server-pushed Meta boundary default (top-level config, no
+	// in-headset toggle): applied live on every map receipt. Startup
+	// default comes from the untouched client setting until the first map
+	// arrives; the map is always sent, even empty.
+	{
+		bool suppress;
+		{
+			auto locked = fiducial_map.lock();
+			suppress = locked->suppress_meta_boundary;
+		}
+		static bool last_suppress = false;
+		static bool have_last = false;
+		if (not have_last or suppress != last_suppress)
+		{
+			have_last = true;
+			last_suppress = suppress;
+			session.set_passthrough_boundary_enabled(not suppress);
+			spdlog::info("Meta boundary in passthrough: {}", suppress ? "suppressed (server)" : "shown (server)");
+		}
+	}
+
 	// Request models missing from the local cache
 	std::error_code ec;
 	auto cache_dir = application::get_config_path() / "fiducial_models";

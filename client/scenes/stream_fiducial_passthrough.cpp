@@ -387,9 +387,77 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 
 bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
 {
+	// Boundary zones never map camera onto geometry: they drive the
+	// global scene fade through the flat union's floor instead.
+	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed")
+		return false;
 	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
 		return it->second;
 	return ost.def.surface_projected;
+}
+
+void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, XrTime now)
+{
+	auto & fp = fiducial_passthrough;
+	xr::boundary_mix mix;
+	bool any_placed = false;
+	bool any_valid = false;
+	for (auto & [oid, ost]: passthrough_objects)
+	{
+		(void)oid;
+		bool normal = ost.def.type == "3d-boundary";
+		bool reversed = ost.def.type == "3d-boundary-reversed";
+		if (not normal and not reversed)
+			continue;
+		ost.boundary_valid = false;
+		if (not ost.soup_ready or not ost.fused.placed)
+			continue;
+		any_placed = true;
+		if (not have_head)
+			continue;
+		float t = std::max(0.f, ost.def.transition_distance_m);
+		xr::boundary_query q = xr::boundary_signed_distance(
+		        ost.soup.vertices, ost.soup.indices,
+		        ost.fused.world_pose, ost.fused.world_scale.x,
+		        head_pos.x, head_pos.y, head_pos.z);
+		if (not q.valid)
+			continue;
+		float op = xr::boundary_smoothstep(q.signed_m, t);
+		if (reversed)
+			op = 1 - op;
+		ost.boundary_valid = true;
+		ost.boundary_inside = q.inside;
+		ost.boundary_signed_m = q.signed_m;
+		ost.boundary_opacity = op;
+		mix.add(op, reversed);
+		any_valid = true;
+	}
+	// No live zone: fail open to game video.
+	float s = any_valid ? mix.result() : 1;
+	fp.boundary_any = any_placed;
+	fp.boundary_s = s;
+	bool veil = any_valid and s < 0.999f;
+	// Transition edges always log (a swimming cutout is the felt
+	// defect); steady state gets a 5s heartbeat while zones are placed.
+	bool was_veil = fp.boundary_veil;
+	fp.boundary_veil = veil;
+	if (veil != was_veil)
+		spdlog::info("boundary veil: {} (s {:.3f})", veil ? "active" : "released", (double)s);
+	if (any_placed and (veil != was_veil or now - fp.last_boundary_log > 5'000'000'000LL))
+	{
+		fp.last_boundary_log = now;
+		spdlog::info("boundary fade: s {:.3f} veil {} head ({:.2f},{:.2f},{:.2f})", (double)s, veil,
+		             (double)head_pos.x, (double)head_pos.y, (double)head_pos.z);
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			(void)oid;
+			if (not ost.boundary_valid)
+				continue;
+			spdlog::info("boundary zone: \"{}\" {} {:+.0f}mm op {:.3f}", ost.def.id,
+			             ost.boundary_inside ? "in" : "out",
+			             (double)(ost.boundary_signed_m * 1000.f), (double)ost.boundary_opacity);
+		}
+	}
 }
 
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
@@ -687,22 +755,27 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				spdlog::info("board config: fid \"{}\" {} markers{}",
 				             f.id, f.is_static ? "static" : "moving", cfg);
 			}
-			for (const auto & o: map.objects)
+		for (const auto & o: map.objects)
+		{
+			std::string fids;
+			for (const auto & fid: o.fiducial)
 			{
-				std::string fids;
-				for (const auto & fid: o.fiducial)
-				{
-					fids += fid;
-					fids += ',';
-				}
+				fids += fid;
+				fids += ',';
+			}
+			if (o.type == "3d-boundary" or o.type == "3d-boundary-reversed")
+				spdlog::info("board config: object \"{}\" type \"{}\" transition {:.2f}m fids -> {}", o.id, o.type,
+				             (double)o.transition_distance_m, fids);
+			else
 				spdlog::info("board config: object \"{}\" type \"{}\"{} fids -> {}", o.id, o.type,
 				             o.surface_projected ? " projected" : "", fids);
-			}
-			for (const auto & o: map.objects)
-			{
-				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed")
-					spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", o.id, o.type);
-			}
+		}
+		for (const auto & o: map.objects)
+		{
+			if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and
+			    o.type != "3d-boundary" and o.type != "3d-boundary-reversed")
+				spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", o.id, o.type);
+		}
 			if (fp.ready)
 			{
 				spdlog::info("Fiducial map changed, clearing projected mesh");
@@ -860,12 +933,17 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	{
 		// Reversed objects place exactly like normal ones (fused board
 		// pose, mesh, fade); only the mask raster treats them as cuts.
-		// The binary projected fallback has no hole vocabulary, so the
+		// Boundary zones place identically too (fused pose + mesh for
+		// the distance query); only the veil submit uses them. The
+		// binary projected fallback has no hole vocabulary, so the
 		// render shim below stays normal-only.
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed")
+		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary)
 			continue;
 		auto & ost = passthrough_objects[def.id];
 		ost.def = def;
+		if (is_boundary and def.model_hash.empty())
+			ost.status = "no model configured (boundary needs model-path)";
 		// Model geometry upload (shared across this object's instances).
 		if (not def.model_hash.empty())
 		{
@@ -949,6 +1027,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			break;
 		}
 	}
+
+	// ---- boundary veil: global scene opacity from placed zones ----
+	// Runs on the smoothed placements above (same frame as the mask
+	// record's one-frame-stale inputs: record consumes last frame's
+	// fp.boundary_* while submit uses these fresh values; the lag is
+	// one frame, same class as the window staleness).
+	update_boundary_fade(head_pos, have_head, now);
 
 	// ---- surface-projected instances: one geometry instance per placed,
 	// flagged object on the shared projected layer (mask path only; the
@@ -1051,6 +1136,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	// Strict gating: tracking above runs unconditionally (status UI and
 	// debug overlays), but nothing mesh-related submits until an object
 	// is placed on a fused board pose.
+	// Boundary veil without the mask path has no alpha control to ramp
+	// through: hard switch, fullscreen flat camera when outside
+	// (s < 0.5), game video when inside. Submitted before the gate so
+	// boundary-only configs (never calibrated) still veil. Mask-path
+	// runtimes veil through the B-union floor in render() instead.
+	if (not composition_layer_alpha_blend_supported and fp.boundary_veil and fp.boundary_s < 0.5f)
+		add_passthrough_layer();
 	if (not fp.calibrated)
 		return;
 
@@ -1133,6 +1225,7 @@ void scenes::stream::gui_passthrough()
 	{
 		xr::board_solver_selftest();
 		xr::board_filter_selftest();
+		xr::boundary_selftest();
 	}
 	if (not fp.held_codes.empty())
 	{
@@ -1224,13 +1317,15 @@ void scenes::stream::gui_fiducial_status()
 	{
 		(void)oid;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
-		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed")
+		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
+		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
 			continue;
 		}
 		bool reversed = ost.def.type == "3d-passthrough-reversed";
+		bool boundary = ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed";
 		if (not ost.soup_ready)
 		{
 			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
@@ -1242,6 +1337,19 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
+		if (boundary)
+		{
+			if (ost.boundary_valid)
+				ImGui::Text("%s %.40s%s: %s %s %+.0fmm op %.2f (stale %.1fs)",
+				            _S("Object"), label.c_str(),
+				            ost.def.type == "3d-boundary-reversed" ? _S(" (reversed)") : "",
+				            _S("zone"), ost.boundary_inside ? _S("in") : _S("out"),
+				            (double)(ost.boundary_signed_m * 1000.f), (double)ost.boundary_opacity, stale_s);
+			else
+				ImGui::Text("%s %.40s: %s (stale %.1fs)",
+				            _S("Object"), label.c_str(), _S("zone, no solution"), stale_s);
+			continue;
+		}
 		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
 		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
 		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);

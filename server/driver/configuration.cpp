@@ -549,6 +549,11 @@ configuration::configuration()
 				}
 				if (item.contains("model-path"))
 					o.model_path = item["model-path"];
+				if (o.model_path.empty() and (o.type == "3d-boundary" or o.type == "3d-boundary-reversed"))
+				{
+					U_LOG_W("passthrough object \"%s\": %s needs model-path (a zone without geometry), skipping", o.id.c_str(), o.type.c_str());
+					continue;
+				}
 				if (item.contains("position"))
 					o.position = item["position"];
 				if (item.contains("orientation"))

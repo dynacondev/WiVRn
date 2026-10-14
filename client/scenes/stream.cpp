@@ -1547,10 +1547,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready)
 						continue;
-					for (auto & key: live_groups)
-					{
-						if (key.first == fiducial_passthrough_state::kDebugCutoutFeather)
-							continue;
+			for (auto & key: live_groups)
+			{
+				if (key.first == fiducial_passthrough_state::kDebugCutoutFeather or
+				    key.first == fiducial_passthrough_state::kBoundaryFloorFeather)
+					continue;
 						auto git = fp.mask_groups.find(key);
 						if (git == fp.mask_groups.end() or not git->second.renderer)
 							continue;
@@ -1563,26 +1564,45 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				}
-				// Debug-only cutout group (no objects): lets the marker
-				// window punch with a fiducials-only config. Reserved key
-				// in union B (cutouts punch flat only: no geometry to map
-				// onto); flows through eager setup, record (empty draws,
-				// cutouts punch), submit and stale drop like any group.
-				// Claimed whenever fresh codes exist but no B group does
-				// (fiducials-only, or projected-only objects): real B
-				// groups punch cutouts themselves, so no extra group then.
-				// Reaps itself on loss via the stale-group sweep below.
-				if (live_b.empty() and not cutouts.empty())
-				{
-					const float df = fiducial_passthrough_state::kDebugCutoutFeather;
-					live_groups.emplace_back(df, false);
-					auto key = std::make_pair(df, false);
-					auto & g = fp.mask_groups[key];
-					g.feather_px = df;
-					g.projected = false;
-					if (not g.renderer)
-						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
-				}
+			// Debug-only cutout group (no objects): lets the marker
+			// window punch with a fiducials-only config. Reserved key
+			// in union B (cutouts punch flat only: no geometry to map
+			// onto); flows through eager setup, record (empty draws,
+			// cutouts punch), submit and stale drop like any group.
+			// Claimed whenever fresh codes exist but no B group does
+			// (fiducials-only, or projected-only objects): real B
+			// groups punch cutouts themselves, so no extra group then.
+			// Reaps itself on loss via the stale-group sweep below.
+			if (live_b.empty() and not cutouts.empty())
+			{
+				const float df = fiducial_passthrough_state::kDebugCutoutFeather;
+				live_groups.emplace_back(df, false);
+				auto key = std::make_pair(df, false);
+				auto & g = fp.mask_groups[key];
+				g.feather_px = df;
+				g.projected = false;
+				if (not g.renderer)
+					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+			}
+			// Boundary-veil floor group: claimed only while the veil is
+			// active (stale flag: update_fiducial_passthrough runs after
+			// record, so this is last frame's verdict) and no flat-union
+			// group exists to carry its floor (boundary-only /
+			// projected-only configs). Empty draws (clear-only record);
+			// the submit-time bias lifts the cleared image to a uniform
+			// floor. Reaps itself on release via the sweep below.
+			bool have_b_group = std::ranges::any_of(live_groups, [](const auto & k) { return not k.second; });
+			if (fp.boundary_veil and not have_b_group)
+			{
+				const float bf = fiducial_passthrough_state::kBoundaryFloorFeather;
+				live_groups.emplace_back(bf, false);
+				auto bkey = std::make_pair(bf, false);
+				auto & g = fp.mask_groups[bkey];
+				g.feather_px = bf;
+				g.projected = false;
+				if (not g.renderer)
+					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain_format);
+			}
 				// Permanent record-order log: group costs are positional, so
 				// the per-group loop order below is load-bearing diagnostics.
 				// Logged on change only (config/map edits, anchor flapping).
@@ -1629,11 +1649,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					++git;
 				}
-				// Record per group: draws from anchored instances of member
-				// objects (union-scoped), full opacity (TODO(fade-reintro)).
-				// Cutouts punch union B only (flat): no geometry exists to
-				// map them onto, so A must never see them.
-				static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+			// Record per group: draws from anchored instances of member
+			// objects (union-scoped), full opacity (TODO(fade-reintro)).
+			// Cutouts punch union B only (flat): no geometry exists to
+			// map them onto, so A must never see them.
+			static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+			// First B key in record order: the veil's forced hold when
+			// every B group culls out of view. Stale veil flag (update
+			// runs after record); the floor group (claimed above when no
+			// B group exists) is always first when present.
+			std::pair<float, bool> first_b_key{0, false};
+			bool have_first_b = false;
+			for (auto & k: live_groups)
+			{
+				if (not k.second)
+				{
+					first_b_key = k;
+					have_first_b = true;
+					break;
+				}
+			}
+			bool veil_hold = fp.boundary_veil;
 				for (auto [f, proj]: live_groups)
 				{
 					auto & g = fp.mask_groups[{f, proj}];
@@ -1752,13 +1788,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							append_draw(oid, ost, true);
 						}
 					}
-					// Reversed-only draws rasterize to a provable no-op
-					// (record() clear-onlies them), so a group with no
-					// positive draws is skipped exactly like an empty one
-					// (the debug cutout group excepted, as before).
-					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					if (draws.empty() or not any_positive)
-					{
+				// Reversed-only draws rasterize to a provable no-op
+				// (record() clear-onlies them), so a group with no
+				// positive draws is skipped exactly like an empty one
+				// (the debug cutout group excepted, as before).
+				bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
+				bool is_floor = (f == fiducial_passthrough_state::kBoundaryFloorFeather);
+				// Veil floor + forced hold proceed with empty draws
+				// (clear-only record gives the submit bias a uniform
+				// image to lift); everything else skips as before.
+				bool hold = veil_hold and not proj and
+				        (is_floor or (have_first_b and f == first_b_key.first));
+				if ((draws.empty() or not any_positive) and not hold)
+				{
 						// Debug cutout group carries no draws; its cutouts
 						// still punch (record() early-outs only when meshes
 						// AND cutouts are both absent).
@@ -1778,11 +1820,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							continue;
 						}
 					}
-					if (not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
-					{
-						g.last_draws_log = instance.now();
-						spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px union {})", draws.size(), f, proj ? "A" : "B");
-					}
+				if (not is_floor and not g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+				{
+					g.last_draws_log = instance.now();
+					spdlog::info("Fiducial mask draws resumed with {} draws (feather {}px union {})", draws.size(), f, proj ? "A" : "B");
+				}
 					g.had_draws = true;
 					int mask_index = g.swapchain.acquire();
 					// Paired from acquisition: the group joins the release
@@ -2040,8 +2082,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			else
 				++b_active;
 		}
+		// Boundary veil (fresh values: update_fiducial_passthrough ran
+		// just above): lift the flat union's floor by (1 - s) through
+		// colorScaleBias on the B masks (first submitted B mask gets
+		// scale+lift, the rest scale-only: ADD would multi-add the lift).
+		// Skipped at full-inside so steady state stays bit-identical.
+		// Without colorScaleBias the veil degrades to a hard switch at
+		// s = 0.5 (opaque fullscreen flat when outside, no masks needed).
+		float veil_s = std::clamp(fp.boundary_s, 0.f, 1.f);
+		bool veil_lift = fp.boundary_veil and veil_s < 0.999f and composition_layer_color_scale_bias_supported;
+		bool veil_hard_out = fp.boundary_veil and not composition_layer_color_scale_bias_supported and veil_s < 0.5f;
 		bool submit_projected = have_projected && a_active > 0;
-		bool submit_flat = need_flat && b_active > 0;
+		bool submit_flat = (need_flat || (fp.boundary_veil && composition_layer_color_scale_bias_supported) || veil_hard_out) &&
+		        (b_active > 0 || veil_hard_out);
 		// Forensic submit decisions (change-triggered): which camera layer
 		// submits and why. Permanent: coexistence bugs read as wrong output
 		// with no error, so the decision itself must be in the log.
@@ -2076,6 +2129,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					continue;
 				if (not g.active)
 					continue;
+				// Opaque hard-outside flat needs no masks at all.
+				if (veil_hard_out and not proj_union)
+					continue;
 			std::array<XrCompositionLayerProjectionView, view_count> mask_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
@@ -2104,6 +2160,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			else
 				set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB,
 				                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+			if (veil_lift and not proj_union)
+			{
+				// Coverage·s + (1−s): window interiors stay ~1, empty
+				// areas lift to the uniform veil floor, feather bands
+				// interpolate. RGB untouched (ignored downstream anyway).
+				if (first_group)
+					set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
+				else
+					set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
+			}
 			first_group = false;
 			}
 			// Each union's camera layer consumes its own alpha: A feeds
@@ -2127,8 +2193,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (submit_flat)
 				{
 					add_passthrough_layer();
-					set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
-					                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					// Hard-outside veil is opaque fullscreen: no blend.
+					if (not veil_hard_out)
+						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+						                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 				}
 			}
 		}
