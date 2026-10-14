@@ -117,6 +117,18 @@ private:
 		std::atomic<uint64_t> sent_index{0};
 		std::atomic<uint64_t> reliable_sent{0};
 		std::atomic<bool> force_idr{true};
+		// Drop accounting (app stages, worker consumes/drops; atomics so
+		// both sides bump without the eye lock).
+		std::atomic<uint64_t> drop_overwrite{0}; // staged over an unconsumed job
+		std::atomic<uint64_t> drop_feeding{0};   // skipped: worker busy or eye lock held
+		std::atomic<uint64_t> drop_encode{0};    // worker-side drops (dead/bad/snapshot/empty)
+		// IDR-force cooldown (owned-index proxy for the NACK's frame: the
+		// net callback carries no index, so the worker records the last
+		// IDR it actually sent; a force already pending, in flight, or
+		// unsuperseded covers a new NACK). Net RX thread reads, worker
+		// writes.
+		std::atomic<uint64_t> idr_sent_idx{UINT64_MAX};
+		std::atomic<bool> idr_inflight{false};
 		// Latest-only mailbox (app -> worker). pending is lock-free so
 		// end_frame can drop without blocking; payload under mutex.
 		std::atomic<bool> pending{false};
@@ -148,6 +160,13 @@ private:
 	std::condition_variable_any worker_cv_;
 	void worker_loop(std::stop_token stop);
 	void encode_eye(uint32_t eye_index);
+	// Fair order: alternate the starting eye per worker wake (worker
+	// thread only). Pair-gate + cooldown counters (atomics: worker bumps,
+	// heartbeat reads; appended to the log line as key=value only).
+	bool worker_flip_ = false;
+	std::atomic<uint64_t> gated_pairs_{0};
+	std::atomic<uint64_t> solo_pairs_{0};
+	std::atomic<uint64_t> idr_cooldown_skips_{0};
 
 	bool lastConnected_ = false;
 	uint64_t cookie_ = 0;

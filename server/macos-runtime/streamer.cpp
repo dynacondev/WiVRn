@@ -12,11 +12,42 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <random>
 #include <thread>
 
 namespace wivrn_macos
 {
+
+namespace
+{
+// WIVRN_MACOS_BITRATE_SPLIT=0 disables the per-eye halving (default: the
+// effective bitrate is divided across both eyes so the wire total fits the
+// client's setting instead of doubling it).
+bool bitrate_split_enabled()
+{
+	const char * e = std::getenv("WIVRN_MACOS_BITRATE_SPLIT");
+	return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+}
+
+uint32_t per_eye_bitrate(uint32_t total_bps)
+{
+	if (bitrate_split_enabled())
+		return total_bps / 2;
+	return total_bps;
+}
+
+// WIVRN_MACOS_PAIR_GATE_US: stereo-pair gate bound in microseconds
+// (default 1500; 0 disables the wait).
+uint64_t pair_gate_us()
+{
+	const char * e = std::getenv("WIVRN_MACOS_PAIR_GATE_US");
+	if (e == nullptr)
+		return 1500;
+	long v = std::strtol(e, nullptr, 10);
+	return v <= 0 ? 0 : (uint64_t)v;
+}
+} // namespace
 
 Streamer & Streamer::singleton()
 {
@@ -51,7 +82,26 @@ void Streamer::ensure_started(const StreamerConfig & config)
 	HeadsetLink::Events events;
 	events.connected = [this](const wivrn::from_headset::headset_info_packet & info) { on_connected(info); };
 	events.disconnected = [this] { on_disconnected(); };
-	events.need_idr = [this] { eyes_[0].force_idr = eyes_[1].force_idr = true; };
+	events.need_idr = [this] {
+		// IDR-force cooldown: keep the both-eyes co-force (the client
+		// needs L/R together), but skip when an IDR is already pending,
+		// in flight, or unsuperseded on BOTH eyes — a stale/duplicate
+		// NACK must not re-force. The net callback carries no frame
+		// index, so coverage uses indices the worker owns: force_idr
+		// (pending), idr_inflight (consumed, not yet sent), and
+		// idr_sent_idx == sent_index (last sent frame is already that
+		// IDR — nothing newer exists for the NACK to have seen).
+		bool covered0 = eyes_[0].force_idr.load() || eyes_[0].idr_inflight.load() ||
+		                eyes_[0].idr_sent_idx.load() == eyes_[0].sent_index.load();
+		bool covered1 = eyes_[1].force_idr.load() || eyes_[1].idr_inflight.load() ||
+		                eyes_[1].idr_sent_idx.load() == eyes_[1].sent_index.load();
+		if (covered0 && covered1)
+		{
+			++idr_cooldown_skips_;
+			return;
+		}
+		eyes_[0].force_idr = eyes_[1].force_idr = true;
+	};
 	events.settings_changed = [this](uint32_t bitrate_bps, uint32_t fps) {
 		std::lock_guard lock(mutex_);
 		// Applied by the worker before its next feed (the encoder is
@@ -351,9 +401,15 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 			// for take (never across snapshot/feed), so try_lock.
 			std::unique_lock eye_lock(eye.mutex, std::try_to_lock);
 			if (!eye_lock.owns_lock())
+			{
+				++eye.drop_feeding; // worker mid-take; same cause as below
 				continue;
+			}
 			if (eye.feeding.load())
+			{
+				++eye.drop_feeding;
 				continue; // worker mid-feed; its job is newer than ours anyway
+			}
 			if (eye.session != session)
 				eye.dead = false; // new session on this eye: revive (worker drops while dead)
 				                  // Stage the released image for the worker (latest-only: an
@@ -362,6 +418,8 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 				                  // skips staged/active images so the app can never reclaim one
 				                  // mid-copy. No pixel work happens on this thread anymore.
 			swap->lastReleased = -1;  // consume-once
+			if (eye.pending.load())
+				++eye.drop_overwrite; // latest-only: the unconsumed stage dies here
 			swap->staged_idx.store(released, std::memory_order_release);
 			eye.session = session;
 			eye.job_swap = swap;
@@ -372,14 +430,14 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 			// R/B lane swap for the NV12 conversion.
 			eye.job_swap_rb = swap->format == (int64_t)VK_FORMAT_R8G8B8A8_SRGB;
 			eye.job_force_idr = eye.force_idr.exchange(false);
-			eye.job_bitrate = config_.bitrate_bps;
+			eye.job_bitrate = per_eye_bitrate(config_.bitrate_bps);
 			eye.job_fps = 90;
 			{
 				auto info = link_.info();
 				if (info.has_value())
 				{
 					if (info->settings.bitrate_bps > 0)
-						eye.job_bitrate = info->settings.bitrate_bps;
+						eye.job_bitrate = per_eye_bitrate(info->settings.bitrate_bps);
 					if (info->settings.preferred_refresh_rate >= 60.0f)
 						eye.job_fps = (uint32_t)info->settings.preferred_refresh_rate;
 				}
@@ -422,8 +480,37 @@ void Streamer::worker_loop(std::stop_token stop)
 			return;
 		try
 		{
-			encode_eye(0);
-			encode_eye(1);
+			// Stereo-pair gate: exactly one eye pending usually means the
+			// sibling stage is microseconds behind (the app stages both
+			// eyes from the same EndFrame). Wait a bounded 1-2 ms so
+			// pairs encode together instead of skewing; a truly dead
+			// sibling costs the healthy eye at most the bound.
+			bool p0 = eyes_[0].pending.load();
+			bool p1 = eyes_[1].pending.load();
+			if (p0 != p1)
+			{
+				uint64_t gate = pair_gate_us();
+				if (gate > 0)
+					std::this_thread::sleep_for(std::chrono::microseconds(gate));
+				if (eyes_[0].pending.load() && eyes_[1].pending.load())
+					++gated_pairs_;
+				else
+					++solo_pairs_;
+			}
+			// Fair order: alternate the starting eye per wake so neither
+			// eye starves when the worker runs behind (strict eye0-first
+			// showed systematic eye0 priority on-headset).
+			worker_flip_ = !worker_flip_;
+			if (worker_flip_)
+			{
+				encode_eye(1);
+				encode_eye(0);
+			}
+			else
+			{
+				encode_eye(0);
+				encode_eye(1);
+			}
 		}
 		catch (const std::exception & e)
 		{
@@ -464,15 +551,20 @@ void Streamer::encode_eye(uint32_t eye_index)
 	force_idr = eye.force_idr.exchange(false) || force_idr;
 	eye.pending = false;
 	eye.feeding = true;
+	eye.idr_inflight = force_idr;
 	if (swap == nullptr || width == 0 || height == 0)
 	{
 		eye.feeding = false;
+		eye.idr_inflight = false;
+		++eye.drop_encode;
 		return;
 	}
 	int32_t claimed = swap->staged_idx.exchange(-1, std::memory_order_acq_rel);
 	if (claimed < 0 || (uint32_t)claimed >= swap->images.size())
 	{
 		eye.feeding = false;
+		eye.idr_inflight = false;
+		++eye.drop_encode;
 		return;
 	}
 	uint32_t image_idx = (uint32_t)claimed;
@@ -501,6 +593,8 @@ void Streamer::encode_eye(uint32_t eye_index)
 			log("streamer: eye %u snapshot init failed", eye_index);
 			swap->active_idx.store(-1, std::memory_order_release);
 			eye.feeding = false;
+			eye.idr_inflight = false;
+			++eye.drop_encode;
 			return;
 		}
 		eye.width = width;
@@ -530,13 +624,15 @@ void Streamer::encode_eye(uint32_t eye_index)
 	{
 		log("streamer: eye %u snapshot failed", eye_index);
 		eye.feeding = false;
+		eye.idr_inflight = false;
+		++eye.drop_encode;
 		return;
 	}
 	{
 		std::lock_guard lock(mutex_);
 		if (pending_bitrate_ > 0 && pending_fps_ > 0)
 		{
-			bitrate = pending_bitrate_;
+			bitrate = per_eye_bitrate(pending_bitrate_);
 			fps = pending_fps_;
 		}
 	}
@@ -555,6 +651,8 @@ void Streamer::encode_eye(uint32_t eye_index)
 			{
 				log("streamer: eye %u encoder open failed", eye_index);
 				eye.feeding = false;
+				eye.idr_inflight = false;
+				++eye.drop_encode;
 				return;
 			}
 			eye.enc_width = width;
@@ -572,10 +670,18 @@ void Streamer::encode_eye(uint32_t eye_index)
 		// Drop instead of sending into a dead session (destroyed mid-feed).
 		std::lock_guard dead_check(eye.mutex);
 		if (eye.dead)
+		{
+			eye.idr_inflight = false;
+			++eye.drop_encode;
 			return;
+		}
 	}
 	if (nals.empty())
+	{
+		eye.idr_inflight = false;
+		++eye.drop_encode;
 		return;
+	}
 
 	OutgoingFrame out;
 	out.stream_idx = (uint8_t)eye_index;
@@ -629,10 +735,13 @@ void Streamer::encode_eye(uint32_t eye_index)
 	eye.sent_index = out.frame_idx;
 	if (out.reliable)
 		++eye.reliable_sent;
+	if (out.reliable)
+		eye.idr_sent_idx = out.frame_idx; // any IDR (forced, settings, init) covers new NACKs
+	eye.idr_inflight = false;
 	link_.send_frame(std::move(out));
 
 	if (++eye.encoded_count % 60 == 0)
-		log("streamer: eye %u encoded=%llu idx=%llu rel=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms",
+		log("streamer: eye %u encoded=%llu idx=%llu rel=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms ow=%llu sk=%llu ed=%llu gated=%llu solo=%llu idrcd=%llu",
 		    eye_index,
 		    (unsigned long long)eye.encoded_count,
 		    (unsigned long long)eye.sent_index.load(),
@@ -640,7 +749,13 @@ void Streamer::encode_eye(uint32_t eye_index)
 		    (unsigned long long)link_.sent_frames(),
 		    (unsigned long long)link_.dropped_frames(),
 		    snap_ns / 1e6,
-		    (encode_end - encode_begin) / 1e6);
+		    (encode_end - encode_begin) / 1e6,
+		    (unsigned long long)eye.drop_overwrite.load(),
+		    (unsigned long long)eye.drop_feeding.load(),
+		    (unsigned long long)eye.drop_encode.load(),
+		    (unsigned long long)gated_pairs_.load(),
+		    (unsigned long long)solo_pairs_.load(),
+		    (unsigned long long)idr_cooldown_skips_.load());
 
 	// Periodic clock sync (every ~120 encoded frames per eye stream).
 	static thread_local uint64_t timesync_counter = 0;
