@@ -122,6 +122,7 @@ private:
 		std::atomic<uint64_t> drop_overwrite{0}; // staged over an unconsumed job
 		std::atomic<uint64_t> drop_feeding{0};   // skipped: worker busy or eye lock held
 		std::atomic<uint64_t> drop_encode{0};    // worker-side drops (dead/bad/snapshot/empty)
+		std::atomic<uint64_t> drop_acquire{0};   // app had nothing to stage (acquire failed / no release)
 		// IDR-force cooldown (owned-index proxy for the NACK's frame: the
 		// net callback carries no index, so the worker records the last
 		// IDR it actually sent; a force already pending, in flight, or
@@ -164,6 +165,12 @@ private:
 	// thread only). Pair-gate + cooldown counters (atomics: worker bumps,
 	// heartbeat reads; appended to the log line as key=value only).
 	bool worker_flip_ = false;
+	// Takes served per eye (worker thread only). Take order is takes-
+	// balance first (fewer takes goes first), then skip-deficit, then
+	// the flip: under overload the pool pressure can strand one eye's
+	// acquires (silent staging skips), and pure alternation then locks
+	// onto serving the other eye. Balancing takes breaks the lock.
+	uint64_t served_[2] = {0, 0};
 	std::atomic<uint64_t> gated_pairs_{0};
 	std::atomic<uint64_t> solo_pairs_{0};
 	std::atomic<uint64_t> idr_cooldown_skips_{0};

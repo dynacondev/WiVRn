@@ -374,7 +374,10 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 			const XrCompositionLayerProjectionView & view = proj->views[vi];
 			XrSwapchain swapchain = view.subImage.swapchain;
 			if (swapchain == nullptr)
+			{
+				++eyes_[eye_index].drop_acquire; // malformed layer: nothing to stage
 				continue;
+			}
 			// Find the swapchain record + most recently released image.
 			Swapchain * swap = nullptr;
 			{
@@ -391,10 +394,16 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 				}
 			}
 			if (swap == nullptr || swap->lastReleased < 0)
+			{
+				++eyes_[eye_index].drop_acquire; // acquire failed or nothing released: no stage
 				continue;
+			}
 			int32_t released = swap->lastReleased;
 			if (released < 0 || (uint32_t)released >= swap->images.size())
+			{
+				++eyes_[eye_index].drop_acquire; // stale release index: no stage
 				continue;
+			}
 
 			Eye & eye = eyes_[eye_index];
 			// Never block the app loop: the worker only holds the lock
@@ -497,19 +506,38 @@ void Streamer::worker_loop(std::stop_token stop)
 				else
 					++solo_pairs_;
 			}
-			// Fair order: alternate the starting eye per wake so neither
-			// eye starves when the worker runs behind (strict eye0-first
-			// showed systematic eye0 priority on-headset).
-			worker_flip_ = !worker_flip_;
-			if (worker_flip_)
+			// Take order: takes-balance first, skip-deficit second, flip
+			// tiebreak. Strict eye0-first showed systematic eye0 priority
+			// on-headset; flip alone still mode-locks under overload (pool
+			// pressure strands one eye's acquires, so only the other eye is
+			// ever pending and the flip never bites). Serving the
+			// fewer-takes eye first breaks the lock; the skip deficit
+			// (drops minus takes, saturating) covers the mixed case.
+			uint64_t unserved[2] = {0, 0};
+			for (uint32_t e = 0; e < 2; ++e)
 			{
-				encode_eye(1);
+				uint64_t drops = eyes_[e].drop_feeding.load(std::memory_order_relaxed) +
+				                 eyes_[e].drop_overwrite.load(std::memory_order_relaxed) +
+				                 eyes_[e].drop_acquire.load(std::memory_order_relaxed);
+				unserved[e] = drops >= served_[e] ? drops - served_[e] : 0;
+			}
+			worker_flip_ = !worker_flip_;
+			bool first0;
+			if (served_[0] != served_[1])
+				first0 = served_[0] < served_[1];
+			else if (unserved[0] != unserved[1])
+				first0 = unserved[0] > unserved[1];
+			else
+				first0 = !worker_flip_;
+			if (first0)
+			{
 				encode_eye(0);
+				encode_eye(1);
 			}
 			else
 			{
-				encode_eye(0);
 				encode_eye(1);
+				encode_eye(0);
 			}
 		}
 		catch (const std::exception & e)
@@ -551,6 +579,7 @@ void Streamer::encode_eye(uint32_t eye_index)
 	force_idr = eye.force_idr.exchange(false) || force_idr;
 	eye.pending = false;
 	eye.feeding = true;
+	++served_[eye_index]; // deficit round-robin: a served take clears backlog
 	eye.idr_inflight = force_idr;
 	if (swap == nullptr || width == 0 || height == 0)
 	{
@@ -741,7 +770,7 @@ void Streamer::encode_eye(uint32_t eye_index)
 	link_.send_frame(std::move(out));
 
 	if (++eye.encoded_count % 60 == 0)
-		log("streamer: eye %u encoded=%llu idx=%llu rel=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms ow=%llu sk=%llu ed=%llu gated=%llu solo=%llu idrcd=%llu",
+		log("streamer: eye %u encoded=%llu idx=%llu rel=%llu sent=%llu drop=%llu snap=%.1fms enc=%.1fms ow=%llu sk=%llu ed=%llu aq=%llu tk=%llu gated=%llu solo=%llu idrcd=%llu",
 		    eye_index,
 		    (unsigned long long)eye.encoded_count,
 		    (unsigned long long)eye.sent_index.load(),
@@ -753,6 +782,8 @@ void Streamer::encode_eye(uint32_t eye_index)
 		    (unsigned long long)eye.drop_overwrite.load(),
 		    (unsigned long long)eye.drop_feeding.load(),
 		    (unsigned long long)eye.drop_encode.load(),
+		    (unsigned long long)eye.drop_acquire.load(),
+		    (unsigned long long)served_[eye_index],
 		    (unsigned long long)gated_pairs_.load(),
 		    (unsigned long long)solo_pairs_.load(),
 		    (unsigned long long)idr_cooldown_skips_.load());
