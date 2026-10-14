@@ -9,7 +9,9 @@
 
 #include <CoreVideo/CoreVideo.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 
@@ -19,8 +21,9 @@ namespace
 {
 
 constexpr CMTimeScale kTimescale = 90000;
-constexpr int64_t kFeedTimeoutMs = 500;
-constexpr int32_t kMaxKeyFrameInterval = 3600;
+constexpr uint32_t kDefaultIdrEvery = 120; // ~1.3 s at 90 fps
+constexpr uint32_t kDefaultFeedTimeoutMs = 500;
+constexpr int32_t kMaxKeyFrameInterval = 3600; // VT backstop; the periodic IDR fires first
 
 CFNumberRef make_s32(int32_t v)
 {
@@ -47,6 +50,30 @@ void append_annexb_nal(std::vector<EncodedNal> & out, const uint8_t * data, size
 	out.push_back(std::move(nal));
 }
 
+uint32_t env_u32(const char * name, uint32_t fallback, uint32_t maxv)
+{
+	if (const char * value = std::getenv(name))
+	{
+		char * end = nullptr;
+		unsigned long parsed = std::strtoul(value, &end, 10);
+		if (end != value && parsed <= maxv)
+			return (uint32_t)parsed;
+	}
+	return fallback;
+}
+
+bool env_bool(const char * name, bool fallback)
+{
+	if (const char * value = std::getenv(name))
+	{
+		if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "off") == 0 ||
+		    std::strcmp(value, "no") == 0)
+			return false;
+		return true;
+	}
+	return fallback;
+}
+
 } // namespace
 
 VTEncoder::~VTEncoder()
@@ -54,15 +81,53 @@ VTEncoder::~VTEncoder()
 	close();
 }
 
+OSStatus VTEncoder::try_property(CFStringRef key, CFTypeRef value)
+{
+	return VTSessionSetProperty(session_, key, value);
+}
+
 bool VTEncoder::set_property(CFStringRef key, CFTypeRef value, bool required)
 {
-	OSStatus st = VTSessionSetProperty(session_, key, value);
+	OSStatus st = try_property(key, value);
 	if (st != noErr && required)
 	{
 		log("vt: required property set failed (%d), aborting open", (int)st);
 		return false;
 	}
 	return true;
+}
+
+// Read back ExpectedFrameRate after each set: the hint drives VT's
+// rate-control/energy planning, so a coerced value is logged rather
+// than silently trusted.
+void VTEncoder::verify_fps(uint32_t requested)
+{
+	CFTypeRef value = nullptr;
+	int32_t actual = -1;
+	if (VTSessionCopyProperty(session_, kVTCompressionPropertyKey_ExpectedFrameRate, kCFAllocatorDefault, &value) == noErr &&
+	    value != nullptr)
+	{
+		if (CFGetTypeID(value) == CFNumberGetTypeID())
+			CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, &actual);
+		CFRelease(value);
+	}
+	if (actual != (int32_t)requested)
+		log("vt: fps hint mismatch (requested=%u effective=%d)", requested, (int)actual);
+}
+
+// One-shot probe at open(): documents whether this machine's HW
+// encoder gates MaxH264SliceBytes, without changing any default.
+void VTEncoder::probe_slice_support()
+{
+	CFDictionaryRef supported = nullptr;
+	if (VTSessionCopySupportedPropertyDictionary(session_, &supported) != noErr || supported == nullptr)
+	{
+		log("vt: slice support probe unavailable");
+		return;
+	}
+	bool present = CFDictionaryContainsKey(supported, kVTCompressionPropertyKey_MaxH264SliceBytes);
+	log("vt: slice support (max_slice_bytes_supported=%d)", present ? 1 : 0);
+	CFRelease(supported);
 }
 
 bool VTEncoder::open(const EncoderParams & params)
@@ -74,6 +139,14 @@ bool VTEncoder::open(const EncoderParams & params)
 		return false; // 4:2:0 needs even dimensions
 	if (params.bitrate_bps == 0)
 		return false;
+
+	idr_every_ = env_u32("WIVRN_MACOS_VT_IDR_EVERY", kDefaultIdrEvery, 3600);
+	feed_timeout_ms_ = env_u32("WIVRN_MACOS_VT_FEED_TIMEOUT_MS", kDefaultFeedTimeoutMs, 10000);
+	idr_on_drop_ = env_bool("WIVRN_MACOS_VT_IDR_ON_DROP", true);
+	want_speed_ = env_bool("WIVRN_MACOS_VT_FAST", true);
+	want_color_ = env_bool("WIVRN_MACOS_VT_COLOR", true);
+	fps_override_ = env_u32("WIVRN_MACOS_VT_FPS", 0, 1000);
+	slice_bytes_ = env_u32("WIVRN_MACOS_VT_SLICE_BYTES", 0, 65535);
 
 	// Require hardware: without this the session can silently fall back
 	// to software (defeating the phase). Failure -> x264 fallback.
@@ -106,7 +179,13 @@ bool VTEncoder::open(const EncoderParams & params)
 		return false;
 	}
 	{
-		CFNumberRef fps = make_s32((int32_t)params.fps);
+		// The hint must match the cadence VT actually sees: params fps
+		// comes from the headset refresh, with an env override for
+		// rigs whose per-eye cadence differs. The PTS timescale below
+		// always stays params fps (mid-stream timescale jumps would
+		// skew every later timestamp).
+		uint32_t hint = fps_override_ > 0 ? fps_override_ : params.fps;
+		CFNumberRef fps = make_s32((int32_t)hint);
 		bool ok = set_property(kVTCompressionPropertyKey_ExpectedFrameRate, fps, true);
 		CFRelease(fps);
 		if (!ok)
@@ -114,6 +193,7 @@ bool VTEncoder::open(const EncoderParams & params)
 			close();
 			return false;
 		}
+		verify_fps(hint);
 	}
 	{
 		// NOTE: VT takes bits/sec (x264's i_bitrate is kbps — do not
@@ -143,6 +223,48 @@ bool VTEncoder::open(const EncoderParams & params)
 		set_property(CFSTR("MaxFrameDelayCount"), md, false);
 		CFRelease(md);
 	}
+	// Latency-first hint: the HW encoder otherwise spends extra passes
+	// refining decisions at this bitrate. Best-effort (not all
+	// encoders implement it); WIVRN_MACOS_VT_FAST=0 reverts.
+	if (want_speed_)
+	{
+		OSStatus st = try_property(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
+		log("vt: speed hint (prioritize_encoding_speed=%d)", st == noErr ? 1 : 0);
+	}
+	// x264-parity VUI (encode.cpp: primaries/matrix 709, sRGB transfer,
+	// full-range): without these VT emits unspecified colorimetry and
+	// the two backends decode differently on the client. Best-effort —
+	// a rejection is logged, never fatal. The HW encoder may only
+	// accept the 709 transfer, so sRGB falls back to 709 (still fully
+	// specified, and what the client forces on decode).
+	bool color_ok = false;
+	if (want_color_)
+	{
+		OSStatus s_prim = try_property(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+		OSStatus s_tr = try_property(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_sRGB);
+		if (s_tr != noErr)
+			s_tr = try_property(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+		OSStatus s_mx = try_property(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+		color_ok = s_prim == noErr && s_tr == noErr && s_mx == noErr;
+		log("vt: color (primaries=%d transfer=%d matrix=%d signaled=%d)",
+		    (int)s_prim,
+		    (int)s_tr,
+		    (int)s_mx,
+		    color_ok ? 1 : 0);
+	}
+	color_ok_.store(color_ok, std::memory_order_relaxed);
+	// Slice ceiling: opt-in only (WIVRN_MACOS_VT_SLICE_BYTES). The v1
+	// transport shards flattened frames with no per-slice recovery, so
+	// slices alone cannot bound loss spread — periodic IDRs do that.
+	// Kept as a lever for links that need bounded NAL sizes.
+	if (slice_bytes_ > 0)
+	{
+		CFNumberRef sb = make_s32((int32_t)slice_bytes_);
+		OSStatus st = try_property(kVTCompressionPropertyKey_MaxH264SliceBytes, sb);
+		CFRelease(sb);
+		log("vt: slices (max_bytes=%u applied=%d)", slice_bytes_, st == noErr ? 1 : 0);
+	}
+	probe_slice_support();
 	st = VTCompressionSessionPrepareToEncodeFrames(session_);
 	if (st != noErr)
 	{
@@ -167,8 +289,9 @@ bool VTEncoder::open(const EncoderParams & params)
 		}
 	}
 	// Reusable BGRA input buffer (pool copy: deterministic row stride
-	// for the HW encoder; attachments tag the VUI-ish colorspace to
-	// match the x264 path's 709/sRGB signaling).
+	// for the HW encoder). Source color attachments tag the conversion
+	// VT performs internally, matching the x264 path's 709/sRGB input
+	// assumptions; full-range because BGRA pixels are full-range.
 	st = CVPixelBufferCreate(
 	        kCFAllocatorDefault, (size_t)params.width, (size_t)params.height, kCVPixelFormatType_32BGRA, nullptr, &pool_px_);
 	if (st != kCVReturnSuccess || pool_px_ == nullptr)
@@ -177,10 +300,33 @@ bool VTEncoder::open(const EncoderParams & params)
 		close();
 		return false;
 	}
+	if (want_color_)
+	{
+		CVBufferSetAttachment(
+		        pool_px_, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+		CVBufferSetAttachment(
+		        pool_px_, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_sRGB, kCVAttachmentMode_ShouldPropagate);
+		CVBufferSetAttachment(
+		        pool_px_, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+		CVBufferSetAttachment(
+		        pool_px_, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanTrue, kCVAttachmentMode_ShouldPropagate);
+	}
 	params_ = params;
-	frame_index_ = 0;
+	next_pts_ = 0;
+	submitted_.store(0, std::memory_order_relaxed);
+	encoded_.store(0, std::memory_order_relaxed);
+	dropped_.store(0, std::memory_order_relaxed);
+	late_.store(0, std::memory_order_relaxed);
+	frames_since_idr_ = 0;
+	drop_recover_ = false;
 	need_sets_ = false;
-	log("vt: hardware H.264 session open (%ux%u @%u, %u bps)", params.width, params.height, params.fps, params.bitrate_bps);
+	log("vt: hardware H.264 session open (%ux%u @%u, %u bps, idr_every=%u, timeout_ms=%u)",
+	    params.width,
+	    params.height,
+	    params.fps,
+	    params.bitrate_bps,
+	    idr_every_,
+	    feed_timeout_ms_);
 	return true;
 }
 
@@ -199,29 +345,46 @@ void VTEncoder::close()
 		CVPixelBufferRelease(pool_px_);
 		pool_px_ = nullptr;
 	}
-	pending_.clear();
-	sps_.clear();
-	pps_.clear();
-	failed_ = false;
-	need_sets_ = false;
-	// Drain any stale completion signal (drain callbacks post during
-	// close with no waiter; the next session must not consume it).
-	while (done_.try_acquire())
 	{
+		std::lock_guard lock(mutex_);
+		has_waiter_ = false;
+		done_ = false;
+		pending_.clear();
+		sps_.clear();
+		pps_.clear();
+		failed_ = false;
+		need_sets_ = false;
+		drop_recover_ = false;
 	}
+	cv_.notify_all();
 }
 
-void VTEncoder::output_callback(void * refcon, void *, OSStatus status, VTEncodeInfoFlags, CMSampleBufferRef sample)
+void VTEncoder::output_callback(void * refcon, void * sourceFrameRefCon, OSStatus status, VTEncodeInfoFlags, CMSampleBufferRef sample)
 {
 	VTEncoder * self = static_cast<VTEncoder *>(refcon);
-	std::lock_guard lock(self->mutex_);
-	if (self->session_ == nullptr)
+	self->on_output((uint64_t)(uintptr_t)sourceFrameRefCon, status, sample);
+}
+
+void VTEncoder::on_output(uint64_t seq, OSStatus status, CMSampleBufferRef sample)
+{
+	std::unique_lock lock(mutex_);
+	if (session_ == nullptr)
 		return; // closed mid-drain
+	// Sequence match: a callback arriving after its feed timed out (or
+	// from an earlier session generation) must never release, or be
+	// attributed to, a later frame's wait. Count and discard it.
+	if (!has_waiter_ || seq != wait_seq_)
+	{
+		late_.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
 	if (status != noErr || sample == nullptr)
-		self->failed_ = true;
-	else if (!self->parse_sample(sample))
-		self->failed_ = true;
-	self->done_.release();
+		failed_ = true;
+	else if (!parse_sample(sample))
+		failed_ = true;
+	done_ = true;
+	lock.unlock();
+	cv_.notify_one();
 }
 
 bool VTEncoder::extract_params(CMSampleBufferRef sample)
@@ -315,7 +478,13 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 		pending_.clear();
 		failed_ = false;
 	}
-	force_idr = force_idr || need_sets_;
+	// Periodic IDR bounds post-loss smearing to idr_every_ frames even
+	// when no NACK arrives; a locally dropped frame forces the next
+	// feed to IDR (the decoder never saw it, exactly like packet loss).
+	// The +1 keeps the cadence an exact period: with N=5, four P-frames
+	// then an IDR (frames_since_idr_ counts trailing non-IDRs).
+	bool periodic = idr_every_ > 0 && frames_since_idr_ + 1 >= idr_every_;
+	force_idr = force_idr || need_sets_ || drop_recover_ || periodic;
 	// Pool copy into the reusable BGRA buffer (tight snapshot rows ->
 	// pool rows; R/B lane swap for RGBA sources).
 	CVPixelBufferLockBaseAddress(pool_px_, 0);
@@ -350,6 +519,16 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 	}
 	CVPixelBufferUnlockBaseAddress(pool_px_, 0);
 
+	// The sequence doubles as the PTS: one value per accepted submit,
+	// advanced below on every post-submit exit, so timestamps can never
+	// repeat (a retry never reuses its original PTS).
+	uint64_t seq = next_pts_;
+	{
+		std::unique_lock lock(mutex_);
+		has_waiter_ = true;
+		wait_seq_ = seq;
+		done_ = false;
+	}
 	CFDictionaryRef frameProps = nullptr;
 	CFMutableDictionaryRef forceKey = nullptr;
 	if (force_idr)
@@ -360,28 +539,72 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 	}
 	VTEncodeInfoFlags infoFlags = 0;
 	OSStatus st = VTCompressionSessionEncodeFrame(
-	        session_, pool_px_, CMTimeMake((int64_t)frame_index_, (int32_t)params_.fps), CMTimeMake(1, (int32_t)params_.fps), frameProps, nullptr, &infoFlags);
+	        session_,
+	        pool_px_,
+	        CMTimeMake((int64_t)seq, (int32_t)params_.fps),
+	        CMTimeMake(1, (int32_t)params_.fps),
+	        frameProps,
+	        (void *)(uintptr_t)seq,
+	        &infoFlags);
 	if (forceKey != nullptr)
 		CFRelease(forceKey);
 	if (st != noErr)
 	{
-		log("vt: encode frame %llu failed (%d)", (unsigned long long)frame_index_, (int)st);
+		// Never submitted: no PTS consumed, safe to retry with the
+		// same value next feed.
+		std::lock_guard lock(mutex_);
+		has_waiter_ = false;
+		log("vt: encode frame %llu failed (%d)", (unsigned long long)seq, (int)st);
 		return empty;
 	}
-	if (!done_.try_acquire_for(std::chrono::milliseconds(kFeedTimeoutMs)))
+	submitted_.fetch_add(1, std::memory_order_relaxed);
+	bool arrived = false;
 	{
-		log("vt: encode frame %llu timed out", (unsigned long long)frame_index_);
+		std::unique_lock lock(mutex_);
+		arrived = cv_.wait_for(lock, std::chrono::milliseconds(feed_timeout_ms_), [this] { return done_; });
+		has_waiter_ = false;
+	}
+	// The PTS is consumed whatever happened: the frame entered the
+	// session, so the next submit must advance past it.
+	next_pts_ = seq + 1;
+	if (!arrived)
+	{
+		// The late callback (if any) is discarded by sequence match in
+		// on_output; the decoder gap is closed by a recovery IDR.
+		dropped_.fetch_add(1, std::memory_order_relaxed);
+		drop_recover_ = idr_on_drop_;
+		frames_since_idr_ += 1;
+		log("vt: frame dropped (reason=timeout pts=%llu submitted=%llu dropped=%llu)",
+		    (unsigned long long)seq,
+		    (unsigned long long)submitted_.load(std::memory_order_relaxed),
+		    (unsigned long long)dropped_.load(std::memory_order_relaxed));
 		return empty;
 	}
-	std::lock_guard lock(mutex_);
+	std::unique_lock lock(mutex_);
 	if (failed_ || pending_.empty())
 	{
-		if (failed_)
-			log("vt: encode frame %llu callback failed", (unsigned long long)frame_index_);
+		lock.unlock();
+		dropped_.fetch_add(1, std::memory_order_relaxed);
+		drop_recover_ = idr_on_drop_;
+		frames_since_idr_ += 1;
+		log("vt: frame dropped (reason=callback pts=%llu submitted=%llu dropped=%llu)",
+		    (unsigned long long)seq,
+		    (unsigned long long)submitted_.load(std::memory_order_relaxed),
+		    (unsigned long long)dropped_.load(std::memory_order_relaxed));
 		return empty;
 	}
 	pending_.back().is_last = true;
-	frame_index_ += 1;
+	bool saw_idr = std::any_of(pending_.begin(), pending_.end(), [](const EncodedNal & nal) { return nal.is_idr; });
+	if (saw_idr)
+	{
+		frames_since_idr_ = 0;
+		drop_recover_ = false;
+	}
+	else
+	{
+		frames_since_idr_ += 1;
+	}
+	encoded_.fetch_add(1, std::memory_order_relaxed);
 	return std::move(pending_);
 }
 
@@ -392,9 +615,11 @@ void VTEncoder::reconfig(uint32_t bitrate_bps, uint32_t fps)
 	CFNumberRef br = make_s32((int32_t)bitrate_bps); // bits/sec (see open())
 	set_property(kVTCompressionPropertyKey_AverageBitRate, br, false);
 	CFRelease(br);
-	CFNumberRef fr = make_s32((int32_t)fps);
+	uint32_t hint = fps_override_ > 0 ? fps_override_ : fps;
+	CFNumberRef fr = make_s32((int32_t)hint);
 	set_property(kVTCompressionPropertyKey_ExpectedFrameRate, fr, false);
 	CFRelease(fr);
+	verify_fps(hint);
 	params_.bitrate_bps = bitrate_bps;
 	params_.fps = fps;
 }
