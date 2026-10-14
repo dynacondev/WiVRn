@@ -822,12 +822,8 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			        .state = application::get_session_state(),
 			});
 		else if (application::get_session_state() == XR_SESSION_STATE_FOCUSED)
-			// Interactable menus normally report visible (unfocused) so
-			// games pause safely and ignore menu input. The override keeps
-			// reporting focused so games keep rendering while monitored
-			// (see report_focused_override).
 			network_session->send_control(from_headset::session_state_changed{
-			        .state = report_focused_override ? XR_SESSION_STATE_FOCUSED : XR_SESSION_STATE_VISIBLE,
+			        .state = XR_SESSION_STATE_VISIBLE,
 			});
 
 		network_session->send_control(from_headset::stream_tab_changed{.tab = new_status});
