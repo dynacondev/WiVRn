@@ -387,13 +387,9 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 
 bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
 {
-	// TEMPORARY back-to-basics: surface-projected mapping disabled, all
-	// objects render through the flat reconstruction feed. Forcing false
-	// here stops instance creation, removes live instances on the next
-	// update, forces need_flat, and clears the "(projected)" status tags.
-	(void)oid;
-	(void)ost;
-	return false;
+	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
+		return it->second;
+	return ost.def.surface_projected;
 }
 
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
@@ -1166,8 +1162,6 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
-	ImGui::Text("%s", _S("Temporarily disabled: all objects use flat reconstruction (back-to-basics)"));
-	ImGui::BeginDisabled(true);
 	if (not composition_layer_alpha_blend_supported)
 		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));
 	for (auto & [oid, ost]: passthrough_objects)
@@ -1195,7 +1189,6 @@ void scenes::stream::gui_passthrough()
 			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
 		}
 	}
-	ImGui::EndDisabled();
 }
 
 void scenes::stream::gui_fiducial_status()
