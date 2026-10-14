@@ -42,6 +42,7 @@
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -2108,6 +2109,67 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
 
 		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+
+		// TEMPORARY head-locked-mask forensics: which per-frame inputs
+		// advance while an interactable menu is open (video frames?
+		// server view poses? fused board pose?). Tab transitions always
+		// log; open menus add a 1Hz heartbeat. A stuck input names the
+		// frozen pose chain behind the head-locked window.
+		{
+			static XrTime last_adv_log = 0;
+			static stream_tab last_adv_tab = stream_tab::hidden;
+			static XrTime last_vid_time = 0;
+			static XrVector3f last_view0{0, 0, 0};
+			static XrVector3f last_fused{0, 0, 0};
+			static bool adv_baselined = false;
+			XrTime adv_now = instance.now();
+			XrTime vid_time = 0;
+			for (auto & handle: current_blit_handles)
+			{
+				if (handle)
+				{
+					vid_time = handle->view_info.display_time;
+					break;
+				}
+			}
+			XrVector3f fused{0, 0, 0};
+			bool have_fused = false;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.def.type == "3d-passthrough" and ost.fused.placed)
+				{
+					fused = ost.fused.world_pose.position;
+					have_fused = true;
+					break;
+				}
+			}
+			auto travel = [](XrVector3f a, XrVector3f b) {
+				float dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
+				return std::sqrt(dx * dx + dy * dy + dz * dz) * 1000.f;
+			};
+			bool tab_changed = (gui_status != last_adv_tab);
+			last_adv_tab = gui_status;
+			if (tab_changed or (is_gui_interactable() and adv_now - last_adv_log > 1'000'000'000LL))
+			{
+				last_adv_log = adv_now;
+				if (not adv_baselined)
+				{
+					adv_baselined = true;
+					spdlog::info("menu-forensics: tab={} (baseline)", magic_enum::enum_name(gui_status));
+				}
+				else
+				{
+					spdlog::info("menu-forensics: tab={} video_time +{:.1f}ms view0 moved {:.1f}mm fused{} moved {:.1f}mm",
+					             magic_enum::enum_name(gui_status), (double)(vid_time - last_vid_time) * 1e-6,
+					             (double)travel(pose[0].position, last_view0), have_fused ? "" : " (none)",
+					             have_fused ? (double)travel(fused, last_fused) : 0.0);
+				}
+				last_vid_time = vid_time;
+				last_view0 = pose[0].position;
+				last_fused = fused;
+			}
+		}
 
 		// Fiducial debug overlays record as world-space lines (zero
 		// composition layers); this heartbeat reports what was recorded.

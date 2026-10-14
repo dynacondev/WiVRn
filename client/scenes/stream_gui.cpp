@@ -818,13 +818,22 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 		// Override session state if the GUI is interactable
 		if (not is_gui_interactable())
+		{
+			XrSessionState actual = application::get_session_state();
+			// TEMPORARY head-locked-mask forensics: log what we report.
+			spdlog::info("Reporting session state {} to server (menu closed)", magic_enum::enum_name(actual));
 			network_session->send_control(from_headset::session_state_changed{
-			        .state = application::get_session_state(),
+			        .state = actual,
 			});
+		}
 		else if (application::get_session_state() == XR_SESSION_STATE_FOCUSED)
+		{
+			// TEMPORARY head-locked-mask forensics: log what we report.
+			spdlog::info("Reporting session state VISIBLE to server (menu open)");
 			network_session->send_control(from_headset::session_state_changed{
 			        .state = XR_SESSION_STATE_VISIBLE,
 			});
+		}
 
 		network_session->send_control(from_headset::stream_tab_changed{.tab = new_status});
 	}
