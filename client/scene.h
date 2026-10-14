@@ -191,9 +191,9 @@ protected:
 	// Append the surface-projected passthrough layer (Quest only) when a
 	// projected mesh or per-object instances are set. Must be called after
 	// the video projection layer so the cutout composites as an overlay.
-	// Submitted opaque (binary-fallback semantics); the mask path layers
-	// it over the flat feed instead of chaining a blend (see stream.cpp).
-	// No-op otherwise.
+	// Submitted with source alpha (meaningful coverage alpha, see the
+	// BLEND_TEXTURE_SOURCE_ALPHA_BIT on the layer); the mask path blends
+	// it over the flat feed (see stream.cpp). No-op otherwise.
 	void add_projected_passthrough_layer();
 
 	void render_world(

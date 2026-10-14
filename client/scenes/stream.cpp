@@ -2059,13 +2059,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		if (have_projected)
 		{
-			// Surface-projected interiors read the same feathered mask
-			// (DST blend, like flat): mapped where the mask is opaque,
-			// feathering through flat at the rim, video outside. Cutouts
-			// force need_flat above, so this never stamps black where
-			// marker windows punch camera with no geometry behind them.
+			// Surface-projected interiors read their own coverage alpha
+			// (SRC blend over the flat feed below): mapped camera where
+			// geometry covers, flat camera everywhere else (feather band,
+			// debug punches, unmapped rims). DST blend ignored that alpha
+			// and stamped black wherever the mask was opaque but geometry
+			// absent; SRC keeps flat's feathering exact everywhere.
 			add_projected_passthrough_layer();
-			set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB,
+			set_alpha_blend(XR_BLEND_FACTOR_SRC_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA_FB,
 			                XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 		}
 	}
