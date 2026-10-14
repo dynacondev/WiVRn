@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <backends/imgui_impl_vulkan.h>
 #include <boost/locale.hpp>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <glm/gtc/matrix_access.hpp>
@@ -1051,6 +1052,25 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 
 		if (not visible)
 			continue;
+
+		// A degenerate orientation rejects the entire composition
+		// (xrEndFrame POSE_INVALID), blacking out video, passthrough
+		// and GUI together. Viewports posed only on use (tooltip)
+		// must never veto healthy layers; skip and surface it.
+		float qn = std::sqrt(i.orientation.x * i.orientation.x + i.orientation.y * i.orientation.y +
+		                     i.orientation.z * i.orientation.z + i.orientation.w * i.orientation.w);
+		if (not std::isfinite(qn) or std::abs(qn - 1.f) > 1e-2f)
+		{
+			static auto last_quad_warn = std::chrono::steady_clock::now();
+			auto quad_now = std::chrono::steady_clock::now();
+			if (quad_now - last_quad_warn > std::chrono::seconds(2))
+			{
+				last_quad_warn = quad_now;
+				spdlog::warn("Skipping quad with degenerate orientation (norm {:.3f}) in {} viewport", (double)qn,
+				             i.tooltip_viewport ? "tooltip" : "popup");
+			}
+			continue;
+		}
 
 		quads.emplace_back(
 		        i.z_index,

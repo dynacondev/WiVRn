@@ -127,8 +127,13 @@ public:
 	{
 		// Position of this viewport in the world
 		xr::spaces space; // Must be world to allow the cursor to work
-		glm::vec3 position;
-		glm::quat orientation;
+		// Posed every frame for the main viewport (and popup via
+		// place_layer_relative); tooltip only on hover. Identity-init:
+		// an unposed viewport must never carry a degenerate (e.g. zero)
+		// orientation into a composition layer, where one invalid pose
+		// rejects the whole submit (xrEndFrame POSE_INVALID blackout).
+		glm::vec3 position{0, 0, 0};
+		glm::quat orientation{1, 0, 0, 0};
 		glm::vec2 size;
 
 		// Position of this viewport in the swapchain image
