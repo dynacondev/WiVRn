@@ -74,6 +74,12 @@ bool env_bool(const char * name, bool fallback)
 	return fallback;
 }
 
+uint64_t now_ns()
+{
+	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	        .count();
+}
+
 } // namespace
 
 VTEncoder::~VTEncoder()
@@ -147,6 +153,7 @@ bool VTEncoder::open(const EncoderParams & params)
 	want_color_ = env_bool("WIVRN_MACOS_VT_COLOR", true);
 	fps_override_ = env_u32("WIVRN_MACOS_VT_FPS", 0, 1000);
 	slice_bytes_ = env_u32("WIVRN_MACOS_VT_SLICE_BYTES", 0, 65535);
+	bench_ = env_bool("WIVRN_MACOS_VT_BENCH", false);
 
 	// Require hardware: without this the session can silently fall back
 	// to software (defeating the phase). Failure -> x264 fallback.
@@ -317,6 +324,15 @@ bool VTEncoder::open(const EncoderParams & params)
 	encoded_.store(0, std::memory_order_relaxed);
 	dropped_.store(0, std::memory_order_relaxed);
 	late_.store(0, std::memory_order_relaxed);
+	feeds_timed_ = 0;
+	enqueue_ns_total_ = 0;
+	wait_ns_total_ = 0;
+	feed_ns_total_ = 0;
+	feed_ns_min_ = 0;
+	feed_ns_max_ = 0;
+	last_enqueue_us_ = 0;
+	last_wait_us_ = 0;
+	last_total_us_ = 0;
 	frames_since_idr_ = 0;
 	drop_recover_ = false;
 	need_sets_ = false;
@@ -487,6 +503,7 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 	force_idr = force_idr || need_sets_ || drop_recover_ || periodic;
 	// Pool copy into the reusable BGRA buffer (tight snapshot rows ->
 	// pool rows; R/B lane swap for RGBA sources).
+	uint64_t copy_start_ns = now_ns();
 	CVPixelBufferLockBaseAddress(pool_px_, 0);
 	uint8_t * dst = static_cast<uint8_t *>(CVPixelBufferGetBaseAddress(pool_px_));
 	size_t dstStride = CVPixelBufferGetBytesPerRow(pool_px_);
@@ -538,6 +555,7 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 		frameProps = forceKey;
 	}
 	VTEncodeInfoFlags infoFlags = 0;
+	uint64_t enc_call_ns = now_ns();
 	OSStatus st = VTCompressionSessionEncodeFrame(
 	        session_,
 	        pool_px_,
@@ -546,6 +564,7 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 	        frameProps,
 	        (void *)(uintptr_t)seq,
 	        &infoFlags);
+	uint64_t wait_start_ns = now_ns();
 	if (forceKey != nullptr)
 		CFRelease(forceKey);
 	if (st != noErr)
@@ -564,6 +583,7 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 		arrived = cv_.wait_for(lock, std::chrono::milliseconds(feed_timeout_ms_), [this] { return done_; });
 		has_waiter_ = false;
 	}
+	uint64_t wait_end_ns = now_ns();
 	// The PTS is consumed whatever happened: the frame entered the
 	// session, so the next submit must advance past it.
 	next_pts_ = seq + 1;
@@ -595,6 +615,36 @@ std::vector<EncodedNal> VTEncoder::feed(const uint8_t * rgba, bool swap_rb, bool
 	}
 	pending_.back().is_last = true;
 	bool saw_idr = std::any_of(pending_.begin(), pending_.end(), [](const EncodedNal & nal) { return nal.is_idr; });
+	// Timing split: the EncodeFrame call only enqueues (returns once the
+	// frame is queued), the condition wait covers the HW queue + service.
+	// VT exposes no finer split — enqueue vs wait is the separable pair.
+	uint64_t enqueue_ns = wait_start_ns >= enc_call_ns ? wait_start_ns - enc_call_ns : 0;
+	uint64_t wait_ns = wait_end_ns >= wait_start_ns ? wait_end_ns - wait_start_ns : 0;
+	uint64_t total_ns = wait_end_ns >= copy_start_ns ? wait_end_ns - copy_start_ns : 0;
+	feeds_timed_ += 1;
+	enqueue_ns_total_ += enqueue_ns;
+	wait_ns_total_ += wait_ns;
+	feed_ns_total_ += total_ns;
+	if (feeds_timed_ == 1 || total_ns < feed_ns_min_)
+		feed_ns_min_ = total_ns;
+	if (total_ns > feed_ns_max_)
+		feed_ns_max_ = total_ns;
+	last_enqueue_us_ = enqueue_ns / 1000;
+	last_wait_us_ = wait_ns / 1000;
+	last_total_us_ = total_ns / 1000;
+	if (bench_)
+	{
+		size_t nbytes = 0;
+		for (const EncodedNal & nal: pending_)
+			nbytes += nal.bytes.size();
+		log("vt bench: feed=%llu enqueue_us=%llu wait_us=%llu total_us=%llu bytes=%zu idr=%d",
+		    (unsigned long long)seq,
+		    (unsigned long long)(enqueue_ns / 1000),
+		    (unsigned long long)(wait_ns / 1000),
+		    (unsigned long long)(total_ns / 1000),
+		    nbytes,
+		    saw_idr ? 1 : 0);
+	}
 	if (saw_idr)
 	{
 		frames_since_idr_ = 0;

@@ -29,6 +29,9 @@
 //                                 recovery, so this stays opt-in)
 //   WIVRN_MACOS_VT_FEED_TIMEOUT_MS  callback wait bound (default 500;
 //                                 diagnostic lever, 0 forces timeouts)
+//   WIVRN_MACOS_VT_BENCH=1        per-feed timing log (enqueue/wait/total
+//                                 key=value; default off — measurement only,
+//                                 no behavior change)
 
 #pragma once
 
@@ -109,6 +112,51 @@ public:
 	{
 		return color_ok_.load(std::memory_order_relaxed);
 	}
+	// Per-feed timing split (feed thread only): EncodeFrame call cost
+	// (enqueue) vs callback wait (HW queue + service) vs whole feed
+	// (pool copy + enqueue + wait). Frames that drop never produce a
+	// callback, so they are excluded: submitted == timed + dropped
+	// always holds. Whether the per-feed bench log is on.
+	uint64_t feeds_timed() const
+	{
+		return feeds_timed_;
+	}
+	uint64_t enqueue_ns_total() const
+	{
+		return enqueue_ns_total_;
+	}
+	uint64_t wait_ns_total() const
+	{
+		return wait_ns_total_;
+	}
+	uint64_t feed_ns_total() const
+	{
+		return feed_ns_total_;
+	}
+	uint64_t feed_ns_min() const
+	{
+		return feed_ns_min_;
+	}
+	uint64_t feed_ns_max() const
+	{
+		return feed_ns_max_;
+	}
+	uint64_t last_enqueue_us() const
+	{
+		return last_enqueue_us_;
+	}
+	uint64_t last_wait_us() const
+	{
+		return last_wait_us_;
+	}
+	uint64_t last_total_us() const
+	{
+		return last_total_us_;
+	}
+	bool bench_enabled() const
+	{
+		return bench_;
+	}
 
 	// True while a session is open (tests + backend selection).
 	bool is_open() const
@@ -165,6 +213,17 @@ private:
 	bool want_color_ = true;
 	uint32_t fps_override_ = 0;
 	uint32_t slice_bytes_ = 0;
+	bool bench_ = false; // WIVRN_MACOS_VT_BENCH=1: per-feed key=value log
+	// Per-feed timing split (feed thread only; see the getters).
+	uint64_t feeds_timed_ = 0;
+	uint64_t enqueue_ns_total_ = 0;
+	uint64_t wait_ns_total_ = 0;
+	uint64_t feed_ns_total_ = 0;
+	uint64_t feed_ns_min_ = 0;
+	uint64_t feed_ns_max_ = 0;
+	uint64_t last_enqueue_us_ = 0;
+	uint64_t last_wait_us_ = 0;
+	uint64_t last_total_us_ = 0;
 };
 
 #else
