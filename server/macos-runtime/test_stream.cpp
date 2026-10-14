@@ -1515,11 +1515,17 @@ int run_skew()
 	if (!lags.empty())
 	{
 		for (double lag: lags)
-		{
-			mean += lag;
 			maxabs = std::max(maxabs, std::fabs(lag));
-		}
-		mean /= (double)lags.size();
+		// Trimmed mean (drop top/bottom 5%): a single multi-second
+		// transient (startup hitch, host scheduling) must not mask or
+		// fake the systematic inter-eye bias this phase measures. The
+		// p50 assert below independently catches systematic shifts.
+		std::sort(lags.begin(), lags.end());
+		size_t trim = lags.size() / 20;
+		size_t lo = std::min(trim, lags.size() / 2), hi = lags.size() - lo;
+		for (size_t i = lo; i < hi; ++i)
+			mean += lags[i];
+		mean /= (double)(hi - lo);
 		std::nth_element(lags.begin(), lags.begin() + (long long)(lags.size() / 2), lags.end());
 		p50 = lags[lags.size() / 2];
 	}
