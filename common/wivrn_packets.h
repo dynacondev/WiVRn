@@ -1018,8 +1018,10 @@ struct passthrough_object
 	// Behavior type. "3d-passthrough" renders the model as a
 	// surface-projected passthrough cutout; "3d-passthrough-reversed"
 	// reverse-cuts the model from every mask layer instead (game video
-	// shows through, depth-tested against covering windows). Unknown
-	// types are skipped client-side (forward-compat).
+	// shows through, depth-tested against covering windows). "3d-boundary"
+	// shows game video only inside the model volume (passthrough outside),
+	// "3d-boundary-reversed" inverts it. Boundary meshes must be closed
+	// volumes. Unknown types are skipped client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
 	std::string tag;
@@ -1038,16 +1040,20 @@ struct passthrough_object
 	// Passthrough window feather width in screen pixels (alpha-gradient
 	// blend band around the mesh silhouette). Mask stacks group by this
 	// value so each object feathers independently. 0 disables feathering.
-	// Not accepted for 3d-passthrough-reversed (warned + ignored on the
-	// server).
+	// Not accepted for 3d-passthrough-reversed and 3d-boundary(-reversed)
+	// (warned + ignored on the server).
 	float feather_px = 24;
 	// Surface-projected mapping: the headset projects camera imagery onto
 	// this object's mesh (geometry instance on the projected passthrough
 	// layer) instead of the flat reconstruction feed. Enabled by default;
 	// opt out per object with false (plus a live in-headset override).
-	// Ignored for 3d-passthrough-reversed (warned + ignored on the
-	// server).
+	// Ignored for 3d-passthrough-reversed and 3d-boundary(-reversed)
+	// (warned + ignored on the server).
 	bool surface_projected = true;
+	// Boundary fade width in meters (3d-boundary(-reversed) only):
+	// symmetric smoothstep over +/- this distance around the mesh
+	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
+	float transition_distance_m = 0.3f;
 };
 
 struct fiducial_map
@@ -1059,6 +1065,10 @@ struct fiducial_map
 	// starts on first placement per map and retriggers on reacquire
 	// jumps. Objects placing later appear instantly.
 	float fade_in_ms = 1000;
+	// Suppress the Meta (OS) boundary while our passthrough is shown.
+	// Server-pushed (top-level config, no in-headset toggle); a request
+	// only, the runtime may refuse. Always sent, even with an empty map.
+	bool suppress_meta_boundary = true;
 };
 
 struct fiducial_model_chunk

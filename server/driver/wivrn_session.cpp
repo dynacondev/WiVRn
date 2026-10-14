@@ -1032,16 +1032,16 @@ std::optional<model_file> read_model_file(const std::string & path)
 void wivrn_session::send_fiducial_map()
 {
 	configuration config;
+	// Always sent, even empty: the map carries the suppress-meta-boundary
+	// default (top-level config) with no in-headset toggle to fall back on.
 	if (config.fiducials.empty() and config.passthrough_objects.empty())
-	{
 		U_LOG_I("Fiducial map: no entries configured");
-		return;
-	}
-
-	U_LOG_I("Fiducial map: sending %u fiducials, %u passthrough objects",
-	        (unsigned)config.fiducials.size(), (unsigned)config.passthrough_objects.size());
+	else
+		U_LOG_I("Fiducial map: sending %u fiducials, %u passthrough objects",
+		        (unsigned)config.fiducials.size(), (unsigned)config.passthrough_objects.size());
 	to_headset::fiducial_map msg;
 	msg.fade_in_ms = config.fade_in_ms;
+	msg.suppress_meta_boundary = config.suppress_meta_boundary;
 	for (const auto & entry: config.fiducials)
 	{
 		to_headset::fiducial_entry e{
@@ -1083,6 +1083,7 @@ void wivrn_session::send_fiducial_map()
 		        .scale = entry.scale,
 		        .feather_px = entry.feather_px,
 		        .surface_projected = entry.surface_projected,
+		        .transition_distance_m = entry.transition_distance_m,
 		};
 
 		// Display label: the tag, or the id when untagged.
