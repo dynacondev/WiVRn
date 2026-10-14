@@ -6,7 +6,9 @@
 #include "streamer.h"
 #include "vk_context.h"
 
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
 namespace
 {
@@ -84,6 +86,24 @@ extern "C"
 		frameState->predictedDisplayTime = predicted;
 		frameState->predictedDisplayPeriod = session->data.periodNs;
 		frameState->shouldRender = XR_TRUE;
+		// Blocking wait (WIVRN_MACOS_WAITFRAME_BLOCK=0 disables): sleep
+		// until the predicted display time so apps run at headset rate
+		// instead of free-running and overflowing the worker's
+		// latest-only mailbox (which kept only the tail). Capped: a clock
+		// jump must return early, never wedge the app.
+		static bool block = [] {
+			const char * e = std::getenv("WIVRN_MACOS_WAITFRAME_BLOCK");
+			return e == nullptr || !(e[0] == '0' && e[1] == '\0');
+		}();
+		if (block)
+		{
+			int64_t wait_ns = predicted - wivrn_macos::now_ns();
+			const int64_t cap_ns = 250'000'000;
+			if (wait_ns > cap_ns)
+				wait_ns = cap_ns;
+			if (wait_ns > 0)
+				std::this_thread::sleep_for(std::chrono::nanoseconds(wait_ns));
+		}
 		return XR_SUCCESS;
 	}
 
