@@ -4,6 +4,7 @@
 // size 1-2, no mips/cubemap/multisample/depth in v1 (loud refusals).
 
 #include "runtime.h"
+#include "snapshot.h" // queue-submit mutex + worker release handoff (A3)
 #include "streamer.h" // release_swapchain barrier (worker may hold images)
 #include "vk_context.h"
 
@@ -277,6 +278,10 @@ extern "C"
 		// Signal GPU completion of all prior app work with an empty submit:
 		// from here the runtime (Phase 5 snapshot) may read the image. Only
 		// legal against an unsignaled fence, i.e. one previously waited.
+		// The submit holds the shared queue mutex (serialized with the
+		// worker's copy-submit; leaf critical section, no GPU wait
+		// inside, so the app thread never blocks on the worker).
+		bool gpuEdge = false;
 		if (swap.waited[target])
 		{
 			VkSubmitInfo submit{
@@ -290,13 +295,32 @@ extern "C"
 			        .signalSemaphoreCount = 0,
 			        .pSignalSemaphores = nullptr,
 			};
-			if (vkQueueSubmit(swap.queue, 1, &submit, swap.fences[target]) != VK_SUCCESS)
+			VkResult submitted = VK_SUCCESS;
+			{
+				std::lock_guard queueLock(wivrn_macos::snapshot_queue_mutex());
+				submitted = vkQueueSubmit(swap.queue, 1, &submit, swap.fences[target]);
+			}
+			if (submitted != VK_SUCCESS)
 			{
 				wivrn_macos::log("swapchain: release submit failed");
 				return XR_ERROR_RUNTIME_FAILURE;
 			}
+			gpuEdge = true;
 			swap.waited[target] = false;
 		}
+		// Handoff for the worker-side snapshot (A3): the copy consumes
+		// this note and waits the fence (bounded) before reading, so it
+		// can never read a mid-render image when the app waited first.
+		// Without a prior Wait there is no GPU edge (flagged in the
+		// note); the copy then relies on queue order alone.
+		wivrn_macos::SnapshotReleaseNote note{};
+		note.device = swap.device;
+		note.fence = swap.fences[target];
+		note.gpu_edge = gpuEdge;
+		note.width = swap.width;
+		note.height = swap.height;
+		note.arraySize = swap.arraySize;
+		wivrn_macos::note_snapshot_release(swap.images[target], note);
 		swap.busy[target] = false;
 		if (swap.lastAcquired == (int32_t)target && swap.outstanding.empty())
 			swap.lastAcquired = -1;
