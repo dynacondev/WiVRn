@@ -81,8 +81,10 @@ inert unless set; full flow in `docs/profiling.md`.
 
 ## Conventions
 
-- i18n: `tools/update_messages.sh [lang]` regenerates `locale/`; client
-  uses gettext `_()`/`_F()`, dashboard uses `i18n()` in QML/C++.
+- i18n: client uses gettext `_()`/`_F()`, dashboard uses `i18n()` in
+  QML/C++. Do NOT run `tools/update_messages.sh` or touch `locale/` in
+  feature work — translators regenerate it separately; just mark new
+  strings with the usual macros.
 - QR fiducials: one payload string = one identity. Same payload printed
   twice is NOT two trackables; for multi-location coverage print
   distinct payloads and link one object to several fiducial ids

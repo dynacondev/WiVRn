@@ -8,7 +8,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: WiVRn-dashboard\n"
 "Report-Msgid-Bugs-To: \n"
-"POT-Creation-Date: 2026-10-13 15:13+1100\n"
+"POT-Creation-Date: 2026-07-11 14:46+0200\n"
 "PO-Revision-Date: 2026-02-03 23:56+0200\n"
 "Last-Translator: 8osm3rka <admin@osm8.live>\n"
 "Language-Team: Russian\n"
@@ -97,7 +97,7 @@ msgid "OpenXR runtime"
 msgstr "Среда выполнения OpenXR"
 
 #: dashboard/qml/About.qml:17 dashboard/qml/ApkInstallPage.qml:65
-#: dashboard/qml/HeadsetStatsPage.qml:36 dashboard/qml/HeadsetsPage.qml:183
+#: dashboard/qml/HeadsetsPage.qml:183 dashboard/qml/HeadsetStatsPage.qml:36
 #: dashboard/qml/TroubleshootPage.qml:71
 #, kde-format
 msgctxt "go back to the home page"
@@ -120,8 +120,8 @@ msgstr "Проверяю новейшую версию..."
 msgid "No APK is available for this version"
 msgstr "APK файл для этой версии отсутствует"
 
-#: dashboard/qml/ApkInstallPage.qml:45 dashboard/qml/Main.qml:444
-#: dashboard/qml/Main.qml:556 dashboard/qml/WizardPage.qml:211
+#: dashboard/qml/ApkInstallPage.qml:45 dashboard/qml/Main.qml:376
+#: dashboard/qml/Main.qml:434 dashboard/qml/WizardPage.qml:211
 #: dashboard/qml/WizardPage.qml:337
 #, kde-format
 msgid "ADB is not installed"
@@ -163,12 +163,7 @@ msgstr "Переустановить WiVRn"
 msgid "Install WiVRn"
 msgstr "Установить WiVRn"
 
-#: dashboard/qml/HeadsetStatsPage.qml:12
-#, kde-format
-msgid "Headset statistics"
-msgstr "Статистика шлема"
-
-#: dashboard/qml/HeadsetsPage.qml:12 dashboard/qml/Main.qml:561
+#: dashboard/qml/HeadsetsPage.qml:12 dashboard/qml/Main.qml:439
 #, kde-format
 msgid "Headsets"
 msgstr "Шлемы"
@@ -264,6 +259,11 @@ msgstr "Включить сопряжение"
 msgid "Pair a new headset"
 msgstr "Сопрячь новый шлем"
 
+#: dashboard/qml/HeadsetStatsPage.qml:12
+#, kde-format
+msgid "Headset statistics"
+msgstr "Статистика шлема"
+
 #: dashboard/qml/Main.qml:12
 #, kde-format
 msgid "WiVRn dashboard"
@@ -283,109 +283,49 @@ msgstr ""
 "Сервер WiVRn еще активен.\n"
 "Закрытие данного окна его остановит."
 
-#: dashboard/qml/Main.qml:99
-#, kde-format
-msgid "Bundled defaults (read-only)"
-msgstr ""
-
-#: dashboard/qml/Main.qml:101
-#, kde-format
-msgid "Host system data"
-msgstr ""
-
-#: dashboard/qml/Main.qml:103
-#, kde-format
-msgid "Host system config"
-msgstr ""
-
-#: dashboard/qml/Main.qml:105
-#, kde-format
-msgid "Host user config"
-msgstr ""
-
-#: dashboard/qml/Main.qml:107
-#, kde-format
-msgid "Sandbox system config (ephemeral)"
-msgstr ""
-
-#: dashboard/qml/Main.qml:107
-#, kde-format
-msgid "System config"
-msgstr ""
-
-#: dashboard/qml/Main.qml:109
-#, kde-format
-msgid "App config (dashboard)"
-msgstr ""
-
-#: dashboard/qml/Main.qml:109
-#, kde-format
-msgid "User config"
-msgstr ""
-
-#: dashboard/qml/Main.qml:117
-#, kde-format
-msgid "In use"
-msgstr ""
-
-#: dashboard/qml/Main.qml:119
-#, kde-format
-msgid "Not found"
-msgstr ""
-
-#: dashboard/qml/Main.qml:121
-#, kde-format
-msgid "Invalid — see server log"
-msgstr ""
-
-#: dashboard/qml/Main.qml:123
-#, kde-format
-msgid "Unavailable"
-msgstr ""
-
-#: dashboard/qml/Main.qml:210
+#: dashboard/qml/Main.qml:142
 #, kde-format
 msgid "Avahi daemon is not installed"
 msgstr "Сервис avahi не установлен"
 
-#: dashboard/qml/Main.qml:218
+#: dashboard/qml/Main.qml:150
 #, kde-format
 msgid "Avahi daemon is not started"
 msgstr "Сервис avahi не запущен"
 
-#: dashboard/qml/Main.qml:225 dashboard/qml/Main.qml:239
-#: dashboard/qml/Main.qml:299
+#: dashboard/qml/Main.qml:157 dashboard/qml/Main.qml:171
+#: dashboard/qml/Main.qml:231
 #, kde-format
 msgid "Fix it"
 msgstr "Исправить"
 
-#: dashboard/qml/Main.qml:233
+#: dashboard/qml/Main.qml:165
 #, kde-format
 msgid "Firewall may not allow port 9757"
 msgstr "Брандмауэр может не разрешать порт 9757"
 
-#: dashboard/qml/Main.qml:247
+#: dashboard/qml/Main.qml:179
 #, kde-format
 msgid ""
 "NVIDIA GPUs require at least driver version 565.77, current version is %1"
 msgstr "NVIDIA ГПУ требуют драйвер версии не ниже 565.77, текущая версия: %1"
 
-#: dashboard/qml/Main.qml:253
+#: dashboard/qml/Main.qml:185
 #, kde-format
 msgid "More info"
 msgstr "Больше информации"
 
-#: dashboard/qml/Main.qml:261
+#: dashboard/qml/Main.qml:193
 #, kde-format
 msgid "Vulkan drivers cannot be found, you may need to run \"flatpak update\""
 msgstr ""
 
-#: dashboard/qml/Main.qml:261
+#: dashboard/qml/Main.qml:193
 #, kde-format
 msgid "Vulkan drivers cannot be found"
 msgstr ""
 
-#: dashboard/qml/Main.qml:269
+#: dashboard/qml/Main.qml:201
 #, kde-format
 msgid ""
 "Use the Mesa (radv) driver for AMD GPUs\n"
@@ -394,7 +334,7 @@ msgstr ""
 "Используйте Mesa (radv) драйвер для AMD ГПУ\n"
 "Аппаратная кодировка с vaapi не работает с AMDVLK и AMDGPU-PRO"
 
-#: dashboard/qml/Main.qml:277
+#: dashboard/qml/Main.qml:209
 #, kde-format
 msgid ""
 "No OpenVR compatibility detected, Steam games won't be able to load VR.\n"
@@ -403,141 +343,126 @@ msgstr ""
 "OpenVR совместимости не обнаружено, игры из Steam не смогут загрузить VR.\n"
 "Установите xrizer или OpenComposite."
 
-#: dashboard/qml/Main.qml:285
+#: dashboard/qml/Main.qml:217
 #, kde-format
 msgid "Steam is installed as a snap. Snaps are not compatible with WiVRn."
 msgstr "Steam установлен как snap-пакет. Snap-пакеты не совместимы с WiVRn."
 
-#: dashboard/qml/Main.qml:293
+#: dashboard/qml/Main.qml:225
 #, kde-format
 msgid ""
 "Steam is installed as a flatpak but does not have sufficient permissions."
 msgstr ""
 "Steam установлен как flatpak-пакет но у него нет необходимых разрешений."
 
-#: dashboard/qml/Main.qml:308
+#: dashboard/qml/Main.qml:240
 #, kde-format
 msgid "Restart the server for configuration changes to take effect"
 msgstr "Перезапустите сервер для применения изменённых настроек"
 
-#: dashboard/qml/Main.qml:314
+#: dashboard/qml/Main.qml:246
 #, kde-format
 msgctxt "restart the server"
 msgid "Restart now"
 msgstr "Перезапустить сейчас"
 
-#: dashboard/qml/Main.qml:339
+#: dashboard/qml/Main.qml:271
 #, kde-format
 msgid "Server failed to start"
 msgstr "Не удалось запустить сервер"
 
-#: dashboard/qml/Main.qml:345 dashboard/qml/TroubleshootPage.qml:89
+#: dashboard/qml/Main.qml:277 dashboard/qml/TroubleshootPage.qml:89
 #, kde-format
 msgid "Open server logs"
 msgstr "Открыть логи сервера"
 
-#: dashboard/qml/Main.qml:371
+#: dashboard/qml/Main.qml:303
 #, kde-format
 msgid "Server status"
 msgstr "Статус сервера"
 
-#: dashboard/qml/Main.qml:377
+#: dashboard/qml/Main.qml:309
 #, kde-format
 msgctxt "whether the server is running, displayed in front of a checkbox"
 msgid "Running"
 msgstr "Запущено"
 
-#: dashboard/qml/Main.qml:390
+#: dashboard/qml/Main.qml:322
 #, kde-format
 msgctxt "whether pairing is enabled, displayed in front of a checkbox"
 msgid "Pairing"
 msgstr "Сопряжение"
 
-#: dashboard/qml/Main.qml:410
+#: dashboard/qml/Main.qml:342
 #, kde-format
 msgid "Headset status"
 msgstr "Статус шлема"
 
-#: dashboard/qml/Main.qml:417
+#: dashboard/qml/Main.qml:349
 #, kde-format
 msgctxt "label for headset name/status under server running switch"
 msgid "Headset"
 msgstr "Шлем"
 
-#: dashboard/qml/Main.qml:420
+#: dashboard/qml/Main.qml:352
 #, kde-format
 msgid "Not connected"
 msgstr "Не подключено"
 
-#: dashboard/qml/Main.qml:424
+#: dashboard/qml/Main.qml:356
 #, kde-format
 msgid "Disconnect"
 msgstr "Отключиться"
 
-#: dashboard/qml/Main.qml:433 dashboard/qml/Main.qml:441
-#: dashboard/qml/Main.qml:448
+#: dashboard/qml/Main.qml:365 dashboard/qml/Main.qml:373
+#: dashboard/qml/Main.qml:380
 #, kde-format
 msgctxt "label for USB status or connect button"
 msgid "USB"
 msgstr "USB"
 
-#: dashboard/qml/Main.qml:434
+#: dashboard/qml/Main.qml:366
 #, kde-format
 msgctxt "usb connect button"
 msgid "Connect (wired)"
 msgstr "Подключить (по проводу)"
 
-#: dashboard/qml/Main.qml:451 dashboard/qml/WizardPage.qml:339
+#: dashboard/qml/Main.qml:383 dashboard/qml/WizardPage.qml:339
 #, kde-format
 msgid "No headset is connected or your headset is not in developer mode"
 msgstr "Нет подключенного шлема, либо ваш шлем не в режиме разработчика"
 
-#: dashboard/qml/Main.qml:457
-#, kde-format
-msgid "Configuration files"
-msgstr ""
-
-#: dashboard/qml/Main.qml:465
-#, kde-format
-msgid "Config files:"
-msgstr ""
-
-#: dashboard/qml/Main.qml:473
-#, kde-format
-msgid "No config file found"
-msgstr ""
-
-#: dashboard/qml/Main.qml:526
+#: dashboard/qml/Main.qml:404
 #, kde-format
 msgid "Steam information"
 msgstr "Информация для Steam"
 
-#: dashboard/qml/Main.qml:542
+#: dashboard/qml/Main.qml:420
 #, kde-format
 msgid "Wizard"
 msgstr "Мастер настройки"
 
-#: dashboard/qml/Main.qml:548
+#: dashboard/qml/Main.qml:426
 #, kde-format
 msgid "Install the app"
 msgstr "Установить приложение"
 
-#: dashboard/qml/Main.qml:567 dashboard/qml/SettingsPage.qml:14
+#: dashboard/qml/Main.qml:445 dashboard/qml/SettingsPage.qml:14
 #, kde-format
 msgid "Settings"
 msgstr "Настройки"
 
-#: dashboard/qml/Main.qml:573
+#: dashboard/qml/Main.qml:451
 #, kde-format
 msgid "About"
 msgstr "О WiVRn"
 
-#: dashboard/qml/Main.qml:578 dashboard/qml/TroubleshootPage.qml:10
+#: dashboard/qml/Main.qml:456 dashboard/qml/TroubleshootPage.qml:10
 #, kde-format
 msgid "Troubleshoot"
 msgstr "Устранение неполадок"
 
-#: dashboard/qml/Main.qml:585
+#: dashboard/qml/Main.qml:463
 #, kde-format
 msgid "Version %1"
 msgstr "Версия %1"
@@ -665,90 +590,49 @@ msgstr ""
 "Устройства должны быть включены перед подключенем к WiVRn.\n"
 "Внешняя утилита, такая как motoc, необходима для калибрации."
 
-#: dashboard/qml/SettingsPage.qml:138
-#, kde-format
-msgid "Clamp extrapolation for SteamVR tracked devices"
-msgstr ""
-
-#: dashboard/qml/SettingsPage.qml:142
-#, kde-format
-msgid "SteamVR max pose extrapolation"
-msgstr ""
-
-#: dashboard/qml/SettingsPage.qml:152
-#, kde-format
-msgctxt "value display for SteamVR max pose extrapolation"
-msgid "%1ms"
-msgid_plural "%1ms"
-msgstr[0] ""
-msgstr[1] ""
-msgstr[2] ""
-
-#: dashboard/qml/SettingsPage.qml:157
-#, kde-format
-msgid ""
-"Maximum time in milliseconds that poses may be extrapolated ahead for "
-"SteamVR tracked devices. Tune this value if you experience jittery or wobbly "
-"tracking."
-msgstr ""
-
-#: dashboard/qml/SettingsPage.qml:162
-#, kde-format
-msgid "SteamVR joystick deadzone"
-msgstr ""
-
-#: dashboard/qml/SettingsPage.qml:177
-#, kde-format
-msgid ""
-"Deadzone to apply to joysticks on lighthouse-tracked controllers, such as "
-"Index.\n"
-"For standalone controllers, deadzones may be adjusted via the headset's "
-"system settings."
-msgstr ""
-
-#: dashboard/qml/SettingsPage.qml:185
+#: dashboard/qml/SettingsPage.qml:140
 #, kde-format
 msgid "Custom adb location"
 msgstr "Пользовательское расположение adb"
 
-#: dashboard/qml/SettingsPage.qml:196
+#: dashboard/qml/SettingsPage.qml:151
 #, kde-format
 msgid "Adb location:"
 msgstr "Расположение adb:"
 
-#: dashboard/qml/SettingsPage.qml:205
+#: dashboard/qml/SettingsPage.qml:160
 #, kde-format
 msgctxt "browse a file to choose the adb binary"
 msgid "Browse"
 msgstr "Обзор"
 
-#: dashboard/qml/SettingsPage.qml:215
+#: dashboard/qml/SettingsPage.qml:170
 #, kde-format
 msgid "Default"
 msgstr "По умолчанию"
 
-#: dashboard/qml/SettingsPage.qml:229
+#: dashboard/qml/SettingsPage.qml:184
 #, kde-format
 msgctxt "set a custom OpenVR compatibility library"
 msgid "Custom"
 msgstr "Пользовательская"
 
-#: dashboard/qml/SettingsPage.qml:234
+#: dashboard/qml/SettingsPage.qml:189
 #, kde-format
 msgid "Disabled"
 msgstr "Выключена"
 
-#: dashboard/qml/SettingsPage.qml:250
+#: dashboard/qml/SettingsPage.qml:205
 #, kde-format
 msgid "OpenVR compatibility library:"
 msgstr "Библиотека для совместимости с OpenVR"
 
-#: dashboard/qml/SettingsPage.qml:280
+#: dashboard/qml/SettingsPage.qml:235
 #, kde-format
 msgid "Library path, excluding bin/linux64/vrclient.so"
 msgstr "Путь библиотеки, исключая bin/linux64/vrclient.so"
 
-#: dashboard/qml/SettingsPage.qml:285
+#: dashboard/qml/SettingsPage.qml:240
 #, kde-format
 msgctxt "browse to choose the OpenVR compatibility to use"
 msgid "Browse"
@@ -1093,12 +977,12 @@ msgstr "Завершить"
 msgid "Finished"
 msgstr "Завершено"
 
-#: dashboard/wivrn_server.cpp:606
+#: dashboard/wivrn_server.cpp:565
 #, kde-format
 msgid "xrizer"
 msgstr "xrizer"
 
-#: dashboard/wivrn_server.cpp:607
+#: dashboard/wivrn_server.cpp:566
 #, kde-format
 msgid "Open Composite"
 msgstr "Open Composite"
