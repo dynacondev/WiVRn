@@ -100,11 +100,15 @@ replaces Avahi on macOS). Ports 9757 TCP+UDP (`main.cpp:51`,
 2. Headset package/intent (docs/debugging.md:109-137,264-274):
    - Variants: `org.meumeu.wivrn[.local|.github|.github.testing|.github.nightly]`.
    - `WIVRN_PKG=$(adb shell pm list packages | grep wivrn | cut -d: -f2)`
-   - USB baseline first:
-     ```bash
-     adb reverse tcp:9757 tcp:9757
-     adb shell am start -a android.intent.action.VIEW -d "wivrn+tcp://localhost:9757" ${WIVRN_PKG}
-     ```
+    - USB baseline first (the intent below points at headset-side
+      `localhost:9757`, which exists ONLY through the reverse tunnel —
+      without it the client fails with "server refused the connection"
+      even though the server is fine. Create AND verify the tunnel):
+      ```bash
+      adb reverse tcp:9757 tcp:9757
+      adb reverse --list   # must show ... tcp:9757 tcp:9757 ...; if empty, the tunnel failed (cable/USB mode/daemon) — fix that first
+      adb shell am start -a android.intent.action.VIEW -d "wivrn+tcp://localhost:9757" ${WIVRN_PKG}
+      ```
    - Then WiFi runs (same intent with the Mac's LAN address).
 3. Client log filter: `adb logcat '*:S' WiVRn:V` (docs/debugging.md:70).
    Watch for (all grep-verified):
