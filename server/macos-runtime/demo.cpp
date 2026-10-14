@@ -306,6 +306,13 @@ int main(int argc, char ** argv)
 	// Headless pixel proof: snapshot eye 0 once and assert the cube
 	// drew. Documented at the capture site below.
 	bool verifyPixels = std::getenv("WIVRN_MACOS_VERIFY_PIXELS") != nullptr;
+	// Tear-detector hook (headless harness only): paint the frame
+	// sequence number into a 32x32 corner block of both eyes so a
+	// mid-render snapshot copy shows two generations in one capture.
+	// Clear color R=(1 - gen lo), G=gen hi, B=0.5 (sRGB-encoded on write;
+	// the self-check below inverts the curve back).
+	// Off by default: output is pixel-identical without the variable.
+	bool genTag = std::getenv("WIVRN_MACOS_DEMO_GEN_TAG") != nullptr;
 
 	// ---- OpenXR instance/session through the real loader ----
 	const char * enabledExts[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
@@ -815,6 +822,62 @@ int main(int argc, char ** argv)
 			vkFreeCommandBuffers(dev.device, pool, 1, &cmd);
 			vkDestroyFramebuffer(dev.device, fb, nullptr);
 
+			// Generation-tag hook (see genTag above): a second
+			// loadOp-CLEAR pass over the 32x32 corner block only. Same
+			// verified clear path as the main pass; skipped by default.
+			if (genTag)
+			{
+				VkCommandBuffer tagCmd = VK_NULL_HANDLE;
+				CHECK_VK(vkAllocateCommandBuffers(dev.device, &cmdInfo, &tagCmd));
+				CHECK_VK(vkBeginCommandBuffer(tagCmd, &begin));
+				VkFramebufferCreateInfo tagFbInfo{
+				        .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+				        .pNext = nullptr,
+				        .flags = 0,
+				        .renderPass = pass,
+				        .attachmentCount = 1,
+				        .pAttachments = &eyes[eye].views[index],
+				        .width = 1024,
+				        .height = 1024,
+				        .layers = 1,
+				};
+				VkFramebuffer tagFb = VK_NULL_HANDLE;
+				CHECK_VK(vkCreateFramebuffer(dev.device, &tagFbInfo, nullptr, &tagFb));
+				VkClearValue tagClear{};
+				tagClear.color.float32[0] = 1.0f - (float)(frame & 0xFF) / 255.0f;
+				tagClear.color.float32[1] = (float)((frame >> 8) & 0xFF) / 255.0f;
+				tagClear.color.float32[2] = 0.5f;
+				tagClear.color.float32[3] = 1.0f;
+				VkRenderPassBeginInfo tagRpBegin{
+				        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+				        .pNext = nullptr,
+				        .renderPass = pass,
+				        .framebuffer = tagFb,
+				        .renderArea = {{0, 0}, {32, 32}},
+				        .clearValueCount = 1,
+				        .pClearValues = &tagClear,
+				};
+				vkCmdBeginRenderPass(tagCmd, &tagRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+				vkCmdEndRenderPass(tagCmd);
+				CHECK_VK(vkEndCommandBuffer(tagCmd));
+				VkSubmitInfo tagSubmit{
+				        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+				        .pNext = nullptr,
+				        .waitSemaphoreCount = 0,
+				        .pWaitSemaphores = nullptr,
+				        .pWaitDstStageMask = nullptr,
+				        .commandBufferCount = 1,
+				        .pCommandBuffers = &tagCmd,
+				        .signalSemaphoreCount = 0,
+				        .pSignalSemaphores = nullptr,
+				};
+				vkResetFences(dev.device, 1, &fence);
+				CHECK_VK(vkQueueSubmit(dev.queue, 1, &tagSubmit, fence));
+				CHECK_VK(vkWaitForFences(dev.device, 1, &fence, VK_TRUE, 10'000'000'000ull));
+				vkFreeCommandBuffers(dev.device, pool, 1, &tagCmd);
+				vkDestroyFramebuffer(dev.device, tagFb, nullptr);
+			}
+
 			// Headless pixel proof (WIVRN_MACOS_VERIFY_PIXELS=1, checked
 			// once at frame 30): snapshot eye 0 through the same path the
 			// encoder uses and assert the cube drew upright. Regression
@@ -833,7 +896,13 @@ int main(int argc, char ** argv)
 				const uint8_t * px = snap.capture(eyes[eye].images[index]);
 				CHECK(px != nullptr);
 				// Corner pixel = background (the cube renders centered).
-				uint8_t bb = px[0], bg = px[1], br = px[2];
+				// With the generation-tag hook the corner holds the tag
+				// block instead, so take the reference from the opposite
+				// corner (outside the 32x32 block).
+				const uint8_t * bgRef = px;
+				if (genTag)
+					bgRef = px + ((size_t)1023 * 1024 + 1023) * 4;
+				uint8_t bb = bgRef[0], bg = bgRef[1], br = bgRef[2];
 				size_t diff = 0;
 				uint64_t gTop = 0, gBot = 0;
 				for (uint32_t y = 0; y < 1024; ++y)
@@ -859,6 +928,30 @@ int main(int argc, char ** argv)
 				        (unsigned long long)gTop,
 				        (unsigned long long)gBot);
 				bool ok = diff > 1024 && gTop > gBot * 6 / 5;
+				// Generation-tag hook self-check: the corner block (see
+				// above) must decode to this frame. Clear values written
+				// into the sRGB attachment undergo the linear-to-sRGB
+				// transfer on write, so compare against the encoded
+				// bytes (±2). Runs only when both
+				// WIVRN_MACOS_VERIFY_PIXELS and WIVRN_MACOS_DEMO_GEN_TAG
+				// are set; default output is untouched.
+				if (genTag)
+				{
+					auto srgb = [](float l) {
+						return l <= 0.0031308f ? 12.92f * l : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+					};
+					uint8_t expR = (uint8_t)(srgb(1.0f - (float)(frame & 0xFF) / 255.0f) * 255.0f + 0.5f);
+					uint8_t expG = (uint8_t)(srgb((float)((frame >> 8) & 0xFF) / 255.0f) * 255.0f + 0.5f);
+					const uint8_t * c = px + ((size_t)16 * 1024 + 16) * 4;
+					std::printf(
+					        "demo gentag: corner (%u,%u) expect (%u,%u) (frame %llu)\n",
+					        c[2],
+					        c[1],
+					        expR,
+					        expG,
+					        (unsigned long long)frame);
+					ok = ok && std::abs((int)c[2] - (int)expR) <= 2 && std::abs((int)c[1] - (int)expG) <= 2;
+				}
 				std::printf("demo pixels: %s\n", ok ? "PASS" : "FAIL");
 				std::exit(ok ? 0 : 1);
 			}
