@@ -175,14 +175,18 @@ One-knob-at-a-time; record the exact env per run in the log filename
 
 Rollback: all toggles default to fixed behavior — `unset` every
 `WIVRN_MACOS_*` (and `WIVRN_PORT`/`WIVRN_HOSTNAME` overrides) to return
-to shipped behavior. To revert to the pre-operation build:
+to shipped behavior. To revert to the pre-operation build WITHOUT
+touching this checkout (it may hold uncommitted state), use a spare
+worktree that reuses the shared dependency cache:
 
 ```bash
-git stash -u && git checkout bbad2e41 && cmake --preset macos-server && cmake --build build-macos-server
+git worktree add ../WiVRn-baseline bbad2e41
+export CCACHE_DIR=/Users/luke/Documents/Projects/WiVRn.worktrees/_ccache
+cmake --preset macos-server "-DFETCHCONTENT_BASE_DIR=/Users/luke/Documents/Projects/WiVRn.worktrees/_fetchcontent-shared" -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+cmake --build build-macos-server
 ```
-
-(re-checkout your branch afterwards; `git log --oneline -1` should show
-`bbad2e41` while on the reverted tree.)
+(run the last two with `../WiVRn-baseline` as the working directory;
+remove it afterwards with `git worktree remove ../WiVRn-baseline`.)
 
 ## 6. Known headless-vs-headset gaps (do not over-claim lab results)
 
