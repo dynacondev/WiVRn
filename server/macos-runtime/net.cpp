@@ -11,6 +11,8 @@
 #include <arpa/inet.h>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -125,6 +127,80 @@ template <typename T>
 const T * get_as(const FromPackets & packet)
 {
 	return std::get_if<T>(&packet);
+}
+
+// ---- Transport tuning knobs (env, defaults active) ----
+//
+// WIVRN_MACOS_PACED_SEND=0/1  shard pacing over the UDP stream socket
+//                             (default 1).
+// WIVRN_MACOS_SHARD_BURST=N   max shards sent back-to-back before a
+//                             pacing slice (default 8, clamped 1..256).
+// WIVRN_MACOS_TCP_ONLY=0/1    force the TCP-only video path (stream
+//                             shards over control; default 0). Read here so
+//                             USB setups can force it without touching the
+//                             streamer (LinkConfig lives in net.h).
+//
+// AF41 (DSCP 34) traffic class for the UDP stream socket: low-delay
+// Assured-Forwarding video class, best-effort (logged, never fatal).
+constexpr int kStreamTos = 0x88; // DSCP 34 << 2
+
+bool env_is_true(const char * name, bool def)
+{
+	const char * v = std::getenv(name);
+	if (v == nullptr || v[0] == '\0')
+		return def;
+	if (v[0] == '1' || v[0] == 't' || v[0] == 'T' || v[0] == 'y' || v[0] == 'Y')
+		return true;
+	if ((v[0] == 'o' || v[0] == 'O') && (v[1] == 'n' || v[1] == 'N'))
+		return true; // "on"
+	return false;
+}
+
+long env_long(const char * name, long def)
+{
+	const char * v = std::getenv(name);
+	if (v == nullptr || v[0] == '\0')
+		return def;
+	char * end = nullptr;
+	long parsed = std::strtol(v, &end, 10);
+	if (end == v)
+		return def;
+	return parsed;
+}
+
+int64_t steady_ns()
+{
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Best-effort stream-socket tuning at pin time: DSCP AF41 (v4-mapped leg
+// via IP_TOS, native v6 leg via IPV6_TCLASS) + a 1 MB receive buffer so
+// tracking/feedback bursts never drop on ingress. TX stays 5 MB (set by
+// the caller). Failures are logged, never thrown.
+template <typename Socket>
+void tune_stream_socket(Socket & udp)
+{
+	bool tos_ok = false;
+	int tos_err = 0;
+	try
+	{
+		udp.set_tos(kStreamTos);
+		tos_ok = true;
+	}
+	catch (const std::system_error & e)
+	{
+		tos_err = e.code().value();
+	}
+	int tclass = kStreamTos;
+	bool tclass_ok = ::setsockopt(udp.get_fd(), IPPROTO_IPV6, IPV6_TCLASS, &tclass, sizeof(tclass)) == 0;
+	int tclass_err = tclass_ok ? 0 : errno;
+	if (tos_ok || tclass_ok)
+		log("link: stream DSCP AF41 (tos=%s tclass=%s)", tos_ok ? "ok" : "fail", tclass_ok ? "ok" : "fail");
+	else
+		log("link: stream DSCP set failed (tos=%s tclass=%s)", std::strerror(tos_err), std::strerror(tclass_err));
+	int rcvbuf = 1 * 1024 * 1024;
+	if (::setsockopt(udp.get_fd(), SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0)
+		log("link: stream SO_RCVBUF set failed: %s", std::strerror(errno));
 }
 
 } // namespace
@@ -323,6 +399,13 @@ bool HeadsetLink::start(const LinkConfig & config, Events events)
 	if (listening_)
 		return false;
 	config_ = config;
+	// USB fallback without touching the streamer: force the TCP-only
+	// video path (stream_port=-1, shards over control) from the env.
+	if (env_is_true("WIVRN_MACOS_TCP_ONLY", false))
+	{
+		config_.tcp_only = true;
+		log("link: TCP-only video forced by WIVRN_MACOS_TCP_ONLY");
+	}
 	events_ = std::move(events);
 	try
 	{
@@ -552,6 +635,7 @@ bool HeadsetLink::accept_and_handshake(std::stop_token stop)
 						udp->connect(addr);
 						int sndbuf = 5 * 1024 * 1024;
 						::setsockopt(udp->get_fd(), SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+						tune_stream_socket(*udp);
 						log("link: stream pinned to %s", format_peer(addr).c_str());
 						stream = std::move(udp);
 						pinned = true;
@@ -637,6 +721,10 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 						       !last_ack_[stream].compare_exchange_weak(ack, feedback->frame_index))
 						{
 						}
+						// The forced IDR landed: the decoder reached past
+						// the force point, so re-arm the gate.
+						if (idr_waiting_[stream].load() && feedback->frame_index > idr_force_point_[stream].load())
+							idr_waiting_[stream].store(false);
 					}
 					// Journey log on completions/NACKs only: per-display
 					// updates (disp>=1) flood at 240 lines/s otherwise.
@@ -650,8 +738,7 @@ void HeadsetLink::control_rx_loop(std::stop_token stop)
 						    (long long)feedback->received_from_decoder,
 						    (long long)feedback->blitted,
 						    (long long)feedback->displayed);
-					if (!feedback->sent_to_decoder && feedback->frame_index >= last_ack_[stream].load() &&
-					    events_.need_idr)
+					if (!feedback->sent_to_decoder && events_.need_idr && nack_should_force(stream, feedback->frame_index))
 					{
 						log("link: NACK stream=%u frame=%llu, forcing IDR", stream, (unsigned long long)feedback->frame_index);
 						try
@@ -813,12 +900,167 @@ void HeadsetLink::send_timesync_burst()
 	}
 }
 
+void HeadsetLink::note_frame_sent(uint8_t stream, uint64_t frame_idx, bool reliable)
+{
+	if (stream >= 2)
+		return;
+	uint64_t prev = last_sent_idx_[stream].load();
+	while (prev < frame_idx && !last_sent_idx_[stream].compare_exchange_weak(prev, frame_idx))
+	{
+	}
+	if (!reliable)
+		return;
+	uint64_t prev_rel = last_reliable_idx_[stream].load();
+	while (prev_rel < frame_idx && !last_reliable_idx_[stream].compare_exchange_weak(prev_rel, frame_idx))
+	{
+	}
+	reliable_seen_[stream].store(true);
+}
+
+// NACK->IDR damping (Linux default_idr_handler ideas, wire semantics
+// unchanged): stale NACKs, NACKs covered by an IDR already on the wire,
+// and duplicates while a forced IDR is still in flight all coalesce — a
+// loss storm costs one force per decoder round-trip, not one per NACK.
+// The both-eyes co-force is preserved: a true return fires need_idr,
+// whose handler forces L+R together (the client needs the pair).
+bool HeadsetLink::nack_should_force(uint8_t stream, uint64_t frame_idx)
+{
+	int64_t now = steady_ns();
+	// Stale: the decoder already got past this frame (mirrors the Linux
+	// running.last_ack gate: only frame_index >= last_ack forces).
+	if (frame_idx < last_ack_[stream].load())
+	{
+		uint64_t n = ++idr_suppressed_;
+		if (n == 1 || n % 60 == 0)
+			log("link: NACK stream=%u frame=%llu suppressed (stale, ack=%llu)",
+			    stream,
+			    (unsigned long long)frame_idx,
+			    (unsigned long long)last_ack_[stream].load());
+		return false;
+	}
+	// Covered: an IDR newer than the NACK is already encoded and on the
+	// wire (reliable/TCP, so it will arrive). No re-force.
+	if (reliable_seen_[stream].load() && frame_idx <= last_reliable_idx_[stream].load())
+	{
+		uint64_t n = ++idr_suppressed_;
+		if (n == 1 || n % 60 == 0)
+			log("link: NACK stream=%u frame=%llu suppressed (covered, rel=%llu)",
+			    stream,
+			    (unsigned long long)frame_idx,
+			    (unsigned long long)last_reliable_idx_[stream].load());
+		return false;
+	}
+	int64_t last_force = last_force_ns_[stream].load();
+	// In flight: a force is outstanding and the decoder hasn't confirmed
+	// past it (Linux wait_idr_feedback). Coalesce unless the wait clearly
+	// timed out (>1 s or >100 frames sent since the force, mirroring the
+	// Linux 100-frame IDR timeout) — then re-arm and evaluate fresh.
+	if (idr_waiting_[stream].load())
+	{
+		bool timed_out = (now - last_force > 1'000'000'000) ||
+		                 (last_sent_idx_[stream].load() > idr_force_point_[stream].load() + 100);
+		if (!timed_out)
+		{
+			uint64_t n = ++idr_suppressed_;
+			if (n == 1 || n % 60 == 0)
+				log("link: NACK stream=%u frame=%llu suppressed (idr in flight)", stream, (unsigned long long)frame_idx);
+			return false;
+		}
+		idr_waiting_[stream].store(false);
+	}
+	// Cooldown: at most one force per 100 ms per stream. A genuinely new
+	// loss right after a landed IDR waits out the remainder; everything
+	// older is already covered by the stale/covered rules above.
+	if (now - last_force < 100'000'000)
+	{
+		uint64_t n = ++idr_suppressed_;
+		if (n == 1 || n % 60 == 0)
+			log("link: NACK stream=%u frame=%llu suppressed (cooldown)", stream, (unsigned long long)frame_idx);
+		return false;
+	}
+	idr_force_point_[stream].store(last_sent_idx_[stream].load());
+	last_force_ns_[stream].store(now);
+	idr_waiting_[stream].store(true);
+	++idr_forced_;
+	return true;
+}
+
 void HeadsetLink::send_frame(OutgoingFrame frame)
 {
 	std::lock_guard lock(mutex_);
 	if (!connected_ || !control_)
 		return;
+	uint8_t stream = frame.stream_idx;
 	bool use_stream = stream_ != nullptr && !frame.reliable;
+	// The encoder advanced past this index even if the send below drops
+	// the frame: record it for the NACK gate up front.
+	note_frame_sent(stream, frame.frame_idx, false);
+	size_t nshards = frame.shards.size();
+
+	// Pacing budget: spread this frame's shards over min(1 ms, measured
+	// inter-send interval / 4) per eye, so both eyes together stay well
+	// under half a frame interval (worst case ~2.7 ms incl. sleep
+	// overshoot vs 4.16 ms at 120 Hz). Only the UDP path is paced
+	// (reliable shards ride TCP, where the kernel paces already).
+	bool paced = use_stream && env_is_true("WIVRN_MACOS_PACED_SEND", true);
+	long burst = env_long("WIVRN_MACOS_SHARD_BURST", 8);
+	if (burst < 1)
+		burst = 1;
+	if (burst > 256)
+		burst = 256;
+	int64_t budget_ns = 1'000'000;
+	if (paced && stream < 2)
+	{
+		int64_t send_now = steady_ns();
+		int64_t prev_send = last_send_ns_[stream].load();
+		if (prev_send != 0)
+		{
+			int64_t interval = send_now - prev_send;
+			if (interval < 2'000'000)
+				interval = 2'000'000;
+			if (interval > 50'000'000)
+				interval = 50'000'000;
+			if (interval / 4 < budget_ns)
+				budget_ns = interval / 4;
+		}
+		last_send_ns_[stream].store(send_now);
+	}
+	int64_t slice_ns = (paced && nshards > 0) ? budget_ns * burst / (int64_t)nshards : 0;
+
+	// Transient send-buffer exhaustion: wait writable up to 1 ms per
+	// frame total, then drop the frame on the existing path. UDP sockets
+	// are non-blocking, so a full buffer raises EAGAIN (or ENOBUFS);
+	// anything else is fatal and propagates as before.
+	int64_t eagain_deadline = 0;
+	bool stalled = false;
+	size_t sent_shards = 0;
+	auto send_udp = [&](const wivrn::to_headset::video_stream_data_shard & s) {
+		for (;;)
+		{
+			try
+			{
+				stream_->send(wivrn::to_headset::video_stream_data_shard{s});
+				return;
+			}
+			catch (const std::system_error & e)
+			{
+				int err = e.code().value();
+				if (err != EAGAIN && err != ENOBUFS)
+					throw;
+				int64_t now = steady_ns();
+				if (eagain_deadline == 0)
+				{
+					eagain_deadline = now + 1'000'000;
+					stalled = true;
+				}
+				if (now >= eagain_deadline)
+					throw;
+				pollfd pfd{.fd = stream_->get_fd(), .events = POLLOUT, .revents = 0};
+				::poll(&pfd, 1, 1);
+			}
+		}
+	};
+
 	try
 	{
 		wivrn::to_headset::video_stream_data_shard shard;
@@ -842,12 +1084,33 @@ void HeadsetLink::send_frame(OutgoingFrame frame)
 			if (frame.reliable)
 				control_->send(wivrn::to_headset::video_stream_data_shard{shard});
 			else if (use_stream)
-				stream_->send(wivrn::to_headset::video_stream_data_shard{shard});
+				send_udp(shard);
 			else
 				control_->send(wivrn::to_headset::video_stream_data_shard{shard});
 			++shard.shard_idx;
+			++sent_shards;
+			// Pace after each burst group — never after the tail shard,
+			// so no sleep is added past the frame's last byte.
+			if (slice_ns > 0 && (i + 1) % (size_t)burst == 0 && i + 1 < frame.shards.size())
+				std::this_thread::sleep_for(std::chrono::nanoseconds(slice_ns));
 		}
-		++sent_frames_;
+		if (frame.reliable)
+			note_frame_sent(stream, frame.frame_idx, true);
+		if (stalled)
+			++eagain_saved_;
+		uint64_t sent = ++sent_frames_;
+		// Periodic transport accounting (key=value like the streamer
+		// heartbeat; the `link: fb` journey lines above stay byte-stable
+		// for existing parsers).
+		if (sent % 300 == 0)
+			log("link: net sent=%llu drop=%llu dshard=%llu estall=%llu esaved=%llu idr_force=%llu idr_supp=%llu",
+			    (unsigned long long)sent,
+			    (unsigned long long)dropped_frames_.load(),
+			    (unsigned long long)dropped_shards_.load(),
+			    (unsigned long long)eagain_stalls_.load(),
+			    (unsigned long long)eagain_saved_.load(),
+			    (unsigned long long)idr_forced_.load(),
+			    (unsigned long long)idr_suppressed_.load());
 	}
 	catch (const std::exception & e)
 	{
@@ -862,6 +1125,9 @@ void HeadsetLink::send_frame(OutgoingFrame frame)
 		}
 		else
 		{
+			if (stalled)
+				++eagain_stalls_;
+			dropped_shards_ += nshards - sent_shards;
 			uint64_t dropped = ++dropped_frames_;
 			if (dropped == 1 || dropped % 60 == 0)
 				log("link: stream send dropped frame %llu (%s)", (unsigned long long)dropped, e.what());

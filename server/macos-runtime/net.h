@@ -171,6 +171,35 @@ private:
 	// Newest decoded frame per stream (from feedback received_from_decoder;
 	// gates NACK->IDR so stale skips don't force pointless IDRs).
 	std::atomic<uint64_t> last_ack_[2]{0, 0};
+	// NACK-gate damping (Linux default_idr_handler ideas, wire unchanged):
+	// newest frame_idx handed to send_frame per stream, newest reliable
+	// (IDR/config over control) frame_idx sent per stream, and
+	// IDR-in-flight state so a loss storm coalesces to one force per
+	// decoder round-trip. Both-eyes co-force is preserved (the need_idr
+	// callback forces L+R together).
+	std::atomic<uint64_t> last_sent_idx_[2]{0, 0};
+	std::atomic<uint64_t> last_reliable_idx_[2]{0, 0};
+	std::atomic<bool> reliable_seen_[2]{false, false};
+	std::atomic<bool> idr_waiting_[2]{false, false};
+	std::atomic<uint64_t> idr_force_point_[2]{0, 0};
+	std::atomic<int64_t> last_force_ns_[2]{0, 0};
+	// Transport accounting, reported on the periodic `link: net` key=value
+	// line from send_frame (EAGAIN stalls/saves, unsent shards on drop,
+	// NACK-gate force/suppress decisions).
+	std::atomic<uint64_t> eagain_stalls_{0};
+	std::atomic<uint64_t> eagain_saved_{0};
+	std::atomic<uint64_t> dropped_shards_{0};
+	std::atomic<uint64_t> idr_forced_{0};
+	std::atomic<uint64_t> idr_suppressed_{0};
+	// Pacing state: last send_frame time per stream (steady ns), so the
+	// per-eye spread budget tracks the live frame rate.
+	std::atomic<int64_t> last_send_ns_[2]{0, 0};
+
+	// NACK gate: true = fire events_.need_idr for (stream, frame_idx).
+	bool nack_should_force(uint8_t stream, uint64_t frame_idx);
+	// Bookkeeping for the gate: newest frame_idx handed to send_frame,
+	// plus the newest reliable one once it is on the wire.
+	void note_frame_sent(uint8_t stream, uint64_t frame_idx, bool reliable);
 };
 
 } // namespace wivrn_macos
