@@ -370,6 +370,74 @@ int main()
 		CHECK(!nals.empty());
 	}
 
+	// VideoToolbox backend (Phase H): same wire assertions as x264
+	// (Annex-B, SPS/PPS + IDR present, shardable). Skips cleanly where
+	// no hardware encoder exists (VMs); the facade fallback is covered
+	// below regardless.
+	{
+		VideoEncoder vt;
+		EncoderParams vparams{.width = kWidth, .height = kHeight, .fps = 90, .bitrate_bps = 5'000'000};
+		if (!vt.open(vparams, VideoBackend::VT))
+		{
+			std::puts("vt backend unavailable, skipping VT cases");
+		}
+		else
+		{
+			CHECK(vt.using_vt());
+			size_t vbytes = 0;
+			bool vsawConfig = false, vsawIdr = false;
+			for (int frame = 0; frame < 10; ++frame)
+			{
+				CHECK(clear_image(dev, image, pool, frame % 2 == 0 ? 0.2f : 0.8f, 0.3f, 0.9f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				bool forceIdr = frame == 0 || frame == 5;
+				std::vector<EncodedNal> nals = vt.feed(bgra, false, forceIdr);
+				CHECK(!nals.empty());
+				CHECK(nals.back().is_last);
+				bool frameIdr = false;
+				for (const EncodedNal & nal: nals)
+				{
+					CHECK(!nal.bytes.empty());
+					CHECK(nal.bytes.size() >= 4 && nal.bytes[0] == 0 && nal.bytes[1] == 0 && nal.bytes[2] == 0 &&
+					      nal.bytes[3] == 1);
+					vbytes += nal.bytes.size();
+					vsawConfig = vsawConfig || nal.is_config;
+					vsawIdr = vsawIdr || nal.is_idr;
+					frameIdr = frameIdr || nal.is_idr;
+				}
+				CHECK(!forceIdr || frameIdr);
+			}
+			std::printf("vt encoded 10 frames, %zu total bytes\n", vbytes);
+			// Flat test content compresses to ~100 B/frame on a HW
+			// CABAC encoder (roundtrip-verified faithful); the floor
+			// only guards against total collapse, not bitrate.
+			CHECK(vbytes > 400);
+			CHECK(vsawConfig && vsawIdr);
+			vt.reconfig(10'000'000, 72);
+			{
+				CHECK(clear_image(dev, image, pool, 0.5f, 0.5f, 0.5f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				std::vector<EncodedNal> nals = vt.feed(bgra, false, true);
+				CHECK(!nals.empty());
+			}
+			vt.close();
+		}
+	}
+
+	// Facade selection: explicit x264 always serves x264; auto serves
+	// VT where available else x264 (either satisfies the contract).
+	{
+		VideoEncoder forced;
+		CHECK(forced.open(params, VideoBackend::X264));
+		CHECK(!forced.using_vt());
+		forced.close();
+		VideoEncoder automatic;
+		CHECK(automatic.open(params, VideoBackend::Auto));
+		automatic.close();
+	}
+
 	snapshot.shutdown();
 	vkDestroyCommandPool(dev.device, pool, nullptr);
 	vkDestroyImage(dev.device, image, nullptr);

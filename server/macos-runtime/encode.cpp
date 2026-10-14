@@ -5,16 +5,83 @@
 
 #include "encode.h"
 
+#include "encode_vt.h"
 #include "runtime.h" // log()
 
 #include <x264.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 
 namespace wivrn_macos
 {
+
+// Out-of-line (VTEncoder complete here; header only forward-declares).
+VideoEncoder::VideoEncoder() = default;
+VideoEncoder::~VideoEncoder() = default;
+
+bool VideoEncoder::open(const EncoderParams & params, VideoBackend backend)
+{
+	close();
+	if (backend == VideoBackend::Auto)
+	{
+		if (const char * env = std::getenv("WIVRN_MACOS_VIDEO_ENCODER"))
+		{
+			if (std::strcmp(env, "x264") == 0)
+				backend = VideoBackend::X264;
+			else if (std::strcmp(env, "vt") == 0)
+				backend = VideoBackend::VT;
+		}
+	}
+	if (backend != VideoBackend::X264)
+	{
+		vt_ = std::make_unique<VTEncoder>();
+		if (vt_->open(params))
+		{
+			use_vt_ = true;
+			return true;
+		}
+		log("video-encoder: VT unavailable, falling back to x264");
+		vt_.reset();
+	}
+	use_vt_ = false;
+	return x264_.open(params);
+}
+
+void VideoEncoder::close()
+{
+	if (vt_)
+	{
+		vt_->close();
+		vt_.reset();
+	}
+	x264_.close();
+	use_vt_ = false;
+}
+
+std::vector<EncodedNal> VideoEncoder::feed(const uint8_t * rgba, bool swap_rb, bool force_idr)
+{
+	if (vt_)
+		return vt_->feed(rgba, swap_rb, force_idr);
+	return x264_.feed(rgba, swap_rb, force_idr);
+}
+
+void VideoEncoder::reconfig(uint32_t bitrate_bps, uint32_t fps)
+{
+	if (vt_)
+		vt_->reconfig(bitrate_bps, fps);
+	else
+		x264_.reconfig(bitrate_bps, fps);
+}
+
+uint64_t VideoEncoder::frames_encoded() const
+{
+	if (vt_)
+		return vt_->frames_encoded();
+	return x264_.frames_encoded();
+}
 
 void convert_to_nv12(const uint8_t * rgba, uint32_t width, uint32_t height, bool swap_rb, uint8_t * yuv)
 {

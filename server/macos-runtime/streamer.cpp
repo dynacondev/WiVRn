@@ -109,31 +109,24 @@ bool Streamer::has_headset() const
 
 void Streamer::session_destroyed(Session * session)
 {
-	// Mark dead + drop snapshot under lock (snapshot is app-thread-only;
-	// DestroySession is not concurrent with EndFrame in v1 apps), then
-	// wait out any in-flight worker feed before closing the encoder.
-	for (Eye & eye: eyes_)
-	{
-		std::lock_guard lock(eye.mutex);
-		if (eye.initialized && eye.session == session)
-		{
-			eye.dead = true;
-			eye.snapshot.shutdown();
-			eye.initialized = false;
-			eye.session = nullptr;
-			eye.pending = false;
-			eye.pixels.clear();
-		}
-	}
+	// Wait out any in-flight worker snapshot+feed first (feeding spans
+	// take through send-end), then tear down under lock. DestroySession
+	// is not concurrent with EndFrame in v1 apps, so no new jobs stage
+	// mid-teardown; the worker sees dead at take and drops.
 	for (Eye & eye: eyes_)
 	{
 		while (eye.feeding.load())
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		std::lock_guard lock(eye.mutex);
-		if (eye.dead)
+		if (eye.initialized && eye.session == session)
 		{
+			eye.dead = true;
+			eye.snapshot.shutdown();
 			eye.encoder.close();
-			eye.dead = false;
+			eye.initialized = false;
+			eye.session = nullptr;
+			eye.pending = false;
+			eye.job_swap = nullptr;
 			eye.enc_width = 0;
 			eye.enc_height = 0;
 			eye.last_bitrate = 0;
@@ -142,9 +135,41 @@ void Streamer::session_destroyed(Session * session)
 	}
 }
 
+void Streamer::release_swapchain(Swapchain * swap)
+{
+	if (swap == nullptr)
+		return;
+	// Drop staged jobs on this record under eye locks (a worker take
+	// serializes on the same lock: taken jobs set feeding and are
+	// waited out below, untaken ones die here).
+	for (Eye & eye: eyes_)
+	{
+		std::lock_guard lock(eye.mutex);
+		if (eye.job_swap == swap)
+		{
+			eye.job_swap = nullptr;
+			eye.pending = false;
+		}
+	}
+	swap->staged_idx.store(-1, std::memory_order_release);
+	// Wait out any in-flight snapshot/feed that claimed an image of
+	// this record before the drop above (bounded: snapshot fence and
+	// encoder waits time out; destroy is rare).
+	for (Eye & eye: eyes_)
+	{
+		while (eye.feeding.load())
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	}
+}
+
 void streamer_session_destroyed(Session * session)
 {
 	Streamer::singleton().session_destroyed(session);
+}
+
+void streamer_release_swapchain(Swapchain * swap)
+{
+	Streamer::singleton().release_swapchain(swap);
 }
 
 void Streamer::on_connected(const wivrn::from_headset::headset_info_packet & info)
@@ -317,55 +342,30 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 			}
 			if (swap == nullptr || swap->lastReleased < 0)
 				continue;
-			uint32_t image_idx = (uint32_t)swap->lastReleased;
-			if (image_idx >= swap->images.size())
+			int32_t released = swap->lastReleased;
+			if (released < 0 || (uint32_t)released >= swap->images.size())
 				continue;
 
 			Eye & eye = eyes_[eye_index];
 			// Never block the app loop: the worker only holds the lock
-			// for take/init/destroy (never across feed), so try_lock.
+			// for take (never across snapshot/feed), so try_lock.
 			std::unique_lock eye_lock(eye.mutex, std::try_to_lock);
 			if (!eye_lock.owns_lock())
 				continue;
 			if (eye.feeding.load())
 				continue; // worker mid-feed; its job is newer than ours anyway
-			if (!eye.initialized || eye.session != session || eye.width != swap->width || eye.height != swap->height)
-			{
-				eye.snapshot.shutdown();
-				eye.encoder.close();
-				eye.session = session;
-				if (!eye.snapshot.init(
-				            session->vkPhysicalDevice, session->vkDevice, session->vkQueue, session->vkQueueFamily, swap->width, swap->height))
-				{
-					log("streamer: eye %u snapshot init failed", eye_index);
-					continue;
-				}
-				// (Encoder opens lazily on the worker from the first job;
-				// see encode_eye. Snapshot init stays here: its submits
-				// serialize with release submits on this same thread.)
-				eye.width = swap->width;
-				eye.height = swap->height;
-				eye.initialized = true;
-				eye.force_idr = true;
-				// Describe the stream now that dims are known.
-				float fps = 90.0f;
-				{
-					auto info = link_.info();
-					if (info.has_value() && info->settings.preferred_refresh_rate >= 60.0f)
-						fps = info->settings.preferred_refresh_rate;
-				}
-				link_.send_video_stream_description((uint16_t)swap->width, (uint16_t)swap->height, fps);
-				link_.send_tracking_control();
-			}
-
-			int64_t snap_begin = now_ns();
-			const uint8_t * bgra = eye.snapshot.capture(swap->images[image_idx]);
-			if (bgra == nullptr)
-			{
-				log("streamer: eye %u snapshot failed", eye_index);
-				continue;
-			}
-			eye.pixels.assign(bgra, bgra + (size_t)swap->width * swap->height * 4);
+			if (eye.session != session)
+				eye.dead = false; // new session on this eye: revive (worker drops while dead)
+				                  // Stage the released image for the worker (latest-only: an
+				                  // unconsumed previous stage is silently dropped). The pixels
+				                  // stay on the GPU until the worker snapshots them; acquire
+				                  // skips staged/active images so the app can never reclaim one
+				                  // mid-copy. No pixel work happens on this thread anymore.
+			swap->lastReleased = -1;  // consume-once
+			swap->staged_idx.store(released, std::memory_order_release);
+			eye.session = session;
+			eye.job_swap = swap;
+			eye.job_image_idx = (uint32_t)released;
 			eye.job_width = swap->width;
 			eye.job_height = swap->height;
 			// Snapshot bytes follow the swapchain format; RGBA needs an
@@ -402,7 +402,6 @@ void Streamer::end_frame(Session * session, const XrFrameEndInfo * frameEndInfo,
 					eye.job_fov[v] = sane_fov(proj->views[v].fov) ? proj->views[v].fov : fallback_fov;
 			}
 			eye.job_display_time = display_headset;
-			eye.job_snap_ns = now_ns() - snap_begin;
 			eye.pending = true;
 			eye_lock.unlock();
 			worker_cv_.notify_one();
@@ -445,42 +444,93 @@ void Streamer::encode_eye(uint32_t eye_index)
 		return;
 	Eye & eye = eyes_[eye_index];
 	std::unique_lock eye_lock(eye.mutex);
-	if (!eye.pending.load() || !eye.initialized || eye.dead)
+	if (!eye.pending.load() || eye.dead)
 		return;
-	// Take the job (move pixels out, clear pending first so the app can
-	// already stage the next frame while this one encodes). feeding stays
-	// set across the lock-free feed so session_destroyed waits us out.
-	std::vector<uint8_t> pixels = std::move(eye.pixels);
+	// Take the job (meta copies + staged image claim). feeding is set
+	// here under lock so session_destroyed waits out the snapshot below
+	// as well as the feed; the lock is released across both so the app
+	// never blocks.
+	Swapchain * swap = eye.job_swap;
 	uint32_t width = eye.job_width, height = eye.job_height;
-	bool swap_rb = eye.job_swap_rb, force_idr = eye.job_force_idr;
-	// NACKs landing between stage and take are swallowed by mailbox
-	// overwrites (the staged flag dies with the dropped job): pick the
-	// live flag up directly so a real loss always gets its IDR.
-	force_idr = eye.force_idr.exchange(false) || force_idr;
+	bool swap_rb = eye.job_swap_rb;
+	bool force_idr = eye.job_force_idr;
 	uint32_t bitrate = eye.job_bitrate, fps = eye.job_fps;
 	auto pose = eye.job_pose;
 	auto fov = eye.job_fov;
 	XrTime display_time = eye.job_display_time;
-	int64_t snap_ns = eye.job_snap_ns;
+	// NACKs landing between stage and take are swallowed by mailbox
+	// overwrites (the staged flag dies with the dropped job): pick the
+	// live flag up directly so a real loss always gets its IDR.
+	force_idr = eye.force_idr.exchange(false) || force_idr;
 	eye.pending = false;
 	eye.feeding = true;
-	if (pixels.size() != (size_t)width * height * 4 || width == 0 || height == 0)
+	if (swap == nullptr || width == 0 || height == 0)
 	{
 		eye.feeding = false;
 		return;
 	}
-	// From here the feed runs lock-free (feeding guards session_destroyed);
-	// the app keeps staging via try_lock meanwhile.
+	int32_t claimed = swap->staged_idx.exchange(-1, std::memory_order_acq_rel);
+	if (claimed < 0 || (uint32_t)claimed >= swap->images.size())
+	{
+		eye.feeding = false;
+		return;
+	}
+	uint32_t image_idx = (uint32_t)claimed;
+	// Pin across the snapshot so acquire can't hand the image out
+	// mid-copy (freed the moment the copy lands).
+	swap->active_idx.store((int32_t)image_idx, std::memory_order_release);
+	Session * session = eye.session;
 	eye_lock.unlock();
 
-	// Encoder lifecycle lives entirely on the worker: open on first
-	// job, reopen on size change, reconfig on settings. (Snapshot dims
-	// eye.width/height are app-set and only gate the snapshot side.)
-	if (eye.enc_width != width || eye.enc_height != height)
+	// Snapshot + encoder lifecycle live entirely on the worker: open on
+	// first job, reopen on session/size change, reconfig on settings.
+	// (Snapshot submits serialize with release submits on the shared
+	// queue by submission order.)
+	if (!eye.initialized || session == nullptr || eye.width != width || eye.height != height)
 	{
+		// Unlocked init region: concurrent end_frame touches only job_*
+		// fields, staged_idx and atomics (disjoint); session_destroyed
+		// waits out feeding before tearing down, so no teardown races.
+		eye.snapshot.shutdown();
 		eye.encoder.close();
-		eye.enc_width = 0;
+		eye.session = session;
+		if (session == nullptr ||
+		    !eye.snapshot.init(
+		            session->vkPhysicalDevice, session->vkDevice, session->vkQueue, session->vkQueueFamily, width, height))
+		{
+			log("streamer: eye %u snapshot init failed", eye_index);
+			swap->active_idx.store(-1, std::memory_order_release);
+			eye.feeding = false;
+			return;
+		}
+		eye.width = width;
+		eye.height = height;
+		eye.initialized = true;
+		eye.enc_width = 0; // force encoder (re)open below
 		eye.enc_height = 0;
+		eye.force_idr = true;
+		force_idr = true;
+		// Describe the stream now that dims are known.
+		float desc_fps = 90.0f;
+		{
+			auto info = link_.info();
+			if (info.has_value() && info->settings.preferred_refresh_rate >= 60.0f)
+				desc_fps = info->settings.preferred_refresh_rate;
+		}
+		link_.send_video_stream_description((uint16_t)width, (uint16_t)height, desc_fps);
+		link_.send_tracking_control();
+	}
+
+	int64_t snap_begin = now_ns();
+	const uint8_t * bgra = eye.snapshot.capture(swap->images[image_idx]);
+	int64_t snap_end = now_ns();
+	swap->active_idx.store(-1, std::memory_order_release);
+	int64_t snap_ns = snap_end - snap_begin;
+	if (bgra == nullptr)
+	{
+		log("streamer: eye %u snapshot failed", eye_index);
+		eye.feeding = false;
+		return;
 	}
 	{
 		std::lock_guard lock(mutex_);
@@ -515,7 +565,7 @@ void Streamer::encode_eye(uint32_t eye_index)
 		force_idr = true;
 	}
 	int64_t encode_begin = now_ns();
-	std::vector<EncodedNal> nals = eye.encoder.feed(pixels.data(), swap_rb, force_idr);
+	std::vector<EncodedNal> nals = eye.encoder.feed(bgra, swap_rb, force_idr);
 	int64_t encode_end = now_ns();
 	eye.feeding = false;
 	{

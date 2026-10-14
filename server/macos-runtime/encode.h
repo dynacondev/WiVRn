@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -77,6 +78,46 @@ private:
 	bool failed_ = false;
 	// Owned NV12 frame (converted from BGRA in feed()).
 	std::vector<uint8_t> yuv_;
+};
+
+class VTEncoder; // encode_vt.h (Apple backend, non-Apple stub)
+
+// Backend selection for the per-eye encoder (Phase H): VideoToolbox
+// hardware first, x264 fallback. WIVRN_MACOS_VIDEO_ENCODER overrides
+// (auto|vt|x264, default auto). Wire behavior is identical whichever
+// backend serves a frame (Annex-B, SPS/PPS per IDR, no B-frames).
+enum class VideoBackend
+{
+	Auto,
+	X264,
+	VT,
+};
+
+class VideoEncoder
+{
+public:
+	// Defaulted in encode.cpp (VTEncoder is incomplete here).
+	VideoEncoder();
+	// Defined in encode.cpp (VTEncoder is incomplete here).
+	~VideoEncoder();
+	VideoEncoder(VideoEncoder &&) = delete;
+	VideoEncoder & operator=(VideoEncoder &&) = delete;
+	VideoEncoder(const VideoEncoder &) = delete;
+	VideoEncoder & operator=(const VideoEncoder &) = delete;
+	bool open(const EncoderParams & params, VideoBackend backend = VideoBackend::Auto);
+	void close();
+	std::vector<EncodedNal> feed(const uint8_t * rgba, bool swap_rb, bool force_idr);
+	void reconfig(uint32_t bitrate_bps, uint32_t fps);
+	uint64_t frames_encoded() const;
+	bool using_vt() const
+	{
+		return use_vt_;
+	}
+
+private:
+	X264Encoder x264_;
+	std::unique_ptr<VTEncoder> vt_;
+	bool use_vt_ = false;
 };
 
 // Packed 32-bit (memory order B,G,R,A or R,G,B,A per swap_rb) to NV12,

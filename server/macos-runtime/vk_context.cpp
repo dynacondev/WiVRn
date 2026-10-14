@@ -13,7 +13,10 @@ namespace wivrn_macos
 namespace
 {
 
-constexpr uint32_t swapchainImageCount = 3;
+// Quad-buffered: the async snapshot worker can hold one image
+// (staged) plus snapshot another (active) while the app renders a
+// third, so acquire always has a free image for single-flight apps.
+constexpr uint32_t swapchainImageCount = 4;
 
 bool format_ok(VkPhysicalDevice phys, VkFormat format)
 {

@@ -4,6 +4,7 @@
 // size 1-2, no mips/cubemap/multisample/depth in v1 (loud refusals).
 
 #include "runtime.h"
+#include "streamer.h" // release_swapchain barrier (worker may hold images)
 #include "vk_context.h"
 
 namespace
@@ -123,6 +124,9 @@ extern "C"
 		{
 			if (it->get() == swapchain)
 			{
+				// Barrier first: the worker may hold/stage this record's
+				// images (async snapshot); free only after it is out.
+				wivrn_macos::streamer_release_swapchain(&(*it)->data);
 				wivrn_macos::destroy_swapchain_images((*it)->data);
 				self->ownedSwapchains.erase(it);
 				return XR_SUCCESS;
@@ -182,10 +186,18 @@ extern "C"
 		if (found == nullptr)
 			return XR_ERROR_HANDLE_INVALID;
 		wivrn_macos::Swapchain & swap = *found;
+		int32_t staged = swap.staged_idx.load(std::memory_order_acquire);
+		int32_t active = swap.active_idx.load(std::memory_order_acquire);
 		for (size_t step = 0; step < swap.images.size(); ++step)
 		{
 			uint32_t candidate = (swap.nextIndex + (uint32_t)step) % (uint32_t)swap.images.size();
 			if (swap.busy[candidate])
+				continue;
+			// Never hand out an image the worker staged or is
+			// snapshotting (Phase H holds); skipping is the backpressure
+			// signal only when every image is thus held (pool of 4
+			// covers app + staged + active + free for single-flight apps).
+			if ((int32_t)candidate == staged || (int32_t)candidate == active)
 				continue;
 			swap.busy[candidate] = true;
 			swap.waited[candidate] = false;
@@ -195,7 +207,7 @@ extern "C"
 			*index = candidate;
 			return XR_SUCCESS;
 		}
-		wivrn_macos::log("swapchain: all images busy on acquire");
+		wivrn_macos::log("swapchain: all images busy or worker-held on acquire");
 		return XR_ERROR_RUNTIME_FAILURE;
 	}
 

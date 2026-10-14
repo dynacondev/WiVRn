@@ -1,28 +1,36 @@
-# macOS bespoke server (v1 MVP) — isolated from Linux server/ + Monado.
-# Upstream-clean rule: no includes of xrt_*/comp_*/ipc_*/u_* here. Reuse
-# common/ (packets/serialization/crypto) by link only, via thin adapters
-# defined in this folder (see ROADMAP.md "macOS Server v1 MVP").
+#macOS bespoke server(v1 MVP) — isolated from Linux server / +Monado.
+#Upstream - clean rule : no includes of xrt_ * / comp_ * / ipc_ * / u_ * here.Reuse
+#common / (packets / serialization / crypto) by link only, via thin adapters
+#defined in this folder(see ROADMAP.md "macOS Server v1 MVP").
 #
-# v1 architecture: the runtime dylib IS the server core, hosted in the
-# OpenXR application process (no service/IPC split). The headset connects
-# directly to the application process; wivrn-server-macos is the
-# launcher/headless companion (full daemon role arrives in Phase 5+).
+#v1 architecture : the runtime dylib IS the server core, hosted in the
+#OpenXR application process(no service / IPC split).The headset connects
+#directly to the application process; wivrn - server - macos is the
+#launcher / headless companion(full daemon role arrives in Phase 5 +).
 
 include(FetchContent)
 
-# Same revision the client uses (top-level declares it; populate here —
-# the client tree is OFF in this preset so this is the first populate).
+#Same revision the client uses(top - level declares it; populate here —
+#the client tree is OFF in this preset so this is the first populate).
 FetchContent_GetProperties(openxr_loader)
 if(NOT openxr_loader_POPULATED)
 	FetchContent_MakeAvailable(openxr_loader)
 endif()
 
-# x264 software encoder (brew x264; v1 hardware path is VideoToolbox in v2).
+#x264 software encoder(brew x264; fallback + non - Apple path).
 pkg_check_modules(X264 REQUIRED IMPORTED_TARGET x264)
 
-# Runtime dylib, loaded by the Khronos loader via wivrn-macos.json.
-# Headers come straight from the SDK include dir; the runtime must NOT
-# link the loader itself (the loader dlopens the runtime, not vice versa).
+#VideoToolbox hardware H.264(Phase H primary on Apple Silicon).
+if(APPLE)
+	find_library(VIDEOTOOLBOX_LIBRARY VideoToolbox REQUIRED)
+	find_library(COREMEDIA_LIBRARY CoreMedia REQUIRED)
+	find_library(COREVIDEO_LIBRARY CoreVideo REQUIRED)
+	find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+endif()
+
+#Runtime dylib, loaded by the Khronos loader via wivrn - macos.json.
+#Headers come straight from the SDK include dir; the runtime must NOT
+#link the loader itself(the loader dlopens the runtime, not vice versa).
 add_library(wivrn-macos-runtime MODULE
 	runtime.cpp
 	loader_entry.cpp
@@ -43,28 +51,34 @@ add_library(wivrn-macos-runtime MODULE
 	streamer.cpp
 	bonjour.cpp
 )
+if(APPLE)
+	target_sources(wivrn-macos-runtime PRIVATE encode_vt.cpp)
+endif()
 target_include_directories(wivrn-macos-runtime PRIVATE
 	${openxr_loader_SOURCE_DIR}/include
 	.
 )
 target_link_libraries(wivrn-macos-runtime PRIVATE Vulkan::Vulkan wivrn-common PkgConfig::X264)
+if(APPLE)
+	target_link_libraries(wivrn-macos-runtime PRIVATE ${VIDEOTOOLBOX_LIBRARY} ${COREMEDIA_LIBRARY} ${COREVIDEO_LIBRARY} ${COREFOUNDATION_LIBRARY})
+endif()
 set_target_properties(wivrn-macos-runtime PROPERTIES
 	PREFIX ""
 	SUFFIX ".dylib"
 )
 
-# Loader manifest: absolute library_path keeps dev runs hermetic
-# (XR_RUNTIME_JSON=<build>/wivrn-macos.json, no install needed).
+#Loader manifest : absolute library_path keeps dev runs hermetic
+#(XR_RUNTIME_JSON =<build> / wivrn - macos.json, no install needed).
 set(WIVRN_MACOS_RUNTIME_PATH "${CMAKE_CURRENT_BINARY_DIR}/wivrn-macos-runtime.dylib")
 configure_file(wivrn-macos.json.in wivrn-macos.json @ONLY)
 
-# Launcher / headless companion executable (stub until Phase 5+).
+#Launcher / headless companion executable(stub until Phase 5 +).
 add_executable(wivrn-server-macos
 	main.cpp
 )
 
-# Phase 2 proof: drive the real Khronos loader against our manifest and
-# exercise negotiate -> CreateInstance -> GetSystem -> views -> session.
+#Phase 2 proof : drive the real Khronos loader against our manifest and
+#exercise negotiate->CreateInstance->GetSystem->views->session.
 add_executable(wivrn-macos-runtime-test
 	test_runtime.cpp
 )
@@ -74,9 +88,9 @@ target_include_directories(wivrn-macos-runtime-test PRIVATE
 )
 target_link_libraries(wivrn-macos-runtime-test PRIVATE openxr_loader)
 
-# Phase 4 proof: headless MoltenVK frame-loop drive through the real
-# loader (instance extensions + device bring-up + swapchain cycles +
-# Wait/Begin/EndFrame), with validation layers when available.
+#Phase 4 proof : headless MoltenVK frame - loop drive through the real
+#loader(instance extensions + device bring - up + swapchain cycles +
+#Wait / Begin / EndFrame), with validation layers when available.
 add_executable(wivrn-macos-graphics-test
 	test_graphics.cpp
 )
@@ -86,21 +100,27 @@ target_include_directories(wivrn-macos-graphics-test PRIVATE
 )
 target_link_libraries(wivrn-macos-graphics-test PRIVATE openxr_loader Vulkan::Vulkan)
 
-# Phase 5a proof: clear-to-encode pixels-to-bits (no loader/headset).
+#Phase 5a proof : clear - to - encode pixels - to - bits(no loader / headset).
 add_executable(wivrn-macos-encode-test
 	test_encode.cpp
 	runtime.cpp
 	snapshot.cpp
 	encode.cpp
 )
+if(APPLE)
+	target_sources(wivrn-macos-encode-test PRIVATE encode_vt.cpp)
+endif()
 target_include_directories(wivrn-macos-encode-test PRIVATE
 	${openxr_loader_SOURCE_DIR}/include
 	.
 )
 target_link_libraries(wivrn-macos-encode-test PRIVATE Vulkan::Vulkan PkgConfig::X264)
+if(APPLE)
+	target_link_libraries(wivrn-macos-encode-test PRIVATE ${VIDEOTOOLBOX_LIBRARY} ${COREMEDIA_LIBRARY} ${COREVIDEO_LIBRARY} ${COREFOUNDATION_LIBRARY})
+endif()
 
-# Phase 5b proof: full handshake + steady-state exchange against a
-# loopback fake headset (no real hardware).
+#Phase 5b proof : full handshake + steady - state exchange against a
+#loopback fake headset(no real hardware).
 add_executable(wivrn-macos-net-test
 	test_net.cpp
 	runtime.cpp
@@ -113,9 +133,9 @@ target_include_directories(wivrn-macos-net-test PRIVATE
 )
 target_link_libraries(wivrn-macos-net-test PRIVATE Vulkan::Vulkan wivrn-common)
 
-# Phase 5d proof: full pixels-to-wire-to-poses loopback (fake headset +
-# real runtime dylib + in-process mini app). Needs XR_RUNTIME_JSON and
-# must NOT set WIVRN_MACOS_HEADLESS (streaming is the point).
+#Phase 5d proof : full pixels - to - wire - to - poses loopback(fake headset +
+#real runtime dylib + in - process mini app).Needs XR_RUNTIME_JSON and
+#must NOT set WIVRN_MACOS_HEADLESS(streaming is the point).
 add_executable(wivrn-macos-stream-test
 	test_stream.cpp
 )
@@ -125,11 +145,11 @@ target_include_directories(wivrn-macos-stream-test PRIVATE
 )
 target_link_libraries(wivrn-macos-stream-test PRIVATE openxr_loader Vulkan::Vulkan wivrn-common)
 
-# Minimal animated demo app (v1 headset proof vehicle): cycling background
-# + spinning cube through our swapchains. Uses only verified paths
-# (loadOp-CLEAR, no depth/culling/ClearAttachments); hello_xr cannot serve
-# as the proof (its ClearAttachments yields driver fill + its BACK+CW
-# cubes are culled on MoltenVK — see ROADMAP run 8).
+#Minimal animated demo app(v1 headset proof vehicle) : cycling background
+#+ spinning cube through our swapchains.Uses only verified paths
+#(loadOp - CLEAR, no depth / culling / ClearAttachments); hello_xr cannot serve
+#as the proof(its ClearAttachments yields driver fill + its BACK + CW
+#cubes are culled on MoltenVK — see ROADMAP run 8).
 find_program(GLSLANG_VALIDATOR glslangValidator)
 if(GLSLANG_VALIDATOR)
 	add_custom_command(
@@ -154,17 +174,17 @@ else()
 	message(STATUS "glslangValidator not found, skipping wivrn-macos-demo")
 endif()
 
-# Phase 6: stock hello_xr from OpenXR-SDK-Source, built isolated via
-# ExternalProject (its loader target would collide with ours in one
-# scope). Trimmed to samples only; default graphics overridden on the
-# command line (--graphics Vulkan) at run time.
+#Phase 6 : stock hello_xr from OpenXR - SDK - Source, built isolated via
+#ExternalProject(its loader target would collide with ours in one
+#scope).Trimmed to samples only; default graphics overridden on the
+#command line(--graphics Vulkan) at run time.
 option(WIVRN_BUILD_MACOS_HELLO_XR "Build stock hello_xr for headset testing" OFF)
 if(WIVRN_BUILD_MACOS_HELLO_XR)
 	include(ExternalProject)
-	# MoltenVK workarounds (see ROADMAP run 8): loadOp-CLEAR instead of
-	# LOAD+ClearAttachments (ClearAttachments yields driver fill), CULL_NONE
-	# instead of BACK+CW (hello_xr's cubes are fully culled otherwise).
-	# Applied at fetch time like patches/monado (same apply.sh helper).
+#MoltenVK workarounds(see ROADMAP run 8) : loadOp - CLEAR instead of
+#LOAD + ClearAttachments(ClearAttachments yields driver fill), CULL_NONE
+#instead of BACK + CW(hello_xr's cubes are fully culled otherwise).
+#Applied at fetch time like patches / monado(same apply.sh helper).
 	file(GLOB HELLO_XR_PATCHES CONFIGURE_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/../../patches/hello_xr/*)
 	ExternalProject_Add(hello_xr_external
 		URL https://github.com/KhronosGroup/OpenXR-SDK-Source/archive/refs/tags/release-1.1.59.tar.gz

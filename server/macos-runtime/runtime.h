@@ -13,6 +13,7 @@
 #include <openxr/openxr_platform.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -224,10 +225,17 @@ struct Swapchain
 	std::vector<uint32_t> outstanding;
 	uint32_t nextIndex = 0;
 	// Most recently acquired (-1 when nothing outstanding) and released
-	// images. EndFrame encodes the released one (release-after-EndFrame
-	// apps cost one frame).
+	// images. EndFrame stages the released one for the worker
+	// (release-after-EndFrame apps cost one frame).
 	int32_t lastAcquired = -1;
 	int32_t lastReleased = -1;
+	// Worker handoff holds (Phase H async snapshot): staged_idx is the
+	// image end_frame offered the worker (overwrites drop silently,
+	// latest-only); active_idx is the image the worker is snapshotting
+	// right now. Acquire skips both so the app can never reclaim an
+	// image out from under a copy. -1 when empty.
+	std::atomic<int32_t> staged_idx{-1};
+	std::atomic<int32_t> active_idx{-1};
 };
 
 // Process-wide singleton: v1 supports exactly one instance at a time

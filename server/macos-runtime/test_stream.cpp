@@ -663,7 +663,7 @@ int main()
 		CHECK_XR(xrCreateSwapchain(session, &swapInfo, &swapchains[eye]), XR_SUCCESS);
 		uint32_t imageCount = 0;
 		CHECK_XR(xrEnumerateSwapchainImages(swapchains[eye], 0, &imageCount, nullptr), XR_SUCCESS);
-		CHECK(imageCount == 3);
+		CHECK(imageCount == 4); // quad-buffered: app + staged + active + free
 	}
 
 	XrReferenceSpaceCreateInfo spaceInfo{
@@ -729,6 +729,12 @@ int main()
 		CHECK_XR(xrEndFrame(session, &endInfo), XR_SUCCESS);
 		for (int eye = 0; eye < 2; ++eye)
 			CHECK_XR(xrReleaseSwapchainImage(swapchains[eye], &releaseInfo), XR_SUCCESS);
+		// Paced like a display-driven app (~40 Hz): an unthrottled loop
+		// finishes all 400 frames in milliseconds (our WaitFrame never
+		// blocks), outrunning the worker's cold start (snapshot init +
+		// encoder open ≈ 100-300 ms) so only the first burst's tail ever
+		// encodes. Pacing lets the worker drain steadily like production.
+		std::this_thread::sleep_for(std::chrono::milliseconds(25));
 	}
 
 	// ---- Assertions on the loop ----

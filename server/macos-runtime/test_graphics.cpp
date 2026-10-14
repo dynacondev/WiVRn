@@ -396,7 +396,7 @@ int main()
 
 		uint32_t imageCount = 0;
 		CHECK_XR(xrEnumerateSwapchainImages(swapchains[eye], 0, &imageCount, nullptr), XR_SUCCESS);
-		CHECK(imageCount == 3);
+		CHECK(imageCount == 4); // quad-buffered: app + staged + active + free
 		std::vector<XrSwapchainImageVulkan2KHR> images(imageCount, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
 		CHECK_XR(
 		        xrEnumerateSwapchainImages(

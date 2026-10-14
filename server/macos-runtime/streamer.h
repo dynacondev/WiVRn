@@ -1,10 +1,12 @@
 // Streamer: owns the headset link, per-eye snapshots/encoders, and
 // Bonjour; driven from EndFrame on the app thread. Encode runs on a
-// worker thread with a latest-only mailbox per eye: the app snapshots
-// each presented frame (fast) and drops it if the worker is still busy,
-// so the app loop is never throttled and the wire always carries fresh
-// frames. v1 model: the runtime dylib IS the server core in the
-// application process (no service/IPC split) — the headset connects
+// worker thread with a latest-only mailbox per eye: the app stages each
+// presented image (cheap) and the worker snapshots + encodes it, so the
+// app loop is never throttled and the wire always carries fresh frames.
+// Swapchain images are quad-buffered: at most one app-outstanding, one
+// staged and one worker-active image per pool, one always free for
+// single-flight apps. v1 model: the runtime dylib IS the server core in
+// the application process (no service/IPC split) — the headset connects
 // directly to the app. Headless apps (no headset) run untouched.
 
 #pragma once
@@ -65,6 +67,12 @@ public:
 	// cleanup would touch a dead device).
 	void session_destroyed(Session * session);
 
+	// Barrier for swapchain teardown: drop any staged job on the record
+	// and wait out worker snapshot/feed touching it, so DestroySwapchain
+	// can free images while a frame is in flight (apps destroy
+	// swapchains before sessions).
+	void release_swapchain(Swapchain * swap);
+
 	// Encode one presented frame: snapshot each referenced swapchain
 	// image, encode, shard, and send. Skips eyes with no released image
 	// yet (release-after-EndFrame apps cost one frame).
@@ -85,17 +93,19 @@ private:
 
 	struct Eye
 	{
-		// App thread owns snapshot init + capture; worker owns encoder
-		// open/feed. Guarded by mutex, except: pending/feeding/dead are
-		// atomic for lock-free fast paths, and the worker releases the
-		// lock across feed (see encode_eye) so the app never blocks.
+		// App thread stages (swapchain, image) + job meta; worker owns
+		// snapshot init + capture + encoder open/feed. Guarded by mutex,
+		// except: pending/feeding/dead are atomic for lock-free fast
+		// paths, staged_idx/active_idx live in the Swapchain record
+		// (acquire consults them lock-free), and the worker releases the
+		// lock across snapshot + feed so the app never blocks.
 		std::mutex mutex;
 		bool initialized = false;
 		Session * session = nullptr;
 		uint32_t width = 0;
 		uint32_t height = 0;
 		EyeSnapshot snapshot;
-		X264Encoder encoder;
+		VideoEncoder encoder;
 		uint32_t last_bitrate = 0;
 		uint32_t last_fps = 0;
 		uint32_t enc_width = 0;
@@ -117,7 +127,11 @@ private:
 		// Set under mutex by session_destroyed; worker drops jobs for
 		// dead eyes instead of sending.
 		bool dead = false;
-		std::vector<uint8_t> pixels; // w*h*4 snapshot bytes
+		// Staged image for the worker (set with the meta below under
+		// mutex in end_frame; claimed by the worker via staged_idx).
+		// Invariant: pending implies job_swap valid.
+		Swapchain * job_swap = nullptr;
+		uint32_t job_image_idx = 0;
 		uint32_t job_width = 0;
 		uint32_t job_height = 0;
 		bool job_swap_rb = false;
@@ -127,7 +141,6 @@ private:
 		std::array<XrPosef, 2> job_pose{};
 		std::array<XrFovf, 2> job_fov{};
 		XrTime job_display_time = 0;
-		int64_t job_snap_ns = 0;
 	};
 	Eye eyes_[2]{};
 
@@ -157,5 +170,9 @@ XrPosef streamer_local_origin();
 
 // Called by DestroySession: release per-eye GPU resources bound to it.
 void streamer_session_destroyed(Session * session);
+
+// Called by DestroySwapchain: barrier for worker snapshot/feed use of
+// the record's images (see release_swapchain).
+void streamer_release_swapchain(Swapchain * swap);
 
 } // namespace wivrn_macos

@@ -615,10 +615,43 @@ on stdin EOF — pipe `sleep` to keep it alive for smoke runs;
 
 Accept: `./wivrn-server-macos` runs headless, reconnects cleanly.
 
+## Phase H — Hardware encode + async snapshot [status: done 2026-10-14]
+
+- [x] `encode_vt.{h,cpp}`: VideoToolbox H.264 Main backend behind the
+  existing wire contract (Annex-B, SPS/PPS prepended per IDR, no
+  B-frames, ABR). 32BGRA input kills the CPU NV12 conversion; HW
+  required at open (`UsingHardwareAcceleratedVideoEncoder` verified),
+  x264 fallback otherwise. `VideoEncoder` facade (`Auto|X264|VT` +
+  `WIVRN_MACOS_VIDEO_ENCODER` override) keeps streamer churn to the
+  `Eye::encoder` member type.
+- [x] Snapshot off the app thread: end_frame stages (swapchain, image)
+  + meta into the latest-only mailbox; the worker owns
+  snapshot+encode+release. `staged_idx`/`active_idx` holds keep acquire
+  from reclaiming mid-copy; pools 3→4 cover app+staged+active+free;
+  `release_swapchain` barriers DestroySwapchain against in-flight
+  frames. App blocks only on genuine acquire-busy backpressure.
+- [x] Encode test gains VT cases (Annex-B/SPS/IDR/reconfig/facade
+  selection; skips cleanly without HW). Stream test app loop paced
+  25 ms: an unthrottled loop outruns worker cold start (snapshot init
+  + encoder open) so only the burst tail encodes and ≥4 frames never
+  lands — pacing mirrors display-driven apps.
+
+Accept: all 5 suites green, demo pixel proof PASS, VT roundtrip
+decode-verified faithful (ffmpeg: alternating colors exact).
+Deferred: IOSurface zero-copy input (pool copy now), HEVC, paced
+WaitFrame, x264 frame threads (kept single-threaded).
+
+Findings: VT `AverageBitRate` is bits/sec (x264's is kbps — /1000
+crushed output to ~100 B/frame); `DataRateLimits` is a hard
+bytes-per-window cap, not VBV (dropped); flat test content compresses
+to ~100 B/frame on HW CABAC (roundtrip-faithful, not broken — verify
+by decode, not size); first-frame SPS hex-decodes to exact session
+dims (hand-check).
+
 ## v2 backlog (explicitly deferred, do not build in v1)
 
-- VideoToolbox HW encode (H.264/HEVC/Main10 + Rosetta-helper
-  question) + BT.709 color contract + ABR/FEC hardening.
+- HEVC/Main10 + Rosetta-helper question + BT.709 color contract +
+  ABR/FEC hardening (H.264 VT shipped in Phase H).
 - CoreAudio input/output.
 - D-Bus control plane (keep `io.github.wivrn.Server.xml` names;
   decide brew `dbus-daemon` vs new transport) + `wivrnctl` port.
