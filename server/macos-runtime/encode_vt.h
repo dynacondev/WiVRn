@@ -3,17 +3,42 @@
 // client cannot tell which backend encoded a frame. Differences from
 // x264: 32BGRA pixels in (no CPU NV12 conversion — VT converts
 // internally), hardware encode, synchronous feed() via a per-frame
-// semaphore wait on the encode callback. Non-Apple builds get a stub
+// condition wait on the encode callback. Non-Apple builds get a stub
 // whose open() always fails (x264 remains the only backend there).
+//
+// Encode-resilience knobs (all read from the environment at open(),
+// all new behavior ON by default, each revertible; unset == default):
+//   WIVRN_MACOS_VT_IDR_EVERY=N    periodic IDR every N feeds (default
+//                                 120, ~1.3 s at 90 fps; 0 = off, forced
+//                                 IDRs/NACK recovery unaffected)
+//   WIVRN_MACOS_VT_IDR_ON_DROP=0  disable recovery IDR after a locally
+//                                 dropped frame (default: drop forces the
+//                                 next frame to IDR — a dropped frame
+//                                 desyncs the decoder like packet loss)
+//   WIVRN_MACOS_VT_FAST=0         disable PrioritizeEncodingSpeed hint
+//                                 (default: speed prioritized)
+//   WIVRN_MACOS_VT_COLOR=0        disable x264-matching VUI signaling
+//                                 (default: 709 primaries/matrix, sRGB
+//                                 transfer, full-range source tag)
+//   WIVRN_MACOS_VT_FPS=N          override the ExpectedFrameRate hint
+//                                 (default 0 = params fps from the headset
+//                                 refresh; the PTS timescale always stays
+//                                 params fps)
+//   WIVRN_MACOS_VT_SLICE_BYTES=N  best-effort MaxH264SliceBytes (default
+//                                 0 = off; transport has no per-slice
+//                                 recovery, so this stays opt-in)
+//   WIVRN_MACOS_VT_FEED_TIMEOUT_MS  callback wait bound (default 500;
+//                                 diagnostic lever, 0 forces timeouts)
 
 #pragma once
 
 #include "encode.h" // EncoderParams, EncodedNal
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
-#include <semaphore>
 #include <vector>
 
 #if defined(__APPLE__)
@@ -44,7 +69,9 @@ public:
 	// Feed one packed 32-bit frame (stride = width*4, channel order per
 	// swap_rb: false = memory B,G,R,A, true = R,G,B,A). Blocks (bounded)
 	// for the encode callback; returns the frame's NALs in decode
-	// order, empty on failure/timeout (caller drops the frame).
+	// order, empty on failure/timeout (caller drops the frame). Every
+	// accepted submit consumes exactly one PTS value, so timestamps
+	// never repeat — even across timeouts and callback failures.
 	std::vector<EncodedNal> feed(const uint8_t * rgba, bool swap_rb, bool force_idr);
 
 	// Live bitrate/fps update (applies at the next frame; caller forces
@@ -53,7 +80,34 @@ public:
 
 	uint64_t frames_encoded() const
 	{
-		return frame_index_;
+		return encoded_.load(std::memory_order_relaxed);
+	}
+
+	// Resilience accounting (monotonic per open; submitted ==
+	// encoded + dropped always holds).
+	uint64_t frames_submitted() const
+	{
+		return submitted_.load(std::memory_order_relaxed);
+	}
+	uint64_t frames_dropped() const
+	{
+		return dropped_.load(std::memory_order_relaxed);
+	}
+	// Callbacks that arrived after their waiter left (stale, safely
+	// discarded by sequence match — never attributed to a later frame).
+	uint64_t late_callbacks() const
+	{
+		return late_.load(std::memory_order_relaxed);
+	}
+	// Effective periodic-IDR interval (0 = off) and whether the
+	// x264-matching color triple was accepted by the HW encoder.
+	uint32_t idr_every() const
+	{
+		return idr_every_;
+	}
+	bool color_signaled() const
+	{
+		return color_ok_.load(std::memory_order_relaxed);
 	}
 
 	// True while a session is open (tests + backend selection).
@@ -69,24 +123,48 @@ private:
 	        OSStatus status,
 	        VTEncodeInfoFlags infoFlags,
 	        CMSampleBufferRef sample);
-	void on_output(OSStatus status, CMSampleBufferRef sample);
+	void on_output(uint64_t seq, OSStatus status, CMSampleBufferRef sample);
 	// AVCC -> Annex-B into pending_; prepends cached SPS/PPS on IDRs
 	// (re-extracted per IDR so mid-stream set changes survive).
 	bool parse_sample(CMSampleBufferRef sample);
 	bool extract_params(CMSampleBufferRef sample);
 	bool set_property(CFStringRef key, CFTypeRef value, bool required);
+	OSStatus try_property(CFStringRef key, CFTypeRef value);
+	void verify_fps(uint32_t requested);
+	void probe_slice_support();
 
 	VTCompressionSessionRef session_ = nullptr;
 	CVPixelBufferRef pool_px_ = nullptr; // reusable BGRA input (pool copy)
 	EncoderParams params_{};
-	uint64_t frame_index_ = 0;
+	// Next PTS value (feed thread only; +1 per accepted submit, never
+	// reused, so a retried frame can never collide with its original).
+	uint64_t next_pts_ = 0;
+	std::atomic<uint64_t> submitted_{0};
+	std::atomic<uint64_t> encoded_{0};
+	std::atomic<uint64_t> dropped_{0};
+	std::atomic<uint64_t> late_{0};
+	std::atomic<bool> color_ok_{false};
 	std::mutex mutex_;
-	std::binary_semaphore done_{0};
+	std::condition_variable cv_;
+	bool has_waiter_ = false; // a feed is parked waiting for wait_seq_
+	uint64_t wait_seq_ = 0;
+	bool done_ = false;
 	std::vector<EncodedNal> pending_;
 	std::vector<uint8_t> sps_;
 	std::vector<uint8_t> pps_;
 	bool failed_ = false;
 	bool need_sets_ = false; // IDR shipped without param sets: force IDR until they do
+	// Periodic-IDR pacing (feed thread only).
+	uint32_t idr_every_ = 0;
+	uint64_t frames_since_idr_ = 0;
+	bool drop_recover_ = false; // a drop desyncs the decoder: next feed IDRs
+	// Env-configured behavior (read at open()).
+	uint32_t feed_timeout_ms_ = 500;
+	bool idr_on_drop_ = true;
+	bool want_speed_ = true;
+	bool want_color_ = true;
+	uint32_t fps_override_ = 0;
+	uint32_t slice_bytes_ = 0;
 };
 
 #else
@@ -112,6 +190,26 @@ public:
 	uint64_t frames_encoded() const
 	{
 		return 0;
+	}
+	uint64_t frames_submitted() const
+	{
+		return 0;
+	}
+	uint64_t frames_dropped() const
+	{
+		return 0;
+	}
+	uint64_t late_callbacks() const
+	{
+		return 0;
+	}
+	uint32_t idr_every() const
+	{
+		return 0;
+	}
+	bool color_signaled() const
+	{
+		return false;
 	}
 	bool is_open() const
 	{

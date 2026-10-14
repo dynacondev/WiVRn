@@ -4,6 +4,7 @@
 //   ./wivrn-macos-encode-test
 
 #include "encode.h"
+#include "encode_vt.h"
 #include "snapshot.h"
 
 #include <vulkan/vulkan.h>
@@ -424,6 +425,199 @@ int main()
 			}
 			vt.close();
 		}
+	}
+
+	// Facade selection: explicit x264 always serves x264; auto serves
+	// VT where available else x264 (either satisfies the contract).
+	{
+		VTEncoder pen;
+		EncoderParams pparams{.width = kWidth, .height = kHeight, .fps = 90, .bitrate_bps = 5'000'000};
+		// Periodic IDR: EVERY=5 bounds every gap between IDR frames
+		// even with no NACK (forced-IDR path below stays intact).
+		setenv("WIVRN_MACOS_VT_IDR_EVERY", "5", 1);
+		if (!pen.open(pparams))
+		{
+			std::puts("vt periodic-IDR cases skipped (no HW)");
+		}
+		else
+		{
+			CHECK(pen.idr_every() == 5);
+			// x264-matching VUI triple accepted by the HW encoder.
+			CHECK(pen.color_signaled());
+			std::vector<int> idr_frames;
+			std::vector<uint8_t> dump;
+			for (int frame = 0; frame < 13; ++frame)
+			{
+				CHECK(clear_image(dev, image, pool, frame % 2 == 0 ? 0.2f : 0.8f, 0.3f, 0.9f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				std::vector<EncodedNal> nals = pen.feed(bgra, false, false);
+				CHECK(!nals.empty());
+				CHECK(nals.back().is_last);
+				bool frameIdr = false;
+				for (const EncodedNal & nal: nals)
+				{
+					CHECK(nal.bytes.size() >= 4 && nal.bytes[0] == 0 && nal.bytes[1] == 0 && nal.bytes[2] == 0 &&
+					      nal.bytes[3] == 1);
+					frameIdr = frameIdr || nal.is_idr;
+					dump.insert(dump.end(), nal.bytes.begin(), nal.bytes.end());
+				}
+				if (frameIdr)
+					idr_frames.push_back(frame);
+			}
+			// Forced IDRs fire on the 5-frame period at the latest:
+			// gaps stay bounded and the tail of the run is covered.
+			CHECK(idr_frames.size() >= 2);
+			for (size_t i = 1; i < idr_frames.size(); ++i)
+				CHECK(idr_frames[i] - idr_frames[i - 1] <= 5);
+			CHECK(!idr_frames.empty() && idr_frames.back() >= 7);
+			// NACK-forced IDR still served on demand.
+			{
+				CHECK(clear_image(dev, image, pool, 0.1f, 0.4f, 0.7f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				std::vector<EncodedNal> nals = pen.feed(bgra, false, true);
+				CHECK(!nals.empty());
+				bool frameIdr = false;
+				for (const EncodedNal & nal: nals)
+					frameIdr = frameIdr || nal.is_idr;
+				CHECK(frameIdr);
+			}
+			// No drops on a healthy session; the accounting identity holds.
+			CHECK(pen.frames_dropped() == 0);
+			CHECK(pen.frames_submitted() == pen.frames_encoded() + pen.frames_dropped());
+			std::printf("vt periodic IDR frames:");
+			for (int f: idr_frames)
+				std::printf(" %d", f);
+			std::puts("");
+			std::printf("vt accounting (submitted=%llu encoded=%llu dropped=%llu late=%llu)\n",
+			            (unsigned long long)pen.frames_submitted(),
+			            (unsigned long long)pen.frames_encoded(),
+			            (unsigned long long)pen.frames_dropped(),
+			            (unsigned long long)pen.late_callbacks());
+			// Annex-B dump for the ffmpeg roundtrip (ffprobe VUI +
+			// content-faithful decode, run outside the test).
+			FILE * out = std::fopen("/tmp/vt_roundtrip.h264", "wb");
+			CHECK(out != nullptr);
+			if (out != nullptr)
+			{
+				CHECK(std::fwrite(dump.data(), 1, dump.size(), out) == dump.size());
+				std::fclose(out);
+				std::printf("vt roundtrip dump %zu bytes -> /tmp/vt_roundtrip.h264\n", dump.size());
+			}
+			pen.close();
+		}
+		unsetenv("WIVRN_MACOS_VT_IDR_EVERY");
+	}
+	{
+		// Timeout accounting: with a 0 ms bound every feed drops, each
+		// consuming a distinct PTS (never repeats), and the counters
+		// add up. The session serves healthy frames again afterwards.
+		VTEncoder ten;
+		EncoderParams tparams{.width = kWidth, .height = kHeight, .fps = 90, .bitrate_bps = 5'000'000};
+		setenv("WIVRN_MACOS_VT_FEED_TIMEOUT_MS", "0", 1);
+		if (!ten.open(tparams))
+		{
+			std::puts("vt timeout cases skipped (no HW)");
+		}
+		else
+		{
+			for (int frame = 0; frame < 3; ++frame)
+			{
+				CHECK(clear_image(dev, image, pool, 0.2f, 0.3f, 0.9f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				CHECK(ten.feed(bgra, false, false).empty());
+			}
+			CHECK(ten.frames_submitted() == 3);
+			CHECK(ten.frames_dropped() == 3);
+			CHECK(ten.frames_encoded() == 0);
+			CHECK(ten.frames_submitted() == ten.frames_encoded() + ten.frames_dropped());
+			std::printf(
+			        "vt timeout accounting (submitted=%llu encoded=%llu dropped=%llu late=%llu)\n",
+			        (unsigned long long)ten.frames_submitted(),
+			        (unsigned long long)ten.frames_encoded(),
+			        (unsigned long long)ten.frames_dropped(),
+			        (unsigned long long)ten.late_callbacks());
+			ten.close();
+		}
+		unsetenv("WIVRN_MACOS_VT_FEED_TIMEOUT_MS");
+		VTEncoder rec;
+		if (rec.open(tparams))
+		{
+			for (int frame = 0; frame < 2; ++frame)
+			{
+				CHECK(clear_image(dev, image, pool, 0.2f, 0.3f, 0.9f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				std::vector<EncodedNal> nals = rec.feed(bgra, false, frame == 0);
+				CHECK(!nals.empty());
+			}
+			CHECK(rec.frames_encoded() == 2);
+			rec.close();
+		}
+	}
+	{
+		// PrioritizeEncodingSpeed A/B: both modes must emit valid
+		// frames; timings are reported for the keep-if-neutral call.
+		EncoderParams sparams{.width = kWidth, .height = kHeight, .fps = 90, .bitrate_bps = 5'000'000};
+		for (int mode = 0; mode < 2; ++mode)
+		{
+			if (mode == 0)
+				unsetenv("WIVRN_MACOS_VT_FAST"); // default: speed hint on
+			else
+				setenv("WIVRN_MACOS_VT_FAST", "0", 1); // opt-out: hint off
+			VTEncoder sen;
+			if (!sen.open(sparams))
+			{
+				std::puts("vt speed A/B skipped (no HW)");
+				break;
+			}
+			auto clock_ns = [] {
+				return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+				        .count();
+			};
+			int64_t enc_ns = 0;
+			for (int frame = 0; frame < 10; ++frame)
+			{
+				CHECK(clear_image(dev, image, pool, frame % 2 == 0 ? 0.2f : 0.8f, 0.3f, 0.9f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				int64_t t0 = clock_ns();
+				std::vector<EncodedNal> nals = sen.feed(bgra, false, frame == 0);
+				enc_ns += clock_ns() - t0;
+				CHECK(!nals.empty());
+				CHECK(nals.back().is_last);
+			}
+			std::printf("vt speed %s: %.3f ms/frame over 10 frames\n", mode == 0 ? "on " : "off", enc_ns / 10.0 / 1e6);
+			sen.close();
+		}
+		unsetenv("WIVRN_MACOS_VT_FAST");
+	}
+	{
+		// Slice opt-in stays a no-crash lever: output remains valid
+		// whether or not this HW gates MaxH264SliceBytes.
+		VTEncoder sen;
+		EncoderParams lparams{.width = kWidth, .height = kHeight, .fps = 90, .bitrate_bps = 5'000'000};
+		setenv("WIVRN_MACOS_VT_SLICE_BYTES", "1400", 1);
+		if (!sen.open(lparams))
+		{
+			std::puts("vt slice cases skipped (no HW)");
+		}
+		else
+		{
+			for (int frame = 0; frame < 3; ++frame)
+			{
+				CHECK(clear_image(dev, image, pool, 0.2f, 0.3f, 0.9f));
+				const uint8_t * bgra = snapshot.capture(image);
+				CHECK(bgra != nullptr);
+				std::vector<EncodedNal> nals = sen.feed(bgra, false, frame == 0);
+				CHECK(!nals.empty());
+				CHECK(nals.back().is_last);
+			}
+			sen.close();
+		}
+		unsetenv("WIVRN_MACOS_VT_SLICE_BYTES");
 	}
 
 	// Facade selection: explicit x264 always serves x264; auto serves
