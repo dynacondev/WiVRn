@@ -1259,6 +1259,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			std::vector<vtx> tris;
 			tris.reserve(512);
 			XrTime dbg_now = instance.now();
+			// Single map latch for the whole gizmo build below
+			// (was one lock per section per frame).
+			auto fid_map = fiducial_map.lock();
 			auto tri = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c, float r, float g, float bl, float al) {
 				tris.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
 				tris.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
@@ -1291,7 +1294,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			};
 			// Configured payloads, for green vs red.
 			auto is_configured = [&](const std::string & payload) {
-				for (const auto & f: fiducial_map.lock()->fiducials)
+				for (const auto & f: fid_map->fiducials)
 				{
 					for (const auto & m: f.markers)
 					{
@@ -1370,7 +1373,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// re-projected from its fiducial's smoothed pose with the
 				// authored offset (the inverse of the vote path). Green
 				// raw vs orange corrected shows disagreement at a glance.
-				for (const auto & f: fiducial_map.lock()->fiducials)
+				for (const auto & f: fid_map->fiducials)
 				{
 					auto bpit = board_poses.find(f.id);
 					if (bpit == board_poses.end() or not bpit->second.live)
@@ -1410,7 +1413,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// Board origin: use the largest configured tag as the
 					// scale reference (offsets are meaningless without one).
 					float ref_size = 0;
-					for (const auto & f: fiducial_map.lock()->fiducials)
+					for (const auto & f: fid_map->fiducials)
 					{
 						if (f.id != fid)
 							continue;

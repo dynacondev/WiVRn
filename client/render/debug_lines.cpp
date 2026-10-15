@@ -18,8 +18,12 @@
 
 #include "render/debug_lines.h"
 
+#include <glm/mat4x4.hpp>
+#include <glm/vec4.hpp>
+
 #include "vk/shader.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 
@@ -48,9 +52,11 @@ void debug_lines_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	spdlog::info("Debug lines swapchain: {}x{} ({} images)", w, h, swapchain_.images().size());
 	init_pipelines(format);
 	targets.clear();
+	last_areas.clear();
 	for (vk::Image image: swapchain_.images())
 	{
 		targets.emplace_back();
+		last_areas.emplace_back();
 		for (uint32_t eye = 0; eye < 2; ++eye)
 		{
 			vk::ImageViewCreateInfo iv_info{
@@ -297,9 +303,68 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	cmd.bindVertexBuffers(0, vk::Buffer(staging), (vk::DeviceSize)0);
 
 	// Fresh CLEAR images every frame: no barrier, no layout history.
+	// Scissored to content bounds: gizmo geometry is sparse, and a
+	// fullscreen clear+blend+store for a few lines costs a full-image
+	// round-trip per eye. Project the verts with the draw MVP (same
+	// convention as the feather cutout punch); any vert behind the
+	// camera falls back to fullscreen. Viewport stays full (it maps
+	// NDC); only renderArea + scissor tighten.
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		auto & tgt = targets[image_index][eye];
+		vk::Rect2D area{{0, 0}, extents[eye]};
+		vk::Rect2D clear_area = area;
+		{
+			bool behind = false;
+			float minx = (float)extents[eye].width, miny = (float)extents[eye].height;
+			float maxx = 0, maxy = 0;
+			for (size_t vi = 0; vi < vert_count; ++vi)
+			{
+				glm::vec4 c = mvp[eye] * glm::vec4(verts[vi].pos[0], verts[vi].pos[1], verts[vi].pos[2], 1);
+				if (c.w <= 0)
+				{
+					behind = true;
+					break;
+				}
+				float px = (c.x / c.w * 0.5f + 0.5f) * (float)extents[eye].width;
+				float py = (c.y / c.w * 0.5f + 0.5f) * (float)extents[eye].height;
+				minx = std::min(minx, px);
+				miny = std::min(miny, py);
+				maxx = std::max(maxx, px);
+				maxy = std::max(maxy, py);
+			}
+			if (not behind and maxx > minx and maxy > miny)
+			{
+				const int pad = 2;
+				int32_t x0 = std::max<int32_t>(0, (int32_t)minx - pad);
+				int32_t y0 = std::max<int32_t>(0, (int32_t)miny - pad);
+				int32_t x1 = std::min<int32_t>((int32_t)extents[eye].width, (int32_t)maxx + pad);
+				int32_t y1 = std::min<int32_t>((int32_t)extents[eye].height, (int32_t)maxy + pad);
+				if (x1 > x0 and y1 > y0)
+					area = vk::Rect2D{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+			}
+			// Union with this image's stored rect (clears pixels left
+			// by earlier frames that used this image); the draw below
+			// stays clipped to the current bounds.
+			clear_area = area;
+			if (image_index < last_areas.size())
+			{
+				const vk::Rect2D & prev = last_areas[image_index][eye];
+				int32_t x0 = std::min(clear_area.offset.x, prev.offset.x);
+				int32_t y0 = std::min(clear_area.offset.y, prev.offset.y);
+				int32_t x1 = std::max<int32_t>(clear_area.offset.x + (int32_t)clear_area.extent.width,
+				                               prev.offset.x + (int32_t)prev.extent.width);
+				int32_t y1 = std::max<int32_t>(clear_area.offset.y + (int32_t)clear_area.extent.height,
+				                               prev.offset.y + (int32_t)prev.extent.height);
+				x0 = std::max<int32_t>(x0, 0);
+				y0 = std::max<int32_t>(y0, 0);
+				x1 = std::min<int32_t>(x1, (int32_t)extents[eye].width);
+				y1 = std::min<int32_t>(y1, (int32_t)extents[eye].height);
+				if (x1 > x0 and y1 > y0)
+					clear_area = vk::Rect2D{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+				last_areas[image_index][eye] = area;
+			}
+		}
 		cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, push{mvp[eye]});
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
@@ -309,13 +374,13 @@ void debug_lines_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		                        .minDepth = 0,
 		                        .maxDepth = 1,
 		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
+		cmd.setScissor(0, area);
 		vk::ClearValue clear{};
 		clear.color.float32.fill(0);
 		vk::RenderPassBeginInfo begin_info{
 		        .renderPass = *renderpass,
 		        .framebuffer = *tgt.framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .renderArea = clear_area,
 		        .clearValueCount = 1,
 		        .pClearValues = &clear,
 		};

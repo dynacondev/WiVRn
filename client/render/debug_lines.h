@@ -112,6 +112,11 @@ private:
 	};
 	// [image][eye], parallel to the swapchain image list.
 	std::vector<std::array<target, 2>> targets;
+	// Last cleared rect per [image][eye]: swapchain images cycle, so a
+	// tight clear leaves other frames' pixels behind (trailing
+	// remnants). Each frame clears the union of the current bounds and
+	// this image's stored rect, then stores the current bounds.
+	std::vector<std::array<vk::Rect2D, 2>> last_areas;
 
 	buffer_allocation staging;
 	size_t staging_used = 0; // verts consumed this frame (reset by begin_frame)
