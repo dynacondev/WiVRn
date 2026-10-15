@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-	<id>io.github.wivrn.wivrn</id>
+	<id>tech.dynacon.vr</id>
 	<name>DynaconVR Server</name>
 	<metadata_license>FSFAP</metadata_license>
 	<project_license>GPL-3.0-or-later</project_license>
@@ -30,7 +30,7 @@
 
 		<p>For desktop streaming, check out WayVR.</p>
 	</description>
-	<developer id="io.github.wivrn.wivrn">
+	<developer id="tech.dynacon.vr">
 		<name>Guillaume Meunier, Patrick Nicolas et al</name>
 	</developer>
 	<branding>
@@ -38,7 +38,7 @@
 		<color type="primary" scheme_preference="dark">#424242</color>
 	</branding>
 
-	<launchable type="desktop-id">io.github.wivrn.wivrn.desktop</launchable>
+	<launchable type="desktop-id">tech.dynacon.vr.desktop</launchable>
 
 	<categories>
 		<category>Game</category>

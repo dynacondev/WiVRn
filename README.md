@@ -49,7 +49,7 @@ For OpenVR and Steam compatibility, you also need a compatibility library such a
 
 A Flatpak is available on Flathub for all distributions:
 
-[![Flathub](https://flathub.org/api/badge)](https://flathub.org/apps/io.github.wivrn.wivrn)
+[![Flathub](https://flathub.org/api/badge)](https://flathub.org/apps/tech.dynacon.vr)
 
 The Flatpak contains both xrizer and OpenComposite.
 
@@ -85,14 +85,14 @@ On SteamOS, the Avahi configuration needs to be modified to allow user services 
 - For example, if using UFW run `ufw allow 5353/udp` and `ufw allow 9757`.
 
 ### Start the PC server process
-The graphical frontend is listed as "WiVRn server" in the application list, and is `wivrn-dashboard` on command line. On first start, a wizard will guide you through the initial steps.
+The graphical frontend is listed as "DynaconVR Server" in the application list, and is `wivrn-dashboard` on command line. On first start, a wizard will guide you through the initial steps.
 
 The actual server for headless usage is `wivrn-server`. When installed through your distribution's package manager, a systemd user service named `wivrn` is also installed, which can be enabled to automatically start on login with `systemctl --user enable --now wivrn`.
 
 For Steam games, depending on the installation method, you may need to set launch options in the Steam properties for each game you want to run. Either the dashboard or command line output will display the launch command if it is required.
 
 ### Start the headset application
-On the headset, when installed from the store, simply start `WiVRn`. If you installed the app via the dashboard, or manually via `adb`, it will be in an "unknown sources" section.
+On the headset, when installed from the store, simply start `DynaconVR`. If you installed the app via the dashboard, or manually via `adb`, it will be in an "unknown sources" section.
 
 On first start, it will ask if you want to enable some features such as microphone, hand tracking, eye tracking, etc., as they will require permissions to be granted. It is possible to grant those later from the Settings tab.
 
@@ -120,8 +120,8 @@ If you're using the Steam Flatpak, you'll need to grant read only access to the 
 ```bash
 flatpak override \
   --filesystem=xdg-run/wivrn:ro \
-  --filesystem=xdg-data/flatpak/app/io.github.wivrn.wivrn:ro \
-  --filesystem=/var/lib/flatpak/app/io.github.wivrn.wivrn:ro \
+  --filesystem=xdg-data/flatpak/app/tech.dynacon.vr:ro \
+  --filesystem=/var/lib/flatpak/app/tech.dynacon.vr:ro \
   --filesystem=xdg-config/openxr:ro \
   --filesystem=xdg-config/openvr:ro \
   com.valvesoftware.Steam
@@ -154,18 +154,18 @@ If the server list is empty in the headset app:
 
 <details><summary>How do I use a wired connection manually?</summary>
 
-- Make sure the WiVRn Server is installed and running on your computer
-- Make sure you have the WiVRn app installed on your headset
-- After starting the "WiVRn Server" on your computer and ensuring your device is connected to your PC via cable, run the following in your terminal (Note: using `adb` on some devices may require developer mode to be enabled):
+- Make sure the DynaconVR Server is installed and running on your computer
+- Make sure you have the DynaconVR app installed on your headset
+- After starting the "DynaconVR Server" on your computer and ensuring your device is connected to your PC via cable, run the following in your terminal (Note: using `adb` on some devices may require developer mode to be enabled):
    - ```bash
       adb reverse tcp:9757 tcp:9757
-      adb shell am start -a android.intent.action.VIEW -d "wivrn+tcp://localhost" org.meumeu.wivrn
+      adb shell am start -a android.intent.action.VIEW -d "wivrn+tcp://localhost" tech.dynacon.vr
       ```
-   - Depending on your install type, you may need to replace `org.meumeu.wivrn` (Meta Store install) with:
-      - `org.meumeu.wivrn.github` for [releases](https://github.com/WiVRn/WiVRn/releases) on Github
-      - `org.meumeu.wivrn.github.nighly` for Github nightlies (wirvn-apk [repository](https://github.com/WiVRn/WiVRn-APK/releases))
-      - `org.meumeu.wivrn.github.testing` for Github CI builds
-      - `org.meumeu.wivrn.local` for developer builds
+   - Depending on your install type, you may need to replace `tech.dynacon.vr` (Meta Store install) with:
+      - `tech.dynacon.vr.github` for [releases](https://github.com/WiVRn/WiVRn/releases) on Github
+      - `tech.dynacon.vr.github.nightly` for Github nightlies (wirvn-apk [repository](https://github.com/WiVRn/WiVRn-APK/releases))
+      - `tech.dynacon.vr.github.testing` for Github CI builds
+      - `tech.dynacon.vr.local` for developer builds
 - You can now continue the pairing process as documented in the running section.</details>
 
 <details><summary>How do I see server logs when using the dashboard?</summary>
@@ -173,7 +173,7 @@ If the server list is empty in the headset app:
 - Click **Troubleshoot > Open server logs**
 - Or, navigate to `${XDG_STATE_HOME}/wivrn/wivrn-dashboard`
   - In other words, on common setups, the dashboard writes logs to `~/.local/state/wivrn/wivrn-dashboard`
-  - For WiVRn Flatpak, the dashboard writes logs to `~/.var/app/io.github.wivrn.wivrn/.local/state/wivrn/wivrn-dashboard`</details>
+  - For DynaconVR Flatpak, the dashboard writes logs to `~/.var/app/tech.dynacon.vr/.local/state/wivrn/wivrn-dashboard`</details>
 
 <details><summary>My NVIDIA GPU P-State is limited to P2 instead of reaching the highest P0 while using the NVIDIA NVENC encoder</summary>
     

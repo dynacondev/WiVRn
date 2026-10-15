@@ -29,7 +29,7 @@ int main(int argc, char * argv[])
 	        KAboutLicense::GPL_V3,
 	        i18n("(c) 2022-2026 WiVRn development team"));
 
-	aboutData.setDesktopFileName(QStringLiteral("io.github.wivrn.wivrn"));
+	aboutData.setDesktopFileName(QStringLiteral("tech.dynacon.vr"));
 	aboutData.setOrganizationDomain("wivrn.github.io");
 
 	aboutData.setHomepage("https://github.com/WiVRn/WiVRn");

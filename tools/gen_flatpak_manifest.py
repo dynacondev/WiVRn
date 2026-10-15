@@ -11,7 +11,7 @@ from urllib.request import urlopen
 import flatpakcargogenerator
 import toml
 
-TEMPLATE = "flatpak/io.github.wivrn.wivrn.yml.in"
+TEMPLATE = "flatpak/tech.dynacon.vr.yml.in"
 
 
 class CMakeFile:
@@ -104,5 +104,5 @@ if __name__ == "__main__":
     template = template.replace("BOOST_SHA256", boost_sha256)
     template = template.replace("MONADO_COMMIT", monado_commit)
 
-    with open(os.path.join(args.out, "io.github.wivrn.wivrn.yml"), "w") as f:
+    with open(os.path.join(args.out, "tech.dynacon.vr.yml"), "w") as f:
         f.write(template)

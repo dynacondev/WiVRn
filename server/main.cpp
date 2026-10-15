@@ -180,7 +180,7 @@ static std::string steam_command()
 		if (p.starts_with("/usr"))
 			command += "VR_OVERRIDE=/run/host" + p + ' ';
 		else if (p.starts_with("/var") and not p.starts_with(home))
-			command += "PRESSURE_VESSEL_FILESYSTEMS_RW=" + find_dir(p, "io.github.wivrn.wivrn").string() + ' ';
+			command += "PRESSURE_VESSEL_FILESYSTEMS_RW=" + find_dir(p, "tech.dynacon.vr").string() + ' ';
 	}
 
 	if (not command.empty())
