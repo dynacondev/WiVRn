@@ -188,6 +188,7 @@ public:
 	void operator()(const from_headset::get_running_applications &);
 	void operator()(const from_headset::set_active_application &);
 	void operator()(const from_headset::stop_application &);
+	void operator()(from_headset::fiducial_model_request &&);
 	void operator()(audio_data &&);
 
 	void operator()(to_monado::stop &&);

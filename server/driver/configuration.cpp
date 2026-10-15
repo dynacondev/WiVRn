@@ -491,6 +491,87 @@ configuration::configuration()
 		if (auto it = json.find("hid-forwarding"); it != json.end())
 			hid_forwarding = *it;
 
+		if (auto it = json.find("passthrough"); it != json.end())
+		{
+			for (const auto & item: *it)
+			{
+				passthrough_object o;
+				if (item.contains("type"))
+					o.type = item["type"];
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed")
+				{
+					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
+					        item.value("id", o.type).c_str(), o.type.c_str());
+					continue;
+				}
+				if (item.contains("id"))
+					o.id = item["id"];
+				if (o.id.empty())
+				{
+					U_LOG_W("passthrough object without id, skipping");
+					continue;
+				}
+				if (item.contains("tag"))
+					o.tag = item["tag"];
+				if (item.contains("fiducial"))
+				{
+					const auto & f = item["fiducial"];
+					if (f.is_string())
+						o.fiducial.push_back(f);
+					else
+						for (const auto & i: f)
+							o.fiducial.push_back(i);
+				}
+				// Drop dangling references (typos shouldn't nuke the map).
+				o.fiducial.erase(
+				        std::remove_if(o.fiducial.begin(), o.fiducial.end(), [&](const std::string & id) {
+					        bool known = std::ranges::any_of(fiducials, [&](const fiducial_entry & e) { return e.id == id; });
+					        if (not known)
+						        U_LOG_W("passthrough object \"%s\": unknown fiducial \"%s\", dropping reference", o.id.c_str(), id.c_str());
+					        return not known;
+				        }),
+				        o.fiducial.end());
+				if (o.fiducial.empty())
+				{
+					U_LOG_W("passthrough object \"%s\": no valid fiducials, skipping", o.id.c_str());
+					continue;
+				}
+				if (item.contains("model-path"))
+					o.model_path = item["model-path"];
+				if (item.contains("position"))
+					o.position = item["position"];
+				if (item.contains("orientation"))
+					o.orientation = parse_orientation(item["orientation"], "passthrough object");
+				if (item.contains("scale"))
+				{
+					if (item["scale"].is_number())
+						o.scale = item["scale"];
+					else if (item["scale"].is_array() and item["scale"].size() > 0)
+						o.scale = item["scale"].at(0);
+				}
+				if (item.contains("feather-px"))
+				{
+					if (o.type == "3d-passthrough-reversed")
+						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for %s, ignoring", o.id.c_str(), o.type.c_str());
+					else
+						o.feather_px = item["feather-px"];
+				}
+				if (item.contains("surface-projected"))
+				{
+					if (o.type == "3d-passthrough-reversed")
+						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to %s, ignoring", o.id.c_str(), o.type.c_str());
+					else
+						o.surface_projected = item["surface-projected"];
+				}
+				if (std::ranges::any_of(passthrough_objects, [&](const passthrough_object & p) { return p.id == o.id; }))
+				{
+					U_LOG_W("duplicate passthrough object id \"%s\", skipping", o.id.c_str());
+					continue;
+				}
+				passthrough_objects.push_back(std::move(o));
+			}
+		}
+
 		if (auto it = json.find("debug-gui"); it != json.end())
 			debug_gui = *it;
 
