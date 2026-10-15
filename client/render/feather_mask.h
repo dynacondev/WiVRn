@@ -230,31 +230,35 @@ private:
 	// Separable Gaussian blur (fullscreen triangle, sampled input).
 	// Two format variants: R8 for the intermediates, RGBA8 for the V
 	// upscale into swapchain images. Same shaders/layouts (format-free);
-	// only renderpass + pipeline objects split.
-	vk::raii::RenderPass blur_renderpass{nullptr};
-	vk::raii::RenderPass blur_r8_renderpass{nullptr};
+	// only renderpass + pipeline objects split. Multiview (viewMask =
+	// both eyes): one fullscreen draw broadcasts to both layers.
+	vk::raii::RenderPass blur_renderpass_mv{nullptr};
+	vk::raii::RenderPass blur_r8_renderpass_mv{nullptr};
 	vk::raii::PipelineLayout blur_layout{nullptr};
-	vk::raii::Pipeline blur_pipeline{nullptr};
-	vk::raii::Pipeline blur_r8_pipeline{nullptr};
+	// Fullscreen pipelines (multiview: one draw broadcasts to both
+	// eyes). The _mv fragment twins read each view's layer.
+	vk::raii::Pipeline blur_pipeline_mv{nullptr};
+	vk::raii::Pipeline blur_r8_pipeline_mv{nullptr};
 	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
 	// reads the push block's src_texel prefix).
-	vk::raii::Pipeline downsample_pipeline{nullptr};
+	vk::raii::Pipeline downsample_pipeline_mv{nullptr};
 	// Separable box-min erosion for internal-only feathering at any
 	// width: two 1D min passes (H then V, radius = ceil bleed) compose an
 	// exact (2r+1)^2 box. Same fullscreen vertex shader/layout as blur
 	// (24-byte push) and R8 standalone shape as the downsample pass, so
 	// it records into any single-attachment R8 framebuffer (A/B blur_fbs,
 	// eblur blur_fbs) with no new renderpasses or targets.
-	vk::raii::Pipeline erode_pipeline{nullptr};
+	vk::raii::Pipeline erode_pipeline_mv{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// One set per (pass, eye): descriptor updates are host-side writes
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0,1 = blur-H eyes 0,1; 2,3 = blur-V eyes 0,1; 4..9 =
-	// downsample levels 1..3 x eyes 0,1; 10,11 = erode-H eyes 0,1; 12,13
-	// = erode-V eyes 0,1. Erosion needs two sets because its H and V
+	// Index: 0 = blur-H, 2 = blur-V upscale; 4,6,8 = downsample
+	// levels 1..3; 10 = erode-H, 12 = erode-V. One set per pass (not
+	// per eye): the multiview passes sample the array view, so eye-1
+	// slots stay unused. Erosion needs two sets because its H and V
 	// passes sample different images in the same command buffer (one
 	// host-side write per set per frame, like the rest).
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
@@ -276,6 +280,12 @@ private:
 		std::vector<vk::raii::ImageView> views;
 		std::vector<vk::raii::Framebuffer> raster_fbs;
 		std::vector<vk::raii::Framebuffer> blur_fbs;
+		// Multiview sampling + render target: 2D-array view over both
+		// layers and one layers=2 framebuffer. The _mv fullscreen
+		// passes read via view_array (sampler2DArray indexed by
+		// gl_ViewIndex) and render into blur_fb_mv.
+		vk::raii::ImageView view_array{nullptr};
+		vk::raii::Framebuffer blur_fb_mv{nullptr};
 		// Depth-tested raster companions (D16, same extent as the color
 		// target above): depth image + views shared by both eyes' layers,
 		// plus one color+depth framebuffer per eye for the seed raster.
@@ -328,6 +338,11 @@ private:
 		vk::Extent2D extent;
 		std::array<vk::raii::ImageView, 2> views;
 		std::array<vk::raii::Framebuffer, 2> framebuffers;
+		// Multiview V-upscale target: array view + layers=2
+		// framebuffer under blur_renderpass_mv. Per-eye framebuffers
+		// above stay (tier-0 raster, cutout punch).
+		vk::raii::ImageView view_array{nullptr};
+		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companions for tier-0 direct raster (color +
 		// depth, under depth_renderpass): same color views as above plus a
 		// cached submitted-size depth view (see output_depth below). Built
@@ -339,10 +354,14 @@ private:
 		              std::array<vk::raii::ImageView, 2> views_,
 		              std::array<vk::raii::Framebuffer, 2> framebuffers_,
 		              std::array<vk::raii::Framebuffer, 2> depth_framebuffers_,
-		              bool has_depth_) :
+		              bool has_depth_,
+		              vk::raii::ImageView view_array_ = nullptr,
+		              vk::raii::Framebuffer framebuffer_mv_ = nullptr) :
 		        extent(extent_),
 		        views(std::move(views_)),
 		        framebuffers(std::move(framebuffers_)),
+		        view_array(std::move(view_array_)),
+		        framebuffer_mv(std::move(framebuffer_mv_)),
 		        depth_framebuffers(std::move(depth_framebuffers_)),
 		        has_depth(has_depth_)
 		{

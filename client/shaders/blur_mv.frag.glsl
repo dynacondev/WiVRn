@@ -18,10 +18,15 @@
 
 #version 450
 
+#extension GL_EXT_multiview : require
+
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform sampler2D src;
+// Multiview twin of blur.frag.glsl: identical 5-tap Gaussian, reading
+// the calling view's layer. Same push layout (24 bytes), so the
+// multiview pipelines share the blur pipeline layout.
+layout(set = 0, binding = 0) uniform sampler2DArray src;
 
 layout(push_constant) uniform Push
 {
@@ -32,22 +37,12 @@ layout(push_constant) uniform Push
 }
 pc;
 
-// Bilinear-gather 5-tap Gaussian, sigma = 2 texels, tails truncated.
-// Adjacent tap pairs share one linear-filtered fetch at the weighted
-// offset (hardware lerp mixes each pair in exact proportion), so 5 taps
-// cost 3 fetches: center 0.2514, pairs (1,2) at 1.4072 weight 0.3743.
-// The dropped +-(3,4) tails carried 19% of the kernel energy;
-// renormalizing folds it into the kept taps, narrowing the effective
-// sigma slightly and steepening the far edge by low single digits of
-// alpha. The tap offsets scale with spread, so feather-px maps to band
-// width without changing the kernel. Only the mask channel carries
-// information: .r in, replicated out (serves R8 intermediates and the
-// RGBA8 upscale with one body).
 void main()
 {
 	vec2 t = pc.dir * pc.texel * pc.spread;
-	float a = texture(src, uv).r * 0.2514;
-	a += texture(src, uv + t * 1.4072).r * 0.3743;
-	a += texture(src, uv - t * 1.4072).r * 0.3743;
+	vec3 base_uv = vec3(uv, float(gl_ViewIndex));
+	float a = texture(src, base_uv).r * 0.2514;
+	a += texture(src, base_uv + vec3(t * 1.4072, 0)).r * 0.3743;
+	a += texture(src, base_uv - vec3(t * 1.4072, 0)).r * 0.3743;
 	out_color = vec4(a);
 }

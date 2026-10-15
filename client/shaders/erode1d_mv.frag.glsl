@@ -18,17 +18,17 @@
 
 #version 450
 
+#extension GL_EXT_multiview : require
+
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-layout(set = 0, binding = 0) uniform sampler2D src;
+// Multiview twin of erode1d.frag.glsl: identical box-minimum pass,
+// reading the calling view's layer. Same push layout (24 bytes), so it
+// shares the blur pipeline layout. Taps stay on exact texel centers:
+// pair with the point sampler, as in the single-view path.
+layout(set = 0, binding = 0) uniform sampler2DArray src;
 
-// One axis of a separable box-minimum erosion (morphological erosion):
-// minimum over [-radius, +radius] working texels along dir. Two passes
-// (dir = (1,0) then (0,1)) compose an exact (2r+1)^2 box erosion for any
-// radius, so the blur band below lands inside the silhouette at any
-// feather width. Push layout matches the blur shader (24 bytes), so all
-// pipelines share one layout object.
 layout(push_constant) uniform Push
 {
 	vec2 texel;
@@ -41,12 +41,14 @@ pc;
 void main()
 {
 	int r = int(pc.radius + 0.5);
-	float m = texture(src, uv).r;
+	vec3 duv = vec3(pc.dir * pc.texel, 0);
+	vec3 base_uv = vec3(uv, float(gl_ViewIndex));
+	float m = texture(src, base_uv).r;
 	for (int i = -8; i <= 8; ++i)
 	{
 		if (i == 0 || abs(i) > r)
 			continue;
-		m = min(m, texture(src, uv + pc.dir * pc.texel * float(i)).r);
+		m = min(m, texture(src, base_uv + duv * float(i)).r);
 	}
 	out_color = vec4(m);
 }

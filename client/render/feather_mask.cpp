@@ -477,13 +477,24 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .colorAttachmentCount = 1,
 	        .pColorAttachments = &blur_color_ref,
 	};
-	vk::RenderPassCreateInfo blur_rp_info{
+	// Multiview blur passes (viewMask = both eyes, correlated): one
+	// fullscreen draw broadcasts to both layers. Fully overwritten
+	// every use, so no clear and no prior contents needed.
+	uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
+	vk::RenderPassMultiviewCreateInfo mv_rp_info{
+	        .subpassCount = 1,
+	        .pViewMasks = &mv_view_mask,
+	        .correlationMaskCount = 1,
+	        .pCorrelationMasks = &mv_corr_mask,
+	};
+	vk::RenderPassCreateInfo blur_rp_mv_info{
+	        .pNext = &mv_rp_info,
 	        .attachmentCount = 1,
 	        .pAttachments = &blur_attachment,
 	        .subpassCount = 1,
 	        .pSubpasses = &blur_subpass,
 	};
-	blur_renderpass = vk::raii::RenderPass(device, blur_rp_info);
+	blur_renderpass_mv = vk::raii::RenderPass(device, blur_rp_mv_info);
 
 	// R8 variant of the blur pass for the intermediates (same DONT_CARE
 	// shape). The RGBA8 pass above serves only the V upscale into
@@ -505,28 +516,16 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .colorAttachmentCount = 1,
 	        .pColorAttachments = &blur_r8_ref,
 	};
-	vk::RenderPassCreateInfo blur_r8_rp_info{
+	vk::RenderPassCreateInfo blur_r8_rp_mv_info{
+	        .pNext = &mv_rp_info,
 	        .attachmentCount = 1,
 	        .pAttachments = &blur_r8_attachment,
 	        .subpassCount = 1,
 	        .pSubpasses = &blur_r8_subpass,
 	};
-	blur_r8_renderpass = vk::raii::RenderPass(device, blur_r8_rp_info);
+	blur_r8_renderpass_mv = vk::raii::RenderPass(device, blur_r8_rp_mv_info);
 
 	auto blur_vert = load_shader(device, "blur.vert");
-	auto blur_frag = load_shader(device, "blur.frag");
-	vk::PipelineShaderStageCreateInfo blur_stages[2] = {
-	        {
-	                .stage = vk::ShaderStageFlagBits::eVertex,
-	                .module = **blur_vert,
-	                .pName = "main",
-	        },
-	        {
-	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **blur_frag,
-	                .pName = "main",
-	        },
-	};
 
 	vk::PipelineVertexInputStateCreateInfo blur_vertex_input{};
 	vk::PipelineInputAssemblyStateCreateInfo blur_input_assembly{
@@ -585,42 +584,11 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	blur_layout = vk::raii::PipelineLayout(device, blur_layout_info);
 
-	vk::GraphicsPipelineCreateInfo blur_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = blur_stages,
-	        .pVertexInputState = &blur_vertex_input,
-	        .pInputAssemblyState = &blur_input_assembly,
-	        .pViewportState = &blur_viewport_state,
-	        .pRasterizationState = &blur_rasterization,
-	        .pMultisampleState = &blur_multisample,
-	        .pColorBlendState = &blur_blend,
-	        .pDynamicState = &blur_dynamic,
-	        .layout = *blur_layout,
-	        .renderPass = *blur_renderpass,
-	};
-	blur_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), blur_pipeline_info);
-
-	// R8 blur pipeline: same shaders/layout (format-free), R8 pass. Serves
-	// every blur except the V upscale (which targets RGBA8 swapchains).
-	vk::GraphicsPipelineCreateInfo blur_r8_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = blur_stages,
-	        .pVertexInputState = &blur_vertex_input,
-	        .pInputAssemblyState = &blur_input_assembly,
-	        .pViewportState = &blur_viewport_state,
-	        .pRasterizationState = &blur_rasterization,
-	        .pMultisampleState = &blur_multisample,
-	        .pColorBlendState = &blur_blend,
-	        .pDynamicState = &blur_dynamic,
-	        .layout = *blur_layout,
-	        .renderPass = *blur_r8_renderpass,
-	};
-	blur_r8_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), blur_r8_pipeline_info);
-
-	// Box-downsample pipeline: same fullscreen vertex shader, same layout
-	// (reads only the push prefix); R8 throughout (intermediates only).
-	auto downsample_frag = load_shader(device, "downsample.frag");
-	vk::PipelineShaderStageCreateInfo downsample_stages[2] = {
+	// Fullscreen pipelines (multiview: one draw broadcasts to both
+	// eyes). Built here so warm_pipelines covers them like every
+	// other pipe.
+	auto blur_mv_frag = load_shader(device, "blur_mv.frag");
+	vk::PipelineShaderStageCreateInfo blur_mv_stages[2] = {
 	        {
 	                .stage = vk::ShaderStageFlagBits::eVertex,
 	                .module = **blur_vert,
@@ -628,14 +596,61 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        },
 	        {
 	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **downsample_frag,
+	                .module = **blur_mv_frag,
+	                .pName = "main",
+	        },
+	};
+	vk::GraphicsPipelineCreateInfo blur_pipeline_mv_info{
+	        .stageCount = 2,
+	        .pStages = blur_mv_stages,
+	        .pVertexInputState = &blur_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_renderpass_mv,
+	};
+	blur_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), blur_pipeline_mv_info);
+
+	// R8 variant for the intermediates (same DONT_CARE shape). The
+	// RGBA8 pipe above serves only the V upscale into swapchain images.
+	vk::GraphicsPipelineCreateInfo blur_r8_pipeline_mv_info{
+	        .stageCount = 2,
+	        .pStages = blur_mv_stages,
+	        .pVertexInputState = &blur_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_r8_renderpass_mv,
+	};
+	blur_r8_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), blur_r8_pipeline_mv_info);
+
+	// Box-downsample pipeline: same fullscreen vertex shader, same layout
+	// (reads only the push prefix); R8 throughout (intermediates only).
+	auto downsample_mv_frag = load_shader(device, "downsample_mv.frag");
+	vk::PipelineShaderStageCreateInfo downsample_mv_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **blur_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **downsample_mv_frag,
 	                .pName = "main",
 	        },
 	};
 	vk::PipelineVertexInputStateCreateInfo downsample_vertex_input{};
-	vk::GraphicsPipelineCreateInfo downsample_pipeline_info{
+	vk::GraphicsPipelineCreateInfo downsample_pipeline_mv_info{
 	        .stageCount = 2,
-	        .pStages = downsample_stages,
+	        .pStages = downsample_mv_stages,
 	        .pVertexInputState = &downsample_vertex_input,
 	        .pInputAssemblyState = &blur_input_assembly,
 	        .pViewportState = &blur_viewport_state,
@@ -644,17 +659,12 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .pColorBlendState = &blur_blend,
 	        .pDynamicState = &blur_dynamic,
 	        .layout = *blur_layout,
-	        .renderPass = *blur_r8_renderpass,
+	        .renderPass = *blur_r8_renderpass_mv,
 	};
-	downsample_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), downsample_pipeline_info);
+	downsample_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), downsample_pipeline_mv_info);
 
-	// Erosion pipeline (see header): same fullscreen vertex shader,
-	// layout (24-byte push) and R8 standalone shape as the downsample
-	// pass; created against the shared R8 blur pass like every other R8
-	// pipe, so it records into any single-attachment R8 framebuffer (A/B
-	// blur_fbs, eblur blur_fbs) with no new renderpasses or targets.
-	auto erode_frag = load_shader(device, "erode1d.frag");
-	vk::PipelineShaderStageCreateInfo erode_stages[2] = {
+	auto erode_mv_frag = load_shader(device, "erode1d_mv.frag");
+	vk::PipelineShaderStageCreateInfo erode_mv_stages[2] = {
 	        {
 	                .stage = vk::ShaderStageFlagBits::eVertex,
 	                .module = **blur_vert,
@@ -662,13 +672,16 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        },
 	        {
 	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **erode_frag,
+	                .module = **erode_mv_frag,
 	                .pName = "main",
 	        },
 	};
-	vk::GraphicsPipelineCreateInfo erode_pipeline_info{
+	// Erosion pipeline (see header): same fullscreen vertex shader
+	// and layout (24-byte push) as the downsample pass, against the
+	// shared multiview R8 pass.
+	vk::GraphicsPipelineCreateInfo erode_pipeline_mv_info{
 	        .stageCount = 2,
-	        .pStages = erode_stages,
+	        .pStages = erode_mv_stages,
 	        .pVertexInputState = &downsample_vertex_input,
 	        .pInputAssemblyState = &blur_input_assembly,
 	        .pViewportState = &blur_viewport_state,
@@ -677,9 +690,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .pColorBlendState = &blur_blend,
 	        .pDynamicState = &blur_dynamic,
 	        .layout = *blur_layout,
-	        .renderPass = *blur_r8_renderpass,
+	        .renderPass = *blur_r8_renderpass_mv,
 	};
-	erode_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), erode_pipeline_info);
+	erode_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), erode_pipeline_mv_info);
 
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
@@ -892,6 +905,8 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 		target->views.clear();
 		target->raster_fbs.clear();
 		target->blur_fbs.clear();
+		target->view_array.clear();
+		target->blur_fb_mv.clear();
 		// Depth companions likewise (before the depth image assignment
 		// below destroys the old one). Blur-only target B never
 		// rasterizes, so it keeps no depth resources.
@@ -936,9 +951,6 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 		}
 		// Named copies: framebuffer create-info stores the pointer, so the
 		// handles must outlive the constructor calls (no &* temporaries).
-		// Raster and blur passes share these framebuffers: identical
-		// attachment spec (format/count/samples), which is all that
-		// render-pass compatibility compares.
 		vk::ImageView raw_views[2] = {*target->views[0], *target->views[1]};
 		for (int layer = 0; layer < 2; ++layer)
 		{
@@ -951,9 +963,32 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			        .layers = 1,
 			};
 			target->raster_fbs.emplace_back(device, fb_info);
-			fb_info.renderPass = *blur_r8_renderpass;
-			target->blur_fbs.emplace_back(device, fb_info);
 		}
+		// Multiview sampling + render target: array view over both
+		// layers, one layers=2 framebuffer under the multiview R8 pass.
+		target->view_array = vk::raii::ImageView(device,
+		        vk::ImageViewCreateInfo{
+		                .image = *target->image,
+		                .viewType = vk::ImageViewType::e2DArray,
+		                .format = blur_format,
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                        .baseMipLevel = 0,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 0,
+		                        .layerCount = 2,
+		                },
+		        });
+		vk::ImageView raw_array = *target->view_array;
+		target->blur_fb_mv = vk::raii::Framebuffer(device,
+		        vk::FramebufferCreateInfo{
+		                .renderPass = *blur_r8_renderpass_mv,
+		                .attachmentCount = 1,
+		                .pAttachments = &raw_array,
+		                .width = half_targets.width,
+		                .height = half_targets.height,
+		                .layers = 2,
+		        });
 		if (needs_depth)
 		{
 			// Depth-tested seed-raster companions: D16 image + per-eye
@@ -1001,6 +1036,8 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 			};
 			target->views.clear();
 			target->blur_fbs.clear();
+			target->view_array.clear();
+			target->blur_fb_mv.clear();
 			// Depth companions likewise. Seed raster runs on the down
 			// levels (never on the eblur workspaces), so only they keep
 			// depth resources.
@@ -1031,19 +1068,49 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 				};
 				target->views.emplace_back(device, view_info);
 			}
+			// Per-eye framebuffers serve the seed raster only (down
+			// levels; eblur workspaces never rasterize), so they are
+			// built directly against the raster pass now that the
+			// single-view blur pass is gone.
 			vk::ImageView raw_views[2] = {*target->views[0], *target->views[1]};
-			for (int layer = 0; layer < 2; ++layer)
+			if (needs_depth)
 			{
-			vk::FramebufferCreateInfo fb_info{
-			        .renderPass = *blur_r8_renderpass,
-			        .attachmentCount = 1,
-			        .pAttachments = &raw_views[layer],
-			        .width = le.width,
-			        .height = le.height,
-			        .layers = 1,
-			};
-			target->blur_fbs.emplace_back(device, fb_info);
+				for (int layer = 0; layer < 2; ++layer)
+				{
+					vk::FramebufferCreateInfo fb_info{
+					        .renderPass = *raster_r8_renderpass,
+					        .attachmentCount = 1,
+					        .pAttachments = &raw_views[layer],
+					        .width = le.width,
+					        .height = le.height,
+					        .layers = 1,
+					};
+					target->blur_fbs.emplace_back(device, fb_info);
+				}
 			}
+			target->view_array = vk::raii::ImageView(device,
+			        vk::ImageViewCreateInfo{
+			                .image = *target->image,
+			                .viewType = vk::ImageViewType::e2DArray,
+			                .format = blur_format,
+			                .subresourceRange = {
+			                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+			                        .baseMipLevel = 0,
+			                        .levelCount = 1,
+			                        .baseArrayLayer = 0,
+			                        .layerCount = 2,
+			                },
+			        });
+			vk::ImageView raw_array = *target->view_array;
+			target->blur_fb_mv = vk::raii::Framebuffer(device,
+			        vk::FramebufferCreateInfo{
+			                .renderPass = *blur_r8_renderpass_mv,
+			                .attachmentCount = 1,
+			                .pAttachments = &raw_array,
+			                .width = le.width,
+			                .height = le.height,
+			                .layers = 2,
+			        });
 			if (needs_depth)
 			{
 				// Seed raster runs on down_targets[seed-1].blur_fbs (identical
@@ -1186,10 +1253,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 
 	// Same-queue read-after-write between passes (all images GENERAL).
-	// Per-eye subresource range: every pass writes a single-layer
-	// framebuffer, so a full-image barrier would needlessly serialize
-	// the idle eye's layer on tile GPUs.
-	auto make_readable = [&](vk::Image img, uint32_t eye) {
+	// Full-image range: the multiview chain reads both layers together,
+	// so per-eye narrowing no longer applies (one barrier replaces two).
+	auto make_readable = [&](vk::Image img) {
 	vk::ImageMemoryBarrier barrier{
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
@@ -1199,8 +1265,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		        .subresourceRange = {
 		                .aspectMask = vk::ImageAspectFlagBits::eColor,
 		                .levelCount = 1,
-		                .baseArrayLayer = eye,
-		                .layerCount = 1,
+		                .layerCount = 2,
 		        },
 		};
 		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -1285,6 +1350,32 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        return vk::raii::Framebuffer(device, fb_info);
 		        }(),
 		}};
+		// Multiview V-upscale target: array view over both layers plus
+		// one layers=2 framebuffer under blur_renderpass_mv. Per-eye
+		// framebuffers above stay (tier-0 raster, cutout punch).
+		vk::raii::ImageView mv_array_view(device,
+		        vk::ImageViewCreateInfo{
+		                .image = image,
+		                .viewType = vk::ImageViewType::e2DArray,
+		                .format = format,
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                        .baseMipLevel = 0,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 0,
+		                        .layerCount = 2,
+		                },
+		        });
+		vk::ImageView mv_raw_array = *mv_array_view;
+		vk::raii::Framebuffer mv_framebuffer(device,
+		        vk::FramebufferCreateInfo{
+		                .renderPass = *blur_renderpass_mv,
+		                .attachmentCount = 1,
+		                .pAttachments = &mv_raw_array,
+		                .width = out_extent.width,
+		                .height = out_extent.height,
+		                .layers = 2,
+		        });
 		// Depth-tested raster companions for tier-0 direct raster (color +
 		// depth under depth_renderpass): same color views as above plus the
 		// cached submitted-size depth views (swapchain-independent, shared
@@ -1311,7 +1402,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 			has_depth = true;
 		}
-		it = targets.emplace(image, frame_targets(out_extent, std::move(views), std::move(framebuffers), std::move(depth_framebuffers), has_depth)).first;
+		it = targets.emplace(image, frame_targets(out_extent, std::move(views), std::move(framebuffers), std::move(depth_framebuffers), has_depth, std::move(mv_array_view), std::move(mv_framebuffer))).first;
 	}
 
 	vk::ClearValue clear{};
@@ -1387,21 +1478,21 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		cmd.endRenderPass();
 	};
 
-	// Erosion helpers (internal-only feather, see header): one 1D
+	// Erosion helper (internal-only feather, see header): one 1D
 	// box-min pass over src_view into dst_fb at extent e (R8, DONT_CARE
-	// load, fully overwritten), then the separable pair below. Two passes
-	// (H then V, radius = ceil bleed) compose the exact box for any
-	// feather width. Each pass uses its own descriptor set per eye
-	// (10+eye for H, 12+eye for V): descriptor updates are host-side
-	// writes, so sharing one set across passes in the same command buffer
-	// would make every pass sample the last write. Barriers stay
-	// caller-side like every other pass here.
+	// load, fully overwritten), always multiview (one draw broadcasts
+	// to both eyes). Two passes (H then V, radius = ceil bleed) compose
+	// the exact box for any feather width. Each pass uses its own
+	// descriptor set (10 for H, 12 for V): descriptor updates are
+	// host-side writes, so sharing one set across passes in the same
+	// command buffer would make every pass sample the last write.
+	// Barriers stay caller-side like every other pass here.
 	auto erode_1d = [&](vk::ImageView src_view, uint32_t src_set, vk::Framebuffer dst_fb, vk::Extent2D e,
 	                        float dx, float dy, int radius) {
 		// Point sampling: taps land on exact texel centers.
 		update_source(src_view, src_set, true);
 		vk::RenderPassBeginInfo begin_erode{
-		        .renderPass = *blur_r8_renderpass,
+		        .renderPass = *blur_r8_renderpass_mv,
 		        .framebuffer = dst_fb,
 		        .renderArea = {.offset = {0, 0}, .extent = e},
 		        .clearValueCount = 1,
@@ -1409,7 +1500,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(begin_erode, vk::SubpassContents::eInline);
 		set_full_viewport(e);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *erode_pipeline);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *erode_pipeline_mv);
 		std::array<vk::DescriptorSet, 1> sets_e{*descriptor_sets[src_set]};
 		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_e, no_offsets);
 		erode_push push{{1.f / e.width, 1.f / e.height}, {dx, dy}, (float)radius, 0};
@@ -1504,12 +1595,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		}
 		else if (tier == 1)
 		{
-		// Stages 1+2+3 per eye: raster into half-res A, H into half-res B,
-		// V upscale into the swapchain image. Eye-outer order (each eye's
-		// chain completes before the next eye starts) keeps that eye's
-		// tiles hot; same passes, pushes and clears as the old per-pass
-		// loops. One descriptor set per eye (see header): re-pointed per
-		// pass, each written once per frame.
+		// Stages 1+2+3: raster into half-res A stays per-eye (geometry
+		// is trivial), then ONE multiview chain covers both eyes —
+		// erode H/V, blur H, V upscale. Same pushes and clears; the _mv
+		// fragment twins read each view's layer via gl_ViewIndex, so no
+		// per-eye state exists past the raster. One descriptor set per
+		// pass (the eye-0 indices), each written once per frame.
 		blur_push base{
 		        .texel = {1.f / half_extent.width, 1.f / half_extent.height},
 		        .spread = spread,
@@ -1518,74 +1609,72 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// at half res (the blur input here), so the band below lands
 		// inside the silhouette for any feather width.
 		int erode = erode_radius(spread, 2.f);
-		for (int eye = 0; eye < 2; ++eye)
 		{
-			{
-				section_clock raster_clk(&ms_raster);
+			section_clock raster_clk(&ms_raster);
+			for (int eye = 0; eye < 2; ++eye)
 				raster_silhouette({*target_a.raster_fbs[eye], *target_a.raster_depth_fbs[eye], *raster_r8_pipeline, *raster_r8_depth_pipeline, *raster_r8_reverse_pipeline, *raster_r8_renderpass, *raster_r8_depth_renderpass}, half_extent, eye, has_reversed);
-			}
-			make_readable(*target_a.image, eye);
-			if (erode > 0)
-			{
-				// Erode A into B (H) and back into A (V): the eroded
-				// field ends where the raster started, so H below reads
-				// A and writes B exactly like the uneroded path — H/V
-				// bodies stay untouched either way.
-				section_clock erode_clk(&ms_erode);
-				erode_1d(*target_a.views[eye], 10 + eye, *target_b.blur_fbs[eye], half_extent, 1, 0, erode);
-				make_readable(*target_b.image, eye);
-				erode_1d(*target_b.views[eye], 12 + eye, *target_a.blur_fbs[eye], half_extent, 0, 1, erode);
-				make_readable(*target_a.image, eye);
-			}
-			section_clock blur_clk(&ms_blur);
-			// H reads A (eroded or raster) and writes B; V reads B:
-			// identical bodies either way.
-			update_source(*target_a.views[eye], eye);
-			vk::RenderPassBeginInfo begin_h{
-			        .renderPass = *blur_r8_renderpass,
-			        .framebuffer = *target_b.blur_fbs[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = half_extent},
-			        .clearValueCount = 1,
-			        .pClearValues = &clear,
-			};
-			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
-			set_full_viewport(half_extent);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline);
-			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
-			blur_push push = base;
-			push.dir[0] = 1;
-			push.dir[1] = 0;
-			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
-			cmd.draw(3, 1, 0, 0);
-			cmd.endRenderPass();
-			make_readable(*target_b.image, eye);
-			update_source(*target_b.views[eye], 2 + eye);
-			vk::RenderPassBeginInfo begin_v{
-			        .renderPass = *blur_renderpass,
-			        .framebuffer = *it->second.framebuffers[eye],
-			        .renderArea = {.offset = {0, 0}, .extent = out_extent},
-			        .clearValueCount = 1,
-			        .pClearValues = &clear,
-			};
-			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
-			set_full_viewport(out_extent);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
-			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
-			blur_push push_v = base;
-			push_v.dir[0] = 0;
-			push_v.dir[1] = 1;
-			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
-			cmd.draw(3, 1, 0, 0);
-			cmd.endRenderPass();
 		}
+		make_readable(*target_a.image);
+		if (erode > 0)
+		{
+			// Erode A into B (H) and back into A (V): the eroded
+			// field ends where the raster started, so H below reads
+			// A and writes B exactly like the uneroded path — H/V
+			// bodies stay untouched either way.
+			section_clock erode_clk(&ms_erode);
+			erode_1d(*target_a.view_array, 10, *target_b.blur_fb_mv, half_extent, 1, 0, erode);
+			make_readable(*target_b.image);
+			erode_1d(*target_b.view_array, 12, *target_a.blur_fb_mv, half_extent, 0, 1, erode);
+			make_readable(*target_a.image);
+		}
+		section_clock blur_clk(&ms_blur);
+		// H reads A (eroded or raster) and writes B; V reads B:
+		// identical bodies either way.
+		update_source(*target_a.view_array, 0);
+		vk::RenderPassBeginInfo begin_h{
+		        .renderPass = *blur_r8_renderpass_mv,
+		        .framebuffer = *target_b.blur_fb_mv,
+		        .renderArea = {.offset = {0, 0}, .extent = half_extent},
+		        .clearValueCount = 1,
+		        .pClearValues = &clear,
+		};
+		cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
+		set_full_viewport(half_extent);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
+		std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[0]};
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
+		blur_push push = base;
+		push.dir[0] = 1;
+		push.dir[1] = 0;
+		cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+		cmd.draw(3, 1, 0, 0);
+		cmd.endRenderPass();
+		make_readable(*target_b.image);
+		update_source(*target_b.view_array, 2);
+		vk::RenderPassBeginInfo begin_v{
+		        .renderPass = *blur_renderpass_mv,
+		        .framebuffer = *it->second.framebuffer_mv,
+		        .renderArea = {.offset = {0, 0}, .extent = out_extent},
+		        .clearValueCount = 1,
+		        .pClearValues = &clear,
+		};
+		cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
+		set_full_viewport(out_extent);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline_mv);
+		std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2]};
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
+		blur_push push_v = base;
+		push_v.dir[0] = 0;
+		push_v.dir[1] = 1;
+		cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
+		cmd.draw(3, 1, 0, 0);
+		cmd.endRenderPass();
 		} // tier == 1
 		else
 		{
-			// Tiered path per eye: seed-rasterize below full res, downsample
-			// chain to the blur level, blur at 1/k, upscale submit. Eye-outer
-			// order keeps each eye's tiles hot (same rationale as tier 1).
+			// Tiered path: seed-rasterize below full res (per eye), one
+			// multiview downsample/erode/blur chain to the blur level,
+			// blur at 1/k, upscale submit.
 			// Tier 2 seeds at quarter (level 2); higher tiers seed at half,
 			// so the H working level is the deeper of the seed level and
 			// the tier's natural level. down_targets[N].blur_fbs serves the
@@ -1607,103 +1696,103 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// erode at the blur level (te texels), so the band below
 			// lands inside the silhouette for any feather width.
 			int erode = erode_radius(spread, (float)(1 << blur_level));
-			for (int eye = 0; eye < 2; ++eye)
+			// Seed raster stays per-eye; the downsample/erode/blur chain
+			// below runs once per level for both eyes (multiview).
 			{
-				{
-					section_clock raster_clk(&ms_raster);
+				section_clock raster_clk(&ms_raster);
+				for (int eye = 0; eye < 2; ++eye)
 					raster_silhouette({*down_targets[seed_level - 1].blur_fbs[eye], *down_targets[seed_level - 1].raster_depth_fbs[eye], *raster_r8_pipeline, *raster_r8_depth_pipeline, *raster_r8_reverse_pipeline, *raster_r8_renderpass, *raster_r8_depth_renderpass}, de_seed, eye, has_reversed);
-				}
-				make_readable(*down_targets[seed_level - 1].image, eye);
-				section_clock blur_clk(&ms_blur);
-				// Levels seed_level+1..N from the selected tier; sizes shared
-				// with ensure via level_extent() (exact halving required for
-				// the box map).
-				vk::ImageView down_src = *down_targets[seed_level - 1].views[eye];
-				vk::Extent2D down_src_extent = de_seed;
-				int h_src_level = seed_level;
-				for (int l = seed_level + 1; l <= levels; ++l)
-				{
-					blur_target & dst = down_targets[l - 1];
-					vk::Extent2D de = level_extent(extent, l);
-					update_source(down_src, 4 + (l - 1) * 2 + eye);
-					vk::RenderPassBeginInfo begin_down{
-					        .renderPass = *blur_r8_renderpass,
-					        .framebuffer = *dst.blur_fbs[eye],
-					        .renderArea = {.offset = {0, 0}, .extent = de},
-					        .clearValueCount = 1,
-					        .pClearValues = &clear,
-					};
-					cmd.beginRenderPass(begin_down, vk::SubpassContents::eInline);
-					set_full_viewport(de);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *downsample_pipeline);
-					std::array<vk::DescriptorSet, 1> sets_d{*descriptor_sets[4 + (l - 1) * 2 + eye]};
-					cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_d, no_offsets);
-					blur_push push{};
-					push.texel[0] = 1.f / down_src_extent.width;
-					push.texel[1] = 1.f / down_src_extent.height;
-					cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
-					cmd.draw(3, 1, 0, 0);
-					cmd.endRenderPass();
-					make_readable(*dst.image, eye);
-					down_src = *dst.views[eye];
-					down_src_extent = de;
-					h_src_level = l;
-				}
-				if (erode > 0)
-				{
-					// Erode the H input (down_src) into eblur (H) and back
-					// into the down image it just came from (V): the eroded
-					// field ends where the downsample chain left it, so H
-					// below reads the down image and writes eblur exactly
-					// like the uneroded path — H/V bodies stay untouched.
-					section_clock erode_clk(&ms_erode);
-					blur_target & h_src = down_targets[h_src_level - 1];
-					erode_1d(down_src, 10 + eye, *eblur.blur_fbs[eye], te, 1, 0, erode);
-					make_readable(*eblur.image, eye);
-					erode_1d(*eblur.views[eye], 12 + eye, *h_src.blur_fbs[eye], te, 0, 1, erode);
-					make_readable(*h_src.image, eye);
-					down_src = *h_src.views[eye];
-				}
-				update_source(down_src, eye);
-				vk::RenderPassBeginInfo begin_h{
-				        .renderPass = *blur_r8_renderpass,
-				        .framebuffer = *eblur.blur_fbs[eye],
-				        .renderArea = {.offset = {0, 0}, .extent = te},
+			}
+			make_readable(*down_targets[seed_level - 1].image);
+			section_clock blur_clk(&ms_blur);
+			// Levels seed_level+1..N from the selected tier; sizes shared
+			// with ensure via level_extent() (exact halving required for
+			// the box map).
+			vk::ImageView down_src = *down_targets[seed_level - 1].view_array;
+			vk::Extent2D down_src_extent = de_seed;
+			int h_src_level = seed_level;
+			for (int l = seed_level + 1; l <= levels; ++l)
+			{
+				blur_target & dst = down_targets[l - 1];
+				vk::Extent2D de = level_extent(extent, l);
+				update_source(down_src, 4 + (l - 1) * 2);
+				vk::RenderPassBeginInfo begin_down{
+				        .renderPass = *blur_r8_renderpass_mv,
+				        .framebuffer = *dst.blur_fb_mv,
+				        .renderArea = {.offset = {0, 0}, .extent = de},
 				        .clearValueCount = 1,
 				        .pClearValues = &clear,
 				};
-				cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
-				set_full_viewport(te);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
-				blur_push push = base;
-				push.dir[0] = 1;
-				push.dir[1] = 0;
+				cmd.beginRenderPass(begin_down, vk::SubpassContents::eInline);
+				set_full_viewport(de);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *downsample_pipeline_mv);
+				std::array<vk::DescriptorSet, 1> sets_d{*descriptor_sets[4 + (l - 1) * 2]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_d, no_offsets);
+				blur_push push{};
+				push.texel[0] = 1.f / down_src_extent.width;
+				push.texel[1] = 1.f / down_src_extent.height;
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				make_readable(*eblur.image, eye);
-				update_source(*eblur.views[eye], 2 + eye);
-				vk::RenderPassBeginInfo begin_v{
-				        .renderPass = *blur_renderpass,
-				        .framebuffer = *it->second.framebuffers[eye],
-				        .renderArea = {.offset = {0, 0}, .extent = out_extent},
-				        .clearValueCount = 1,
-				        .pClearValues = &clear,
-				};
-				cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
-				set_full_viewport(out_extent);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline);
-				std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2 + eye]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
-				blur_push push_v = base;
-				push_v.dir[0] = 0;
-				push_v.dir[1] = 1;
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
-				cmd.draw(3, 1, 0, 0);
-				cmd.endRenderPass();
+				make_readable(*dst.image);
+				down_src = *dst.view_array;
+				down_src_extent = de;
+				h_src_level = l;
 			}
+			if (erode > 0)
+			{
+				// Erode the H input (down_src) into eblur (H) and back
+				// into the down image it just came from (V): the eroded
+				// field ends where the downsample chain left it, so H
+				// below reads the down image and writes eblur exactly
+				// like the uneroded path — H/V bodies stay untouched.
+				section_clock erode_clk(&ms_erode);
+				blur_target & h_src = down_targets[h_src_level - 1];
+				erode_1d(down_src, 10, *eblur.blur_fb_mv, te, 1, 0, erode);
+				make_readable(*eblur.image);
+				erode_1d(*eblur.view_array, 12, *h_src.blur_fb_mv, te, 0, 1, erode);
+				make_readable(*h_src.image);
+				down_src = *h_src.view_array;
+			}
+			update_source(down_src, 0);
+			vk::RenderPassBeginInfo begin_h{
+			        .renderPass = *blur_r8_renderpass_mv,
+			        .framebuffer = *eblur.blur_fb_mv,
+			        .renderArea = {.offset = {0, 0}, .extent = te},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_h, vk::SubpassContents::eInline);
+			set_full_viewport(te);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
+			std::array<vk::DescriptorSet, 1> sets_h{*descriptor_sets[0]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_h, no_offsets);
+			blur_push push = base;
+			push.dir[0] = 1;
+			push.dir[1] = 0;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+			make_readable(*eblur.image);
+			update_source(*eblur.view_array, 2);
+			vk::RenderPassBeginInfo begin_v{
+			        .renderPass = *blur_renderpass_mv,
+			        .framebuffer = *it->second.framebuffer_mv,
+			        .renderArea = {.offset = {0, 0}, .extent = out_extent},
+			        .clearValueCount = 1,
+			        .pClearValues = &clear,
+			};
+			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
+			set_full_viewport(out_extent);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline_mv);
+			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2]};
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
+			blur_push push_v = base;
+			push_v.dir[0] = 0;
+			push_v.dir[1] = 1;
+			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push_v);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
 		} // tiered
 	}
 
