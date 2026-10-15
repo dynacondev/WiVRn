@@ -27,6 +27,7 @@
 #include "render/debug_lines.h"
 #include "render/feather_mask.h"
 #include "render/imgui_impl.h"
+#include "render/passthrough_mesh.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
 #include "stream_defoveator.h"
@@ -39,6 +40,8 @@
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <array>
+#include <cstddef>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -46,6 +49,7 @@
 #include <set>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
@@ -225,8 +229,17 @@ private:
 	thread_safe<to_headset::running_applications> running_applications;
 
 	// Fiducial tracking markers (Quest only, see docs/configuration.md).
-	// Latest map from the server.
+	// Latest map from the server; model files cached under
+	// application::get_config_path() / "fiducial_models" / <hash>.glb.
 	thread_safe<to_headset::fiducial_map> fiducial_map;
+	struct fiducial_download
+	{
+		uint32_t chunk_count = 0;
+		std::unordered_map<uint32_t, std::vector<std::byte>> chunks;
+	};
+	// Guarded by network thread only (all handlers run there)
+	std::unordered_map<std::string, fiducial_download> fiducial_downloads;
+	static std::filesystem::path fiducial_model_path(const std::string & hash);
 
 	// One runtime tracker per distinct (marker size, static) group, shared
 	// across fiducials (the marker size is context-global, payloads match
@@ -283,6 +296,38 @@ private:
 	// Solver init only, not output smoothing.
 	std::map<std::string, XrPosef> board_warm_start;
 
+	// Single fused placement per object. Objects persist once placed
+	// (map wipe excepted): the pose follows the first referenced
+	// fiducial with a pose, live or held, every frame.
+	struct fused_placement
+	{
+		bool placed = false; // any fused solution ever
+		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrVector3f world_scale{1, 1, 1};
+		XrTime last_solve = 0; // last live frame (stale age)
+	};
+	struct passthrough_object_state
+	{
+		to_headset::passthrough_object def; // snapshot from the map
+		// Model geometry, uploaded once per content hash.
+		passthrough_mesh::triangle_soup soup;
+		std::string soup_hash;
+		bool soup_ready = false;
+		size_t vertex_count = 0;
+		size_t triangle_count = 0;
+		std::string status = "waiting for fiducial map";
+		fused_placement fused;
+	};
+	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
+	// Live in-headset surface-projection overrides (Passthrough tab,
+	// session-scoped): presence wins over the map flag. Render thread
+	// only (GUI runs there too).
+	std::map<std::string /*object id*/, bool> projected_overrides;
+	// Object ids whose projected instance upload failed (runtime refused
+	// the mesh): skip retry so a persistent failure can't spam every
+	// frame. Cleared on map change with everything else.
+	std::set<std::string> projected_failed;
+
 	stream(std::string server_name, scene & parent_scene);
 
 	bool forward_hid_input(from_headset::hid::input_t, bool device_enabled);
@@ -326,6 +371,7 @@ public:
 	void operator()(to_headset::application_icon &&);
 	void operator()(to_headset::running_applications &&);
 	void operator()(to_headset::fiducial_map &&);
+	void operator()(to_headset::fiducial_model_chunk &&);
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);

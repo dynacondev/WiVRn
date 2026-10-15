@@ -135,6 +135,20 @@ std::string group_key_for(float size_m, bool is_static)
 {
 	return std::to_string(size_m) + (is_static ? 'S' : 'M');
 }
+
+// base * offset (translation unaffected by scale). Offset quaternion stored xyzw.
+// Object offsets apply directly (fiducial-to-object); marker offsets go
+// through effective_offset() above.
+XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const std::array<float, 4> & q)
+{
+	glm::quat bq(base.orientation.w, base.orientation.x, base.orientation.y, base.orientation.z);
+	glm::vec3 bp(base.position.x, base.position.y, base.position.z);
+	glm::quat oq(q[3], q[0], q[1], q[2]);
+	glm::vec3 op(p[0], p[1], p[2]);
+	glm::quat rq = bq * oq;
+	glm::vec3 rp = bp + bq * op;
+	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
+}
 } // namespace
 
 // No-config discovery vehicle payload: a sentinel no real QR payload will
@@ -482,6 +496,22 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			map_key += ';';
 		}
 	}
+	// Fingerprint: object identity (id/type/flags/model). Tags excluded
+	// (display-only); geometry/pose ride the soup + placements below.
+	for (const auto & o: map->objects)
+	{
+		map_key += 'O';
+		map_key += o.type;
+		map_key += ';';
+		map_key += o.id;
+		map_key += ';';
+		map_key += o.model_hash;
+		map_key += ';';
+		map_key += o.surface_projected ? 'P' : 'F';
+		map_key += ';';
+		map_key += std::to_string(o.feather_px);
+		map_key += ';';
+	}
 	// Trackers run every frame, independent of consumers (their state
 	// feeds the status UI below).
 	sync_fiducial_trackers(*map);
@@ -500,6 +530,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fiducial_votes.clear();
 		board_poses.clear();
 		board_warm_start.clear();
+		passthrough_objects.clear();
+		// Projected instances are rebuilt from placements below (the
+		// per-frame sync destroys stale ones, the map wipe clears the
+		// rest).
+		projected_failed.clear();
+		session.clear_projected_instances();
 		// `board config:` makes every future log self-describing:
 		// marker sizes, offsets and tuning, so tuning sessions never
 		// guess what geometry produced the data.
@@ -709,6 +745,136 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		double horizon_ms = (predicted_display_time - now) * 1e-6;
 		log_board_tuning(f.id, bv, sol, bp, horizon_ms, now, solve_dt, have_head, head_pos);
 	}
+
+	// ---- behavior objects: first referenced board pose wins ----
+	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
+	{
+		if (std::ranges::any_of(map->objects, [&](const to_headset::passthrough_object & o) { return o.id == oit->first; }))
+			++oit;
+		else
+			oit = passthrough_objects.erase(oit);
+	}
+	for (const auto & def: map->objects)
+	{
+		// Reversed objects place exactly like normal ones (fused board
+		// pose, mesh); only the mask raster treats them as cuts. The
+		// binary projected fallback has no hole vocabulary, so only
+		// normal objects drive it (not carried: mask path only).
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed")
+		{
+			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
+			continue;
+		}
+		auto & ost = passthrough_objects[def.id];
+		ost.def = def;
+		// Model geometry upload (shared across this object's instances).
+		if (not def.model_hash.empty())
+		{
+			std::error_code ec;
+			if (std::filesystem::exists(fiducial_model_path(def.model_hash), ec) and ost.soup_hash != def.model_hash)
+			{
+				ost.soup_hash = def.model_hash;
+				ost.soup_ready = false;
+				try
+				{
+					ost.soup = passthrough_mesh::flatten_gltf(fiducial_model_path(def.model_hash));
+					ost.soup_ready = true;
+					ost.vertex_count = ost.soup.vertices.size();
+					ost.triangle_count = ost.soup.indices.size() / 3;
+					ost.status = "mesh ready";
+					spdlog::info("Passthrough object \"{}\": mesh ready: {} triangles", def.id, ost.triangle_count);
+				}
+				catch (std::exception & e)
+				{
+					ost.status = std::string("mesh error: ") + e.what();
+					spdlog::warn("Passthrough object \"{}\": mesh failed: {}", def.id, e.what());
+				}
+			}
+		}
+		// Placement: first referenced fiducial with a pose (live or
+		// held) wins. Held poses keep rendering through occlusion.
+		// Objects persist once placed (map wipe excepted): the pose
+		// follows every frame, never un-places.
+		for (const auto & fid: def.fiducial)
+		{
+			auto bpit = board_poses.find(fid);
+			if (bpit == board_poses.end())
+				continue;
+			auto & fu = ost.fused;
+			fu.world_pose = compose_pose(bpit->second.pose, def.position, def.orientation);
+			fu.world_scale = {def.scale, def.scale, def.scale};
+			if (not fu.placed)
+			{
+				fu.placed = true;
+				spdlog::info("Passthrough object \"{}\" placed on fiducial \"{}\"", def.id, fid);
+			}
+			fu.last_solve = now;
+			break;
+		}
+	}
+
+	// ---- surface-projected instances: one geometry instance per placed,
+	// flagged object on the shared projected layer. Created on placement
+	// from the smoothed pose, updated every frame, destroyed on
+	// unselect/unplace. Reversed objects never qualify (they show game,
+	// not camera).
+	if (composition_layer_alpha_blend_supported)
+	{
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			bool want = ost.def.type == "3d-passthrough" and ost.soup_ready and ost.fused.placed and
+			        surface_projected_effective(oid, ost) and session.projected_passthrough_supported() and
+			        not projected_failed.contains(oid);
+			bool have = session.has_projected_instance(oid);
+			if (want and not have)
+			{
+				try
+				{
+					session.set_projected_instance_mesh(oid, ost.soup.vertices, ost.soup.indices, world_space,
+					                                    ost.fused.world_pose, ost.fused.world_scale);
+				}
+				catch (std::exception & e)
+				{
+					// Persistent per mesh (too big, runtime refused): skip
+					// retry so one bad mesh can't spam every frame. Cleared
+					// on map change with everything else.
+					projected_failed.insert(oid);
+					spdlog::warn("Projected instance \"{}\": upload failed (falling back to flat): {}", oid, e.what());
+				}
+			}
+			else if (have and not want)
+			{
+				session.remove_projected_instance(oid);
+				spdlog::info("Projected instance \"{}\" removed", oid);
+			}
+			if (want and session.has_projected_instance(oid))
+			{
+				try
+				{
+					session.update_projected_instance_transform(oid, world_space, predicted_display_time,
+					                                            ost.fused.world_pose, ost.fused.world_scale);
+				}
+				catch (std::exception & e)
+				{
+					// Throttled: a persistently bad transform keeps last
+					// good state instead of spamming every frame.
+					static XrTime last_transform_warn = 0;
+					if (now - last_transform_warn > 5'000'000'000LL)
+					{
+						last_transform_warn = now;
+						spdlog::warn("Projected instance \"{}\": transform update failed: {}", oid, e.what());
+					}
+				}
+			}
+		}
+	}
+}
+
+bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
+{
+	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
+		return it->second;
+	return ost.def.surface_projected;
 }
 
 void scenes::stream::gui_passthrough()
