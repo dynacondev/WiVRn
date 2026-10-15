@@ -85,13 +85,21 @@ struct getter_data
 	uintptr_t data;
 	int stride;
 	float multiplier;
+	// Ring-slot decimation for this series (1 = every sample).
+	// Tessellation and shaded fills dominate GUI build cost; at
+	// overlay sizes half the points are indistinguishable. The max
+	// scan stays full-ring so axis rescaling still sees spikes.
+	int slot_stride = 1;
 };
+
+// Global-plot decimation only (decoder plots keep every sample).
+constexpr int plot_stride = 2;
 
 ImPlotPoint getter(int index, void * data_)
 {
 	getter_data & data = *(getter_data *)data_;
 
-	return ImPlotPoint(index, *(float *)(data.data + index * data.stride) * data.multiplier);
+	return ImPlotPoint(index, *(float *)(data.data + index * data.slot_stride * data.stride) * data.multiplier);
 }
 } // namespace
 
@@ -141,6 +149,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.fence_wait_ms = (float)(fence_wait_ms * 1e-3);
 	gm.submit_ms = (float)(submit_ms * 1e-3);
 	gm.gui_ms = (float)(gui_ms * 1e-3);
+	gm.gui_build_ms = (float)(gui_build_ms * 1e-3);
+	gm.gui_submit_ms = (float)(gui_submit_ms * 1e-3);
 	gm.mask_first_gpu_ms = last_gpu_timestamps.mask_first_gpu_time;
 	gm.mask_rest_gpu_ms = last_gpu_timestamps.mask_rest_gpu_time;
 
@@ -152,7 +162,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
@@ -173,7 +183,9 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.mask_draws,
 			             gm.fence_wait_ms * 1e3f,
 			             gm.gui_ms * 1e3f,
-			             gm.submit_ms * 1e3f);
+			             gm.submit_ms * 1e3f,
+			             gm.gui_build_ms * 1e3f,
+			             gm.gui_submit_ms * 1e3f);
 			// Window maxima over the sample ring (~last 300 frames):
 			// single-frame stalls alias into scary single samples, so
 			// report what the worst frame in the window actually hit.
@@ -183,7 +195,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 					m = std::max(m, g.*field);
 				return m;
 			};
-			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             ring_max(&global_metric::cpu_time) * 1e3f,
 			             ring_max(&global_metric::gpu_time) * 1e3f,
 			             ring_max(&global_metric::defoveate_gpu_ms) * 1e3f,
@@ -199,7 +211,9 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::gizmo_ms) * 1e3f,
 			             ring_max(&global_metric::fence_wait_ms) * 1e3f,
 			             ring_max(&global_metric::gui_ms) * 1e3f,
-			             ring_max(&global_metric::submit_ms) * 1e3f);
+			             ring_max(&global_metric::submit_ms) * 1e3f,
+			             ring_max(&global_metric::gui_build_ms) * 1e3f,
+			             ring_max(&global_metric::gui_submit_ms) * 1e3f);
 		}
 	}
 
@@ -283,6 +297,8 @@ void scenes::stream::gui_performance_metrics()
 
 	        plot(_("Frame"), {{_("Fence wait"), &global_metric::fence_wait_ms},
 	                           {_("GUI"),         &global_metric::gui_ms},
+	                           {_("GUI build"),   &global_metric::gui_build_ms},
+	                           {_("GUI submit"),  &global_metric::gui_submit_ms},
 	                           {_("Submit"),      &global_metric::submit_ms}}, "s"),
 	        // clang-format on
 	};
@@ -327,7 +343,9 @@ void scenes::stream::gui_performance_metrics()
 			std::string units = std::string(prefix) + unit;
 			std::string title_with_units = units.empty() ? std::string(title) : std::string(title) + " [" + units + "]";
 			ImPlot::SetupAxes(nullptr, title_with_units.c_str(), ImPlotAxisFlags_NoDecorations, 0);
-			ImPlot::SetupAxesLimits(0, global_metrics.size() - 1, min_v * multiplier, axis_scale[n] * multiplier, ImGuiCond_Always);
+			// Strided x-range matches the decimated point count below.
+			const int plot_count = (int)global_metrics.size() / plot_stride;
+			ImPlot::SetupAxesLimits(0, plot_count - 1, min_v * multiplier, axis_scale[n] * multiplier, ImGuiCond_Always);
 			int k = 0;
 			for (const auto & [subtitle, data]: subplots)
 			{
@@ -343,10 +361,12 @@ void scenes::stream::gui_performance_metrics()
 				        .data = (uintptr_t)&(global_metrics.data()->*data),
 				        .stride = sizeof(global_metric),
 				        .multiplier = multiplier,
+				        .slot_stride = plot_stride,
 				};
-				ImPlot::PlotLineG(subtitle.c_str(), getter, &gdata, global_metrics.size(), spec);
+				ImPlot::PlotLineG(subtitle.c_str(), getter, &gdata, plot_count, spec);
 
-				double x[] = {double(metrics_offset), double(metrics_offset)};
+				// Head cursor in strided space (same head slot).
+				double x[] = {double(metrics_offset / plot_stride), double(metrics_offset / plot_stride)};
 				double y[] = {0, axis_scale[n] * multiplier};
 				spec.LineColor = ImVec4(1, 1, 1, 1);
 				ImPlot::PlotLine("", x, y, 2, spec);
@@ -738,6 +758,9 @@ void scenes::stream::gui_toasts()
 
 void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period)
 {
+	// Parts measured below (build vs submit); the caller still clocks
+	// the whole call, so the remainder names locate/hand overhead.
+	gui_build_ms = gui_submit_ms = 0;
 	if (auto new_status = next_gui_status.load(); new_status != gui_status)
 	{
 		spdlog::info("Switch tab from {} to {}", magic_enum::enum_name(gui_status), magic_enum::enum_name(new_status));
@@ -776,6 +799,32 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		network_session->send_control(from_headset::stream_tab_changed{.tab = new_status});
 	}
 
+	float alpha = 1;
+	bool is_urgent = false;
+	if (gui_status == stream_tab::hidden)
+	{
+		auto toast = gui_toast.lock();
+		if (toast->has_value())
+			is_urgent = (*toast)->is_urgent;
+
+		float t = (predicted_display_time - gui_status_last_change) * 1.e-9f;
+		float delay = is_urgent ? constants::stream::urgent_fade_delay : constants::stream::fade_delay;
+
+		alpha = std::clamp<float>(1 - (t - delay) / constants::stream::fade_duration, 0, 1);
+
+		if (alpha == 0)
+		{
+			// Fully faded: no locate, no build, no submit. Hand
+			// trackers only exist while interactable (never here),
+			// but release defensively: this return skips the release
+			// block below.
+			toast->reset();
+			left_hand.reset();
+			right_hand.reset();
+			return;
+		}
+	}
+
 	bool interactable = true;
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto views = session.locate_views(viewconfig, predicted_display_time, world_space).second;
@@ -810,26 +859,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		left_hand.reset();
 		right_hand.reset();
 	}
-
-	float alpha = 1;
-	bool is_urgent = false;
-	if (gui_status == stream_tab::hidden)
-	{
-		auto toast = gui_toast.lock();
-		if (toast->has_value())
-			is_urgent = (*toast)->is_urgent;
-
-		float t = (predicted_display_time - gui_status_last_change) * 1.e-9f;
-		float delay = is_urgent ? constants::stream::urgent_fade_delay : constants::stream::fade_delay;
-
-		alpha = std::clamp<float>(1 - (t - delay) / constants::stream::fade_duration, 0, 1);
-
-		if (alpha == 0)
-		{
-			toast->reset();
-			return;
-		}
-	}
+	auto gui_build_t0 = std::chrono::steady_clock::now();
 
 	// Lock the GUI position to the head, do it before displaying the GUI to avoid being off by one frame when gui_status changes
 	std::optional<std::pair<glm::vec3, glm::quat>> head_position = application::locate_controller(application::space(xr::spaces::view), world_space, predicted_display_time);
@@ -1159,7 +1189,9 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	ImGui::End();
 	ImGui::PopStyleVar(2);  // ImGuiStyleVar_ChildBorderSize, ImGuiStyleVar_WindowPadding
 	ImGui::PopStyleColor(); // ImGuiCol_WindowBg
+	gui_build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_build_t0).count();
 
+	auto gui_submit_t0 = std::chrono::steady_clock::now();
 	auto layers = imgui_ctx->end_frame();
 
 	// No menu depth while projected instances are live: depth-tested menu
@@ -1273,4 +1305,5 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		if (composition_layer_depth_test_supported and menu_depth)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);
 	}
+	gui_submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_submit_t0).count();
 }

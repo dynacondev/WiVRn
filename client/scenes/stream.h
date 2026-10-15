@@ -432,6 +432,10 @@ private:
 	// draw_gui, and render_end (end_frame IPC). Assigned
 	// unconditionally on the render path each frame, so no reset needed.
 	double fence_wait_ms = 0, submit_ms = 0, gui_ms = 0;
+	// draw_gui phases (measured inside draw_gui itself): ImGui build
+	// (new_frame through End) vs end_frame record + layer submit.
+	// gui_ms above stays the total for plot continuity.
+	double gui_build_ms = 0, gui_submit_ms = 0;
 	// Sticky warn flag for the bounded video-swapchain wait (same
 	// pattern as the mask groups' wait_warned).
 	bool video_wait_warned = false;
@@ -494,6 +498,8 @@ private:
 		float fence_wait_ms = 0;
 		float submit_ms = 0;
 		float gui_ms = 0;
+		float gui_build_ms = 0;
+		float gui_submit_ms = 0;
 		float feat_votes = 0;
 		float feat_tags = 0;
 		float mask_draws = 0;
