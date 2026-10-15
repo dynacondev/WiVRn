@@ -227,6 +227,17 @@ Print the QR encoding exactly the `marker-data` string, e.g.
 case-sensitive; any other QR code in view is reported in the headset
 Passthrough tab (red) to help you copy it verbatim into the config.
 
+A fiducial with several markers fuses them into one 6DoF frame: every
+sighted marker votes its board hypothesis (observed pose composed with
+its offset), and a robust estimator (Cauchy IRLS with leave-one-out
+outlier selection at 3+ votes) collapses the votes into one pose, which
+is then temporally smoothed. A lone marker passes through directly; a
+single jumping vote is held at the last good pose instead of displayed
+(the K1 jump guard). The Passthrough tab shows the per-tag weights,
+residuals, range/incidence/settle inputs and the filter state for each
+fiducial, and the server log carries the same detail (`board solve:`,
+`board tags:`, `board pop:`, `board flip:` lines).
+
 > [!NOTE]
 > A QR payload is a single identity: printing the *same* payload twice
 > does not create two trackables. The runtime reports one jumping track

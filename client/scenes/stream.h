@@ -32,9 +32,11 @@
 #include "wifi_lock.h"
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
+#include "xr/board_solver.h"
 #include "xr/fiducial_filter.h"
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
+#include <array>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -42,6 +44,7 @@
 #include <set>
 #include <shared_mutex>
 #include <thread>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace scenes
@@ -229,44 +232,53 @@ private:
 	// destroyed. Render thread only (all trackers run there).
 	std::map<std::string, xr::marker_tracker> fiducial_trackers;
 	std::string last_tracker_key; // group fingerprint; re-sync on change
-	std::string last_frame_key;   // map fingerprint for the smoothed frames; reset on change
-	// Union of configured marker payloads (any fiducial). Green vs red.
-	std::set<std::string> configured_marker_payloads;
+	std::string last_frame_key;   // map fingerprint for the fused poses; reset on change
 	// Set once: the runtime hides spatial tracking without its grant.
 	bool marker_support_logged = false;
 
-	// Solved fiducial frame per (fiducial, entity): observed marker pose
-	// composed with the marker-to-fiducial offset. All configured markers
-	// resolve (each entity carries one payload); fusing several markers to
-	// one fiducial frame is downstream work. Rebuilt every frame from live
-	// sightings only (ephemeral); render thread only.
-	struct fiducial_sighting
+	// One board hypothesis (vote) per (fiducial, marker, entity):
+	// observed tag pose plus the marker's size, offset and latch time.
+	// ALL markers of a fiducial vote; board_solver fuses each fiducial's
+	// votes into one pose. Rebuilt every frame; render thread only.
+	struct fiducial_vote
 	{
 		std::string fiducial_id;
 		std::string payload;
-		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}};
-		XrExtent2Df extents{0, 0};
-		XrTime time = 0;
-		bool novel = false;
+		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}};
+		float tag_size_m = 0;
+		std::array<float, 3> offset_pos{0, 0, 0}; // marker->board offset
+		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw
+		XrTime latch_time = 0; // track (re)latch time, 0 = unknown (settled)
+		XrTime time = 0; // sighting time (vote dedupe: newest wins)
+		bool novel = false; // fresh detector output (filter ingests these)
 	};
-	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_sighting> fiducial_sightings;
+	std::vector<fiducial_vote> fiducial_votes;
 
-	// Smoothed (latched) fiducial frame per (fiducial, entity): the held
-	// 6DoF persists when codes leave view (consumers read this, never the
-	// ephemeral sightings). Novel samples ingest; every frame advances the
-	// robust-Euro filter toward its held target for render. Kept 60s unseen
-	// (the runtime recycles long-gone entity ids: without expiry a return
-	// would leave a frozen ghost beside the fresh frame). Render thread only.
-	struct fiducial_frame
+	// Fused board pose per fiducial id: live solution when votes exist,
+	// held (frozen) otherwise. The robust-Euro filter smooths the fused
+	// poses over time; consumers read pose, never the ephemeral
+	// sightings. Render thread only.
+	struct board_fused
 	{
-		xr::fiducial_filter filter;
-		std::string tuning_key; // filter tuning source; re-configure on change
 		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
-		XrTime last_seen = 0;
-		XrTime last_predicted = 0;
+		XrTime time = 0; // last live solution (stale age = now - time)
+		bool live = false; // solved this frame
+		float rms_mm = 0, rms_deg = 0;
+		double solve_us = 0;
+		int lm_iters = 0;
+		int tags_visible = 0, tags_used = 0;
+		bool single = true;
+		std::vector<xr::board_tag_stat> tag_stats;
+		std::vector<xr::board_vote> last_votes; // accepted-solve inputs, same order as tag_stats
+		xr::fiducial_filter filter; // post-resolution temporal smoothing
+		std::string tuning_key; // filter tuning source; re-configure on change
 		uint64_t samples_ingested = 0;
+		XrTime last_predicted = 0; // last advance time (advance dt source)
 	};
-	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_frame> fiducial_frames;
+	std::map<std::string /*fiducial id*/, board_fused> board_poses;
+	// Warm starts for the solver (fiducial id -> last smoothed pose).
+	// Solver init only, not output smoothing.
+	std::map<std::string, XrPosef> board_warm_start;
 
 	stream(std::string server_name, scene & parent_scene);
 
@@ -428,5 +440,11 @@ private:
 	void request_spatial_permissions();
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
 	void update_fiducial_passthrough(XrTime predicted_display_time);
+	bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
+	                   const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
+	void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
+	                      const xr::board_solution & sol, const board_fused & bp,
+	                      double horizon_ms, XrTime now, double dt,
+	                      bool have_head, glm::vec3 head_pos);
 };
 } // namespace scenes
