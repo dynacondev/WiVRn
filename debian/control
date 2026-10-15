@@ -1,4 +1,4 @@
-Source: wivrn
+Source: dynaconvr
 Section: net
 Priority: optional
 Maintainer: Guillaume Meunier <guillaume.meunier@centraliens.net>
@@ -46,14 +46,14 @@ Homepage: https://wivrn.github.io
 #Vcs-Browser: https://salsa.debian.org/debian/wivrn
 #Vcs-Git: https://salsa.debian.org/debian/wivrn.git
 
-Package: wivrn
+Package: dynaconvr
 Architecture: any
 Multi-Arch: foreign
 Depends:
  ${shlibs:Depends},
  ${misc:Depends},
 Description: OpenXR streaming application to a standalone headset
- WiVRn wirelessly connects a standalone VR headset to a Linux
+ DynaconVR wirelessly connects a standalone VR headset to a Linux
  computer. You can then play PCVR games on the headset while
  processing is done on the computer.
  .

@@ -204,17 +204,17 @@ jobs:
         git config --global --add safe.directory $(pwd)
         pip install toml aiohttp
         tools/gen_flatpak_manifest.py --gitlocal --out flatpak
-        cat flatpak/io.github.wivrn.wivrn.yml
+        cat flatpak/tech.dynacon.vr.yml
 
     - uses: flatpak/flatpak-github-actions/flatpak-builder@v6.7
       with:
-        manifest-path: flatpak/io.github.wivrn.wivrn.yml
-        bundle: wivrn-server.flatpak
+        manifest-path: flatpak/tech.dynacon.vr.yml
+        bundle: dynaconvr-server.flatpak
         # The manifest is regenerated on every commit with the git hash embedded,
         # so its default (manifest-hash) cache key never hits. Key on the files
         # that actually define the dependency set instead, so the toolchain
         # downloads and build cache persist across commits.
-        cache-key: flatpak-builder-${{ hashFiles('flatpak/io.github.wivrn.wivrn.yml.in', 'flatpak/ct-ng-x86_64.config', 'flatpak/ct-ng-aarch64.config', 'monado-rev', 'CMakeLists.txt') }}
+        cache-key: flatpak-builder-${{ hashFiles('flatpak/tech.dynacon.vr.yml.in', 'flatpak/ct-ng-x86_64.config', 'flatpak/ct-ng-aarch64.config', 'monado-rev', 'CMakeLists.txt') }}
 
     - name: Debug bundle
       uses: actions/upload-artifact@v7
@@ -458,7 +458,7 @@ jobs:
     - name: Publish package
       uses: actions/upload-artifact@v7
       with:
-        name: wivrn-${{ matrix.distro }}
+        name: dynaconvr-${{ matrix.distro }}
         path: |
           *.deb
           *.ddeb
@@ -493,7 +493,7 @@ jobs:
       if: ${{ steps.flathub-token-check.outputs.available == 'true' }}
       with:
         fetch-depth: 0
-        repository: ${{ github.repository_owner }}/io.github.wivrn.wivrn
+        repository: ${{ github.repository_owner }}/tech.dynacon.vr
         path: flathub
         token: ${{ secrets.FLATHUB_TOKEN }}
 
@@ -506,7 +506,7 @@ jobs:
     - name: Download artifacts (flatpak)
       uses: actions/download-artifact@v8
       with:
-        name: wivrn-server-x86_64.flatpak
+        name: dynaconvr-server-x86_64.flatpak
         path: flatpak
 
     - name: Release
@@ -530,7 +530,7 @@ jobs:
         sudo apt-get install python3-toml python3-aiohttp
 
         cd flathub
-        git remote add upstream https://github.com/flathub/io.github.wivrn.wivrn.git
+        git remote add upstream https://github.com/flathub/tech.dynacon.vr.git
         git fetch upstream
         git reset --hard upstream/master
 
@@ -539,7 +539,7 @@ jobs:
         cp ../wivrn/flatpak/*.config .
 
         git checkout -b $WIVRN_TAG
-        git add io.github.wivrn.wivrn.yml xrizer-gen-src.json *.config
+        git add tech.dynacon.vr.yml xrizer-gen-src.json *.config
         git commit -m "Version "$WIVRN_TAG
         git push --set-upstream origin $WIVRN_TAG
 

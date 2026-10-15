@@ -107,11 +107,11 @@ There will be multiple files in the directory, one for each video stream per cod
 ### HMD Client
 
 The package name varies by build variant:
-- `org.meumeu.wivrn` - for app store builds
-- `org.meumeu.wivrn.github` - for GitHub release builds
-- `org.meumeu.wivrn.local` - for locally built APK
-- `org.meumeu.wivrn.github.testing` - for CI runs
-- `org.meumeu.wivrn.github.nightly` - for APK repo
+- `tech.dynacon.vr` - for app store builds
+- `tech.dynacon.vr.github` - for GitHub release builds
+- `tech.dynacon.vr.local` - for locally built APK
+- `tech.dynacon.vr.github.testing` - for CI runs
+- `tech.dynacon.vr.github.nightly` - for APK repo
 
 Find your installed package with:
 
@@ -123,7 +123,7 @@ Start via ADB:
 
 ```bash
 WIVRN_PKG=$(adb shell pm list packages | grep wivrn | cut -d: -f2)
-adb shell am start ${WIVRN_PKG}/org.meumeu.wivrn.MainActivity
+adb shell am start ${WIVRN_PKG}/tech.dynacon.vr.MainActivity
 ```
 
 Connect to a specific server:
@@ -433,7 +433,7 @@ Start the client with debugging enabled:
 
 ```bash
 WIVRN_PKG=$(adb shell pm list packages | grep wivrn | cut -d: -f2)
-adb shell am start -D ${WIVRN_PKG}/org.meumeu.wivrn.MainActivity
+adb shell am start -D ${WIVRN_PKG}/tech.dynacon.vr.MainActivity
 ```
 
 Set up LLDB debugging:

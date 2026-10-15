@@ -107,7 +107,7 @@ jobs:
         cd apk
         for f in *.apk; do
           BASENAME=`echo ${f}|awk -F '-APK-' '{print $2}'`
-          mv "${f}" "org.meumeu.wivrn-${BASENAME}"
+          mv "${f}" "tech.dynacon.vr-${BASENAME}"
         done
 
     - name: Download APK debug artifacts

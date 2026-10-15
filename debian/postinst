@@ -1,5 +1,5 @@
 #!/bin/sh
-# postinst script for wivrn.
+# postinst script for dynaconvr.
 #
 # See: dh_installdeb(1).
 

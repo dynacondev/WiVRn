@@ -66,7 +66,7 @@ qt_add_qml_module(wivrn-dashboard
 )
 
 configure_file(gui_config.h.in gui_config.h)
-configure_file(io.github.wivrn.wivrn.desktop.in io.github.wivrn.wivrn.desktop)
+configure_file(tech.dynacon.vr.desktop.in tech.dynacon.vr.desktop)
 
 target_link_libraries(wivrn-dashboard
     PRIVATE
@@ -91,15 +91,15 @@ target_link_libraries(wivrn-dashboard
 
 install(TARGETS wivrn-dashboard ${KDE_INSTALL_TARGETS_DEFAULT_ARGS})
 
-install(FILES io.github.wivrn.wivrn.metainfo.xml
+install(FILES tech.dynacon.vr.metainfo.xml
 	DESTINATION share/metainfo
 )
 
 install(FILES ../images/wivrn.svg
 	DESTINATION share/icons/hicolor/scalable/apps
-	RENAME io.github.wivrn.wivrn.svg
+	RENAME tech.dynacon.vr.svg
 )
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/io.github.wivrn.wivrn.desktop
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/tech.dynacon.vr.desktop
 	DESTINATION share/applications
 )
 
