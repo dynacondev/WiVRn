@@ -421,9 +421,28 @@ private:
 	float bandwidth_rx = 0;
 	float bandwidth_tx = 0;
 
+	// Per-frame passthrough accumulators (milliseconds / counts), filled
+	// by update_fiducial_passthrough and the mask record loop below, then
+	// sampled by accumulate_metrics into global_metrics.
+	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
+	int fid_votes = 0, fid_tags = 0;
+	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
+	int mask_draws = 0;
+
 	struct gpu_timestamps
 	{
 		float gpu_time = 0;
+		// Query plan (all stamps written unconditionally at fixed
+		// command-buffer points, TopOfPipe except the closing one):
+		// q0 frame top, q1 frame end (BottomOfPipe), q2 after
+		// defoveate, q3 at mask-phase start. Spans: frame = q1-q0,
+		// defoveate = q2-q0, gizmos = q3-q2, mask = q1-q3. TopOfPipe
+		// stamps don't drain prior fragment work, so a late producer
+		// inflates the *following* span — read spikes by span, not as
+		// exact per-pass costs.
+		float defoveate_gpu_time = 0;
+		float gizmo_gpu_time = 0;
+		float mask_gpu_time = 0;
 	};
 
 	struct global_metric
@@ -432,6 +451,23 @@ private:
 		float cpu_time = 0;
 		float bandwidth_rx = 0;
 		float bandwidth_tx = 0;
+		// Passthrough timings (seconds, sampled per frame): fiducial
+		// detection/tracking, board solve + smoothing, placement +
+		// instance updates, then mask raster/erode/blur, gizmos and the
+		// mask GPU span. Counts are unitless.
+		float track_ms = 0;
+		float solve_ms = 0;
+		float place_ms = 0;
+		float mask_raster_ms = 0;
+		float mask_erode_ms = 0;
+		float mask_blur_ms = 0;
+		float gizmo_ms = 0;
+		float mask_gpu_ms = 0;
+		float defoveate_gpu_ms = 0;
+		float gizmo_gpu_ms = 0;
+		float feat_votes = 0;
+		float feat_tags = 0;
+		float mask_draws = 0;
 	};
 
 	struct plot

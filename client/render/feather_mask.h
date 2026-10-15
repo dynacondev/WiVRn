@@ -134,6 +134,7 @@ public:
 	struct mask_stage_cpu
 	{
 		double raster_ms = 0; // Stage 1 silhouettes (or tier-0 direct raster)
+		double erode_ms = 0;  // separable box-min erosion (H+V, any radius)
 		double blur_ms = 0;   // blur H+V (tier 1) or downsample+H+V (tiered)
 		double punch_ms = 0;  // marker-window cutout punch
 		double total_ms = 0;  // whole record() body, incl. target setup

@@ -53,6 +53,11 @@ float compute_plot_max_value(float * data, int count, ptrdiff_t stride)
 		max = std::max(max, *(float *)(ptr + i * stride));
 	}
 
+	// Idle plots (all zeros: no fiducials, no masks) would feed log10(0)
+	// below; park at a 1ms/count axis instead of NaN limits. Small enough
+	// that live data rescales within a second, via the smoothing below.
+	if (not (max > 0))
+		return 1e-3f;
 	// First power of 10 less than the max
 	float x = pow(10, floor(log10(max)));
 	return ceil(max / x) * x;
@@ -115,10 +120,72 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	bytes_received = rx;
 	bytes_sent = tx;
 
-	*(gpu_timestamps *)&global_metrics[metrics_offset] = timestamps;
-	global_metrics[metrics_offset].cpu_time = application::get_cpu_time().count() * 1e-9f;
-	global_metrics[metrics_offset].bandwidth_rx = bandwidth_rx * 8;
-	global_metrics[metrics_offset].bandwidth_tx = bandwidth_tx * 8;
+	global_metric & gm = global_metrics[metrics_offset];
+	gm.gpu_time = timestamps.gpu_time;
+	gm.defoveate_gpu_ms = timestamps.defoveate_gpu_time;
+	gm.gizmo_gpu_ms = timestamps.gizmo_gpu_time;
+	gm.mask_gpu_ms = timestamps.mask_gpu_time;
+	gm.cpu_time = application::get_cpu_time().count() * 1e-9f;
+	gm.bandwidth_rx = bandwidth_rx * 8;
+	gm.bandwidth_tx = bandwidth_tx * 8;
+	gm.track_ms = (float)(fid_detect_ms * 1e-3);
+	gm.solve_ms = (float)(fid_solve_ms * 1e-3);
+	gm.place_ms = (float)(fid_place_ms * 1e-3);
+	gm.mask_raster_ms = (float)(mask_raster_ms * 1e-3);
+	gm.mask_erode_ms = (float)(mask_erode_ms * 1e-3);
+	gm.mask_blur_ms = (float)(mask_blur_ms * 1e-3);
+	gm.gizmo_ms = (float)(mask_gizmo_ms * 1e-3);
+	gm.feat_votes = (float)fid_votes;
+	gm.feat_tags = (float)fid_tags;
+	gm.mask_draws = (float)mask_draws;
+
+	// Periodic logcat summary (the plots above are in-headset only):
+	// one line every 5s with the headline numbers so `adb logcat`
+	// captures performance without screen recording.
+	{
+		static XrTime last_stats_log = 0;
+		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
+		{
+			last_stats_log = predicted_display_time;
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f}",
+			             gm.cpu_time * 1e3f,
+			             gm.gpu_time * 1e3f,
+			             gm.defoveate_gpu_ms * 1e3f,
+			             gm.mask_gpu_ms * 1e3f,
+			             gm.bandwidth_rx * 1e-6f,
+			             gm.bandwidth_tx * 1e-6f,
+			             gm.track_ms * 1e3f,
+			             gm.solve_ms * 1e3f,
+			             gm.place_ms * 1e3f,
+			             gm.mask_raster_ms * 1e3f,
+			             gm.mask_erode_ms * 1e3f,
+			             gm.mask_blur_ms * 1e3f,
+			             gm.gizmo_ms * 1e3f,
+			             gm.feat_votes,
+			             gm.feat_tags,
+			             gm.mask_draws);
+			// Window maxima over the sample ring (~last 300 frames):
+			// single-frame stalls alias into scary single samples, so
+			// report what the worst frame in the window actually hit.
+			auto ring_max = [&](float global_metric::* field) {
+				float m = 0;
+				for (auto & g: global_metrics)
+					m = std::max(m, g.*field);
+				return m;
+			};
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (mask {:.1f}ms) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms",
+			             ring_max(&global_metric::cpu_time) * 1e3f,
+			             ring_max(&global_metric::gpu_time) * 1e3f,
+			             ring_max(&global_metric::mask_gpu_ms) * 1e3f,
+			             ring_max(&global_metric::track_ms) * 1e3f,
+			             ring_max(&global_metric::solve_ms) * 1e3f,
+			             ring_max(&global_metric::place_ms) * 1e3f,
+			             ring_max(&global_metric::mask_raster_ms) * 1e3f,
+			             ring_max(&global_metric::mask_erode_ms) * 1e3f,
+			             ring_max(&global_metric::mask_blur_ms) * 1e3f,
+			             ring_max(&global_metric::gizmo_ms) * 1e3f);
+		}
+	}
 
 	std::vector<shard_accumulator::blit_handle *> active_handles;
 	active_handles.reserve(blit_handles.size());
@@ -176,10 +243,25 @@ void scenes::stream::gui_performance_metrics()
 	        // clang-format off
 	        plot(_("CPU time"), {{"",          &global_metric::cpu_time}},     "s"),
 
-	        plot(_("GPU time"), {{_("Defoveate"), &global_metric::gpu_time}},  "s"),
+	        plot(_("GPU time"), {{_("Frame"),     &global_metric::gpu_time},
+	                             {_("Defoveate"), &global_metric::defoveate_gpu_ms},
+	                             {_("Gizmos"),     &global_metric::gizmo_gpu_ms},
+	                             {_("Mask"),      &global_metric::mask_gpu_ms}}, "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),
+
+	        plot(_("Passthrough"), {{_("Detect"),      &global_metric::track_ms},
+	                                {_("Solve"),       &global_metric::solve_ms},
+	                                {_("Place"),       &global_metric::place_ms},
+	                                {_("Mask raster"), &global_metric::mask_raster_ms},
+	                                {_("Mask erode"),   &global_metric::mask_erode_ms},
+	                                {_("Mask blur"),    &global_metric::mask_blur_ms},
+	                                {_("Gizmos"),       &global_metric::gizmo_ms}}, "s"),
+
+	        plot(_("Features"), {{_("Votes"), &global_metric::feat_votes},
+	                             {_("Tags"),  &global_metric::feat_tags},
+	                             {_("Draws"), &global_metric::mask_draws}}, ""),
 	        // clang-format on
 	};
 
@@ -220,19 +302,21 @@ void scenes::stream::gui_performance_metrics()
 			else
 				axis_scale[n] = 0.99 * axis_scale[n] + 0.01 * max_v;
 
-			auto color = ImPlot::GetColormapColor(n);
-
-			std::string title_with_units = std::string(title) + " [" + prefix + unit + "]";
+			std::string units = std::string(prefix) + unit;
+			std::string title_with_units = units.empty() ? std::string(title) : std::string(title) + " [" + units + "]";
 			ImPlot::SetupAxes(nullptr, title_with_units.c_str(), ImPlotAxisFlags_NoDecorations, 0);
 			ImPlot::SetupAxesLimits(0, global_metrics.size() - 1, min_v * multiplier, axis_scale[n] * multiplier, ImGuiCond_Always);
-			ImPlotSpec spec;
-			spec.LineColor = color;
-			spec.FillColor = color;
-			spec.FillAlpha = 0.25;
-			spec.Flags = ImPlotLineFlags_Shaded;
-
+			int k = 0;
 			for (const auto & [subtitle, data]: subplots)
 			{
+				ImPlotSpec spec;
+				// One colormap entry per series (shared with the plot
+				// index base, so single-series plots look as before).
+				auto color = ImPlot::GetColormapColor(n + k++);
+				spec.LineColor = color;
+				spec.FillColor = color;
+				spec.FillAlpha = 0.25;
+				spec.Flags = ImPlotLineFlags_Shaded;
 				getter_data gdata{
 				        .data = (uintptr_t)&(global_metrics.data()->*data),
 				        .stride = sizeof(global_metric),

@@ -19,6 +19,7 @@
 
 #include "application.h"
 #include "scenes/lobby.h"
+#include "spdlog/async.h"
 #include "spdlog/spdlog.h"
 #include "version.h"
 
@@ -84,6 +85,9 @@ void real_main()
 				source->process(native_app, source);
 		}
 	}
+	// Flush the async log queue before exiting (exit() skips static
+	// destructors, so the tail would otherwise be lost).
+	spdlog::shutdown();
 	exit(0);
 #endif
 }
@@ -91,7 +95,18 @@ void real_main()
 #ifdef __ANDROID__
 void android_main(android_app * native_app)
 {
-	static auto logger = spdlog::android_logger_mt("WiVRn", "WiVRn");
+	// Async logging: every log call (including the render thread's
+	// per-frame tuning lines) only enqueues; the logcat/IPC write
+	// happens on this worker. That removes logd backpressure stalls
+	// from all time-critical threads. Queue is deep (8192) and the
+	// policy blocks rather than drops, so no diagnostic is lost in
+	// practice; a wedged logd would show as multi-second log gaps.
+	spdlog::init_thread_pool(8192, 1);
+	static auto logger = std::make_shared<spdlog::async_logger>(
+	        "WiVRn",
+	        std::make_shared<spdlog::sinks::android_sink_mt>("WiVRn"),
+	        spdlog::thread_pool(),
+	        spdlog::async_overflow_policy::block);
 
 	spdlog::set_default_logger(logger);
 
@@ -100,7 +115,13 @@ void android_main(android_app * native_app)
 #else
 int main(int argc, char * argv[])
 {
-	spdlog::set_default_logger(spdlog::stdout_color_mt("WiVRn"));
+	spdlog::init_thread_pool(8192, 1);
+	static auto logger = std::make_shared<spdlog::async_logger>(
+	        "WiVRn",
+	        std::make_shared<spdlog::sinks::stdout_color_sink_mt>(),
+	        spdlog::thread_pool(),
+	        spdlog::async_overflow_policy::block);
+	spdlog::set_default_logger(logger);
 
 	char * loglevel = getenv("WIVRN_LOGLEVEL");
 	if (loglevel)

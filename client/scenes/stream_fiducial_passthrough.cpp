@@ -34,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <glm/gtc/quaternion.hpp>
@@ -476,6 +477,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 {
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto map = fiducial_map.lock();
+	auto fid_t0 = std::chrono::steady_clock::now();
+	auto fid_elapsed_ms = [&] {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fid_t0).count();
+	};
 
 	// Fingerprint: tracking identity. Tags excluded (display-only): a
 	// rename must not disturb tracking. Any other change resets the
@@ -632,6 +637,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		head_pos = head->first;
 		have_head = true;
 	}
+	fid_detect_ms = fid_elapsed_ms();
+	fid_votes = (int)fiducial_votes.size();
+	fid_t0 = std::chrono::steady_clock::now();
 
 	for (auto it = board_poses.begin(); it != board_poses.end();)
 	{
@@ -647,6 +655,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			++it;
 		}
 	}
+	int tags_total = 0;
 	for (const auto & f: map->fiducials)
 	{
 		std::vector<xr::board_vote> bv;
@@ -751,6 +760,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		bp.tags_used = 0;
 		for (const auto & t: sol.tags)
 			bp.tags_used += t.used;
+		tags_total += bp.tags_used;
 		bp.tags_visible = (int)sol.tags.size();
 		bp.tag_stats = std::move(sol.tags);
 		bp.last_votes = bv;
@@ -758,6 +768,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		double horizon_ms = (predicted_display_time - now) * 1e-6;
 		log_board_tuning(f.id, bv, sol, bp, horizon_ms, now, solve_dt, have_head, head_pos);
 	}
+	fid_solve_ms = fid_elapsed_ms();
+	fid_tags = tags_total;
+	fid_t0 = std::chrono::steady_clock::now();
 
 	// ---- behavior objects: first referenced board pose wins ----
 	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
@@ -881,6 +894,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			}
 		}
 	}
+	fid_place_ms = fid_elapsed_ms();
 }
 
 void scenes::stream::gui_passthrough()

@@ -599,7 +599,12 @@ void xr::marker_tracker::log_dup_stats(XrTime now)
 	if (update_queries_total == 0)
 		return;
 	int dup_pct = (int)((update_queries_total - update_queries_novel) * 100 / update_queries_total);
-	if (dup_pct != last_dup_pct or now - last_dup_log >= 5'000'000'000)
+	// Rate gate: while totals are small the novelty pct jitters on every
+	// query (45Hz log burst at startup on the render thread), so
+	// change-triggered lines need a minimum interval too; the 5s arm is
+	// the liveness heartbeat regardless of change.
+	if ((now - last_dup_log >= 2'000'000'000LL and dup_pct != last_dup_pct) or
+	    now - last_dup_log >= 5'000'000'000LL)
 	{
 		last_dup_pct = dup_pct;
 		last_dup_log = now;

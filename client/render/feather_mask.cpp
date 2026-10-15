@@ -1144,7 +1144,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    vk::Extent2D out_extent)
 {
 	auto t_total0 = std::chrono::steady_clock::now();
-	double ms_raster = 0, ms_blur = 0, ms_punch = 0;
+	double ms_raster = 0, ms_erode = 0, ms_blur = 0, ms_punch = 0;
 	size_t n_draws = 0;
 	int tier_out = -1;
 	bool has_reversed = std::ranges::any_of(draws, [](const instance_draw & d) { return d.reverse; });
@@ -1157,6 +1157,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		if (cpu_stats)
 		{
 			cpu_stats->raster_ms = ms_raster;
+			cpu_stats->erode_ms = ms_erode;
 			cpu_stats->blur_ms = ms_blur;
 			cpu_stats->punch_ms = ms_punch;
 			cpu_stats->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total0).count();
@@ -1518,6 +1519,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// field ends where the raster started, so H below reads
 				// A and writes B exactly like the uneroded path — H/V
 				// bodies stay untouched either way.
+				section_clock erode_clk(&ms_erode);
 				erode_1d(*target_a.views[eye], 10 + eye, *target_b.blur_fbs[eye], half_extent, 1, 0, erode);
 				make_readable(*target_b.image);
 				erode_1d(*target_b.views[eye], 12 + eye, *target_a.blur_fbs[eye], half_extent, 0, 1, erode);
@@ -1642,6 +1644,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					// field ends where the downsample chain left it, so H
 					// below reads the down image and writes eblur exactly
 					// like the uneroded path — H/V bodies stay untouched.
+					section_clock erode_clk(&ms_erode);
 					blur_target & h_src = down_targets[h_src_level - 1];
 					erode_1d(down_src, 10 + eye, *eblur.blur_fbs[eye], te, 1, 0, erode);
 					make_readable(*eblur.image);

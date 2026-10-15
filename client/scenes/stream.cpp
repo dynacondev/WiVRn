@@ -32,7 +32,6 @@
 
 #include "application.h"
 #include "audio/audio.h"
-#include "boost/pfr/core.hpp"
 #include "decoder/shard_accumulator.h"
 #include "inplace_vector.hpp"
 #include "spdlog/spdlog.h"
@@ -41,6 +40,7 @@
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -880,18 +880,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	gpu_timestamps timestamps;
 	if (query_pool_filled)
 	{
+		// Only the four written queries (0..3): the pool is sized for
+		// the whole struct but the spare query is never written, and
+		// eWait on an unwritten query blocks forever (black screen:
+		// the render thread stalls here after exactly one frame).
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
-		        size_gpu_timestamps,
-		        size_gpu_timestamps * sizeof(uint64_t),
+		        4,
+		        4 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 
 		if (res == vk::Result::eSuccess)
 		{
-			boost::pfr::for_each_field(timestamps, [n = 1, &timestamps2](float & t) mutable {
-				t = (timestamps2[n++] - timestamps2[0]) * application::get_physical_device_properties().limits.timestampPeriod / 1e9;
-			});
+			float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
+			timestamps.gpu_time = (timestamps2[1] - timestamps2[0]) * period;
+			timestamps.defoveate_gpu_time = (timestamps2[2] - timestamps2[0]) * period;
+			timestamps.gizmo_gpu_time = (timestamps2[3] - timestamps2[2]) * period;
+			timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
 		}
 	}
 
@@ -1134,6 +1140,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		                      {scale, scale, scale, 1.},
 		                      {bias, bias, bias, 0.},
 		                      image_index);
+		// GPU span point: closes the defoveate span (q2-q0), opens the
+		// gizmo gap below. Unconditional (defoveate runs every frame).
+		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 2);
 
 #if WIVRN_USE_V4L2
 		// the blit handles keep CAPTURE buffers alive until this cmd buffer's fence has completed
@@ -1174,6 +1183,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// record phase below (cutouts, gizmos) and the status UI.
 		update_fiducial_passthrough(frame_state.predictedDisplayTime);
 
+		// Fresh frame accumulators for the Statistics plots (filled by
+		// the gizmo and mask record phases below, sampled by
+		// accumulate_metrics).
+		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
+		mask_draws = 0;
+
 		// View-only transforms, shared by the mask record and the debug
 		// gizmos below. Live predicted views (mask_pose/mask_fov), not the
 		// video frame's pose: see the mask_pose block above.
@@ -1188,6 +1203,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		int dbg_image = -1;
 		if (debug_overlays)
 		{
+			auto gizmo_t0 = std::chrono::steady_clock::now();
 			if (not gizmo_lines)
 				gizmo_lines = std::make_unique<debug_lines_renderer>(device);
 			// Reset the append cursor: all records in a frame share one
@@ -1402,6 +1418,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
 			}
+			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
 		// Debug mask record: the local debug group (union B) carries the
@@ -1410,6 +1427,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		cutouts_punched = false;
 		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
 		std::vector<mask_group *> acquired_groups;
+		// GPU span point: closes the gizmo gap (q3-q2), opens the mask
+		// span (closed by query 1 after the phase). Unconditional so no
+		// validity tracking is needed; without mask work the span just
+		// measures submit prep.
+		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 3);
 		if (mask_frame)
 		{
 			int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
@@ -1757,10 +1779,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				g.acquired = true;
 				g.active = true;
 				g.extent = {(int32_t)gw, (int32_t)gh};
+				feather_mask_renderer::mask_stage_cpu mstats{};
 				try
 				{
 					g.renderer->record(command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-					                   true, f, proj ? no_cutouts : cutouts, world_mvp, nullptr, {(uint32_t)gw, (uint32_t)gh});
+					                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh});
 				}
 				catch (std::exception & e)
 				{
@@ -1770,6 +1793,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g.acquired = false;
 					g.active = false;
 				}
+				// Cutout punch (debug-only) folds into raster.
+				mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+				mask_erode_ms += mstats.erode_ms;
+				mask_blur_ms += mstats.blur_ms;
+				mask_draws += (int)mstats.draws;
 			}
 			// Debug group record (cutouts only, full-res, clear + hard
 			// punch): runs only while claimed above.
@@ -1800,13 +1828,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g.acquired = true;
 					g.active = true;
 					acquired_groups.push_back(&g);
+					feather_mask_renderer::mask_stage_cpu mstats{};
 					try
 					{
 						// Full-res submit (feather 0 = tier 0): the hard
 						// punch needs no blur intermediates.
 						vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
 						g.renderer->record(command_buffer, g.swapchain.image(mask_index), mex, {}, true, 0,
-						                   cutouts, world_mvp, nullptr, mex);
+						                   cutouts, world_mvp, &mstats, mex);
 					}
 					catch (std::exception & e)
 					{
@@ -1817,6 +1846,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.active = false;
 						cutouts_punched = false;
 					}
+					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+					mask_erode_ms += mstats.erode_ms;
+					mask_blur_ms += mstats.blur_ms;
+					mask_draws += (int)mstats.draws;
 				}
 			}
 			else
