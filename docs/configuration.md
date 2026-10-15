@@ -205,12 +205,11 @@ Each `fiducials` entry has:
   `optimizeForStaticMarker`: keep `true` for a stationary rig, set `false`
   for a moving reference marker. Toggling recreates the client spatial
   context (brief tracking hitch).
-- Resolver/smoothing tuning (all optional): `window-size` (default `12`),
-  `min-samples` (default `4`), `sigma-k` (default `3`),
-  `pos-gain`/`rot-gain` (default `24`, per-second proportional catch-up),
-  `euro-min-cutoff` (default `0.4`), `euro-beta` (default `0.07`),
-  `knee-inner-mm`/`knee-outer-mm` (defaults `1`/`5`),
-  `knee-inner-deg`/`knee-outer-deg` (defaults `0.1`/`0.5`).
+- Resolver/smoothing tuning (all optional, filter auto-adapts):
+  `sigma-k` (default `3`, outlier tolerance), `euro-min-cutoff`
+  (default `0.4`), `euro-beta` (default `0.07`),
+  `hold-inner-mm`/`hold-inner-deg` (defaults `1`/`0.1`, sub-threshold
+  residuals hold; outer knees are 5x inner internally).
 - `markers`: list of markers resolving to the one fiducial frame, each with:
   - `marker-data`: exact QR payload string to match, byte-for-byte (required)
   - `marker-size-m`: physical marker size in meters (required for pose

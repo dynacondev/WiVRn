@@ -988,18 +988,13 @@ struct fiducial_entry
 	// Maps to optimizeForStaticMarker in the QR spatial context.
 	bool is_static = true;
 	// Resolver/smoothing tuning, carried through to the per-instance
-	// filters on the headset.
-	int window_size = 12;
-	int min_samples = 4;
+	// filters on the headset. All optional; the filter auto-adapts and
+	// these only bias it. Outer hold knees are 5x their inner.
 	float sigma_k = 3;
-	float pos_gain = 24;
-	float rot_gain = 24;
 	float euro_min_cutoff = 0.4f;
 	float euro_beta = 0.07f;
-	float knee_inner_mm = 1;
-	float knee_outer_mm = 5;
-	float knee_inner_deg = 0.1f;
-	float knee_outer_deg = 0.5f;
+	float hold_inner_mm = 1;
+	float hold_inner_deg = 0.1f;
 	std::vector<fiducial_marker> markers;
 };
 

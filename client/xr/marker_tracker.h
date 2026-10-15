@@ -66,16 +66,19 @@ public:
 	marker_tracker(instance &, session &, system &);
 	static bool supported(instance &);
 
-	// (Re)configure for a marker; kicks off async context creation.
+	// (Re)configure for a marker group; kicks off async context creation.
 	// No-op when already configured for the same size/payload/static, and
 	// throttled by the failure backoff (no per-frame re-attempt spam).
-	// Payload is required: QR runtimes report markerId 0, so identity is
+	// Empty payload means enumerate-all: the tracker reports every readable
+	// QR code (shared group tracker, callers match payloads client-side).
+	// A non-empty payload matches that exact string only (legacy
+	// single-marker mode). QR runtimes report markerId 0, so identity is
 	// the payload alone. Tag is display-only (UI/logs) and never gates:
 	// a rename updates the label live without restarting tracking.
 	// is_static maps to optimizeForStaticMarker: toggling it recreates the
 	// spatial context (brief tracking hitch). Poses for all known codes
 	// refresh every frame via update snapshots (no timers); the detector
-	// is slower, so repeats are flagged novel=false.
+	// is slower, so repeats are flagged novel=false (epsilon compare).
 	void configure(float marker_size_m, std::string marker_payload, std::string tag, bool is_static = true);
 
 	// Advance the async state machine + throttled discovery.
@@ -238,11 +241,12 @@ private:
 	void start_discovery();
 	void complete_discovery(XrSpace world_space, XrTime predicted_time);
 	// Synchronous live pose refresh for all latched entities, every frame.
-	// No re-enumeration, no timers: novelty is reported per entity via
-	// code_sighting::novel so consumers overlay exactly on new data.
+	// Discovery latches handles only; this path owns poses and novelty
+	// (code_sighting::novel, epsilon compare) so consumers ingest novel
+	// samples only.
 	void update_snapshot(XrSpace world_space, XrTime now, XrTime predicted_time);
 	void ensure_entity(XrSpatialEntityIdEXT id);
-	// Echo check for one entity pose; records current pose on novel.
+	// Echo check for one entity pose (epsilon); records current pose on novel.
 	bool note_pose(XrSpatialEntityIdEXT id, const XrPosef & pose);
 	void log_dup_stats(XrTime now);
 };

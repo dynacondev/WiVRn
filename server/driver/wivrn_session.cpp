@@ -442,17 +442,11 @@ void wivrn_session::send_fiducial_map()
 		        .id = entry.id,
 		        .tag = entry.tag,
 		        .is_static = entry.is_static,
-		        .window_size = entry.window_size,
-		        .min_samples = entry.min_samples,
 		        .sigma_k = entry.sigma_k,
-		        .pos_gain = entry.pos_gain,
-		        .rot_gain = entry.rot_gain,
 		        .euro_min_cutoff = entry.euro_min_cutoff,
 		        .euro_beta = entry.euro_beta,
-		        .knee_inner_mm = entry.knee_inner_mm,
-		        .knee_outer_mm = entry.knee_outer_mm,
-		        .knee_inner_deg = entry.knee_inner_deg,
-		        .knee_outer_deg = entry.knee_outer_deg,
+		        .hold_inner_mm = entry.hold_inner_mm,
+		        .hold_inner_deg = entry.hold_inner_deg,
 		};
 		for (const auto & m: entry.markers)
 			e.markers.push_back(to_headset::fiducial_marker{

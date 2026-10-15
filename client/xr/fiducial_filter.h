@@ -29,24 +29,19 @@
 
 // Continuous-mode pose filter for fiducial-anchored passthrough meshes.
 //
-// Two stages, both adaptive (no fixed gates, no binary deadband):
+// Fused robust One Euro (no window, no median delay): each novel detector
+// sample (marker pose * config offset, world space) updates a held target,
+// and the per-frame rendered pose approaches it with a velocity-adaptive
+// (One Euro) alpha multiplied by a Cauchy soft-weight and a soft-knee hold
+// for sub-perceptual residuals. At rest the cutoff collapses and jitter
+// cancels; sustained motion opens the cutoff and gets through. The Cauchy
+// scale adapts to the recent target spread (excluding the current sample):
+// tight history means spikes get ~zero weight and cannot drag the pose,
+// while consistent motion widens the scale so genuine moves migrate within
+// a few novel intervals instead of sticking.
 //
-//  1. Resolve: a rolling window of mesh-target samples (marker pose *
-//     config offset, world space) is robustly averaged. Each sample gets a
-//     Cauchy soft-weight from its distance to the window median, scaled by
-//     MAD-derived sigma: mild outliers count a little, wild ones ~zero.
-//     During warmup (fewer than min_samples) everything counts at full
-//     weight so the filter seeds; a genuine move migrates the median after
-//     ~window/2 consistent samples while a lone spike cannot drag it.
-//  2. Follow: the per-frame rendered pose approaches the resolved target
-//     through a One Euro (velocity-adaptive) stage plus an exponential
-//     catch-up with a soft-knee residual clamp. At rest the cutoff
-//     collapses and jitter cancels; sustained motion (even slow drift)
-//     carries velocity, opens the cutoff, and gets through — no
-//     stick-slip step like a binary deadband would produce.
-//
-// All state lives on the render thread; ingest() runs at the live update
-// rate (5-10Hz novel samples), advance() runs every frame.
+// All state lives on the render thread; ingest() runs at the live novel
+// rate (5-10Hz), advance() runs every frame against the held target.
 namespace xr
 {
 
@@ -55,17 +50,11 @@ class fiducial_filter
 public:
 	struct tuning
 	{
-		int window_size = 12;
-		int min_samples = 4;
-		float sigma_k = 3;
-		float pos_gain = 3;
-		float rot_gain = 3;
 		float euro_min_cutoff = 0.4f;
 		float euro_beta = 0.07f;
-		float knee_inner_mm = 1;
-		float knee_outer_mm = 5;
-		float knee_inner_deg = 0.1f;
-		float knee_outer_deg = 0.5f;
+		float sigma_k = 3;
+		float hold_inner_mm = 1;
+		float hold_inner_deg = 0.1f;
 	};
 
 	struct pose
@@ -80,33 +69,34 @@ public:
 	void configure(const tuning & t);
 	void reset();
 
-	// Ingest one mesh-target sample (world space). Duplicates/echoes must
-	// be filtered by the caller (marker_tracker::sighting::novel).
+	// Ingest one mesh-target sample (world space). Only novel detector
+	// output: the caller must filter on marker_tracker::sighting::novel,
+	// echoes (repeated poses) carry no information and must not enter.
 	void ingest(const glm::vec3 & pos, const glm::quat & quat, XrTime t);
 
 	bool has_target() const
 	{
-		return not window.empty();
+		return held.has_value();
 	}
 	size_t sample_count() const
 	{
-		return window.size();
+		return recent.size();
 	}
-	// Mean Cauchy weight of the current window (1 = clean, ->0 = noisy).
+	// Last robust weight (min of position/rotation, 1 = clean, ->0 = rejected).
 	float mean_weight() const
 	{
-		return last_mean_weight;
+		return last_weight;
 	}
 
-	// Robust resolved target from the current window.
+	// Latest held novel target (null when nothing ingested yet).
 	std::optional<pose> resolve() const;
 
-	// Advance the smoothed rendered pose toward resolve() by dt seconds.
-	// Proportional: large errors take large steps, converging without
-	// overshoot; sub-knee residuals hold still.
+	// Advance the smoothed rendered pose toward the held target by dt
+	// seconds. Robust One Euro: large errors take large steps, converging
+	// without overshoot; sub-hold residuals blend to still.
 	pose advance(double dt_s);
 
-	// Snap the rendered pose to resolve() (first seed / manual re-seed).
+	// Snap the rendered pose to the held target (first seed / re-seed).
 	// Returns false when there is nothing to seed from.
 	bool snap();
 
@@ -123,42 +113,39 @@ private:
 	struct sample
 	{
 		glm::vec3 pos;
-		glm::quat quat; // hemisphere-aligned to the seed at ingest
+		glm::quat quat; // hemisphere-aligned at ingest
 		XrTime time;
 	};
 
-	// Scalar One Euro channel for the resolved-position stream.
-	struct euro_channel
-	{
-		bool init = false;
-		float x_prev = 0;
-		float dx_hat = 0;
-		float x_hat = 0;
-		float filter(float x, double dt, float min_cutoff, float beta);
-		void reset(float x)
-		{
-			init = true;
-			x_prev = x;
-			x_hat = x;
-			dx_hat = 0;
-		}
-	};
-
-	static float median_of(float * v, size_t n);
 	static float alpha_for(float cutoff, double dt);
 
+	// Outer hold knee is a fixed multiple of the inner (config carries the
+	// inner only): sub-inner residuals hold, outer and beyond pass fully.
+	static constexpr float hold_outer_ratio = 5.f;
+	// Adaptive-scale divisor: the Cauchy scale is the recent predecessor
+	// spread / this (floored at the nominal noise floor), so consistent
+	// motion widens its own gate. ~1.5 migrates a continuing step with
+	// weight ~0.5 on its third sample.
+	static constexpr float spread_divisor = 1.5f;
+	static constexpr size_t recent_depth = 4;
+
 	tuning cfg;
-	std::deque<sample> window;
-	mutable float last_mean_weight = 1;
+	// Held novel target + short history for move-vs-spike disambiguation.
+	std::optional<pose> held;
+	XrTime held_time = 0;
+	std::deque<sample> recent;
+	mutable float last_weight = 1;
 
 	pose smoothed{};
 	bool rendered_valid = false;
-	euro_channel euro[3];
-	bool euro_init = false;
-	// Filtered angular speed (rad/s) driving the adaptive rotation alpha.
+	// Filtered target speed from accepted novel samples (spikes frozen out).
+	glm::vec3 vel_hat{0};
 	float omega_hat = 0;
-	glm::quat prev_resolved{1, 0, 0, 0};
-	bool prev_resolved_valid = false;
+	// Previous novel target for velocity differencing.
+	glm::vec3 prev_target_pos{0};
+	glm::quat prev_target_quat{1, 0, 0, 0};
+	XrTime prev_target_time = 0;
+	bool prev_target_valid = false;
 };
 
 } // namespace xr

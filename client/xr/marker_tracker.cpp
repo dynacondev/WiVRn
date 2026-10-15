@@ -21,6 +21,7 @@
 #include "xr/instance.h"
 #include "xr/system.h"
 #include <algorithm>
+#include <cmath>
 #include <spdlog/spdlog.h>
 
 namespace
@@ -132,20 +133,19 @@ void xr::marker_tracker::configure(float size_m, std::string payload, std::strin
 	current_state = state::idle;
 	status_text = "checking capabilities";
 
-	if (marker_payload.empty())
-	{
-		fail("fiducial map entry has no QR payload (marker-data)");
-		return;
-	}
-	spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\" ({})",
-	             label(), (double)(size_m * 1000), marker_payload.substr(0, 64),
-	             marker_static ? "static" : "moving");
-
 	if (marker_size_m <= 0)
 	{
 		fail("invalid marker size");
 		return;
 	}
+	if (marker_payload.empty())
+		spdlog::info("marker_tracker: tracking all QR code markers ({:.0f}mm) group \"{}\" ({})",
+		             (double)(size_m * 1000), marker_tag,
+		             marker_static ? "static" : "moving");
+	else
+		spdlog::info("marker_tracker: tracking QR code marker \"{}\" ({:.0f}mm) payload \"{}\" ({})",
+		             label(), (double)(size_m * 1000), marker_payload.substr(0, 64),
+		             marker_static ? "static" : "moving");
 
 	// Require the QR capability before creating the context
 	uint32_t count = 0;
@@ -454,67 +454,91 @@ void xr::marker_tracker::complete_discovery(XrSpace world_space, XrTime predicte
 		// capacities the runtime may echo back untouched (sentinels in the
 		// scratch prove what was actually written).
 		uint32_t count = std::min({result.entityIdCountOutput, (uint32_t)marker_data.size(), (uint32_t)bound_boxes.size()});
-		bool found = false;
-		// All readable codes are reported (matched and otherwise), and
-		// every entity id is latched so the per-frame update path
-		// refreshes them all.
-		all_sightings.clear();
+		// Empty payload means enumerate-all (shared group tracker):
+		// every readable code matches.
+		auto is_match = [&](const std::string & p) { return marker_payload.empty() or p == marker_payload; };
+		if (not xrCreateSpatialUpdateSnapshotEXT)
+		{
+			// Discovery-only fallback (update snapshots unsupported):
+			// report poses straight from discovery.
+			bool found = false;
+			all_sightings.clear();
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				auto payload = read_payload(snapshot, marker_data[i].data);
+				if (not payload)
+					continue;
+				bool matched = is_match(*payload);
+				if (not matched)
+				{
+					if (unknown_payloads_logged.size() < 8 and
+					    unknown_payloads_logged.insert(*payload).second)
+						spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
+						             payload->substr(0, 64));
+				}
+				XrSpatialEntityIdEXT eid = i < result.entityIdCountOutput ? entity_ids[i] : XR_NULL_SPATIAL_ENTITY_ID_EXT;
+				ensure_entity(eid);
+				if (eid != XR_NULL_SPATIAL_ENTITY_ID_EXT)
+					last_poses[eid] = bound_boxes[i].center;
+				all_sightings.push_back(code_sighting{
+				        .payload = *payload,
+				        .pose = bound_boxes[i].center,
+				        .extents = bound_boxes[i].extents,
+				        .entity_id = eid,
+				        .time = predicted_time,
+				        .matched = matched,
+				        .novel = true,
+				});
+				if (not matched)
+					continue;
+				if (not current.tracked)
+				{
+					const auto & c = bound_boxes[i].center;
+					const auto & e = bound_boxes[i].extents;
+					spdlog::info("marker_tracker: marker \"{}\" sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f})",
+					             label(), c.position.x, c.position.y, c.position.z,
+					             c.orientation.x, c.orientation.y, c.orientation.z, c.orientation.w,
+					             e.width, e.height);
+				}
+				current.tracked = true;
+				current.pose = bound_boxes[i].center;
+				current.time = predicted_time;
+				current.novel = true;
+				status_text = "tracking marker";
+				found = true;
+			}
+			if (not found)
+			{
+				if (current.tracked)
+					spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
+				current.tracked = false;
+				current.novel = false;
+				status_text = "marker not in view";
+			}
+			return;
+		}
+		// Update path available: acquisition-only. Latch handles so the
+		// per-frame update snapshots refresh poses; never overwrite live
+		// poses here (a 2Hz snapshot must not clobber 72Hz tracking).
 		for (uint32_t i = 0; i < count; ++i)
 		{
-			// QR runtimes report markerId 0: identity is the payload
 			auto payload = read_payload(snapshot, marker_data[i].data);
 			if (not payload)
 				continue;
-			bool matched = *payload == marker_payload;
-			if (not matched)
-			{
-				// Diagnostic: capped, so a room full of foreign QR
-				// codes shows what strings exist without spamming
-				if (unknown_payloads_logged.size() < 8 and
-				    unknown_payloads_logged.insert(*payload).second)
-					spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
-					             payload->substr(0, 64));
-			}
+			if (not is_match(*payload) and unknown_payloads_logged.size() < 8 and
+			    unknown_payloads_logged.insert(*payload).second)
+				spdlog::info("marker_tracker: ignoring unconfigured QR payload \"{}\"",
+				             payload->substr(0, 64));
 			XrSpatialEntityIdEXT eid = i < result.entityIdCountOutput ? entity_ids[i] : XR_NULL_SPATIAL_ENTITY_ID_EXT;
-			ensure_entity(eid);
-			if (eid != XR_NULL_SPATIAL_ENTITY_ID_EXT)
-				last_poses[eid] = bound_boxes[i].center;
-			all_sightings.push_back(code_sighting{
-			        .payload = *payload,
-			        .pose = bound_boxes[i].center,
-			        .extents = bound_boxes[i].extents,
-			        .entity_id = eid,
-			        .time = predicted_time,
-			        .matched = matched,
-			        // Discovery is acquisition: always novel so consumers
-			        // seed even if the pose later echoes.
-			        .novel = true,
-			});
-			if (not matched)
+			if (eid == XR_NULL_SPATIAL_ENTITY_ID_EXT)
 				continue;
-			if (not current.tracked)
+			if (not spatial_entities.contains(eid))
 			{
-				const auto & c = bound_boxes[i].center;
-				const auto & e = bound_boxes[i].extents;
-				spdlog::info("marker_tracker: marker \"{}\" sighted at ({:.2f}, {:.2f}, {:.2f}) quat ({:.3f}, {:.3f}, {:.3f}, {:.3f}) extents ({:.3f}, {:.3f})",
-				             label(), c.position.x, c.position.y, c.position.z,
-				             c.orientation.x, c.orientation.y, c.orientation.z, c.orientation.w,
-				             e.width, e.height);
+				ensure_entity(eid);
+				// Force novel on the next update so consumers seed even
+				// if the pose then echoes.
+				last_poses.erase(eid);
 			}
-			current.tracked = true;
-			current.pose = bound_boxes[i].center;
-			current.time = predicted_time;
-			current.novel = true;
-			status_text = "tracking marker";
-			found = true;
-		}
-		if (not found)
-		{
-			if (current.tracked)
-				spdlog::info("marker_tracker: lost sight of marker \"{}\"", label());
-			current.tracked = false;
-			current.novel = false;
-			status_text = "marker not in view";
 		}
 		return;
 	}
@@ -541,18 +565,24 @@ void xr::marker_tracker::ensure_entity(XrSpatialEntityIdEXT id)
 
 bool xr::marker_tracker::note_pose(XrSpatialEntityIdEXT id, const XrPosef & pose)
 {
-	// Detector-echo check: the runtime repeats the identical pose when the
-	// CV pipeline has nothing new. Exact float compare is intentional:
-	// these values come back bit-identical on echo.
+	// Detector-echo check: the runtime repeats (near-)identical poses when
+	// the CV pipeline has nothing new. Epsilon compare: exact float
+	// equality misses 1-LSB jitter and floods consumers at frame rate.
+	// Thresholds are far below detector noise (0.05mm, ~0.006deg).
 	auto it = last_poses.find(id);
-	bool same = it != last_poses.end() and
-	    pose.position.x == it->second.position.x and
-	    pose.position.y == it->second.position.y and
-	    pose.position.z == it->second.position.z and
-	    pose.orientation.x == it->second.orientation.x and
-	    pose.orientation.y == it->second.orientation.y and
-	    pose.orientation.z == it->second.orientation.z and
-	    pose.orientation.w == it->second.orientation.w;
+	bool same = false;
+	if (it != last_poses.end())
+	{
+		const XrPosef & p = it->second;
+		float dp = std::sqrt((pose.position.x - p.position.x) * (pose.position.x - p.position.x) +
+		                     (pose.position.y - p.position.y) * (pose.position.y - p.position.y) +
+		                     (pose.position.z - p.position.z) * (pose.position.z - p.position.z));
+		float dot = std::abs(pose.orientation.x * p.orientation.x + pose.orientation.y * p.orientation.y +
+		                     pose.orientation.z * p.orientation.z + pose.orientation.w * p.orientation.w);
+		dot = std::min(1.f, dot);
+		float ang = 2.f * std::acos(dot);
+		same = dp < 5e-5f and ang < 1e-4f;
+	}
 	if (not same)
 		last_poses[id] = pose;
 	return not same;
@@ -680,7 +710,7 @@ void xr::marker_tracker::update_snapshot(XrSpace world_space, XrTime now, XrTime
 		auto payload = read_payload(snapshot, marker_data[i].data);
 		if (not payload)
 			continue;
-		bool matched = *payload == marker_payload;
+		bool matched = marker_payload.empty() or *payload == marker_payload;
 		if (not matched)
 		{
 			if (unknown_payloads_logged.size() < 8 and
@@ -744,7 +774,7 @@ void xr::marker_tracker::update(XrSpace world_space, XrTime now, XrTime predicte
 		case state::failed:
 			// Auto-retry with backoff: transient runtime hiccups recover.
 			// configure() itself honors retry_at, so this only re-arms idle.
-			if (not marker_payload.empty() and now >= retry_at)
+			if (now >= retry_at)
 			{
 				retry_at = now + retry_delay_ns;
 				current_state = state::idle;
@@ -769,9 +799,8 @@ void xr::marker_tracker::update(XrSpace world_space, XrTime now, XrTime predicte
 	case state::ready: {
 		// Live refresh every frame (no timers): the detector is slower
 		// than the frame rate, so most ticks echo and only novel poses
-		// propagate. Runs before the discovery poll below so an
-		// acquisition completing this frame has the final word (its
-		// novel flag seeds consumers; the echo would clobber it).
+		// propagate. Discovery is acquisition-only (latches handles for
+		// the update path) and never overwrites live poses.
 		if (not spatial_entities.empty())
 			update_snapshot(world_space, now, predicted_time);
 		if (discovery_future != XR_NULL_FUTURE_EXT)

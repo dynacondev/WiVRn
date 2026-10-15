@@ -17,10 +17,10 @@
  */
 
 // Fiducial marker tracking (Quest only, see docs/configuration.md).
-// Syncs one runtime tracker per configured QR payload from the server map,
-// resolves sightings to fiducial frames, and smooths each frame with its
-// fiducial's tuning. Runs every frame; the solved frames feed the status
-// UI here and the passthrough consumers downstream.
+// Syncs one runtime tracker per (marker size, static) group from the server
+// map, resolves sightings to fiducial frames, and smooths each frame with
+// its fiducial's tuning. Runs every frame; the latched frames feed the
+// status UI here and the passthrough consumers downstream.
 
 #include "stream.h"
 
@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <glm/gtc/quaternion.hpp>
 #include <map>
+#include <set>
 #include <spdlog/spdlog.h>
 #include <string>
 #include <tuple>
@@ -88,20 +89,15 @@ void scenes::stream::request_spatial_permissions()
 namespace
 {
 // Filter tuning carried through from the fiducial, clamped to sane ranges.
+// Outer hold knees are 5x inner internally (config carries inners only).
 xr::fiducial_filter::tuning tuning_for(const to_headset::fiducial_entry & f)
 {
 	xr::fiducial_filter::tuning t;
-	t.window_size = std::max(2, f.window_size);
-	t.min_samples = std::clamp(f.min_samples, 1, t.window_size);
 	t.sigma_k = std::max(0.5f, f.sigma_k);
-	t.pos_gain = std::max(0.1f, f.pos_gain);
-	t.rot_gain = std::max(0.1f, f.rot_gain);
 	t.euro_min_cutoff = std::max(0.05f, f.euro_min_cutoff);
 	t.euro_beta = std::max(0.f, f.euro_beta);
-	t.knee_inner_mm = f.knee_inner_mm;
-	t.knee_outer_mm = std::max(t.knee_inner_mm, f.knee_outer_mm);
-	t.knee_inner_deg = f.knee_inner_deg;
-	t.knee_outer_deg = std::max(t.knee_inner_deg, f.knee_outer_deg);
+	t.hold_inner_mm = std::max(0.f, f.hold_inner_mm);
+	t.hold_inner_deg = std::max(0.f, f.hold_inner_deg);
 	return t;
 }
 
@@ -121,59 +117,61 @@ XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const
 // fiducial's tuning changes, without disturbing anything else.
 std::string tuning_key_for(const to_headset::fiducial_entry & f)
 {
-	return std::to_string(f.window_size) + ',' + std::to_string(f.min_samples) + ',' +
-	        std::to_string(f.sigma_k) + ',' + std::to_string(f.pos_gain) + ',' + std::to_string(f.rot_gain) + ',' +
-	        std::to_string(f.euro_min_cutoff) + ',' + std::to_string(f.euro_beta) + ',' +
-	        std::to_string(f.knee_inner_mm) + ',' + std::to_string(f.knee_outer_mm) + ',' +
-	        std::to_string(f.knee_inner_deg) + ',' + std::to_string(f.knee_outer_deg);
+	return std::to_string(f.sigma_k) + ',' + std::to_string(f.euro_min_cutoff) + ',' +
+	        std::to_string(f.euro_beta) + ',' + std::to_string(f.hold_inner_mm) + ',' +
+	        std::to_string(f.hold_inner_deg);
+}
+
+// Group key for the shared tracker: marker size is context-global, so one
+// context serves all payloads with the same (size, static).
+std::string group_key_for(float size_m, bool is_static)
+{
+	return std::to_string(size_m) + (is_static ? 'S' : 'M');
 }
 } // namespace
 
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
 {
-	// Union payload -> {size, static, tag}: first wins, conflicts warn.
-	std::map<std::string, std::tuple<float, bool, std::string>> uni;
-	std::string key;
+	// Group (size, static) -> {size, static}: one shared spatial context
+	// per group, payloads match client-side. Payloads stay informational
+	// here (union for diagnostics + ambiguity warnings).
+	std::map<std::string, std::pair<float, bool>> groups;
+	std::map<std::string, std::set<std::string>> payload_groups;
 	for (const auto & f: map.fiducials)
 	{
 		for (const auto & m: f.markers)
 		{
-			key += m.marker_data;
-			key += ';';
-			key += std::to_string(m.marker_size_m);
-			key += f.is_static ? 'S' : 'M';
-			key += ';';
-			auto [it, fresh] = uni.emplace(m.marker_data, std::make_tuple(m.marker_size_m, f.is_static, f.tag));
-			if (not fresh)
-			{
-				auto & [size, st, tag] = it->second;
-				if (size != m.marker_size_m or st != f.is_static)
-					spdlog::warn("Fiducial tracking: payload \"{}\" configured inconsistently, first wins",
-					             m.marker_data.substr(0, 64));
-				(void)tag;
-			}
+			std::string gk = group_key_for(m.marker_size_m, f.is_static);
+			groups.emplace(gk, std::make_pair(m.marker_size_m, f.is_static));
+			payload_groups[m.marker_data].insert(gk);
 		}
 	}
+	std::string key;
+	for (const auto & [gk, _]: groups)
+	{
+		key += gk;
+		key += ';';
+	}
 	configured_marker_payloads.clear();
-	for (const auto & [payload, _]: uni)
+	for (const auto & [payload, _]: payload_groups)
 		configured_marker_payloads.insert(payload);
 
 	if (key != last_tracker_key)
 	{
 		last_tracker_key = key;
-		// Drop trackers for vanished payloads (destroys their contexts).
+		for (const auto & [payload, gks]: payload_groups)
+		{
+			if (gks.size() > 1)
+				spdlog::warn("Fiducial tracking: payload \"{}\" configured with {} different (size, static) groups, each tracks it at its own scale",
+				             payload.substr(0, 64), (unsigned)gks.size());
+		}
+		// Drop trackers for vanished groups (destroys their contexts).
 		for (auto it = fiducial_trackers.begin(); it != fiducial_trackers.end();)
 		{
-			if (uni.contains(it->first))
+			if (groups.contains(it->first))
 				++it;
 			else
 				it = fiducial_trackers.erase(it);
-		}
-		for (const auto & f: map.fiducials)
-		{
-			if (f.markers.size() > 1)
-				spdlog::warn("Fiducial \"{}\": multi-marker resolve not implemented, using first of {} markers",
-				             f.id, (unsigned)f.markers.size());
 		}
 	}
 
@@ -186,11 +184,14 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 		}
 		return;
 	}
-	for (auto & [payload, ss]: uni)
+	for (auto & [gk, ss]: groups)
 	{
-		auto [it, _] = fiducial_trackers.try_emplace(payload, instance, session, system);
-		auto & [size, is_static, tag] = ss;
-		it->second.configure(size, payload, tag, is_static);
+		auto [it, _] = fiducial_trackers.try_emplace(gk, instance, session, system);
+		auto & [size, is_static] = ss;
+		// Empty payload = enumerate-all; update_fiducial_passthrough
+		// matches payloads against each fiducial's markers.
+		std::string tag = "group " + gk;
+		it->second.configure(size, "", tag, is_static);
 	}
 }
 
@@ -244,35 +245,41 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fiducial_frames.clear();
 	}
 
-	// Resolver (single-marker): solved fiducial frame per (fiducial,
-	// entity) = observed * marker offset. Rebuilt every frame.
+	// Resolver (all markers): solved fiducial frame per (fiducial,
+	// entity) = observed * marker offset. Rebuilt every frame from live
+	// sightings only (ephemeral).
 	fiducial_sightings.clear();
 	for (const auto & f: map->fiducials)
 	{
-		if (f.markers.empty())
-			continue;
-		const auto & m = f.markers[0];
-		auto tr = fiducial_trackers.find(m.marker_data);
-		if (tr == fiducial_trackers.end())
-			continue;
-		for (const auto & s: tr->second.sightings())
+		for (const auto & m: f.markers)
 		{
-			if (s.payload != m.marker_data)
+			auto tr = fiducial_trackers.find(group_key_for(m.marker_size_m, f.is_static));
+			if (tr == fiducial_trackers.end())
 				continue;
-			fiducial_sightings[{f.id, s.entity_id}] = {
-			        .fiducial_id = f.id,
-			        .payload = s.payload,
-			        .solved = compose_pose(s.pose, m.position, m.orientation),
-			        .extents = s.extents,
-			        .time = s.time,
-			};
+			for (const auto & s: tr->second.sightings())
+			{
+				if (s.payload != m.marker_data)
+					continue;
+				fiducial_sightings.emplace(
+				        std::make_pair(f.id, s.entity_id),
+				        fiducial_sighting{
+				                .fiducial_id = f.id,
+				                .payload = s.payload,
+				                .solved = compose_pose(s.pose, m.position, m.orientation),
+				                .extents = s.extents,
+				                .time = s.time,
+				                .novel = s.novel,
+				        });
+			}
 		}
 	}
 
-	// Smoothed frames: ingest every live sighting, predict forward for
-	// render, prune ids unseen for 60s (the runtime recycles long-gone
-	// entity ids: without expiry a return would leave a frozen ghost
-	// beside the fresh frame).
+	// Smoothed (latched) frames: the held 6DoF persists when codes leave
+	// view — consumers read these, never the ephemeral sightings above.
+	// Novel samples ingest; every frame (live or blind) advances the
+	// robust-Euro filter toward its held target for render. Prune ids
+	// unseen for 60s (the runtime recycles long-gone entity ids: without
+	// expiry a return would leave a frozen ghost beside the fresh frame).
 	for (auto it = fiducial_frames.begin(); it != fiducial_frames.end();)
 	{
 		if (fiducial_sightings.contains(it->first) or now - it->second.last_seen <= 60'000'000'000LL)
@@ -294,11 +301,18 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			frame.filter.configure(tuning_for(*fdef));
 			frame.last_predicted = 0;
 		}
-		glm::vec3 tp(fs.solved.position.x, fs.solved.position.y, fs.solved.position.z);
-		glm::quat tq(fs.solved.orientation.w, fs.solved.orientation.x, fs.solved.orientation.y, fs.solved.orientation.z);
-		frame.filter.ingest(tp, tq, fs.time);
-		frame.samples_ingested++;
+		if (fs.novel)
+		{
+			glm::vec3 tp(fs.solved.position.x, fs.solved.position.y, fs.solved.position.z);
+			glm::quat tq(fs.solved.orientation.w, fs.solved.orientation.x, fs.solved.orientation.y, fs.solved.orientation.z);
+			frame.filter.ingest(tp, tq, fs.time);
+			frame.samples_ingested++;
+		}
 		frame.last_seen = now;
+	}
+	for (auto & [skey, frame]: fiducial_frames)
+	{
+		(void)skey;
 		double dt = frame.last_predicted > 0 ? (predicted_display_time - frame.last_predicted) * 1e-9 : 1.0 / 72.0;
 		frame.last_predicted = predicted_display_time;
 		auto r = frame.filter.advance(std::clamp(dt, 0.0, 0.25));
@@ -326,8 +340,11 @@ void scenes::stream::gui_fiducial_status()
 	for (const auto & f: map->fiducials)
 	{
 		std::string label = f.tag.empty() ? f.id : f.tag;
-		// Live if any current sighting resolves through this fiducial.
+		// Live while sighted this frame; otherwise fall back to the latched
+		// (held) frame so the resolved 6DoF persists out of view.
 		bool live = false;
+		bool held = false;
+		XrDuration held_age = 0;
 		for (const auto & [key, fs]: fiducial_sightings)
 		{
 			(void)key;
@@ -337,15 +354,39 @@ void scenes::stream::gui_fiducial_status()
 				break;
 			}
 		}
-		ImVec4 dot = live ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
-		ImGui::TextColored(dot, "%s", live ? "[o]" : "[x]");
+		if (not live)
+		{
+			XrTime now = instance.now();
+			for (const auto & [key, fr]: fiducial_frames)
+			{
+				if (key.first == f.id)
+				{
+					held = true;
+					XrDuration age = now - fr.last_seen;
+					if (held_age == 0 or age < held_age)
+						held_age = age;
+				}
+			}
+		}
+		const char * state = live ? _S("tracking") : held ? _S("holding last pose") : _S("seeking");
+		ImVec4 dot = live ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : held ? ImVec4{0.9f, 0.7f, 0.2f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
+		ImGui::TextColored(dot, "%s", live ? "[o]" : held ? "[~]" : "[x]");
 		ImGui::SameLine();
-		ImGui::Text("%s %.40s: %s, %zu marker(s)%s",
-		            _S("Fiducial"),
-		            label.c_str(),
-		            live ? _S("tracking") : _S("seeking"),
-		            f.markers.size(),
-		            f.is_static ? "" : " (moving)");
+		if (held and not live)
+			ImGui::Text("%s %.40s: %s (%.0fs ago), %zu marker(s)%s",
+			            _S("Fiducial"),
+			            label.c_str(),
+			            state,
+			            (double)held_age / 1e9,
+			            f.markers.size(),
+			            f.is_static ? "" : " (moving)");
+		else
+			ImGui::Text("%s %.40s: %s, %zu marker(s)%s",
+			            _S("Fiducial"),
+			            label.c_str(),
+			            state,
+			            f.markers.size(),
+			            f.is_static ? "" : " (moving)");
 	}
 	if (fiducial_trackers.empty())
 	{

@@ -223,11 +223,12 @@ private:
 	// Latest map from the server.
 	thread_safe<to_headset::fiducial_map> fiducial_map;
 
-	// One runtime tracker per unique marker payload (shared across
-	// fiducials listing it). Synced from the map every frame; stale
-	// trackers are destroyed. Render thread only (all trackers run there).
+	// One runtime tracker per distinct (marker size, static) group, shared
+	// across fiducials (the marker size is context-global, payloads match
+	// client-side). Synced from the map every frame; stale trackers are
+	// destroyed. Render thread only (all trackers run there).
 	std::map<std::string, xr::marker_tracker> fiducial_trackers;
-	std::string last_tracker_key; // union fingerprint; re-sync + warn on change
+	std::string last_tracker_key; // group fingerprint; re-sync on change
 	std::string last_frame_key;   // map fingerprint for the smoothed frames; reset on change
 	// Union of configured marker payloads (any fiducial). Green vs red.
 	std::set<std::string> configured_marker_payloads;
@@ -235,9 +236,10 @@ private:
 	bool marker_support_logged = false;
 
 	// Solved fiducial frame per (fiducial, entity): observed marker pose
-	// composed with the marker-to-fiducial offset. Single-marker resolve
-	// only; multi-marker averaging is future work (first marker used).
-	// Rebuilt every frame; render thread only.
+	// composed with the marker-to-fiducial offset. All configured markers
+	// resolve (each entity carries one payload); fusing several markers to
+	// one fiducial frame is downstream work. Rebuilt every frame from live
+	// sightings only (ephemeral); render thread only.
 	struct fiducial_sighting
 	{
 		std::string fiducial_id;
@@ -245,14 +247,16 @@ private:
 		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}};
 		XrExtent2Df extents{0, 0};
 		XrTime time = 0;
+		bool novel = false;
 	};
 	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_sighting> fiducial_sightings;
 
-	// Smoothed fiducial frame per (fiducial, entity): the resolver's raw
-	// solved pose ingested every live frame, predicted forward for render.
-	// Kept 60s unseen (the runtime recycles long-gone entity ids: without
-	// expiry a return would leave a frozen ghost beside the fresh frame).
-	// Render thread only.
+	// Smoothed (latched) fiducial frame per (fiducial, entity): the held
+	// 6DoF persists when codes leave view (consumers read this, never the
+	// ephemeral sightings). Novel samples ingest; every frame advances the
+	// robust-Euro filter toward its held target for render. Kept 60s unseen
+	// (the runtime recycles long-gone entity ids: without expiry a return
+	// would leave a frozen ghost beside the fresh frame). Render thread only.
 	struct fiducial_frame
 	{
 		xr::fiducial_filter filter;
