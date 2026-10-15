@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
 
@@ -127,12 +128,35 @@ vk::Extent2D level_extent(vk::Extent2D full, int level)
 }
 } // namespace
 
+std::shared_ptr<vk::raii::PipelineCache> feather_mask_renderer::pipeline_cache(vk::raii::Device & device)
+{
+	static std::map<VkDevice, std::weak_ptr<vk::raii::PipelineCache>> caches;
+	VkDevice key = *device;
+	if (auto hit = caches[key].lock())
+		return hit;
+	auto built = std::make_shared<vk::raii::PipelineCache>(device, vk::PipelineCacheCreateInfo{}, nullptr);
+	caches[key] = built;
+	return built;
+}
+
+void feather_mask_renderer::warm_pipelines(vk::raii::Device & device,
+                                           vk::raii::PhysicalDevice & physical_device,
+                                           vk::Format format)
+{
+	// Throwaway renderer: its pipeline compiles populate the shared
+	// cache above (and the page cache), so the first real group pays
+	// ~nothing. The descriptor pool etc. built here dies with the
+	// temporary.
+	feather_mask_renderer(device, physical_device, format);
+}
+
 feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
                                              vk::raii::PhysicalDevice & physical_device_,
                                              vk::Format format_) :
         device(device_),
         physical_device(physical_device_),
-        format(format_)
+        format(format_),
+        pipe_cache(pipeline_cache(device_))
 {
 	auto vert = load_shader(device, "mask.vert");
 	auto frag = load_shader(device, "mask.frag");
@@ -308,7 +332,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .layout = *pipeline_layout,
 	        .renderPass = *renderpass,
 	};
-	pipeline = vk::raii::Pipeline(device, nullptr, pipeline_info);
+	pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), pipeline_info);
 
 	// R8 raster pipeline: same shaders (mask.frag replicates opacity to
 	// all channels) and layout, R8 render pass.
@@ -325,7 +349,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .layout = *pipeline_layout,
 	        .renderPass = *raster_r8_renderpass,
 	};
-	raster_r8_pipeline = vk::raii::Pipeline(device, nullptr, raster_r8_pipeline_info);
+	raster_r8_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), raster_r8_pipeline_info);
 
 	// Depth-tested raster variants for reversed draws: a D16 depth
 	// attachment joins the color attachment (same color formats as above,
@@ -427,7 +451,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .layout = *pipeline_layout,
 		        .renderPass = *rp,
 		};
-		return vk::raii::Pipeline(device, nullptr, info);
+		return vk::raii::Pipeline(device, *pipeline_cache(device), info);
 	};
 	depth_pipeline = make_raster_variant(depth_renderpass, blend, depth_write);
 	reverse_pipeline = make_raster_variant(depth_renderpass, min_blend, depth_test);
@@ -574,7 +598,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .layout = *blur_layout,
 	        .renderPass = *blur_renderpass,
 	};
-	blur_pipeline = vk::raii::Pipeline(device, nullptr, blur_pipeline_info);
+	blur_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), blur_pipeline_info);
 
 	// R8 blur pipeline: same shaders/layout (format-free), R8 pass. Serves
 	// every blur except the V upscale (which targets RGBA8 swapchains).
@@ -591,7 +615,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .layout = *blur_layout,
 	        .renderPass = *blur_r8_renderpass,
 	};
-	blur_r8_pipeline = vk::raii::Pipeline(device, nullptr, blur_r8_pipeline_info);
+	blur_r8_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), blur_r8_pipeline_info);
 
 	// Box-downsample pipeline: same fullscreen vertex shader, same layout
 	// (reads only the push prefix); R8 throughout (intermediates only).
@@ -622,7 +646,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .layout = *blur_layout,
 	        .renderPass = *blur_r8_renderpass,
 	};
-	downsample_pipeline = vk::raii::Pipeline(device, nullptr, downsample_pipeline_info);
+	downsample_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), downsample_pipeline_info);
 
 	// Erosion pipeline (see header): same fullscreen vertex shader,
 	// layout (24-byte push) and R8 standalone shape as the downsample
@@ -655,7 +679,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .layout = *blur_layout,
 	        .renderPass = *blur_r8_renderpass,
 	};
-	erode_pipeline = vk::raii::Pipeline(device, nullptr, erode_pipeline_info);
+	erode_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), erode_pipeline_info);
 
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,

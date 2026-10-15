@@ -133,6 +133,11 @@ private:
 	}
 
 	xr::swapchain swapchain;
+	// Retained shared mask-pipeline cache: keeps the driver cache built
+	// by warm_pipelines() alive from first video frame until session end
+	// (renderers alone can't retain it — they don't exist yet at warm
+	// time, and the lookup map holds weak refs only).
+	std::shared_ptr<vk::raii::PipelineCache> mask_pipe_cache;
 
 	std::optional<audio> audio_handle;
 

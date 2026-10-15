@@ -1453,6 +1453,46 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// projected layer, B (false) the flat layer. Record order
 			// is A ascending, then B ascending (submit matches).
 			std::set<float> live_a, live_b;
+			// Pre-warmed (map-known, not necessarily placed) combos.
+			// Kept by the stale-erase below alongside live_groups, but
+			// kept OUT of live_a/live_b: those drive record order and
+			// the debug-cutout fallback, which must reflect placed
+			// objects only.
+			std::set<std::pair<float, bool>> prewarmed_keys;
+			// Pre-warm pass (first-visible-frame hitch fix): claim
+			// renderer + swapchain + intermediates for every (feather,
+			// union) combo in the map, before anything is placed or
+			// uploaded. Placement frames then only rasterize. Combos
+			// with nothing placed record no draws and stay inactive.
+			// Mirrors the storage blocks in the record loop (which
+			// become no-ops once pre-warmed).
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough")
+					continue;
+				float pf = ost.def.feather_px;
+				bool pproj = surface_projected_effective(oid, ost);
+				prewarmed_keys.emplace(pf, pproj);
+				auto pkey = std::make_pair(pf, pproj);
+				auto & pg = mask_groups[pkey];
+				pg.feather_px = pf;
+				pg.projected = pproj;
+				if (not pg.renderer)
+				{
+					pg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+				}
+				int ptier = feather_mask_renderer::tier_for_feather(pf);
+				int pgw = (ptier == 0) ? mw : (ptier == 1) ? hw : qw;
+				int pgh = (ptier == 0) ? mh : (ptier == 1) ? hh : qh;
+				if (not pg.swapchain or pg.swapchain.width() != pgw or pg.swapchain.height() != pgh)
+				{
+					device.waitIdle();
+					pg.swapchain = xr::swapchain(instance, session, device, swapchain.format(), pgw, pgh, 1, view_count);
+					pg.renderer->reset_targets();
+					spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", pgw, pgh, pf, pproj ? "A" : "B", pg.swapchain.image_count());
+				}
+				pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+			}
 			for (auto & [oid, ost]: passthrough_objects)
 			{
 				if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
@@ -1465,7 +1505,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				g.feather_px = f;
 				g.projected = proj;
 				if (not g.renderer)
+				{
 					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+				}
 				auto mh = g.mesh_hashes.find(oid);
 				if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
 				{
@@ -1529,7 +1571,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// touching git->second after ++git reads past end().
 			for (auto git = mask_groups.begin(); git != mask_groups.end();)
 			{
-				if (std::ranges::find(live_groups, git->first) == live_groups.end())
+				// Pre-warmed combos are kept like live ones (they become
+				// live on placement without re-creating storage).
+				if (std::ranges::find(live_groups, git->first) == live_groups.end() and
+				    prewarmed_keys.find(git->first) == prewarmed_keys.end())
 				{
 					// Rare path: swapchain images may be in flight.
 					device.waitIdle();
@@ -2236,6 +2281,14 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	        swapchain.images(),
 	        extent,
 	        swapchain.format());
+
+	// Retain the shared mask-pipeline cache for the session, then
+	// force-build it now (first video swapchain, before any map exists).
+	// Without this the first feather_mask_renderer pays ~85ms of driver
+	// compiles on the first visible frame (later groups hit the cache
+	// anyway).
+	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
+	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()

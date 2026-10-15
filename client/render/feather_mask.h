@@ -46,6 +46,7 @@
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
 #include <map>
+#include <memory>
 #include <openxr/openxr.h>
 #include <optional>
 #include <string>
@@ -61,6 +62,17 @@ public:
 	feather_mask_renderer(vk::raii::Device & device,
 	                      vk::raii::PhysicalDevice & physical_device,
 	                      vk::Format format);
+
+	// Shared driver pipeline cache (one per device): every renderer
+	// compiles identical pipelines, so the first build populates the
+	// cache and the rest hit it (~85ms once per session, not per group).
+	// Held by each renderer, so the cache outlives its users but dies
+	// with the last one (no shutdown-order hazard). Render-thread only.
+	static std::shared_ptr<vk::raii::PipelineCache> pipeline_cache(vk::raii::Device & device);
+	// Force a first build now (e.g. at first video swapchain, before any
+	// map exists) instead of paying driver compiles on the first visible
+	// frame. A throwaway renderer populates the cache above.
+	static void warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format);
 
 	// (Re)upload one object's mesh buffers under its key. Synchronous
 	// (device idle on replace); call when idle, e.g. on map change, not
@@ -174,6 +186,7 @@ private:
 	vk::raii::Device & device;
 	vk::raii::PhysicalDevice & physical_device;
 	vk::Format format;
+	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> make_buffer(vk::DeviceSize size,
 	                                                                vk::BufferUsageFlags usage,
