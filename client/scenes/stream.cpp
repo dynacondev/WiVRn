@@ -1166,6 +1166,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			if (not gizmo_lines)
 				gizmo_lines = std::make_unique<debug_lines_renderer>(device);
+			// Reset the append cursor: all records in a frame share one
+			// upload, and without the reset later memcpys would clobber
+			// earlier draws' data (same buffer, draw at submit). Missing
+			// this freezes the layer once the staging cap trips.
+			gizmo_lines->begin_frame();
 			using vtx = debug_lines_renderer::vertex;
 			std::vector<vtx> tris;
 			tris.reserve(512);
@@ -1212,30 +1217,67 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				return false;
 			};
-			// Raw sightings from every tracker (group trackers plus the
-			// no-config discovery vehicle): matched state comes from the
-			// map, not the trackers.
-			for (auto & [tkey, tr]: fiducial_trackers)
+			// Green boxes come from votes (one sighting per marker via
+			// its own group's tracker, duplicates collapsed): the same
+			// physical code is reported by every group tracker, so raw
+			// sightings would draw it N times at N slightly different
+			// poses. Red boxes (unmatched codes, no correct group) use
+			// deduped raw sightings, newest wins.
+			if (debug_matched)
 			{
-				(void)tkey;
-				for (const auto & s: tr.sightings())
+				for (const auto & v: fiducial_votes)
 				{
-					bool matched = is_configured(s.payload);
-					if (matched and not debug_matched)
+					if (v.extents.width <= 0 or v.extents.height <= 0)
 						continue;
-					if (not matched and not debug_unmatched)
-						continue;
-					if (s.extents.width <= 0 or s.extents.height <= 0)
-						continue;
-					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, s.time);
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, v.time);
 					if (a <= 0.01f)
 						continue;
 					glm::vec3 c, x, y, z;
-					tag_frame(s.pose, c, x, y, z);
-					box_fill(c, x, y, s.extents.width * 0.5f, s.extents.height * 0.5f, matched ? 0.f : 1.f, matched ? 1.f : 0.f, 0.f, a);
+					tag_frame(v.observed, c, x, y, z);
+					box_fill(c, x, y, v.extents.width * 0.5f, v.extents.height * 0.5f, 0.f, 1.f, 0.f, a);
 					++dbg_boxes;
-					if (debug_axes and s.extents.width > 0)
-						tripod(c, x, y, z, s.extents.width, s.extents.width * 0.08f, a);
+					if (debug_axes and v.extents.width > 0)
+						tripod(c, x, y, z, v.extents.width, v.extents.width * 0.08f, a);
+				}
+			}
+			if (debug_unmatched)
+			{
+				// Newest sighting per unmatched payload across all
+				// trackers (group trackers plus the no-config discovery
+				// vehicle): one physical code, one red box.
+				struct red_code
+				{
+					XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+					XrExtent2Df extents{0, 0};
+					XrTime time = 0;
+				};
+				std::map<std::string, red_code> red;
+				for (auto & [tkey, tr]: fiducial_trackers)
+				{
+					(void)tkey;
+					for (const auto & s: tr.sightings())
+					{
+						if (is_configured(s.payload))
+							continue;
+						auto it = red.find(s.payload);
+						if (it == red.end() or s.time > it->second.time)
+							red[s.payload] = {s.pose, s.extents, s.time};
+					}
+				}
+				for (const auto & [payload, rc]: red)
+				{
+					(void)payload;
+					if (rc.extents.width <= 0 or rc.extents.height <= 0)
+						continue;
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, rc.time);
+					if (a <= 0.01f)
+						continue;
+					glm::vec3 c, x, y, z;
+					tag_frame(rc.pose, c, x, y, z);
+					box_fill(c, x, y, rc.extents.width * 0.5f, rc.extents.height * 0.5f, 1.f, 0.f, 0.f, a);
+					++dbg_boxes;
+					if (debug_axes and rc.extents.width > 0)
+						tripod(c, x, y, z, rc.extents.width, rc.extents.width * 0.08f, a);
 				}
 			}
 			if (debug_corrected)
@@ -1261,11 +1303,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						glm::vec3 bp_(bpit->second.pose.position.x, bpit->second.pose.position.y, bpit->second.pose.position.z);
 						glm::quat oq(m.orientation[3], m.orientation[0], m.orientation[1], m.orientation[2]);
 						glm::vec3 op(m.position[0], m.position[1], m.position[2]);
-						// Smoothed board pose * authored offset, inverted
-						// back to tag frame: tag = board * offset^-1.
-						glm::quat iq = glm::conjugate(oq);
-						glm::vec3 c = bp_ + bq * (iq * -op);
-						glm::quat tq = bq * iq;
+						// Authored offsets are tag-in-board: tag = board *
+						// offset directly (the vote path inverts once).
+						glm::quat tq = bq * oq;
+						glm::vec3 c = bp_ + bq * op;
 						glm::vec3 x = tq * glm::vec3(1, 0, 0);
 						glm::vec3 y = tq * glm::vec3(0, 1, 0);
 						glm::vec3 z = tq * glm::vec3(0, 0, 1);
@@ -1319,7 +1360,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 			}
 			dbg_tris = tris.size() / 3;
-			// Own swapchain: acquire once when gizmos will record. Skip
+						// Own swapchain: acquire once when gizmos will record. Skip
 			// the frame on timeout (paired release inside, like masks).
 			if (not tris.empty())
 			{

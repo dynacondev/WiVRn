@@ -214,14 +214,19 @@ Each `fiducials` entry has:
   - `marker-data`: exact QR payload string to match, byte-for-byte (required)
   - `marker-size-m`: physical marker size in meters (required for pose
     scale; measure the printed QR's outer edge)
-  - `position`: `[x, y, z]` marker-to-fiducial offset in meters
-    (default `[0,0,0]`)
-  - `orientation`: `[rx, ry, rz]` marker-to-fiducial rotation in degrees
-    (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
-    single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
+  - `position`: `[x, y, z]` tag center in fiducial meters, i.e.
+    where the tag sits on the board (default `[0,0,0]`). Position
+    edits move along world axes regardless of angles.
+  - `orientation`: `[rx, ry, rz]` tag orientation relative to fiducial
+    axes, in degrees (default `[0,0,0]`). Orientation tweaks pivot
+    about the tag (the tag stays glued). Fixed-frame rotations about
+    X, then Y, then Z, so single-axis values do the obvious thing
+    (e.g. `[0,90,0]` yaws 90°)
 
+Marker offsets are authored tag-in-board and inverted once at load —
+never hand-invert in config. (Identity case: negate position.)
 Poses compose as
-`fiducialPose = observedMarkerPose * markerToFiducialOffset`.
+`fiducialPose = observedMarkerPose * invert(markerOffset)`.
 Print the QR encoding exactly the `marker-data` string, e.g.
 `qrencode -o marker11.png -s 10 "wivrn:11"`. Matching is exact and
 case-sensitive; any other QR code in view is reported in the headset

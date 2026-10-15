@@ -64,9 +64,10 @@ struct configuration
 		// Exact decoded payload identifying the marker (required).
 		std::string marker_data;
 		float marker_size_m = 0;
-		// Marker-to-fiducial offset: fiducialPose = observedMarkerPose
-		// * offset. Position in meters, orientation as xyzw quaternion
-		// (parsed from [rx, ry, rz] degrees).
+		// Marker-to-fiducial offset, authored tag-in-board: position is
+		// the tag center in fiducial meters, orientation the tag axes
+		// relative to fiducial axes. Position in meters, orientation as
+		// xyzw quaternion (parsed from [rx, ry, rz] degrees).
 		std::array<float, 3> position = {0, 0, 0};
 		std::array<float, 4> orientation = {0, 0, 0, 1};
 	};

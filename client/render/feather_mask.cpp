@@ -159,6 +159,21 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .pSubpasses = &subpass,
 	};
 	renderpass = vk::raii::RenderPass(device, renderpass_info);
+
+	vk::GraphicsPipelineCreateInfo pipeline_info{
+	        .stageCount = 2,
+	        .pStages = stages,
+	        .pVertexInputState = &vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &rasterization,
+	        .pMultisampleState = &multisample,
+	        .pColorBlendState = &blend,
+	        .pDynamicState = &dynamic,
+	        .layout = *pipeline_layout,
+	        .renderPass = *renderpass,
+	};
+	pipeline = vk::raii::Pipeline(device, nullptr, pipeline_info);
 }
 
 void feather_mask_renderer::ensure_cutout_buffer(vk::DeviceSize size)

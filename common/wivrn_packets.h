@@ -972,8 +972,10 @@ struct fiducial_marker
 	std::string marker_data;
 	// Physical marker size in meters (needed for pose scale)
 	float marker_size_m;
-	// Marker-to-fiducial offset: fiducialPose = observedMarkerPose *
-	// offset. Position in meters, orientation as xyzw quaternion.
+	// Marker-to-fiducial offset, authored tag-in-board: position is
+	// the tag center in fiducial meters, orientation the tag axes
+	// relative to fiducial axes (parsed from [rx, ry, rz] degrees).
+	// Position in meters, orientation as xyzw quaternion.
 	std::array<float, 3> position;
 	std::array<float, 4> orientation;
 };

@@ -249,8 +249,8 @@ private:
 		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}};
 		XrExtent2Df extents{0, 0}; // measured tag bounds (gizmo boxes, cutout windows)
 		float tag_size_m = 0;
-		std::array<float, 3> offset_pos{0, 0, 0}; // marker->board offset
-		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw
+		std::array<float, 3> offset_pos{0, 0, 0}; // EFFECTIVE marker->board
+		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw (authored tag-in-board, inverted at assembly)
 		XrTime latch_time = 0; // track (re)latch time, 0 = unknown (settled)
 		XrTime time = 0; // sighting time (vote dedupe: newest wins)
 		bool novel = false; // fresh detector output (filter ingests these)

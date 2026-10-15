@@ -113,6 +113,22 @@ std::string tuning_key_for(const to_headset::fiducial_entry & f)
 	        std::to_string(f.hold_inner_deg);
 }
 
+// Authored marker offsets are tag-in-board: position = tag center in
+// fiducial meters, orientation = tag orientation relative to fiducial
+// axes. Votes need the inverse (board-in-tag). Inverted here, once per
+// sighting (nanoseconds, K tiny) — never hand-invert in config. Unit
+// quaternions: conjugate is the inverse.
+void effective_offset(const std::array<float, 3> & p, const std::array<float, 4> & q,
+                      std::array<float, 3> & op, std::array<float, 4> & oq)
+{
+	glm::quat bq(q[3], q[0], q[1], q[2]);
+	glm::vec3 bp(p[0], p[1], p[2]);
+	glm::quat iq = glm::conjugate(bq);
+	glm::vec3 ip = iq * -bp;
+	oq = {iq.x, iq.y, iq.z, iq.w};
+	op = {ip.x, ip.y, ip.z};
+}
+
 // Group key for the shared tracker: marker size is context-global, so one
 // context serves all payloads with the same (size, static).
 std::string group_key_for(float size_m, bool is_static)
@@ -518,6 +534,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			auto tr = fiducial_trackers.find(group_key_for(m.marker_size_m, f.is_static));
 			if (tr == fiducial_trackers.end())
 				continue;
+			std::array<float, 3> ep;
+			std::array<float, 4> eq;
+			effective_offset(m.position, m.orientation, ep, eq);
 			for (const auto & s: tr->second.sightings())
 			{
 				if (s.payload != m.marker_data)
@@ -528,8 +547,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				v.observed = s.pose;
 				v.extents = s.extents;
 				v.tag_size_m = m.marker_size_m;
-				v.offset_pos = m.position;
-				v.offset_quat = m.orientation;
+				v.offset_pos = ep;
+				v.offset_quat = eq;
 				v.latch_time = s.latch_time;
 				v.time = s.time;
 				v.novel = s.novel;
