@@ -26,15 +26,23 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <map>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <random>
 #include <stdlib.h>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "util/u_logging.h"
 
+#include "utils/flatpak.h"
 #include "utils/xdg_base_directory.h"
 #include "wivrn_config.h"
+
+static constexpr size_t config_file_max_size = 256 * 1024;
 
 static auto resolve_path(std::filesystem::path path)
 {
@@ -87,40 +95,212 @@ std::filesystem::path configuration::get_config_file()
 	return config_file;
 }
 
+static void log_effective_config_once(const nlohmann::json & merged)
+{
+	// Process-once: the body is idempotent, so a benign race only risks a repeated line
+	static bool logged = false;
+	if (logged)
+		return;
+	logged = true;
+
+	if (not merged.is_object())
+	{
+		U_LOG_I("Effective configuration: not an object, ignoring");
+		return;
+	}
+
+	std::string keys;
+	for (auto it = merged.begin(); it != merged.end(); ++it)
+	{
+		if (not keys.empty())
+			keys += ", ";
+		keys += it.key();
+	}
+	U_LOG_I("Effective configuration keys: %s", keys.empty() ? "(none)" : keys.c_str());
+}
+
+// One searched location for wivrn/config.json, shared by the config merge,
+// the search log and the ConfigFiles D-Bus property so all three agree.
+// `path` is the host-form path for display (empty when unknown); `local` is
+// the sandbox-visible path used for direct reads (empty for via-host reads);
+// `location` tells the dashboard which side can open it ("host"/"sandbox").
+struct config_candidate
+{
+	std::string id;
+	std::string role;
+	std::string path;
+	std::string location;
+	std::string local;
+	std::string status = "missing";
+	std::optional<std::string> content;
+};
+
+static void log_config_search_once(const std::vector<config_candidate> & candidates,
+                                   const std::map<std::string, std::string> & first_source,
+                                   const std::map<std::string, std::string> & final_source)
+{
+	// Process-once: like log_effective_config_once, read_configuration runs on
+	// every connection so only the first search is reported in full
+	static bool logged = false;
+	if (logged)
+		return;
+	logged = true;
+
+	U_LOG_I("Config search (%u locations):", (unsigned)candidates.size());
+	for (const auto & candidate: candidates)
+	{
+		std::string status = candidate.status;
+		if (status == "invalid")
+			status += " (see error above)";
+		else if (status == "skipped")
+			status += " (HOST_XDG_CONFIG_HOME and HOME unset)";
+		else if (status == "missing" and candidate.local.empty())
+			status = "missing or unreadable";
+		U_LOG_I("Config search: %s: %s: %s",
+		        candidate.role.c_str(),
+		        candidate.path.empty() ? "(location unknown)" : candidate.path.c_str(),
+		        status.c_str());
+	}
+	for (const auto & [key, winner]: final_source)
+	{
+		auto it = first_source.find(key);
+		if (it != first_source.end() and it->second != winner)
+			U_LOG_I("Config key '%s' from %s overridden by %s", key.c_str(), it->second.c_str(), winner.c_str());
+	}
+}
+
+static std::vector<config_candidate> collect_config_candidates()
+{
+	std::vector<config_candidate> candidates;
+	auto try_direct = [&](std::string id, std::string role, std::filesystem::path sandbox_path, std::string display, std::string location) {
+		config_candidate candidate;
+		candidate.id = std::move(id);
+		candidate.role = std::move(role);
+		candidate.location = std::move(location);
+		auto resolved = resolve_path(sandbox_path);
+		candidate.local = resolved.string();
+		candidate.path = display.empty() ? candidate.local : std::move(display);
+		if (std::filesystem::exists(resolved))
+		{
+			std::ifstream file(resolved);
+			candidate.content = std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+		}
+		candidates.push_back(std::move(candidate));
+	};
+	bool flatpak = wivrn::is_flatpak();
+	// HOST_XDG_CONFIG_HOME only exists when the host exports XDG_CONFIG_HOME.
+	// Otherwise the host uses the XDG default, and $HOME inside the sandbox
+	// names the same location as on the host, so $HOME/.config is a valid
+	// host path even though it is invisible from here.
+	std::string host_config_home;
+	if (flatpak)
+	{
+		if (const char * host_xdg = std::getenv("HOST_XDG_CONFIG_HOME"); host_xdg and *host_xdg)
+			host_config_home = host_xdg;
+		else if (const char * home = std::getenv("HOME"); home and *home)
+			host_config_home = (std::filesystem::path(home) / ".config").string();
+	}
+	// Bundled defaults first, then host files, then sandbox files, so
+	// dashboard edits (sandbox per-app config) win. Host paths are
+	// invisible from inside the flatpak sandbox: /run/host/* is
+	// bind-mounted (host-os/host-etc permissions) and the host XDG
+	// config is read from outside the sandbox like model files.
+	try_direct("bundle",
+	           "bundled defaults",
+	           std::filesystem::path(WIVRN_INSTALL_PREFIX "/share") / "wivrn" / "config.json",
+	           "",
+	           "sandbox");
+	if (flatpak)
+	{
+		try_direct("host-usr-share",
+		           "host system data",
+		           std::filesystem::path("/run/host/usr/share") / "wivrn" / "config.json",
+		           "/usr/share/wivrn/config.json",
+		           "host");
+		try_direct("host-etc",
+		           "host system config",
+		           std::filesystem::path("/run/host/etc") / "wivrn" / "config.json",
+		           "/etc/wivrn/config.json",
+		           "host");
+		if (not host_config_home.empty())
+		{
+			config_candidate candidate;
+			candidate.id = "host-xdg";
+			candidate.role = "host user config";
+			candidate.path = (std::filesystem::path(host_config_home) / "wivrn" / "config.json").string();
+			candidate.location = "host";
+			if (auto data = wivrn::read_file_via_host(candidate.path, config_file_max_size))
+				candidate.content = std::string(reinterpret_cast<const char *>(data->data()), data->size());
+			candidates.push_back(std::move(candidate));
+		}
+		else
+		{
+			config_candidate candidate;
+			candidate.id = "host-xdg";
+			candidate.role = "host user config";
+			candidate.location = "host";
+			candidate.status = "skipped";
+			candidates.push_back(std::move(candidate));
+		}
+	}
+	try_direct("etc", flatpak ? "sandbox system config" : "system config", std::filesystem::path("/etc") / "wivrn" / "config.json", "", "sandbox");
+	try_direct("xdg", flatpak ? "sandbox user config" : "user config", xdg_config_home() / "wivrn" / "config.json", "", "sandbox");
+	return candidates;
+}
+
 nlohmann::json configuration::read_configuration()
 {
 	if (config_file.empty())
 	{
 		nlohmann::json merged;
-		for (std::filesystem::path prefix: {
-		             std::filesystem::path(WIVRN_INSTALL_PREFIX "/share"),
-		             std::filesystem::path("/etc"),
-		             xdg_config_home(),
-		     })
+		// First and winning source per top-level key, to spot a later file shadowing an earlier one
+		std::map<std::string, std::string> key_first_source;
+		std::map<std::string, std::string> key_final_source;
+		auto candidates = collect_config_candidates();
+		for (auto & candidate: candidates)
 		{
-			auto path = resolve_path(prefix / "wivrn" / "config.json");
-			if (std::filesystem::exists(path))
+			if (not candidate.content)
+				continue;
+			// Display path identifies the source; via-host reads are marked like the log lines
+			std::string source = candidate.path;
+			if (candidate.local.empty())
+				U_LOG_I("Using configuration file %s (via host)", candidate.path.c_str());
+			else
+				U_LOG_I("Using configuration file %s", candidate.local.c_str());
+			if (candidate.local.empty())
+				source += " (via host)";
+			try
 			{
-				try
+				for (const auto & [key, value]: nlohmann::json::parse(*candidate.content).get<nlohmann::json::object_t>())
 				{
-					for (const auto & [key, value]: nlohmann::json::parse(std::ifstream(path)).get<nlohmann::json::object_t>())
-					{
-						merged[key] = value;
-					}
+					if (not key_first_source.contains(key))
+						key_first_source[key] = source;
+					key_final_source[key] = source;
+					merged[key] = value;
 				}
-				catch (std::exception & e)
-				{
-					U_LOG_E("Invalid configuration file %s: %s", path.c_str(), e.what());
-				}
+				candidate.status = "used";
+			}
+			catch (std::exception & e)
+			{
+				if (candidate.local.empty())
+					U_LOG_E("Invalid configuration file %s (via host): %s", candidate.path.c_str(), e.what());
+				else
+					U_LOG_E("Invalid configuration file %s: %s", candidate.local.c_str(), e.what());
+				candidate.status = "invalid";
 			}
 		}
+		log_config_search_once(candidates, key_first_source, key_final_source);
+		log_effective_config_once(merged);
 		return merged;
 	}
 	else
 	{
+		U_LOG_I("Using configuration file %s", config_file.c_str());
 		try
 		{
-			return nlohmann::json::parse(std::ifstream(config_file));
+			nlohmann::json merged = nlohmann::json::parse(std::ifstream(config_file));
+			log_effective_config_once(merged);
+			return merged;
 		}
 		catch (std::exception & e)
 		{
@@ -128,6 +308,31 @@ nlohmann::json configuration::read_configuration()
 			return nlohmann::json();
 		}
 	}
+}
+
+std::string configuration::config_files_json()
+{
+	nlohmann::json array = nlohmann::json::array();
+	for (auto & candidate: collect_config_candidates())
+	{
+		if (candidate.content)
+		{
+			try
+			{
+				(void)nlohmann::json::parse(*candidate.content).get<nlohmann::json::object_t>();
+				candidate.status = "used";
+			}
+			catch (std::exception &)
+			{
+				candidate.status = "invalid";
+			}
+		}
+		array.push_back({{"id", candidate.id},
+		                 {"path", candidate.path},
+		                 {"status", candidate.status},
+		                 {"location", candidate.location}});
+	}
+	return array.dump();
 }
 
 configuration::encoder parse_encoder(const nlohmann::json & item)

@@ -176,11 +176,13 @@ public:
 	Q_PROPERTY(bool headsetConnected READ isHeadsetConnected NOTIFY headsetConnectedChanged)
 	Q_PROPERTY(bool sessionRunning READ isSessionRunning NOTIFY sessionRunningChanged)
 	Q_PROPERTY(QString jsonConfiguration READ jsonConfiguration WRITE setJsonConfiguration NOTIFY jsonConfigurationChanged)
+	Q_PROPERTY(QString configFiles READ configFiles NOTIFY configFilesChanged)
 	Q_PROPERTY(QString serverLogs READ serverLogs NOTIFY serverLogsChanged)
 	Q_INVOKABLE void start_server();
 	Q_INVOKABLE void stop_server();
 	Q_INVOKABLE void restart_server();
 	Q_INVOKABLE void open_server_logs();
+	Q_INVOKABLE void openConfigLocation(QString filePath, bool fileExists, bool openOnHost);
 
 	// Authentication
 	Q_PROPERTY(QString pin READ pin NOTIFY pinChanged)
@@ -243,6 +245,11 @@ public:
 	}
 
 	void setJsonConfiguration(QString);
+
+	QString configFiles() const
+	{
+		return m_configFiles;
+	}
 
 	QString pin() const
 	{
@@ -362,6 +369,7 @@ private:
 	bool m_headsetConnected{};
 	bool m_sessionRunning{};
 	QString m_jsonConfiguration{};
+	QString m_configFiles{};
 
 	QString m_pin{};
 	QList<headset> m_knownKeys;
@@ -389,6 +397,7 @@ Q_SIGNALS:
 	void headsetConnectedChanged(bool);
 	void sessionRunningChanged(bool);
 	void jsonConfigurationChanged(QString);
+	void configFilesChanged(QString);
 	void needMonadoVulkanLayerChanged(bool);
 	void pinChanged(QString);
 	void knownKeysChanged(QList<headset>);

@@ -45,6 +45,12 @@
 		<property name="SessionRunning"        type="b" access="read"/>
 		<property name="SteamCommand"          type="s" access="read"/>
 		<property name="JsonConfiguration"     type="s" access="readwrite"/>
+		<property name="ConfigFiles"           type="s" access="read"/>
+		<!-- ConfigFiles: JSON array of searched config file locations, in merge order:
+		     [{"id": "bundle"|"host-usr-share"|"host-etc"|"host-xdg"|"etc"|"xdg",
+		       "path": host-form path for display ("" when unknown),
+		       "status": "used"|"missing"|"invalid"|"skipped",
+		       "location": "host"|"sandbox"}] -->
 		<property name="Bitrate"               type="u" access="read"/>
 
 		<!-- Data from the headset info packet -->

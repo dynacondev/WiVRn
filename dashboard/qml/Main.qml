@@ -63,6 +63,69 @@ Kirigami.ApplicationWindow {
     property bool json_loaded: false
     property bool prev_headset_connected: false
 
+    property var configFileEntries: []
+    property string lastOpenedConfigPath: ""
+    property double lastOpenedConfigAt: 0
+    function parseConfigFiles() {
+        try {
+            var parsed = JSON.parse(WivrnServer.configFiles || "[]");
+            configFileEntries = Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            configFileEntries = [];
+        }
+    }
+    // Highest-precedence entry currently in use, or null
+    function activeConfigEntry() {
+        for (var i = configFileEntries.length - 1; i >= 0; i--) {
+            if (configFileEntries[i].status === "used")
+                return configFileEntries[i];
+        }
+        return null;
+    }
+    function openConfigEntry(entry) {
+        if (!entry || entry.path === "")
+            return;
+        // Guard against double activation (delegate click + ComboBox activation)
+        var now = Date.now();
+        if (entry.path === lastOpenedConfigPath && now - lastOpenedConfigAt < 1000)
+            return;
+        lastOpenedConfigPath = entry.path;
+        lastOpenedConfigAt = now;
+        WivrnServer.openConfigLocation(entry.path, entry.status === "used" || entry.status === "invalid", entry.location === "host");
+    }
+    function configEntryLabel(id) {
+        switch (id) {
+        case "bundle":
+            return i18n("Bundled defaults (read-only)");
+        case "host-usr-share":
+            return i18n("Host system data");
+        case "host-etc":
+            return i18n("Host system config");
+        case "host-xdg":
+            return i18n("Host user config");
+        case "etc":
+            return Settings.flatpak ? i18n("Sandbox system config (ephemeral)") : i18n("System config");
+        case "xdg":
+            return Settings.flatpak ? i18n("App config (dashboard)") : i18n("User config");
+        default:
+            return id;
+        }
+    }
+    function configStatusText(status) {
+        switch (status) {
+        case "used":
+            return i18n("In use");
+        case "missing":
+            return i18n("Not found");
+        case "invalid":
+            return i18n("Invalid — see server log");
+        case "skipped":
+            return i18n("Unavailable");
+        default:
+            return status;
+        }
+    }
+
     Connections {
         target: WivrnServer
         function onServerStatusChanged(value) {
@@ -103,6 +166,10 @@ Kirigami.ApplicationWindow {
         function onJsonConfigurationChanged(value) {
             Settings.load(WivrnServer);
         }
+
+        function onConfigFilesChanged() {
+            parseConfigFiles();
+        }
     }
 
     Connections {
@@ -118,6 +185,7 @@ Kirigami.ApplicationWindow {
     }
 
     Component.onCompleted: {
+        parseConfigFiles();
         if (WivrnServer.serverStatus == WivrnServer.Stopped)
             WivrnServer.start_server();
 
@@ -383,6 +451,60 @@ Kirigami.ApplicationWindow {
                         text: i18n("No headset is connected or your headset is not in developer mode");
                         Layout.fillWidth: true
                         wrapMode: Text.Wrap
+                    }
+
+                    Kirigami.Heading {
+                        text: i18n("Configuration files")
+                        level: 1
+                        type: Kirigami.Heading.Type.Primary
+                        enabled: root.server_started
+                    }
+
+                    Controls.ComboBox {
+                        id: config_combo
+                        Kirigami.FormData.label: i18n("Config files:")
+                        enabled: root.server_started && root.configFileEntries.length > 0
+                        model: root.configFileEntries
+                        textRole: "path"
+                        displayText: {
+                            var active = activeConfigEntry();
+                            if (active)
+                                return configEntryLabel(active.id) + " — " + active.path;
+                            return i18n("No config file found");
+                        }
+                        delegate: Controls.ItemDelegate {
+                            width: config_combo.width
+                            contentItem: ColumnLayout {
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    text: configEntryLabel(modelData.id)
+                                    font.bold: modelData.status === "used"
+                                    elide: Text.ElideRight
+                                }
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    text: modelData.path === "" ? configStatusText(modelData.status) : modelData.path
+                                    opacity: 0.7
+                                    elide: Text.ElideMiddle
+                                }
+                                Controls.Label {
+                                    Layout.fillWidth: true
+                                    text: configStatusText(modelData.status)
+                                    opacity: 0.7
+                                    color: modelData.status === "used" ? Kirigami.Theme.positiveTextColor : (modelData.status === "invalid" ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor)
+                                }
+                            }
+                            enabled: modelData.path !== ""
+                            highlighted: config_combo.highlightedIndex === index
+                            onClicked: {
+                                config_combo.currentIndex = index;
+                                config_combo.popup.close();
+                                openConfigEntry(root.configFileEntries[index]);
+                            }
+                        }
+                        onActivated: (index) => {
+                            openConfigEntry(root.configFileEntries[index]);
+                        }
                     }
                 }
                 Item {

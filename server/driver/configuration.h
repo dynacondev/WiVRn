@@ -72,6 +72,11 @@ struct configuration
 	static std::filesystem::path get_config_file();
 
 	static nlohmann::json read_configuration();
+
+	// JSON array describing every searched config file location, in merge
+	// order: [{"id", "path", "status", "location"}]. See ConfigFiles in
+	// dbus/io.github.wivrn.Server.xml. Re-reads the files (cheap).
+	static std::string config_files_json();
 	configuration();
 };
 
