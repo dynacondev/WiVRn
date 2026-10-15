@@ -765,6 +765,12 @@ void on_json_configuration(WivrnServer * server, const GParamSpec * pspec, gpoin
 	wivrn_server_set_steam_command(dbus_server, steam_command().c_str());
 }
 
+static void publish_config_files()
+{
+	std::string config_files = configuration::config_files_json();
+	wivrn_server_set_config_files(dbus_server, config_files.c_str());
+}
+
 void expose_known_keys_on_dbus()
 {
 	GVariantBuilder * builder = g_variant_builder_new(G_VARIANT_TYPE("a(ssx)"));
@@ -824,6 +830,10 @@ void on_headset_info_packet(const wivrn::from_headset::headset_info_packet & inf
 	codecs.push_back(nullptr);
 	wivrn_server_set_supported_codecs(dbus_server, codecs.data());
 	wivrn_server_set_system_name(dbus_server, info.system_name.c_str());
+
+	// A headset (re)connect is a good time to re-check the config files:
+	// the user may have created one since startup.
+	publish_config_files();
 }
 
 void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer user_data)
@@ -888,6 +898,7 @@ void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer
 		std::cerr << "Invalid configuration: " << e.what() << std::endl;
 	}
 	wivrn_server_set_json_configuration(dbus_server, config.c_str());
+	publish_config_files();
 
 	expose_known_keys_on_dbus();
 
@@ -1020,6 +1031,10 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 
 int main(int argc, char * argv[])
 {
+	// Show startup logging (including config search) at info level, like the
+	// forked session child does. Does not override an explicitly exported XRT_LOG.
+	setenv("XRT_LOG", "info", false);
+
 	CLI::App app;
 
 	std::string config_file;
