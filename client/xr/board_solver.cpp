@@ -628,3 +628,4 @@ board_solution solve_board(const std::vector<board_vote> & votes_in, const std::
 	return sol;
 }
 
+} // namespace xr
