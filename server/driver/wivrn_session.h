@@ -242,6 +242,9 @@ private:
 	// nullopt for id stops all apps
 	void stop_application(std::optional<uint32_t> id, int64_t timeout_ns);
 
+	// Sends to_headset::fiducial_map from configuration().fiducials
+	void send_fiducial_map();
+
 	void update_client_states(bool visible, bool focused);
 	void poll_session_loss();
 

@@ -425,6 +425,44 @@ void wivrn_session::pause_session()
 	wivrn::trace::flush_session();
 }
 
+void wivrn_session::send_fiducial_map()
+{
+	configuration config;
+	if (config.fiducials.empty())
+	{
+		U_LOG_I("Fiducial map: no entries configured");
+		return;
+	}
+
+	U_LOG_I("Fiducial map: sending %u fiducials", (unsigned)config.fiducials.size());
+	to_headset::fiducial_map msg;
+	for (const auto & entry: config.fiducials)
+	{
+		to_headset::fiducial_entry e{
+		        .id = entry.id,
+		        .tag = entry.tag,
+		        .is_static = entry.is_static,
+		        .sigma_k = entry.sigma_k,
+		        .euro_min_cutoff = entry.euro_min_cutoff,
+		        .euro_beta = entry.euro_beta,
+		        .hold_inner_mm = entry.hold_inner_mm,
+		        .hold_inner_deg = entry.hold_inner_deg,
+		};
+		for (const auto & m: entry.markers)
+			e.markers.push_back(to_headset::fiducial_marker{
+			        .marker_data = m.marker_data,
+			        .marker_size_m = m.marker_size_m,
+			        .position = m.position,
+			        .orientation = m.orientation,
+			});
+		const char * label = entry.tag.empty() ? entry.id.c_str() : entry.tag.c_str();
+		U_LOG_I("Fiducial \"%s\" (%s): %u markers", label, entry.is_static ? "static" : "moving", (unsigned)e.markers.size());
+		msg.fiducials.push_back(std::move(e));
+	}
+
+	send_control(std::move(msg));
+}
+
 void wivrn_session::resume_session()
 {
 	assert(mnd_ipc_server);
@@ -463,6 +501,8 @@ void wivrn_session::resume_session()
 	        .country = get_info().country,
 	        .variant = get_info().variant,
 	});
+
+	send_fiducial_map();
 
 	// resume session and notify clients
 

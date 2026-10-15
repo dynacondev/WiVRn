@@ -32,12 +32,19 @@
 #include "wifi_lock.h"
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
+#include "xr/board_solver.h"
+#include "xr/fiducial_filter.h"
+#include "xr/marker_tracker.h"
 #include "xr/space.h"
+#include <array>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <shared_mutex>
 #include <thread>
+#include <vector>
 #include <vulkan/vulkan_core.h>
 
 namespace scenes
@@ -153,6 +160,7 @@ private:
 		post_processing,
 		devices,
 		tracking,
+		passthrough,
 		theme,
 		system,
 	};
@@ -201,8 +209,76 @@ private:
 	// Keep a reference to the resources needed to blit the images until vkWaitForFences
 	std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> current_blit_handles;
 
+	// Video stall detection (render thread only). When the decoders stop
+	// delivering frames the compositor keeps submitting an empty layer,
+	// which reads as unexplained grey: surface an explicit toast instead.
+	// ever_received_video latches on the first displayed frame so a slow
+	// first frame doesn't false-positive.
+	XrTime video_starved_since = 0;
+	bool video_stall_toasted = false;
+	bool ever_received_video = false;
+	void update_video_stall_status(bool starved);
+
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
+
+	// Fiducial tracking markers (Quest only, see docs/configuration.md).
+	// Latest map from the server.
+	thread_safe<to_headset::fiducial_map> fiducial_map;
+
+	// One runtime tracker per distinct (marker size, static) group, shared
+	// across fiducials (the marker size is context-global, payloads match
+	// client-side). Synced from the map every frame; stale trackers are
+	// destroyed. Render thread only (all trackers run there).
+	std::map<std::string, xr::marker_tracker> fiducial_trackers;
+	std::string last_tracker_key; // group fingerprint; re-sync on change
+	std::string last_frame_key;   // map fingerprint for the fused poses; reset on change
+	// Set once: the runtime hides spatial tracking without its grant.
+	bool marker_support_logged = false;
+
+	// One board hypothesis (vote) per (fiducial, marker, entity):
+	// observed tag pose plus the marker's size, offset and latch time.
+	// ALL markers of a fiducial vote; board_solver fuses each fiducial's
+	// votes into one pose. Rebuilt every frame; render thread only.
+	struct fiducial_vote
+	{
+		std::string fiducial_id;
+		std::string payload;
+		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}};
+		float tag_size_m = 0;
+		std::array<float, 3> offset_pos{0, 0, 0}; // marker->board offset
+		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw
+		XrTime latch_time = 0; // track (re)latch time, 0 = unknown (settled)
+		XrTime time = 0; // sighting time (vote dedupe: newest wins)
+		bool novel = false; // fresh detector output (filter ingests these)
+	};
+	std::vector<fiducial_vote> fiducial_votes;
+
+	// Fused board pose per fiducial id: live solution when votes exist,
+	// held (frozen) otherwise. The robust-Euro filter smooths the fused
+	// poses over time; consumers read pose, never the ephemeral
+	// sightings. Render thread only.
+	struct board_fused
+	{
+		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrTime time = 0; // last live solution (stale age = now - time)
+		bool live = false; // solved this frame
+		float rms_mm = 0, rms_deg = 0;
+		double solve_us = 0;
+		int lm_iters = 0;
+		int tags_visible = 0, tags_used = 0;
+		bool single = true;
+		std::vector<xr::board_tag_stat> tag_stats;
+		std::vector<xr::board_vote> last_votes; // accepted-solve inputs, same order as tag_stats
+		xr::fiducial_filter filter; // post-resolution temporal smoothing
+		std::string tuning_key; // filter tuning source; re-configure on change
+		uint64_t samples_ingested = 0;
+		XrTime last_predicted = 0; // last advance time (advance dt source)
+	};
+	std::map<std::string /*fiducial id*/, board_fused> board_poses;
+	// Warm starts for the solver (fiducial id -> last smoothed pose).
+	// Solver init only, not output smoothing.
+	std::map<std::string, XrPosef> board_warm_start;
 
 	stream(std::string server_name, scene & parent_scene);
 
@@ -246,6 +322,7 @@ public:
 	void operator()(to_headset::application_list &&);
 	void operator()(to_headset::application_icon &&);
 	void operator()(to_headset::running_applications &&);
+	void operator()(to_headset::fiducial_map &&);
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);
@@ -353,6 +430,21 @@ private:
 	void gui_foveation_settings(float predicted_display_period);
 	void gui_applications();
 	void gui_toasts();
+	void gui_passthrough();
+	void gui_fiducial_status();
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period);
+
+	// Eager USE_SCENE runtime-permission request (Android): manifest presence
+	// makes the spatial extensions enumerable, but tracking data needs the
+	// user grant. Process-once; the result feeds the status-tab hint.
+	void request_spatial_permissions();
+	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
+	void update_fiducial_passthrough(XrTime predicted_display_time);
+	bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
+	                   const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
+	void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
+	                      const xr::board_solution & sol, const board_fused & bp,
+	                      double horizon_ms, XrTime now, double dt,
+	                      bool have_head, glm::vec3 head_pos);
 };
 } // namespace scenes

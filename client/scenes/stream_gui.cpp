@@ -448,6 +448,9 @@ void scenes::stream::gui_settings(float)
 			if (wivrn::gui::settings_tracking(ctx))
 				send_settings_changed_packet(session, network_session.get(), ctx.config);
 			break;
+		case settings_page::passthrough:
+			gui_passthrough();
+			break;
 		case settings_page::system:
 			wivrn::gui::settings_system(ctx);
 			break;
@@ -1032,6 +1035,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			settings_item(ICON_FA_WAND_MAGIC_SPARKLES, _cS("tab label", "Post-processing"), settings_page::post_processing);
 			settings_item(ICON_FA_KEYBOARD, _cS("tab label", "Devices"), settings_page::devices);
 			settings_item(ICON_FA_LOCATION_CROSSHAIRS, _cS("tab label", "Tracking"), settings_page::tracking);
+			settings_item(ICON_FA_QRCODE, _cS("tab label", "Passthrough"), settings_page::passthrough);
 			settings_item(ICON_FA_GEARS, _cS("tab label", "System"), settings_page::system);
 			settings_item(ICON_FA_PALETTE, _cS("tab label", "Theme"), settings_page::theme);
 

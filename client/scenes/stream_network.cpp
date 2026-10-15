@@ -169,6 +169,17 @@ void scenes::stream::operator()(to_headset::running_applications && apps)
 	*running_applications.lock() = std::move(apps);
 }
 
+void scenes::stream::operator()(to_headset::fiducial_map && map)
+{
+	spdlog::info("Received fiducial map with {} fiducials", map.fiducials.size());
+	for (const auto & fid: map.fiducials)
+	{
+		std::string label = fid.tag.empty() ? fid.id : fid.tag;
+		spdlog::info("Fiducial \"{}\": {} marker(s) ({})", label, fid.markers.size(), fid.is_static ? "static" : "moving");
+	}
+	*fiducial_map.lock() = std::move(map);
+}
+
 void scenes::stream::start_application(std::string appid)
 {
 	network_session->send_control(wivrn::from_headset::start_app{

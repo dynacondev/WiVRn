@@ -963,6 +963,46 @@ struct running_applications
 	std::vector<application> applications;
 };
 
+// Fiducial tracking markers (Quest only). The server is authoritative
+// for the map, pushed to the headset on connect.
+struct fiducial_marker
+{
+	// Exact decoded payload string identifying this marker (QR codes: the
+	// runtime reports markerId 0, so matching is by payload). Required.
+	std::string marker_data;
+	// Physical marker size in meters (needed for pose scale)
+	float marker_size_m;
+	// Marker-to-fiducial offset: fiducialPose = observedMarkerPose *
+	// offset. Position in meters, orientation as xyzw quaternion.
+	std::array<float, 3> position;
+	std::array<float, 4> orientation;
+};
+
+struct fiducial_entry
+{
+	// Stable id linking config, protocol and headset UI (required).
+	std::string id;
+	// Display-only label for the headset status UI. Never used for
+	// matching or linkage.
+	std::string tag;
+	// Maps to optimizeForStaticMarker in the QR spatial context.
+	bool is_static = true;
+	// Resolver/smoothing tuning, carried through to the per-instance
+	// filters on the headset. All optional; the filter auto-adapts and
+	// these only bias it. Outer hold knees are 5x their inner.
+	float sigma_k = 3;
+	float euro_min_cutoff = 0.4f;
+	float euro_beta = 0.07f;
+	float hold_inner_mm = 1;
+	float hold_inner_deg = 0.1f;
+	std::vector<fiducial_marker> markers;
+};
+
+struct fiducial_map
+{
+	std::vector<fiducial_entry> fiducials;
+};
+
 using packets = std::variant<
         crypto_handshake,
         pin_check_2,
@@ -981,7 +1021,8 @@ using packets = std::variant<
         stream_tab_change,
         application_list,
         application_icon,
-        running_applications>;
+        running_applications,
+        fiducial_map>;
 } // namespace to_headset
 } // namespace wivrn
 
