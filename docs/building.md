@@ -62,6 +62,19 @@ cmake --build build-dashboard
 
 See [Server](#server-pc) for the server compile options.
 
+# Flatpak
+
+To build the `tech.dynacon.vr` Flatpak locally and install the resulting bundle:
+
+```bash
+tools/gen_flatpak_manifest.py --dir --out flatpak
+flatpak-builder --ccache --force-clean --jobs=12 --repo=repo build-dir flatpak/tech.dynacon.vr.yml
+flatpak build-bundle repo dynaconvr-server.flatpak tech.dynacon.vr
+flatpak install --user --reinstall dynaconvr-server.flatpak
+```
+
+The bundle filename is `dynaconvr-server.flatpak` (same name as produced by CI).
+
 # Client (headset)
 
 #### Build dependencies
