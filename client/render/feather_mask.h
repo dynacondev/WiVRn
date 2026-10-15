@@ -234,6 +234,13 @@ private:
 	// both eyes): one fullscreen draw broadcasts to both layers.
 	vk::raii::RenderPass blur_renderpass_mv{nullptr};
 	vk::raii::RenderPass blur_r8_renderpass_mv{nullptr};
+	// Merged erode-H/erode-V/blur-H triple (one renderpass, 3
+	// subpasses): sampler reads across subpasses keep tile residency
+	// without input attachments (neighborhood taps need real
+	// sampling). Tier-1 [A,B] and tiered [h,eblur] share it: same
+	// formats, same load/store/initial/final pattern (loadOp is not
+	// part of renderpass compatibility anyway).
+	vk::raii::RenderPass triple_rp{nullptr};
 	vk::raii::PipelineLayout blur_layout{nullptr};
 	// Fullscreen pipelines (multiview: one draw broadcasts to both
 	// eyes). The _mv fragment twins read each view's layer.
@@ -248,7 +255,11 @@ private:
 	// (24-byte push) and R8 standalone shape as the downsample pass, so
 	// it records into any single-attachment R8 framebuffer (A/B blur_fbs,
 	// eblur blur_fbs) with no new renderpasses or targets.
-	vk::raii::Pipeline erode_pipeline_mv{nullptr};
+	// Triple-subpass pipes (subpass index is baked in: erode runs in
+	// subpasses 0/1, blur-H in 2). Shared by both triple renderpasses.
+	vk::raii::Pipeline triple_erode_0{nullptr};
+	vk::raii::Pipeline triple_erode_1{nullptr};
+	vk::raii::Pipeline triple_blur_h{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// One set per (pass, eye): descriptor updates are host-side writes
@@ -298,6 +309,13 @@ private:
 	};
 	blur_target target_a;
 	blur_target target_b;
+	// Merged-triple framebuffer (one renderpass, both layers): built
+	// lazily on first record — the (src, tmp) image pair is fixed per
+	// renderer (tier is fixed per group), so no rebuilds after that.
+	// Creation-only (never destroys live targets), hence no waitIdle.
+	vk::raii::Framebuffer triple_fb{nullptr};
+	vk::Image triple_src = VK_NULL_HANDLE;
+	vk::Image triple_tmp = VK_NULL_HANDLE;
 	// Downsample chain (D) and tier blur workspaces (E) at half, quarter
 	// and eighth mask resolution (index 0..2). Tier k blurs at 1/k size
 	// with the same fixed kernel, so tap density (and cost) stays flat
@@ -305,7 +323,8 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	void update_source(vk::ImageView view, uint32_t set, bool nearest = false);
+	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
+	                     vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
 	// shared-read (uploads are rare, map-change only); the pending copy
