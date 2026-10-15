@@ -1687,6 +1687,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				g.wait_warned = false;
 				g.acquired = true;
 				g.active = true;
+				g.extent = {(int32_t)gw, (int32_t)gh};
 				try
 				{
 					g.renderer->record(command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
