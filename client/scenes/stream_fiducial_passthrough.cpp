@@ -368,7 +368,6 @@ void scenes::stream::gui_fiducial_status()
 				}
 			}
 		}
-		const char * state = live ? _S("tracking") : held ? _S("holding last pose") : _S("seeking");
 		ImVec4 dot = live ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : held ? ImVec4{0.9f, 0.7f, 0.2f, 1.0f} : ImVec4{0.9f, 0.25f, 0.2f, 1.0f};
 		ImGui::TextColored(dot, "%s", live ? "[o]" : held ? "[~]" : "[x]");
 		ImGui::SameLine();
@@ -376,7 +375,7 @@ void scenes::stream::gui_fiducial_status()
 			ImGui::Text("%s %.40s: %s (%.0fs ago), %zu marker(s)%s",
 			            _S("Fiducial"),
 			            label.c_str(),
-			            state,
+			            _S("holding last pose"),
 			            (double)held_age / 1e9,
 			            f.markers.size(),
 			            f.is_static ? "" : " (moving)");
@@ -384,7 +383,7 @@ void scenes::stream::gui_fiducial_status()
 			ImGui::Text("%s %.40s: %s, %zu marker(s)%s",
 			            _S("Fiducial"),
 			            label.c_str(),
-			            state,
+			            live ? _S("tracking") : _S("seeking"),
 			            f.markers.size(),
 			            f.is_static ? "" : " (moving)");
 	}
