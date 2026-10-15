@@ -249,6 +249,13 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 // downstream (hold-last) and the warm reference never advances to
 // garbage. Release on resolve / K>=2 consensus / teleport-silence.
 // First sighting (no reference) always accepts: unknowable without history.
+bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
+{
+	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
+		return it->second;
+	return ost.def.surface_projected;
+}
+
 bool scenes::stream::guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
                                       const std::optional<XrPosef> & warm, XrTime now, double & dt_out)
 {
@@ -870,13 +877,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	}
 }
 
-bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
-{
-	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
-		return it->second;
-	return ost.def.surface_projected;
-}
-
 void scenes::stream::gui_passthrough()
 {
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR marker tracking and alignment."));
@@ -897,6 +897,35 @@ void scenes::stream::gui_passthrough()
 	if (ImGui::SliderInt(_S("Marker window cutout"), &debug_window_mm, -1, 512, debug_window_mm < 0 ? "Disabled" : "%d mm"))
 		debug_window_mm = std::clamp(debug_window_mm, -1, 512);
 	ImGui::EndDisabled();
+
+	ImGui::SeparatorText(_S("Surface-projected mapping"));
+	if (not composition_layer_alpha_blend_supported)
+		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));
+	for (auto & [oid, ost]: passthrough_objects)
+	{
+		if (ost.def.type != "3d-passthrough")
+			continue;
+		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
+		// Three-way state, cycled per click: as configured (no override
+		// stored) -> force on -> force off -> as configured ...
+		auto oit = projected_overrides.find(oid);
+		std::string mode = (oit == projected_overrides.end())
+		        ? (ost.def.surface_projected ? _S("As configured (on)") : _S("As configured (off)"))
+		        : (oit->second ? _S("Forced on") : _S("Forced off"));
+		std::string title = label + ": " + mode + "##projected_" + oid;
+		if (ImGui::Button(title.c_str()))
+		{
+			if (oit == projected_overrides.end())
+				projected_overrides[oid] = true;
+			else if (oit->second)
+				oit->second = false;
+			else
+				projected_overrides.erase(oit);
+			auto nit = projected_overrides.find(oid);
+			spdlog::info("Projected override \"{}\" {}", oid,
+			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
+		}
+	}
 }
 
 void scenes::stream::gui_fiducial_status()
@@ -1049,6 +1078,32 @@ void scenes::stream::gui_fiducial_status()
 			else
 				ImGui::Text("%.32s: %s", m.marker_data.substr(0, 32).c_str(), _S("unseen"));
 		}
+	}
+	for (const auto & [oid, ost]: passthrough_objects)
+	{
+		(void)oid;
+		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
+		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed")
+		{
+			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
+			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
+			continue;
+		}
+		bool reversed = ost.def.type == "3d-passthrough-reversed";
+		if (not ost.soup_ready)
+		{
+			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
+			continue;
+		}
+		if (not ost.fused.placed)
+		{
+			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), _S("seeking"));
+			continue;
+		}
+		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
+		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
+		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

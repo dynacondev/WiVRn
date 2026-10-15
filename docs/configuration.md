@@ -256,3 +256,47 @@ to copy verbatim into the config).
 > does not create two trackables. The runtime reports one jumping track
 > for identical prints. For multi-location coverage, print distinct
 > payloads and configure one fiducial per location.
+
+## `passthrough`
+Default value: unset (no objects)
+
+Behavior objects placed from solved fiducial frames. Each entry
+references fiducials by id and places one instance per visible
+pairing (never fused); objects persist once placed and follow every
+frame, live or held.
+
+Each `passthrough` entry has:
+
+- `type`: behavior type (required). `"3d-passthrough"` renders the
+  model as a surface-projected passthrough cutout; unknown types are
+  skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
+  the model from every mask layer instead (game video shows through
+  the silhouette, depth-tested against the windows covering each
+  pixel).
+- `id`: stable identifier (required, must be unique); `tag`:
+  display-only label (optional)
+- `fiducial`: referenced fiducial id, or list of ids (required;
+  dangling references are dropped with a warning, and an object left
+  with none is skipped)
+- `model-path`: path to a `.glb`/`.gltf` file on the server (optional,
+  models larger than 64MB are skipped). May be a host absolute path:
+  under flatpak the server reads it from outside the sandbox. Served
+  to the headset on demand and cached by content hash.
+- `position`: `[x, y, z]` fiducial-to-object offset in meters
+  (default `[0,0,0]`)
+- `orientation`: `[rx, ry, rz]` fiducial-to-object rotation in degrees
+  (default `[0,0,0]`, same fixed-frame convention as markers)
+- `scale`: uniform object scale, number or single-element array
+  (default `1`, applied last)
+- `feather-px`: passthrough window feather width in screen pixels
+  (default `24`; `0` disables feathering). Mask stacks group by this
+  value so each object feathers independently; applied live. Not
+  accepted for `3d-passthrough-reversed` (warned + ignored).
+- `surface-projected`: the headset projects camera imagery onto this
+  object's mesh instead of the flat reconstruction feed (default
+  `true`; opt out per object with `false`, plus a live in-headset
+  override in the Passthrough tab). Ignored for
+  `3d-passthrough-reversed` (warned).
+
+Poses compose as
+`objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

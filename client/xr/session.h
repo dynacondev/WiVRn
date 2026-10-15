@@ -134,6 +134,25 @@ public:
 	// Callers must submit it after the video projection layer (overlay).
 	XrCompositionLayerBaseHeader * projected_passthrough_layer();
 
+	// Per-object geometry instances on the projected layer (mask-path
+	// surface projection). All helpers no-op when the runtime lacks
+	// support.
+	void set_projected_instance_mesh(const std::string & key,
+	                                 std::span<const XrVector3f> vertices,
+	                                 std::span<const uint32_t> indices,
+	                                 XrSpace base_space,
+	                                 const XrPosef & pose,
+	                                 const XrVector3f & scale);
+	void remove_projected_instance(const std::string & key);
+	void clear_projected_instances();
+	bool has_projected_instance(const std::string & key);
+	bool has_projected_instances();
+	void update_projected_instance_transform(const std::string & key,
+	                                         XrSpace base_space,
+	                                         XrTime time,
+	                                         const XrPosef & pose,
+	                                         const XrVector3f & scale);
+
 	void set_performance_level(XrPerfSettingsDomainEXT, XrPerfSettingsLevelEXT);
 
 	bool boundary_visibility_supported() const

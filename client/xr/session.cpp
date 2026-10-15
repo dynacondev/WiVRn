@@ -426,7 +426,7 @@ XrCompositionLayerBaseHeader * xr::session::projected_passthrough_layer()
 {
 	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
 	{
-		if (fb->has_projected_mesh())
+		if (fb->has_projected_mesh() or fb->has_projected_instances())
 			return fb->projected_layer_header();
 	}
 	return nullptr;
@@ -472,4 +472,51 @@ void xr::session::set_performance_level(XrPerfSettingsDomainEXT domain, XrPerfSe
 {
 	if (xrPerfSettingsSetPerformanceLevelEXT)
 		xrPerfSettingsSetPerformanceLevelEXT(*this, domain, level);
+}
+
+void xr::session::set_projected_instance_mesh(const std::string & key,
+                                              std::span<const XrVector3f> vertices,
+                                              std::span<const uint32_t> indices,
+                                              XrSpace base_space,
+                                              const XrPosef & pose,
+                                              const XrVector3f & scale)
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->set_projected_instance_mesh(key, vertices, indices, base_space, pose, scale);
+}
+
+void xr::session::remove_projected_instance(const std::string & key)
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->remove_projected_instance(key);
+}
+
+void xr::session::clear_projected_instances()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->clear_projected_instances();
+}
+
+bool xr::session::has_projected_instance(const std::string & key)
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		return fb->has_projected_instance(key);
+	return false;
+}
+
+bool xr::session::has_projected_instances()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		return fb->has_projected_instances();
+	return false;
+}
+
+void xr::session::update_projected_instance_transform(const std::string & key,
+                                                      XrSpace base_space,
+                                                      XrTime time,
+                                                      const XrPosef & pose,
+                                                      const XrVector3f & scale)
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->update_projected_instance_transform(key, base_space, time, pose, scale);
 }

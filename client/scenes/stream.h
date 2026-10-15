@@ -473,27 +473,45 @@ private:
 
 	// Mask stacks grouped by (feather-px, union): union A holds the
 	// surface-projected content (drives the projected layer), union B
-	// the rest (drives the flat layer). This branch has no window
-	// groups yet (no objects, no blur): the only group is the local
-	// debug one (union B, QR cutout windows). The single dst-alpha
+	// the rest (drives the flat layer). The single dst-alpha
 	// channel carries one union at a time: A is consumed by projected,
 	// then B REPLACEs the alpha (color preserved) and is consumed by
 	// flat, so flat wins overlaps. Render thread only.
 	struct mask_group
 	{
+		float feather_px = 24;
+		// True = union A (projected), false = union B (flat).
+		bool projected = false;
 		std::unique_ptr<feather_mask_renderer> renderer;
 		// Dedicated member swapchain (explicit acquire/release pairing,
 		// never the shared pool).
 		xr::swapchain swapchain;
 		bool acquired = false;
 		bool wait_warned = false; // image-wait timeout already reported
-		XrExtent2Di extent{0, 0};
+		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
 		bool active = false; // submitting this frame
+		bool had_draws = false; // draws present last frame (edge forensics)
+		XrTime last_draws_log = 0; // throttle for the edge log below
+		// Uploaded object soups by object id (hash compare avoids
+		// re-upload; renderer mirrors).
+		std::map<std::string, std::string> mesh_hashes;
 	};
+	// Mask stacks grouped by (feather-px, union): union A holds the
+	// surface-projected objects (drives the projected layer), union B
+	// the rest (drives the flat layer). Same feather value with mixed
+	// flags is two groups (two swapchains/blur stacks). The single
+	// dst-alpha channel carries one union at a time: A is consumed by
+	// projected, then B REPLACEs the alpha (color preserved) and is
+	// consumed by flat, so flat wins overlaps. Render thread only.
+	// Exact float equality groups identical parsed values; the bool
+	// splits projected (A) from flat (B). Iteration order is
+	// feather-ascending within each union; submit does one pass per
+	// union (A then B).
 	std::map<std::pair<float, bool>, mask_group> mask_groups;
 	// Local debug cutout group (union B): QR windows punched at full
 	// alpha. Standalone member, not in the map: debug never keys off
-	// server feather values.
+	// server feather values. Claimed only while cutouts exist and no B
+	// group does (real B groups punch cutouts themselves).
 	mask_group debug_group;
 	// Set when the record phase built marker-window cutouts this frame
 	// (they punch camera with no geometry to map it onto, so the flat
@@ -546,6 +564,7 @@ private:
 	void request_spatial_permissions();
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
 	void update_fiducial_passthrough(XrTime predicted_display_time);
+	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
 	bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
 	                   const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
 	void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,
