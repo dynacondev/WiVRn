@@ -24,6 +24,8 @@
 #include "audio/audio.h"
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
+#include "render/debug_lines.h"
+#include "render/feather_mask.h"
 #include "render/imgui_impl.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
@@ -245,6 +247,7 @@ private:
 		std::string fiducial_id;
 		std::string payload;
 		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}};
+		XrExtent2Df extents{0, 0}; // measured tag bounds (gizmo boxes, cutout windows)
 		float tag_size_m = 0;
 		std::array<float, 3> offset_pos{0, 0, 0}; // marker->board offset
 		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw
@@ -421,6 +424,63 @@ private:
 	float compact_bandwidth_tx = 0;
 	float compact_cpu_time = 0;
 	float compact_gpu_time = 0;
+
+	// Mask stacks grouped by (feather-px, union): union A holds the
+	// surface-projected content (drives the projected layer), union B
+	// the rest (drives the flat layer). This branch has no window
+	// groups yet (no objects, no blur): the only group is the local
+	// debug one (union B, QR cutout windows). The single dst-alpha
+	// channel carries one union at a time: A is consumed by projected,
+	// then B REPLACEs the alpha (color preserved) and is consumed by
+	// flat, so flat wins overlaps. Render thread only.
+	struct mask_group
+	{
+		std::unique_ptr<feather_mask_renderer> renderer;
+		// Dedicated member swapchain (explicit acquire/release pairing,
+		// never the shared pool).
+		xr::swapchain swapchain;
+		bool acquired = false;
+		bool wait_warned = false; // image-wait timeout already reported
+		XrExtent2Di extent{0, 0};
+		bool active = false; // submitting this frame
+	};
+	std::map<std::pair<float, bool>, mask_group> mask_groups;
+	// Local debug cutout group (union B): QR windows punched at full
+	// alpha. Standalone member, not in the map: debug never keys off
+	// server feather values.
+	mask_group debug_group;
+	// Set when the record phase built marker-window cutouts this frame
+	// (they punch camera with no geometry to map it onto, so the flat
+	// feed must stay submitted). Read by the submit phase below.
+	bool cutouts_punched = false;
+
+	// QR debug gizmos (Passthrough tab, session-scoped, render thread
+	// only). Raw sighting poses while visible with a 3s stale fade;
+	// the orange set re-projects fused poses with authored offsets.
+	bool debug_overlays = false; // master toggle
+	bool debug_matched = true;   // green: configured payload
+	bool debug_unmatched = true; // red: anything else sighted
+	bool debug_axes = true;      // RGB XYZ tripod on sighted tags
+	bool debug_corrected = true; // orange: fused-corrected tag boxes
+	bool debug_origin = true;    // larger tripod + center square at board origins
+	bool debug_smoothed = true;  // twin tripod (smaller, cyan square) at the smoothed pose
+	float debug_opacity = 0.5f;  // overlay alpha, 0..1
+	// Marker window cutout, mm past the marker edge punched through
+	// the flat union's mask (-1 = disabled). Gated on the master toggle.
+	int debug_window_mm = 50;
+	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
+	std::unique_ptr<debug_lines_renderer> gizmo_lines;
+
+	// Stale-hold multiplier for debug visuals: full presence on fresh
+	// data, smooth 3s fade-out on hold. Returns 0 (gone) .. 1 (fresh).
+	static constexpr double kStaleFadeS = 3.0;
+	static float stale_hold(XrTime now, XrTime last_seen)
+	{
+		if (last_seen == 0)
+			return 0;
+		double t = std::clamp((now - last_seen) * 1e-9 / kStaleFadeS, 0.0, 1.0);
+		return (float)(1.0 - t * t * (3 - 2 * t));
+	}
 
 	void accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> & blit_handles, const gpu_timestamps & timestamps);
 	void gui_performance_metrics();

@@ -238,6 +238,14 @@ residuals, range/incidence/settle inputs and the filter state for each
 fiducial, and the server log carries the same detail (`board solve:`,
 `board tags:`, `board pop:`, `board flip:` lines).
 
+The Passthrough tab also hosts the QR debug overlays (off by default):
+green boxes on configured codes, red on anything else sighted, RGB axes
+tripods, orange fused-corrected boxes, and board origin/smoothed
+tripods, all with a 3s stale fade. `Marker window cutout` punches a live
+passthrough window at every sighted code through the flat mask (works
+with no map: enable overlays and every code in view reports red, ready
+to copy verbatim into the config).
+
 > [!NOTE]
 > A QR payload is a single identity: printing the *same* payload twice
 > does not create two trackables. The runtime reports one jumping track

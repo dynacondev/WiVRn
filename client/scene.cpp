@@ -90,6 +90,8 @@ scene::scene(key, const meta & current_meta, std::span<const vk::Format> support
 
 	composition_layer_color_scale_bias_supported = instance.has_extension(XR_KHR_COMPOSITION_LAYER_COLOR_SCALE_BIAS_EXTENSION_NAME);
 
+	composition_layer_alpha_blend_supported = instance.has_extension(XR_FB_COMPOSITION_LAYER_ALPHA_BLEND_EXTENSION_NAME);
+
 	if (parent_scene)
 	{
 		renderer = parent_scene->renderer;
@@ -308,20 +310,43 @@ void scene::render_start(bool passthrough, XrTime predicted_display_time_)
 
 	if (passthrough)
 	{
-		std::visit(
-		        utils::overloaded{
-		                [&](std::monostate &) {
-			                assert(false);
-		                },
-		                [&](xr::passthrough_alpha_blend & p) {
-			                blend_mode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
-		                },
-		                [&](auto & p) {
-			                layers.push_back(layer{
-			                        .composition_layer = p.layer(),
-			                });
-		                }},
-		        session.get_passthrough());
+		add_passthrough_layer();
+	}
+}
+
+void scene::add_passthrough_layer()
+{
+	// The session owns its layer struct across frames, but our chained
+	// structs (alpha blend, settings) are per-frame: reset its chain head
+	// first so a stale pointer can never survive into the next submit.
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&session.get_passthrough()))
+		fb->reset_chain();
+	std::visit(
+	        utils::overloaded{
+	                [&](std::monostate &) {
+		                assert(false);
+	                },
+	                [&](xr::passthrough_alpha_blend & p) {
+		                blend_mode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;
+	                },
+	                [&](auto & p) {
+		                layers.push_back(layer{
+		                        .composition_layer = p.layer(),
+		                });
+	                }},
+	        session.get_passthrough());
+}
+
+void scene::add_projected_passthrough_layer()
+{
+	// Session-owned struct, per-frame chains (see add_passthrough_layer):
+	// reset first so a stale alpha-blend pointer can never survive.
+	session.reset_projected_chain();
+	if (XrCompositionLayerBaseHeader * projected = session.projected_passthrough_layer())
+	{
+		layers.push_back(layer{
+		        .composition_layer = projected,
+		});
 	}
 }
 
@@ -396,6 +421,19 @@ void scene::set_layer_settings(XrCompositionLayerSettingsFlagsFB flags)
 	};
 }
 
+void scene::set_alpha_blend(XrBlendFactorFB src_color, XrBlendFactorFB dst_color, XrBlendFactorFB src_alpha, XrBlendFactorFB dst_alpha)
+{
+	assert(composition_layer_alpha_blend_supported);
+	assert(not layers.empty());
+	layers.back().alpha_blend = XrCompositionLayerAlphaBlendFB{
+	        .type = XR_TYPE_COMPOSITION_LAYER_ALPHA_BLEND_FB,
+	        .srcFactorColor = src_color,
+	        .dstFactorColor = dst_color,
+	        .srcFactorAlpha = src_alpha,
+	        .dstFactorAlpha = dst_alpha,
+	};
+}
+
 void scene::render_end()
 {
 	// Fixup all pointers
@@ -437,6 +475,12 @@ void scene::render_end()
 			i.settings->type = XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB;
 			i.settings->next = base->next;
 			base->next = &*i.settings;
+		}
+
+		if (i.alpha_blend)
+		{
+			i.alpha_blend->next = const_cast<void *>(base->next);
+			base->next = &*i.alpha_blend;
 		}
 
 		openxr_layers.push_back(base);

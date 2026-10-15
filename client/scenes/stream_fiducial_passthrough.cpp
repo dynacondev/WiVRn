@@ -121,6 +121,11 @@ std::string group_key_for(float size_m, bool is_static)
 }
 } // namespace
 
+// No-config discovery vehicle payload: a sentinel no real QR payload will
+// equal (leading control char), so every sighting through the vehicle
+// reports unmatched (red). Never inserted into the map union.
+const std::string kDiscoveryVehiclePayload = "\x01__wivrn_discovery__";
+
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
 {
 	// Group (size, static) -> {size, static}: one shared spatial context
@@ -143,6 +148,16 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 		key += gk;
 		key += ';';
 	}
+	// No-config discovery vehicle: with an empty map there is nothing to
+	// match against, yet the debug gizmos/cutouts report raw sightings
+	// (all unmatched/red) whenever the debug toggle is on. One discovering
+	// context suffices: every tracker already reports all codes in view,
+	// and with configured trackers present this is redundant, so the
+	// vehicle exists only while the union is empty. Folded into the
+	// fingerprint so toggle/map transitions re-sync deterministically.
+	bool want_vehicle = groups.empty() and debug_overlays;
+	if (want_vehicle)
+		key += "V;";
 
 	if (key != last_tracker_key)
 	{
@@ -181,6 +196,18 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 		std::string tag = "group " + gk;
 		it->second.configure(size, "", tag, is_static);
 	}
+	if (want_vehicle)
+	{
+		// Discovery vehicle only (see above): size unspecified so no
+		// fixed-size hint is chained (the runtime measures codes itself),
+		// not static so no static-marker assumption either. The sentinel
+		// never matches: every sighting stays unmatched (red), and the
+		// resolver below finds no fiducials, so no fusion engages.
+		auto [it, _] = fiducial_trackers.try_emplace(kDiscoveryVehiclePayload, instance, session, system);
+		it->second.configure(0.f, kDiscoveryVehiclePayload, "discovery", false);
+	}
+	else
+		fiducial_trackers.erase(kDiscoveryVehiclePayload);
 }
 
 // K==1 jump guard: the passthrough path is residual-blind (a lone
@@ -499,6 +526,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				v.fiducial_id = f.id;
 				v.payload = s.payload;
 				v.observed = s.pose;
+				v.extents = s.extents;
 				v.tag_size_m = m.marker_size_m;
 				v.offset_pos = m.position;
 				v.offset_quat = m.orientation;
@@ -668,6 +696,22 @@ void scenes::stream::gui_passthrough()
 {
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR marker tracking and alignment."));
 	gui_fiducial_status();
+
+	ImGui::SeparatorText(_S("Fiducial marker debugging"));
+	ImGui::Checkbox(_S("Marker debug overlays"), &debug_overlays);
+	ImGui::BeginDisabled(not debug_overlays);
+	ImGui::Checkbox(_S("Matched markers (green)"), &debug_matched);
+	ImGui::Checkbox(_S("Unmatched codes (red)"), &debug_unmatched);
+	ImGui::Checkbox(_S("Corrected tags (orange)"), &debug_corrected);
+	ImGui::Checkbox(_S("Axes gizmo (RGB=XYZ)"), &debug_axes);
+	ImGui::Checkbox(_S("Origin tripod (offset boards)"), &debug_origin);
+	ImGui::Checkbox(_S("Smoothed tripod (cyan, filtered pose)"), &debug_smoothed);
+	float pct = debug_opacity * 100;
+	if (ImGui::SliderFloat(_S("Debug overlay opacity"), &pct, 0, 100, "%.0f%%"))
+		debug_opacity = std::clamp(pct / 100, 0.f, 1.f);
+	if (ImGui::SliderInt(_S("Marker window cutout"), &debug_window_mm, -1, 512, debug_window_mm < 0 ? "Disabled" : "%d mm"))
+		debug_window_mm = std::clamp(debug_window_mm, -1, 512);
+	ImGui::EndDisabled();
 }
 
 void scenes::stream::gui_fiducial_status()
@@ -677,6 +721,10 @@ void scenes::stream::gui_fiducial_status()
 	if (map->fiducials.empty())
 	{
 		ImGui::Text("%s", _S("No fiducial map from server"));
+	}
+	if (fiducial_trackers.contains(kDiscoveryVehiclePayload))
+	{
+		ImGui::Text("%s", _S("Discovering QR codes (no map: all codes unmatched)"));
 	}
 	for (const auto & f: map->fiducials)
 	{
@@ -825,7 +873,7 @@ void scenes::stream::gui_fiducial_status()
 		// extensions. On Quest that means the manifest permissions (fixed) and
 		// the USE_SCENE runtime grant; extensions enumerate at instance
 		// creation, so a late grant needs an app restart to take effect.
-		if (not scene_permission_granted and not map->fiducials.empty())
+		if (not scene_permission_granted and (not map->fiducials.empty() or debug_overlays))
 			ImGui::Text("%s", _S("On Quest, grant the Scene permission, then restart the app"));
 #endif
 	}

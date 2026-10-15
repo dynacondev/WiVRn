@@ -1147,6 +1147,285 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 #endif
 
+		// Marker tracking runs every frame: solved frames feed the
+		// record phase below (cutouts, gizmos) and the status UI.
+		update_fiducial_passthrough(frame_state.predictedDisplayTime);
+
+		// View-only transforms, shared by the mask record and the debug
+		// gizmos below.
+		std::array<glm::mat4, view_count> world_mvp;
+		for (uint32_t view = 0; view < view_count; ++view)
+			world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+
+		// QR debug gizmos: tag boxes (green = configured, red = other),
+		// axes tripods, orange fused-corrected boxes, board origin +
+		// smoothed tripods. One transparent projection layer, staged
+		// here and submitted after the camera layers below.
+		int dbg_image = -1;
+		if (debug_overlays)
+		{
+			if (not gizmo_lines)
+				gizmo_lines = std::make_unique<debug_lines_renderer>(device);
+			using vtx = debug_lines_renderer::vertex;
+			std::vector<vtx> tris;
+			tris.reserve(512);
+			XrTime dbg_now = instance.now();
+			auto tri = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c, float r, float g, float bl, float al) {
+				tris.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
+				tris.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
+				tris.push_back({{c.x, c.y, c.z}, {r, g, bl, al}});
+			};
+			// Filled quad (double-sided: cull is off, so no facing math).
+			auto box_fill = [&](glm::vec3 c, glm::vec3 r, glm::vec3 u, float hw, float hh, float cr, float cg, float cb, float ca) {
+				glm::vec3 v0 = c - r * hw - u * hh, v1 = c + r * hw - u * hh;
+				glm::vec3 v2 = c + r * hw + u * hh, v3 = c - r * hw + u * hh;
+				tri(v0, v1, v2, cr, cg, cb, ca);
+				tri(v0, v2, v3, cr, cg, cb, ca);
+			};
+			// Shaft from o along dir, width across wdir (flat quad, 2 tris).
+			auto shaft = [&](glm::vec3 o, glm::vec3 dir, glm::vec3 wdir, float len, float wdt, float cr, float cg, float cb, float ca) {
+				glm::vec3 e = o + dir * len, s = wdir * (wdt * 0.5f);
+				tri(o - s, o + s, e + s, cr, cg, cb, ca);
+				tri(o - s, e + s, e - s, cr, cg, cb, ca);
+			};
+			auto tripod = [&](glm::vec3 o, glm::vec3 x, glm::vec3 y, glm::vec3 z, float len, float wdt, float a) {
+				shaft(o, x, y, len, wdt, 1.f, 0.f, 0.f, a);
+				shaft(o, y, x, len, wdt, 0.f, 1.f, 0.f, a);
+				shaft(o, z, x, len, wdt, 0.f, 0.f, 1.f, a);
+			};
+			auto tag_frame = [&](const XrPosef & p, glm::vec3 & o, glm::vec3 & x, glm::vec3 & y, glm::vec3 & z) {
+				glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+				o = glm::vec3(p.position.x, p.position.y, p.position.z);
+				x = q * glm::vec3(1, 0, 0);
+				y = q * glm::vec3(0, 1, 0);
+				z = q * glm::vec3(0, 0, 1);
+			};
+			// Configured payloads, for green vs red.
+			auto is_configured = [&](const std::string & payload) {
+				for (const auto & f: fiducial_map.lock()->fiducials)
+				{
+					for (const auto & m: f.markers)
+					{
+						if (m.marker_data == payload)
+							return true;
+					}
+				}
+				return false;
+			};
+			// Raw sightings from every tracker (group trackers plus the
+			// no-config discovery vehicle): matched state comes from the
+			// map, not the trackers.
+			for (auto & [tkey, tr]: fiducial_trackers)
+			{
+				(void)tkey;
+				for (const auto & s: tr.sightings())
+				{
+					bool matched = is_configured(s.payload);
+					if (matched and not debug_matched)
+						continue;
+					if (not matched and not debug_unmatched)
+						continue;
+					if (s.extents.width <= 0 or s.extents.height <= 0)
+						continue;
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, s.time);
+					if (a <= 0.01f)
+						continue;
+					glm::vec3 c, x, y, z;
+					tag_frame(s.pose, c, x, y, z);
+					box_fill(c, x, y, s.extents.width * 0.5f, s.extents.height * 0.5f, matched ? 0.f : 1.f, matched ? 1.f : 0.f, 0.f, a);
+					++dbg_boxes;
+					if (debug_axes and s.extents.width > 0)
+						tripod(c, x, y, z, s.extents.width, s.extents.width * 0.08f, a);
+				}
+			}
+			if (debug_corrected)
+			{
+				// Orange fused-corrected boxes: each configured marker
+				// re-projected from its fiducial's smoothed pose with the
+				// authored offset (the inverse of the vote path). Green
+				// raw vs orange corrected shows disagreement at a glance.
+				for (const auto & f: fiducial_map.lock()->fiducials)
+				{
+					auto bpit = board_poses.find(f.id);
+					if (bpit == board_poses.end() or not bpit->second.live)
+						continue;
+					for (const auto & m: f.markers)
+					{
+						if (m.marker_size_m <= 0)
+							continue;
+						float a = std::clamp(debug_opacity, 0.f, 1.f) *
+						          stale_hold(dbg_now, bpit->second.time);
+						if (a <= 0.01f)
+							continue;
+						glm::quat bq(bpit->second.pose.orientation.w, bpit->second.pose.orientation.x, bpit->second.pose.orientation.y, bpit->second.pose.orientation.z);
+						glm::vec3 bp_(bpit->second.pose.position.x, bpit->second.pose.position.y, bpit->second.pose.position.z);
+						glm::quat oq(m.orientation[3], m.orientation[0], m.orientation[1], m.orientation[2]);
+						glm::vec3 op(m.position[0], m.position[1], m.position[2]);
+						// Smoothed board pose * authored offset, inverted
+						// back to tag frame: tag = board * offset^-1.
+						glm::quat iq = glm::conjugate(oq);
+						glm::vec3 c = bp_ + bq * (iq * -op);
+						glm::quat tq = bq * iq;
+						glm::vec3 x = tq * glm::vec3(1, 0, 0);
+						glm::vec3 y = tq * glm::vec3(0, 1, 0);
+						glm::vec3 z = tq * glm::vec3(0, 0, 1);
+						box_fill(c, x, y, m.marker_size_m * 0.5f, m.marker_size_m * 0.5f, 1.f, 0.55f, 0.f, a);
+						++dbg_boxes;
+					}
+				}
+			}
+			if (debug_origin or debug_smoothed)
+			{
+				for (const auto & [fid, bp]: board_poses)
+				{
+					(void)fid;
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, bp.time);
+					if (a <= 0.01f)
+						continue;
+					// Board origin: use the largest configured tag as the
+					// scale reference (offsets are meaningless without one).
+					float ref_size = 0;
+					for (const auto & f: fiducial_map.lock()->fiducials)
+					{
+						if (f.id != fid)
+							continue;
+						for (const auto & m: f.markers)
+							ref_size = std::max(ref_size, m.marker_size_m);
+					}
+					if (ref_size <= 0)
+						continue;
+					if (debug_origin)
+					{
+						// Fused origin tripod + white square (offset check).
+						glm::vec3 o, x, y, z;
+						tag_frame(bp.pose, o, x, y, z);
+						float len = ref_size * 1.5f;
+						tripod(o, x, y, z, len, len * 0.05f, a);
+						float d = len * 0.25f;
+						box_fill(o, x, y, d, d, 1.f, 1.f, 1.f, a);
+						++dbg_boxes;
+					}
+					if (debug_smoothed)
+					{
+						// Smoothed twin (smaller, cyan square).
+						glm::vec3 o, x, y, z;
+						tag_frame(bp.pose, o, x, y, z);
+						float len = ref_size * 1.0f;
+						tripod(o, x, y, z, len, len * 0.06f, a);
+						float d = len * 0.25f;
+						box_fill(o, x, y, d, d, 0.f, 1.f, 1.f, a);
+						++dbg_boxes;
+					}
+				}
+			}
+			dbg_tris = tris.size() / 3;
+			// Own swapchain: acquire once when gizmos will record. Skip
+			// the frame on timeout (paired release inside, like masks).
+			if (not tris.empty())
+			{
+				gizmo_lines->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+				dbg_image = gizmo_lines->acquire();
+			}
+			if (dbg_image >= 0 and not tris.empty())
+			{
+				std::array<vk::Extent2D, 2> eye_ext;
+				std::array<glm::mat4, 2> eye_mvp;
+				for (uint32_t view = 0; view < view_count; ++view)
+				{
+					eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+					eye_mvp[view] = world_mvp[view];
+				}
+				gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
+			}
+		}
+
+		// Debug mask record: the local debug group (union B) carries the
+		// marker-window cutouts. No silhouette raster yet (no objects):
+		// clear + hard cutout punch at full alpha.
+		cutouts_punched = false;
+		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
+		if (mask_frame)
+		{
+			int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
+			int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
+			// Marker window cutouts: raw pose of every live vote,
+			// expanded by the debug window. Fully manual path (no blur):
+			// the punch below is hard-edged by construction.
+			std::vector<std::array<glm::vec3, 6>> cutouts;
+			if (debug_overlays and debug_window_mm >= 0)
+			{
+				for (const auto & v: fiducial_votes)
+				{
+					if (v.extents.width <= 0 or v.extents.height <= 0)
+						continue;
+					glm::quat mq(v.observed.orientation.w, v.observed.orientation.x, v.observed.orientation.y, v.observed.orientation.z);
+					glm::vec3 c(v.observed.position.x, v.observed.position.y, v.observed.position.z);
+					glm::vec3 r = mq * glm::vec3(1, 0, 0);
+					glm::vec3 u = mq * glm::vec3(0, 1, 0);
+					float hw = v.extents.width * 0.5f + debug_window_mm / 1000.f;
+					float hh = v.extents.height * 0.5f + debug_window_mm / 1000.f;
+					glm::vec3 v0 = c - r * hw - u * hh;
+					glm::vec3 v1 = c + r * hw - u * hh;
+					glm::vec3 v2 = c + r * hw + u * hh;
+					glm::vec3 v3 = c - r * hw + u * hh;
+					cutouts.push_back({v0, v1, v2, v0, v2, v3});
+				}
+			}
+			// Fresh cutouts punch camera with no geometry to map it
+			// onto: the flat feed must stay submitted (see submit).
+			cutouts_punched = not cutouts.empty();
+			if (cutouts_punched)
+			{
+				auto & g = debug_group;
+				if (not g.renderer)
+					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+				// (Re)create the member swapchain when the extent moves.
+				if (g.extent.width != mw or g.extent.height != mh)
+				{
+					g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
+					g.extent = {(int32_t)mw, (int32_t)mh};
+					g.renderer->reset_targets();
+				}
+				int mask_index = g.swapchain.acquire();
+				if (not g.swapchain.wait(100'000'000))
+				{
+					// Never park forever: release the untouched
+					// acquisition to keep pairing, skip this frame.
+					g.swapchain.release();
+					g.active = false;
+					cutouts_punched = false;
+					if (not g.wait_warned)
+					{
+						g.wait_warned = true;
+						spdlog::warn("Debug mask image wait timed out, skipping frame");
+					}
+				}
+				else
+				{
+					g.wait_warned = false;
+					g.acquired = true;
+					g.active = true;
+					try
+					{
+						vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
+						g.renderer->record(command_buffer, g.swapchain.image(mask_index), mex, cutouts, world_mvp);
+					}
+					catch (std::exception & e)
+					{
+						// Release the acquisition, otherwise the image
+						// stays outstanding and the pairing breaks.
+						spdlog::warn("Debug mask record failed: {}", e.what());
+						g.swapchain.release();
+						g.acquired = false;
+						g.active = false;
+						cutouts_punched = false;
+					}
+				}
+			}
+			else
+				debug_group.active = false;
+		}
+
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
 		command_buffer.end();
@@ -1180,13 +1459,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		renderdoc_end(*vk_instance);
 #endif
 		swapchain.release();
+		// Paired with the debug-group acquire above: the compositor
+		// takes the last released image, so release right after submit
+		// and reference the swapchain in the layer below.
+		if (debug_group.acquired)
+		{
+			debug_group.acquired = false;
+			debug_group.swapchain.release();
+		}
 
-		if (use_alpha)
+		bool have_fiducial_map = false;
+		{
+			auto map = fiducial_map.lock();
+			have_fiducial_map = not map->fiducials.empty();
+		}
+		// The debug window cutout needs a live passthrough to reveal,
+		// map or not (it punches every live vote).
+		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
+		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
 
-		render_start(use_alpha, frame_state.predictedDisplayTime);
+		// Mask path owns the display when the alpha-blend extension is
+		// present (stereo only, like the mask targets): video, then one
+		// union pass each (A projected, B flat), then debug/GUI. Without
+		// it, previous behavior is untouched (flat auto-submit).
+		render_start(mask_frame ? false : use_alpha, frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
 		std::array<XrCompositionLayerProjectionView, view_count> layer_view;
@@ -1209,15 +1508,186 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			        };
 		}
 		add_projection_layer(
-		        use_alpha ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
+		        // Mask-blend mode drives the window from the feather mask;
+		        // server alpha (if any) is ignored so the two never double-cut.
+		        (use_alpha and not mask_frame) ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
 		        application::space(xr::spaces::world),
 		        layer_view);
 
-	// Marker tracking runs every frame: the solved frames feed the
-	// status UI and downstream passthrough consumers.
-	update_fiducial_passthrough(frame_state.predictedDisplayTime);
+		if (mask_frame)
+		{
+			// Split-union compositing: union A (projected content) drives
+			// the projected layer, union B (the rest) drives the flat
+			// layer, composited projected-below-flat so flat wins overlaps.
+			// Video (opaque) was already added above, then each union's
+			// masks, then the camera layers, then debug/GUI. The single
+			// dst-alpha channel carries one union at a time: the first mask
+			// of each union REPLACEs destination alpha (color preserved),
+			// the rest ADD (saturating union). B's REPLACE resets the alpha
+			// the projected layer consumed, so flat reads only B.
+			//
+			// EITHER/OR camera layers: co-submitting flat reconstruction and
+			// projected mapping breaks video compositing on current runtimes
+			// (video goes black; instantly reversible), so exactly one camera
+			// layer submits per frame.
+			//
+			// This branch has no window groups yet (no objects, no blur):
+			// union A is empty, union B holds only the debug cutout group.
+			// Debug cutouts punch union B only (no geometry to map onto),
+			// so the flat feed must stay submitted.
+			bool need_flat = cutouts_punched;
+			bool have_projected = session.has_projected_passthrough_mesh();
+			size_t a_active = 0, b_active = 0;
+			if (debug_group.active)
+				++b_active;
+			bool submit_projected = have_projected and a_active > 0;
+			bool submit_flat = need_flat and b_active > 0;
+			// Forensic submit decisions (change-triggered): which camera layer
+			// submits and why. Permanent: coexistence bugs read as wrong output
+			// with no error, so the decision itself must be in the log.
+			{
+				static bool last_submit_flat = true;
+				static bool last_submit_projected = false;
+				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected)
+				{
+					last_submit_flat = submit_flat;
+					last_submit_projected = submit_projected;
+					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={})",
+					             (submit_flat and submit_projected) ? "projected+flat"
+					             : submit_flat                      ? "flat"
+					             : submit_projected                 ? "projected"
+					                                                : "video-only",
+					             need_flat,
+					             have_projected,
+					             a_active,
+					             b_active,
+					             cutouts_punched);
+				}
+			}
+			// One mask submit pass per union (A then B): each union's first
+			// active group REPLACEs, the rest ADD.
+			for (bool proj_union: {true, false})
+			{
+				bool first_group = true;
+				// Union A: window groups with projected=true (none yet).
+				for (auto & [key, g]: mask_groups)
+				{
+					if (key.second != proj_union)
+						continue;
+					if (not g.active)
+						continue;
+					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+					for (uint32_t view = 0; view < view_count; ++view)
+					{
+						mask_views[view] = {
+						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+						        .pose = pose[view],
+						        .fov = fov[view],
+						        .subImage = {
+						                .swapchain = g.swapchain,
+						                .imageRect = {
+						                        .offset = {0, 0},
+						                        .extent = {g.extent.width, g.extent.height},
+						                },
+						                .imageArrayIndex = view,
+						        },
+						};
+					}
+					// imageIndex is implicit: the compositor uses the last
+					// released image, which record() acquired above.
+					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+					                     application::space(xr::spaces::world),
+					                     mask_views);
+					if (first_group)
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					else
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+					first_group = false;
+				}
+				// Union B also carries the local debug cutout group.
+				if (not proj_union and debug_group.active)
+				{
+					auto & g = debug_group;
+					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+					for (uint32_t view = 0; view < view_count; ++view)
+					{
+						mask_views[view] = {
+						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+						        .pose = pose[view],
+						        .fov = fov[view],
+						        .subImage = {
+						                .swapchain = g.swapchain,
+						                .imageRect = {
+						                        .offset = {0, 0},
+						                        .extent = {g.extent.width, g.extent.height},
+						                },
+						                .imageArrayIndex = view,
+						        },
+						};
+					}
+					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+					                     application::space(xr::spaces::world),
+					                     mask_views);
+					if (first_group)
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					else
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+				}
+				// Each union's camera layer consumes its own alpha: A feeds
+				// projected, then B REPLACEs the alpha and feeds flat, so
+				// flat wins overlaps.
+				if (proj_union)
+				{
+					if (submit_projected)
+					{
+						add_projected_passthrough_layer();
+						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					}
+				}
+				else
+				{
+					if (submit_flat)
+					{
+						add_passthrough_layer();
+						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					}
+				}
+			}
+		}
 
-	if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
+		// Debug gizmo layer: ONE transparent projection layer for all debug
+		// geometry (standard alpha blend: no FB extensions, works wherever
+		// the old quads did). Always exactly one layer: maxLayerCount can
+		// never overflow. Above passthrough (it annotates real-world tags),
+		// below the GUI.
+		if (dbg_image >= 0)
+		{
+			std::array<XrCompositionLayerProjectionView, view_count> dbg_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				dbg_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = pose[view],
+				        .fov = fov[view],
+				        .subImage = {
+				                .swapchain = gizmo_lines->swapchain(),
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = extents[view],
+				                },
+				                .imageArrayIndex = view,
+				        },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     dbg_views);
+			// Paired with the acquire in the record phase above: the
+			// compositor takes the last released image; release after submit.
+			gizmo_lines->release();
+		}
+
+		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)
 			set_layer_settings(openxr_post_processing.sharpening | openxr_post_processing.super_sampling);
 

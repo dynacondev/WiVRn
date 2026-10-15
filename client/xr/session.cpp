@@ -385,6 +385,53 @@ void xr::session::disable_passthrough()
 	passthrough.emplace<std::monostate>();
 }
 
+bool xr::session::projected_passthrough_supported()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		return fb->projected_mesh_supported();
+	return false;
+}
+
+void xr::session::set_projected_passthrough_mesh(
+        std::span<const XrVector3f> vertices,
+        std::span<const uint32_t> indices,
+        XrSpace base_space,
+        const XrPosef & pose,
+        const XrVector3f & scale)
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->set_projected_mesh(vertices, indices, base_space, pose, scale);
+}
+
+void xr::session::clear_projected_passthrough_mesh()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->clear_projected_mesh();
+}
+
+bool xr::session::has_projected_passthrough_mesh()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		return fb->has_projected_mesh();
+	return false;
+}
+
+void xr::session::update_projected_passthrough_transform(XrSpace base_space, XrTime time, const XrPosef & pose, const XrVector3f & scale)
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->update_projected_transform(base_space, time, pose, scale);
+}
+
+XrCompositionLayerBaseHeader * xr::session::projected_passthrough_layer()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+	{
+		if (fb->has_projected_mesh())
+			return fb->projected_layer_header();
+	}
+	return nullptr;
+}
+
 void xr::session::set_passthrough_boundary_enabled(bool enabled)
 {
 	passthrough_boundary_enabled = enabled;
