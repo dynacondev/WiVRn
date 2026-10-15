@@ -141,6 +141,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.fence_wait_ms = (float)(fence_wait_ms * 1e-3);
 	gm.submit_ms = (float)(submit_ms * 1e-3);
 	gm.gui_ms = (float)(gui_ms * 1e-3);
+	gm.mask_first_gpu_ms = last_gpu_timestamps.mask_first_gpu_time;
+	gm.mask_rest_gpu_ms = last_gpu_timestamps.mask_rest_gpu_time;
 
 	// Periodic logcat summary (the plots above are in-headset only):
 	// one line every 5s with the headline numbers so `adb logcat`
@@ -150,11 +152,13 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
 			             gm.mask_gpu_ms * 1e3f,
+			             gm.mask_first_gpu_ms * 1e3f,
+			             gm.mask_rest_gpu_ms * 1e3f,
 			             gm.bandwidth_rx * 1e-6f,
 			             gm.bandwidth_tx * 1e-6f,
 			             gm.track_ms * 1e3f,
@@ -179,10 +183,13 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 					m = std::max(m, g.*field);
 				return m;
 			};
-			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (mask {:.1f}ms) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
 			             ring_max(&global_metric::cpu_time) * 1e3f,
 			             ring_max(&global_metric::gpu_time) * 1e3f,
+			             ring_max(&global_metric::defoveate_gpu_ms) * 1e3f,
 			             ring_max(&global_metric::mask_gpu_ms) * 1e3f,
+			             ring_max(&global_metric::mask_first_gpu_ms) * 1e3f,
+			             ring_max(&global_metric::mask_rest_gpu_ms) * 1e3f,
 			             ring_max(&global_metric::track_ms) * 1e3f,
 			             ring_max(&global_metric::solve_ms) * 1e3f,
 			             ring_max(&global_metric::place_ms) * 1e3f,
@@ -255,7 +262,9 @@ void scenes::stream::gui_performance_metrics()
 	        plot(_("GPU time"), {{_("Frame"),     &global_metric::gpu_time},
 	                             {_("Defoveate"), &global_metric::defoveate_gpu_ms},
 	                             {_("Gizmos"),     &global_metric::gizmo_gpu_ms},
-	                             {_("Mask"),      &global_metric::mask_gpu_ms}}, "s"),
+	                             {_("Mask"),      &global_metric::mask_gpu_ms},
+	                             {_("Mask 1st"),  &global_metric::mask_first_gpu_ms},
+	                             {_("Mask rest"), &global_metric::mask_rest_gpu_ms}}, "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),

@@ -893,14 +893,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// the render thread.
 	if (query_pool_filled)
 	{
-		// Only the four written queries (0..3): the pool is sized for
-		// the whole struct but the spare query is never written, and
-		// waiting on an unwritten query blocks forever (black screen:
-		// the render thread stalls here after exactly one frame).
+		// Only the five written queries (0..4): the pool is sized for
+		// the whole struct but the spare queries are never written,
+		// and waiting on an unwritten query blocks forever (black
+		// screen: the render thread stalls here after exactly one
+		// frame).
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
-		        4,
-		        4 * sizeof(uint64_t),
+		        5,
+		        5 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64);
 
@@ -911,6 +912,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			last_gpu_timestamps.defoveate_gpu_time = (timestamps2[2] - timestamps2[0]) * period;
 			last_gpu_timestamps.gizmo_gpu_time = (timestamps2[3] - timestamps2[2]) * period;
 			last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
+			last_gpu_timestamps.mask_first_gpu_time = (timestamps2[4] - timestamps2[3]) * period;
+			last_gpu_timestamps.mask_rest_gpu_time = (timestamps2[1] - timestamps2[4]) * period;
 		}
 	}
 
@@ -1473,6 +1476,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// validity tracking is needed; without mask work the span just
 		// measures submit prep.
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 3);
+		// q4 splits the mask span after the first recorded group (set
+		// below; fallback write after the loop keeps the poll range
+		// valid on group-less frames). Groups record sequentially, so
+		// first = q4-q3 localizes one group's chain, rest = q1-q4.
+		bool mask_split_written = false;
 		if (mask_frame)
 		{
 			int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
@@ -1839,6 +1847,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				mask_erode_ms += mstats.erode_ms;
 				mask_blur_ms += mstats.blur_ms;
 				mask_draws += (int)mstats.draws;
+				if (not mask_split_written)
+				{
+					mask_split_written = true;
+					command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 4);
+				}
+			}
+			if (not mask_split_written)
+			{
+				// No group recorded (all culled/skipped): zero-length
+				// first span, so the poll range stays valid and mask
+				// numbers carry over instead of going stale.
+				mask_split_written = true;
+				command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 4);
 			}
 			// Debug group record (cutouts only, full-res, clear + hard
 			// punch): runs only while claimed above.

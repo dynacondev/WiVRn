@@ -442,14 +442,23 @@ private:
 		// Query plan (all stamps written unconditionally at fixed
 		// command-buffer points, TopOfPipe except the closing one):
 		// q0 frame top, q1 frame end (BottomOfPipe), q2 after
-		// defoveate, q3 at mask-phase start. Spans: frame = q1-q0,
-		// defoveate = q2-q0, gizmos = q3-q2, mask = q1-q3. TopOfPipe
-		// stamps don't drain prior fragment work, so a late producer
-		// inflates the *following* span — read spikes by span, not as
-		// exact per-pass costs.
+		// defoveate, q3 at mask-phase start, q4 after the first
+		// recorded group (fallback: right after the group loop, so
+		// the poll range is valid on group-less frames). Spans:
+		// frame = q1-q0, defoveate = q2-q0, gizmos = q3-q2,
+		// mask = q1-q3, mask first-group = q4-q3, mask rest = q1-q4.
+		// TopOfPipe stamps don't drain prior fragment work, so a late
+		// producer inflates the *following* span — read spikes by
+		// span, not as exact per-pass costs.
 		float defoveate_gpu_time = 0;
 		float gizmo_gpu_time = 0;
 		float mask_gpu_time = 0;
+		// Mask split (q4, written after the first recorded group):
+		// first-group = q4-q3, rest = q1-q4. Localizes GPU outliers
+		// to one group's chain (per-pass cost) vs the whole span
+		// (preemption/contention inflates both halves together).
+		float mask_first_gpu_time = 0;
+		float mask_rest_gpu_time = 0;
 	};
 
 	// Last successfully polled GPU timestamps: the query readback is a
@@ -477,6 +486,8 @@ private:
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;
 		float gizmo_gpu_ms = 0;
+		float mask_first_gpu_ms = 0;
+		float mask_rest_gpu_ms = 0;
 		// Frame-phase waits (seconds): fence wait at frame top, GUI,
 		// and render_end submit (end_frame IPC). Names CPU stalls the
 		// section timers above can't see.
