@@ -1038,6 +1038,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
+	// Mask record/submit views: located live at predicted display time,
+	// not the video frame's pose. The video layer keeps its own pose (and
+	// its own runtime warp); masks warped from a stale video pose trail
+	// live geometry (projected instances) and live camera under head
+	// motion (black trailing edge). Each layer warps independently, so a
+	// fresher mask pose strictly reduces warp error. Falls back to the
+	// video pose when locating fails.
+	std::array<XrPosef, view_count> mask_pose = pose;
+	std::array<XrFovf, view_count> mask_fov = fov;
+	{
+		XrSpace live_space = application::space(xr::spaces::world);
+		auto [view_flags, live_views] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, live_space);
+		if (live_views.size() == view_count and (view_flags & XR_VIEW_STATE_POSITION_VALID_BIT) and
+		    (view_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+		{
+			for (size_t i = 0; i < view_count; ++i)
+			{
+				mask_pose[i] = live_views[i].pose;
+				mask_fov[i] = live_views[i].fov;
+			}
+		}
+	}
+
 	// Allow the headset to time warp if we are redisplaying a frame
 	if ((not application::get_hmd_traits().discard_frame) or
 	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
@@ -1152,10 +1175,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		update_fiducial_passthrough(frame_state.predictedDisplayTime);
 
 		// View-only transforms, shared by the mask record and the debug
-		// gizmos below.
+		// gizmos below. Live predicted views (mask_pose/mask_fov), not the
+		// video frame's pose: see the mask_pose block above.
 		std::array<glm::mat4, view_count> world_mvp;
 		for (uint32_t view = 0; view < view_count; ++view)
-			world_mvp[view] = scene::projection_matrix(fov[view]) * scene::view_matrix(pose[view]);
+			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
 
 		// QR debug gizmos: tag boxes (green = configured, red = other),
 		// axes tripods, orange fused-corrected boxes, board origin +
@@ -1938,8 +1962,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						mask_views[view] = {
 						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = pose[view],
-						        .fov = fov[view],
+						        .pose = mask_pose[view],
+						        .fov = mask_fov[view],
 						        .subImage = {
 						                .swapchain = g.swapchain,
 						                .imageRect = {
@@ -1970,8 +1994,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						mask_views[view] = {
 						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = pose[view],
-						        .fov = fov[view],
+						        .pose = mask_pose[view],
+						        .fov = mask_fov[view],
 						        .subImage = {
 						                .swapchain = g.swapchain,
 						                .imageRect = {
@@ -2024,8 +2048,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				dbg_views[view] = {
 				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-				        .pose = pose[view],
-				        .fov = fov[view],
+				        .pose = mask_pose[view],
+				        .fov = mask_fov[view],
 				        .subImage = {
 				                .swapchain = gizmo_lines->swapchain(),
 				                .imageRect = {

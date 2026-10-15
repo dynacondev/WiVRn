@@ -728,7 +728,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		double fdt = bp.time != 0 and now >= bp.time ? (now - bp.time) * 1e-9 : 1.0 / 72.0;
 		double adt = bp.last_predicted > 0 ? (now - bp.last_predicted) * 1e-9 : fdt;
 		bp.last_predicted = now;
-		auto r = bp.filter.advance(std::clamp(adt, 0.0, 0.25));
+		// Predict to display time, not now: the pose is consumed at
+		// predictedDisplayTime (mask raster, projected instances), so
+		// advancing only to now leaves ~1 frame of lag on moving boards.
+		// advance() converges without overshoot, so the extra horizon is
+		// safe; static boards are unaffected.
+		double horizon = predicted_display_time > now ? (predicted_display_time - now) * 1e-9 : 0.0;
+		auto r = bp.filter.advance(std::clamp(adt + horizon, 0.0, 0.25));
 		bp.pose = {
 		        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
 		        .position = {r.pos.x, r.pos.y, r.pos.z},
