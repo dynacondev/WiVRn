@@ -272,7 +272,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        // Intermediates only (never submitted): optimal layout keeps
+	        // Adreno UBWC compression live. Submitted images stay GENERAL.
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference raster_r8_ref{
 	        .attachment = 0,
@@ -355,7 +357,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// attachment joins the color attachment (same color formats as above,
 	// so two renderpasses). Depth is test-only (never sampled) and always
 	// cleared: no layout history is ever assumed.
-	auto make_depth_renderpass = [&](vk::Format color_format) {
+	auto make_depth_renderpass = [&](vk::Format color_format, vk::ImageLayout color_final = vk::ImageLayout::eGeneral) {
 		vk::AttachmentDescription attachments[2] = {
 		        {
 		                .format = color_format,
@@ -363,7 +365,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .loadOp = vk::AttachmentLoadOp::eClear,
 		                .storeOp = vk::AttachmentStoreOp::eStore,
 		                .initialLayout = vk::ImageLayout::eUndefined,
-		                .finalLayout = vk::ImageLayout::eGeneral,
+		                .finalLayout = color_final,
 		        },
 		        {
 		                .format = depth_format,
@@ -399,7 +401,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		return vk::raii::RenderPass(device, depth_rp_info);
 	};
 	depth_renderpass = make_depth_renderpass(format);
-	raster_r8_depth_renderpass = make_depth_renderpass(blur_format);
+	raster_r8_depth_renderpass = make_depth_renderpass(blur_format, vk::ImageLayout::eColorAttachmentOptimal);
 
 	// Same vertex input/assembly/viewport/rasterization/multisample/
 	// dynamic state as the plain raster pipes (reused locals); only blend
@@ -505,7 +507,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .loadOp = vk::AttachmentLoadOp::eDontCare,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference blur_r8_ref{
 	        .attachment = 0,
@@ -1193,7 +1195,7 @@ void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, bool
 	vk::DescriptorImageInfo image_info{
 	        .sampler = nearest ? *sampler_nearest : *sampler,
 	        .imageView = view,
-	        .imageLayout = vk::ImageLayout::eGeneral,
+	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::WriteDescriptorSet write{
 	        .dstSet = *descriptor_sets[set],
@@ -1252,15 +1254,19 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = e});
 	};
 
-	// Same-queue read-after-write between passes (all images GENERAL).
+	// Same-queue read-after-write between passes. Intermediates live
+	// in OPTIMAL layouts (UBWC on); submitted images stay GENERAL and
+	// never pass through here.
 	// Full-image range: the multiview chain reads both layers together,
 	// so per-eye narrowing no longer applies (one barrier replaces two).
-	auto make_readable = [&](vk::Image img) {
+	auto transfer_barrier = [&](vk::Image img, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
+	                            vk::AccessFlags src_access, vk::AccessFlags dst_access,
+	                            vk::PipelineStageFlags src_stage, vk::PipelineStageFlags dst_stage) {
 	vk::ImageMemoryBarrier barrier{
-		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-		        .oldLayout = vk::ImageLayout::eGeneral,
-		        .newLayout = vk::ImageLayout::eGeneral,
+		        .srcAccessMask = src_access,
+		        .dstAccessMask = dst_access,
+		        .oldLayout = old_layout,
+		        .newLayout = new_layout,
 		        .image = img,
 		        .subresourceRange = {
 		                .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -1268,12 +1274,31 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                .layerCount = 2,
 		        },
 		};
-		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-		                    vk::PipelineStageFlagBits::eFragmentShader,
-		                    {},
-		                    {},
-		                    {},
-		                    barrier);
+		cmd.pipelineBarrier(src_stage, dst_stage, {}, {}, {}, barrier);
+	};
+	// Post-write: color write out, shader read in, ATTACH -> READ_ONLY.
+	auto make_readable = [&](vk::Image img) {
+		transfer_barrier(img,
+		                 vk::ImageLayout::eColorAttachmentOptimal,
+		                 vk::ImageLayout::eShaderReadOnlyOptimal,
+		                 vk::AccessFlagBits::eColorAttachmentWrite,
+		                 vk::AccessFlagBits::eShaderRead,
+		                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                 vk::PipelineStageFlagBits::eFragmentShader);
+	};
+	// Pre-write: prior reads out, color write in. oldLayout Undefined
+	// discards (always legal, no first-use tracking); every R8 target
+	// is fully overwritten (DONT_CARE load), and the discard drops the
+	// tile load on TBDR. Not used before raster (initial Undefined
+	// covers) or the GENERAL submit upscale.
+	auto make_writable = [&](vk::Image img) {
+		transfer_barrier(img,
+		                 vk::ImageLayout::eUndefined,
+		                 vk::ImageLayout::eColorAttachmentOptimal,
+		                 vk::AccessFlagBits::eShaderRead,
+		                 vk::AccessFlagBits::eColorAttachmentWrite,
+		                 vk::PipelineStageFlagBits::eFragmentShader,
+		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
 	};
 
 	auto it = targets.find(image);
@@ -1487,10 +1512,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// host-side writes, so sharing one set across passes in the same
 	// command buffer would make every pass sample the last write.
 	// Barriers stay caller-side like every other pass here.
-	auto erode_1d = [&](vk::ImageView src_view, uint32_t src_set, vk::Framebuffer dst_fb, vk::Extent2D e,
+	auto erode_1d = [&](vk::ImageView src_view, uint32_t src_set, vk::Image dst_img, vk::Framebuffer dst_fb, vk::Extent2D e,
 	                        float dx, float dy, int radius) {
 		// Point sampling: taps land on exact texel centers.
 		update_source(src_view, src_set, true);
+		make_writable(dst_img);
 		vk::RenderPassBeginInfo begin_erode{
 		        .renderPass = *blur_r8_renderpass_mv,
 		        .framebuffer = dst_fb,
@@ -1622,15 +1648,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// A and writes B exactly like the uneroded path — H/V
 			// bodies stay untouched either way.
 			section_clock erode_clk(&ms_erode);
-			erode_1d(*target_a.view_array, 10, *target_b.blur_fb_mv, half_extent, 1, 0, erode);
+			erode_1d(*target_a.view_array, 10, *target_b.image, *target_b.blur_fb_mv, half_extent, 1, 0, erode);
 			make_readable(*target_b.image);
-			erode_1d(*target_b.view_array, 12, *target_a.blur_fb_mv, half_extent, 0, 1, erode);
+			erode_1d(*target_b.view_array, 12, *target_a.image, *target_a.blur_fb_mv, half_extent, 0, 1, erode);
 			make_readable(*target_a.image);
 		}
 		section_clock blur_clk(&ms_blur);
 		// H reads A (eroded or raster) and writes B; V reads B:
 		// identical bodies either way.
 		update_source(*target_a.view_array, 0);
+		make_writable(*target_b.image);
 		vk::RenderPassBeginInfo begin_h{
 		        .renderPass = *blur_r8_renderpass_mv,
 		        .framebuffer = *target_b.blur_fb_mv,
@@ -1716,6 +1743,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				blur_target & dst = down_targets[l - 1];
 				vk::Extent2D de = level_extent(extent, l);
 				update_source(down_src, 4 + (l - 1) * 2);
+				make_writable(*dst.image);
 				vk::RenderPassBeginInfo begin_down{
 				        .renderPass = *blur_r8_renderpass_mv,
 				        .framebuffer = *dst.blur_fb_mv,
@@ -1748,13 +1776,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// like the uneroded path — H/V bodies stay untouched.
 				section_clock erode_clk(&ms_erode);
 				blur_target & h_src = down_targets[h_src_level - 1];
-				erode_1d(down_src, 10, *eblur.blur_fb_mv, te, 1, 0, erode);
+				erode_1d(down_src, 10, *eblur.image, *eblur.blur_fb_mv, te, 1, 0, erode);
 				make_readable(*eblur.image);
-				erode_1d(*eblur.view_array, 12, *h_src.blur_fb_mv, te, 0, 1, erode);
+				erode_1d(*eblur.view_array, 12, *h_src.image, *h_src.blur_fb_mv, te, 0, 1, erode);
 				make_readable(*h_src.image);
 				down_src = *h_src.view_array;
 			}
 			update_source(down_src, 0);
+			make_writable(*eblur.image);
 			vk::RenderPassBeginInfo begin_h{
 			        .renderPass = *blur_r8_renderpass_mv,
 			        .framebuffer = *eblur.blur_fb_mv,
