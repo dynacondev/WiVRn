@@ -259,6 +259,13 @@ private:
 	// host-side write per set per frame, like the rest).
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
 	vk::raii::Sampler sampler{nullptr};
+	// Point sampler for the erode passes only: erode taps land on exact
+	// texel centers (integer offsets), where LINEAR == NEAREST
+	// mathematically but executes the full bilinear path per tap.
+	// Blur keeps the linear sampler (its fractional taps deliberately
+	// exploit hardware bilinear); downsample keeps it too (its ±0.5
+	// offsets would hit nearest tie-breaks).
+	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// Blur intermediates (full mask resolution, own images: full usage
 	// control, unlike swapchain images). Recreated when the extent changes.
@@ -288,7 +295,7 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	void update_source(vk::ImageView view, uint32_t set);
+	void update_source(vk::ImageView view, uint32_t set, bool nearest = false);
 
 	// One uploaded mesh per object in the group. Staging is per mesh and
 	// shared-read (uploads are rare, map-change only); the pending copy

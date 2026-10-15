@@ -695,6 +695,13 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .maxLod = 0,
 	};
 	sampler = vk::raii::Sampler(device, sampler_info);
+	// Point twin of the above for erode taps (identical output at
+	// texel centers, single fetch per tap instead of bilinear).
+	vk::SamplerCreateInfo nearest_info = sampler_info;
+	nearest_info.magFilter = vk::Filter::eNearest;
+	nearest_info.minFilter = vk::Filter::eNearest;
+	nearest_info.mipmapMode = vk::SamplerMipmapMode::eNearest;
+	sampler_nearest = vk::raii::Sampler(device, nearest_info);
 
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
@@ -1114,10 +1121,10 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	                    {});
 }
 
-void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set)
+void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, bool nearest)
 {
 	vk::DescriptorImageInfo image_info{
-	        .sampler = *sampler,
+	        .sampler = nearest ? *sampler_nearest : *sampler,
 	        .imageView = view,
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
@@ -1179,7 +1186,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 
 	// Same-queue read-after-write between passes (all images GENERAL).
-	auto make_readable = [&](vk::Image img) {
+	// Per-eye subresource range: every pass writes a single-layer
+	// framebuffer, so a full-image barrier would needlessly serialize
+	// the idle eye's layer on tile GPUs.
+	auto make_readable = [&](vk::Image img, uint32_t eye) {
 	vk::ImageMemoryBarrier barrier{
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
@@ -1189,7 +1199,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		        .subresourceRange = {
 		                .aspectMask = vk::ImageAspectFlagBits::eColor,
 		                .levelCount = 1,
-		                .layerCount = 2,
+		                .baseArrayLayer = eye,
+		                .layerCount = 1,
 		        },
 		};
 		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -1387,7 +1398,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// caller-side like every other pass here.
 	auto erode_1d = [&](vk::ImageView src_view, uint32_t src_set, vk::Framebuffer dst_fb, vk::Extent2D e,
 	                        float dx, float dy, int radius) {
-		update_source(src_view, src_set);
+		// Point sampling: taps land on exact texel centers.
+		update_source(src_view, src_set, true);
 		vk::RenderPassBeginInfo begin_erode{
 		        .renderPass = *blur_r8_renderpass,
 		        .framebuffer = dst_fb,
@@ -1512,7 +1524,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				section_clock raster_clk(&ms_raster);
 				raster_silhouette({*target_a.raster_fbs[eye], *target_a.raster_depth_fbs[eye], *raster_r8_pipeline, *raster_r8_depth_pipeline, *raster_r8_reverse_pipeline, *raster_r8_renderpass, *raster_r8_depth_renderpass}, half_extent, eye, has_reversed);
 			}
-			make_readable(*target_a.image);
+			make_readable(*target_a.image, eye);
 			if (erode > 0)
 			{
 				// Erode A into B (H) and back into A (V): the eroded
@@ -1521,9 +1533,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// bodies stay untouched either way.
 				section_clock erode_clk(&ms_erode);
 				erode_1d(*target_a.views[eye], 10 + eye, *target_b.blur_fbs[eye], half_extent, 1, 0, erode);
-				make_readable(*target_b.image);
+				make_readable(*target_b.image, eye);
 				erode_1d(*target_b.views[eye], 12 + eye, *target_a.blur_fbs[eye], half_extent, 0, 1, erode);
-				make_readable(*target_a.image);
+				make_readable(*target_a.image, eye);
 			}
 			section_clock blur_clk(&ms_blur);
 			// H reads A (eroded or raster) and writes B; V reads B:
@@ -1547,7 +1559,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
-			make_readable(*target_b.image);
+			make_readable(*target_b.image, eye);
 			update_source(*target_b.views[eye], 2 + eye);
 			vk::RenderPassBeginInfo begin_v{
 			        .renderPass = *blur_renderpass,
@@ -1601,7 +1613,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					section_clock raster_clk(&ms_raster);
 					raster_silhouette({*down_targets[seed_level - 1].blur_fbs[eye], *down_targets[seed_level - 1].raster_depth_fbs[eye], *raster_r8_pipeline, *raster_r8_depth_pipeline, *raster_r8_reverse_pipeline, *raster_r8_renderpass, *raster_r8_depth_renderpass}, de_seed, eye, has_reversed);
 				}
-				make_readable(*down_targets[seed_level - 1].image);
+				make_readable(*down_targets[seed_level - 1].image, eye);
 				section_clock blur_clk(&ms_blur);
 				// Levels seed_level+1..N from the selected tier; sizes shared
 				// with ensure via level_extent() (exact halving required for
@@ -1632,7 +1644,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 					cmd.draw(3, 1, 0, 0);
 					cmd.endRenderPass();
-					make_readable(*dst.image);
+					make_readable(*dst.image, eye);
 					down_src = *dst.views[eye];
 					down_src_extent = de;
 					h_src_level = l;
@@ -1647,9 +1659,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					section_clock erode_clk(&ms_erode);
 					blur_target & h_src = down_targets[h_src_level - 1];
 					erode_1d(down_src, 10 + eye, *eblur.blur_fbs[eye], te, 1, 0, erode);
-					make_readable(*eblur.image);
+					make_readable(*eblur.image, eye);
 					erode_1d(*eblur.views[eye], 12 + eye, *h_src.blur_fbs[eye], te, 0, 1, erode);
-					make_readable(*h_src.image);
+					make_readable(*h_src.image, eye);
 					down_src = *h_src.views[eye];
 				}
 				update_source(down_src, eye);
@@ -1671,7 +1683,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				make_readable(*eblur.image);
+				make_readable(*eblur.image, eye);
 				update_source(*eblur.views[eye], 2 + eye);
 				vk::RenderPassBeginInfo begin_v{
 				        .renderPass = *blur_renderpass,
