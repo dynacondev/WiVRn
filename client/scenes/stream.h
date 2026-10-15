@@ -428,6 +428,13 @@ private:
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	int mask_draws = 0;
+	// Frame-phase waits (milliseconds): fence wait at frame top,
+	// draw_gui, and render_end (end_frame IPC). Assigned
+	// unconditionally on the render path each frame, so no reset needed.
+	double fence_wait_ms = 0, submit_ms = 0, gui_ms = 0;
+	// Sticky warn flag for the bounded video-swapchain wait (same
+	// pattern as the mask groups' wait_warned).
+	bool video_wait_warned = false;
 
 	struct gpu_timestamps
 	{
@@ -444,6 +451,11 @@ private:
 		float gizmo_gpu_time = 0;
 		float mask_gpu_time = 0;
 	};
+
+	// Last successfully polled GPU timestamps: the query readback is a
+	// poll (no eWait), so skip-frames (only q0 written) carry these
+	// over instead of stalling.
+	gpu_timestamps last_gpu_timestamps;
 
 	struct global_metric
 	{
@@ -465,6 +477,12 @@ private:
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;
 		float gizmo_gpu_ms = 0;
+		// Frame-phase waits (seconds): fence wait at frame top, GUI,
+		// and render_end submit (end_frame IPC). Names CPU stalls the
+		// section timers above can't see.
+		float fence_wait_ms = 0;
+		float submit_ms = 0;
+		float gui_ms = 0;
 		float feat_votes = 0;
 		float feat_tags = 0;
 		float mask_draws = 0;

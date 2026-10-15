@@ -871,33 +871,46 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		application::pop_scene();
 	}
 
-	if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
-		throw std::runtime_error("Vulkan fence timeout");
+	// Deliberately blocking: with a single in-flight command buffer
+	// the CPU cannot usefully run ahead of the GPU, so this wait is
+	// the correct backpressure (not a bug). Instrumented: when GPU
+	// work overruns, the stall surfaces here as CPU time, and
+	// fence_wait_ms names it.
+	{
+		auto fence_t0 = std::chrono::steady_clock::now();
+		if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
+			throw std::runtime_error("Vulkan fence timeout");
+		fence_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_t0).count();
+	}
 
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
 
-	gpu_timestamps timestamps;
+	// Poll, never wait (no eWait): the fence above already guarantees
+	// last frame's queries on the common path, so this completes
+	// immediately; on a skip-frame (only q0 written) the range reads
+	// not-ready and last frame's values carry over instead of stalling
+	// the render thread.
 	if (query_pool_filled)
 	{
 		// Only the four written queries (0..3): the pool is sized for
 		// the whole struct but the spare query is never written, and
-		// eWait on an unwritten query blocks forever (black screen:
+		// waiting on an unwritten query blocks forever (black screen:
 		// the render thread stalls here after exactly one frame).
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
 		        4,
 		        4 * sizeof(uint64_t),
 		        sizeof(uint64_t),
-		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		        vk::QueryResultFlagBits::e64);
 
 		if (res == vk::Result::eSuccess)
 		{
 			float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
-			timestamps.gpu_time = (timestamps2[1] - timestamps2[0]) * period;
-			timestamps.defoveate_gpu_time = (timestamps2[2] - timestamps2[0]) * period;
-			timestamps.gizmo_gpu_time = (timestamps2[3] - timestamps2[2]) * period;
-			timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
+			last_gpu_timestamps.gpu_time = (timestamps2[1] - timestamps2[0]) * period;
+			last_gpu_timestamps.defoveate_gpu_time = (timestamps2[2] - timestamps2[0]) * period;
+			last_gpu_timestamps.gizmo_gpu_time = (timestamps2[3] - timestamps2[2]) * period;
+			last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
 		}
 	}
 
@@ -1110,7 +1123,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		assert(swapchain);
 		// defoveate the image, apply scale/bias
 		int image_index = swapchain.acquire();
-		swapchain.wait();
+		if (not swapchain.wait(100'000'000))
+		{
+			// Never park forever on an unavailable video image: the
+			// command buffer so far holds only the query reset + q0
+			// stamp, so end it and submit bare to keep the fence
+			// cycling, hand the acquired image back, and submit an
+			// empty frame. Next frame's query poll carries the GPU
+			// numbers over the unwritten q1..q3.
+			if (not video_wait_warned)
+			{
+				video_wait_warned = true;
+				spdlog::warn("Video swapchain image wait timed out, skipping frame");
+			}
+			command_buffer.end();
+			vk::SubmitInfo skip_submit;
+			skip_submit.setCommandBuffers(*command_buffer);
+			device.resetFences(*fence);
+			queue.lock()->submit(skip_submit, *fence);
+#if WIVRN_FEATURE_RENDERDOC
+			renderdoc_end(*vk_instance);
+#endif
+			swapchain.release();
+			session.end_frame(frame_state.predictedDisplayTime, {});
+			return;
+		}
+		video_wait_warned = false;
 
 		switch (gui_status)
 		{
@@ -1185,9 +1223,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		// Fresh frame accumulators for the Statistics plots (filled by
 		// the gizmo and mask record phases below, sampled by
-		// accumulate_metrics).
+		// accumulate_metrics). fence_wait_ms is measured at frame top
+		// above, so it is not reset here; gui_ms/submit_ms are
+		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
 		mask_draws = 0;
+		gui_ms = submit_ms = 0;
 
 		// View-only transforms, shared by the mask record and the debug
 		// gizmos below. Live predicted views (mask_pose/mask_fov), not the
@@ -2150,21 +2191,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)
 			set_layer_settings(openxr_post_processing.sharpening | openxr_post_processing.super_sampling);
 
-		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
+		{
+			auto gui_t0 = std::chrono::steady_clock::now();
+			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+			gui_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_t0).count();
+		}
 
-		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
-
+		// render_end (submit + end_frame IPC) is the remaining
+		// uninstrumented span inside the cpu= measurement: time it so
+		// compositor-side stalls are named instead of unattributed.
+		auto submit_t0 = std::chrono::steady_clock::now();
 		try
 		{
 			render_end();
 		}
 		catch (std::system_error & e)
 		{
-			if (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID)
-				spdlog::info("Invalid pose submitted");
-			else
+			if (not (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID))
 				throw;
+			spdlog::info("Invalid pose submitted");
 		}
+		submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_t0).count();
+
+		// Sampled after render_end so gui_ms/submit_ms above are this
+		// frame's, not last frame's.
+		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, last_gpu_timestamps);
 	}
 
 	// Network operations may be blocking, do them once everything was submitted

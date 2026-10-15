@@ -138,6 +138,9 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.feat_votes = (float)fid_votes;
 	gm.feat_tags = (float)fid_tags;
 	gm.mask_draws = (float)mask_draws;
+	gm.fence_wait_ms = (float)(fence_wait_ms * 1e-3);
+	gm.submit_ms = (float)(submit_ms * 1e-3);
+	gm.gui_ms = (float)(gui_ms * 1e-3);
 
 	// Periodic logcat summary (the plots above are in-headset only):
 	// one line every 5s with the headline numbers so `adb logcat`
@@ -147,7 +150,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f}",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
@@ -163,7 +166,10 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.gizmo_ms * 1e3f,
 			             gm.feat_votes,
 			             gm.feat_tags,
-			             gm.mask_draws);
+			             gm.mask_draws,
+			             gm.fence_wait_ms * 1e3f,
+			             gm.gui_ms * 1e3f,
+			             gm.submit_ms * 1e3f);
 			// Window maxima over the sample ring (~last 300 frames):
 			// single-frame stalls alias into scary single samples, so
 			// report what the worst frame in the window actually hit.
@@ -173,7 +179,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 					m = std::max(m, g.*field);
 				return m;
 			};
-			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (mask {:.1f}ms) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms",
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (mask {:.1f}ms) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms",
 			             ring_max(&global_metric::cpu_time) * 1e3f,
 			             ring_max(&global_metric::gpu_time) * 1e3f,
 			             ring_max(&global_metric::mask_gpu_ms) * 1e3f,
@@ -183,7 +189,10 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::mask_raster_ms) * 1e3f,
 			             ring_max(&global_metric::mask_erode_ms) * 1e3f,
 			             ring_max(&global_metric::mask_blur_ms) * 1e3f,
-			             ring_max(&global_metric::gizmo_ms) * 1e3f);
+			             ring_max(&global_metric::gizmo_ms) * 1e3f,
+			             ring_max(&global_metric::fence_wait_ms) * 1e3f,
+			             ring_max(&global_metric::gui_ms) * 1e3f,
+			             ring_max(&global_metric::submit_ms) * 1e3f);
 		}
 	}
 
@@ -262,6 +271,10 @@ void scenes::stream::gui_performance_metrics()
 	        plot(_("Features"), {{_("Votes"), &global_metric::feat_votes},
 	                             {_("Tags"),  &global_metric::feat_tags},
 	                             {_("Draws"), &global_metric::mask_draws}}, ""),
+
+	        plot(_("Frame"), {{_("Fence wait"), &global_metric::fence_wait_ms},
+	                           {_("GUI"),         &global_metric::gui_ms},
+	                           {_("Submit"),      &global_metric::submit_ms}}, "s"),
 	        // clang-format on
 	};
 
