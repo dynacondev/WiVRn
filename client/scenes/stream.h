@@ -24,7 +24,10 @@
 #include "audio/audio.h"
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
+#include "render/debug_lines.h"
+#include "render/feather_mask.h"
 #include "render/imgui_impl.h"
+#include "render/passthrough_mesh.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
 #include "stream_defoveator.h"
@@ -37,6 +40,8 @@
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <array>
+#include <cstddef>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -44,6 +49,7 @@
 #include <set>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan_core.h>
 
@@ -127,6 +133,11 @@ private:
 	}
 
 	xr::swapchain swapchain;
+	// Retained shared mask-pipeline cache: keeps the driver cache built
+	// by warm_pipelines() alive from first video frame until session end
+	// (renderers alone can't retain it — they don't exist yet at warm
+	// time, and the lookup map holds weak refs only).
+	std::shared_ptr<vk::raii::PipelineCache> mask_pipe_cache;
 
 	std::optional<audio> audio_handle;
 
@@ -223,8 +234,17 @@ private:
 	thread_safe<to_headset::running_applications> running_applications;
 
 	// Fiducial tracking markers (Quest only, see docs/configuration.md).
-	// Latest map from the server.
+	// Latest map from the server; model files cached under
+	// application::get_config_path() / "fiducial_models" / <hash>.glb.
 	thread_safe<to_headset::fiducial_map> fiducial_map;
+	struct fiducial_download
+	{
+		uint32_t chunk_count = 0;
+		std::unordered_map<uint32_t, std::vector<std::byte>> chunks;
+	};
+	// Guarded by network thread only (all handlers run there)
+	std::unordered_map<std::string, fiducial_download> fiducial_downloads;
+	static std::filesystem::path fiducial_model_path(const std::string & hash);
 
 	// One runtime tracker per distinct (marker size, static) group, shared
 	// across fiducials (the marker size is context-global, payloads match
@@ -245,9 +265,10 @@ private:
 		std::string fiducial_id;
 		std::string payload;
 		XrPosef observed{{0, 0, 0, 1}, {0, 0, 0}};
+		XrExtent2Df extents{0, 0}; // measured tag bounds (gizmo boxes, cutout windows)
 		float tag_size_m = 0;
-		std::array<float, 3> offset_pos{0, 0, 0}; // marker->board offset
-		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw
+		std::array<float, 3> offset_pos{0, 0, 0}; // EFFECTIVE marker->board
+		std::array<float, 4> offset_quat{0, 0, 0, 1}; // xyzw (authored tag-in-board, inverted at assembly)
 		XrTime latch_time = 0; // track (re)latch time, 0 = unknown (settled)
 		XrTime time = 0; // sighting time (vote dedupe: newest wins)
 		bool novel = false; // fresh detector output (filter ingests these)
@@ -279,6 +300,38 @@ private:
 	// Warm starts for the solver (fiducial id -> last smoothed pose).
 	// Solver init only, not output smoothing.
 	std::map<std::string, XrPosef> board_warm_start;
+
+	// Single fused placement per object. Objects persist once placed
+	// (map wipe excepted): the pose follows the first referenced
+	// fiducial with a pose, live or held, every frame.
+	struct fused_placement
+	{
+		bool placed = false; // any fused solution ever
+		XrPosef world_pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrVector3f world_scale{1, 1, 1};
+		XrTime last_solve = 0; // last live frame (stale age)
+	};
+	struct passthrough_object_state
+	{
+		to_headset::passthrough_object def; // snapshot from the map
+		// Model geometry, uploaded once per content hash.
+		passthrough_mesh::triangle_soup soup;
+		std::string soup_hash;
+		bool soup_ready = false;
+		size_t vertex_count = 0;
+		size_t triangle_count = 0;
+		std::string status = "waiting for fiducial map";
+		fused_placement fused;
+	};
+	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
+	// Live in-headset surface-projection overrides (Passthrough tab,
+	// session-scoped): presence wins over the map flag. Render thread
+	// only (GUI runs there too).
+	std::map<std::string /*object id*/, bool> projected_overrides;
+	// Object ids whose projected instance upload failed (runtime refused
+	// the mesh): skip retry so a persistent failure can't spam every
+	// frame. Cleared on map change with everything else.
+	std::set<std::string> projected_failed;
 
 	stream(std::string server_name, scene & parent_scene);
 
@@ -323,6 +376,7 @@ public:
 	void operator()(to_headset::application_icon &&);
 	void operator()(to_headset::running_applications &&);
 	void operator()(to_headset::fiducial_map &&);
+	void operator()(to_headset::fiducial_model_chunk &&);
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);
@@ -367,10 +421,54 @@ private:
 	float bandwidth_rx = 0;
 	float bandwidth_tx = 0;
 
+	// Per-frame passthrough accumulators (milliseconds / counts), filled
+	// by update_fiducial_passthrough and the mask record loop below, then
+	// sampled by accumulate_metrics into global_metrics.
+	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
+	int fid_votes = 0, fid_tags = 0;
+	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
+	int mask_draws = 0;
+	// Frame-phase waits (milliseconds): fence wait at frame top,
+	// draw_gui, and render_end (end_frame IPC). Assigned
+	// unconditionally on the render path each frame, so no reset needed.
+	double fence_wait_ms = 0, submit_ms = 0, gui_ms = 0;
+	// draw_gui phases (measured inside draw_gui itself): ImGui build
+	// (new_frame through End) vs end_frame record + layer submit.
+	// gui_ms above stays the total for plot continuity.
+	double gui_build_ms = 0, gui_submit_ms = 0;
+	// Sticky warn flag for the bounded video-swapchain wait (same
+	// pattern as the mask groups' wait_warned).
+	bool video_wait_warned = false;
+
 	struct gpu_timestamps
 	{
 		float gpu_time = 0;
+		// Query plan (all stamps written unconditionally at fixed
+		// command-buffer points, TopOfPipe except the closing one):
+		// q0 frame top, q1 frame end (BottomOfPipe), q2 after
+		// defoveate, q3 at mask-phase start, q4 after the first
+		// recorded group (fallback: right after the group loop, so
+		// the poll range is valid on group-less frames). Spans:
+		// frame = q1-q0, defoveate = q2-q0, gizmos = q3-q2,
+		// mask = q1-q3, mask first-group = q4-q3, mask rest = q1-q4.
+		// TopOfPipe stamps don't drain prior fragment work, so a late
+		// producer inflates the *following* span — read spikes by
+		// span, not as exact per-pass costs.
+		float defoveate_gpu_time = 0;
+		float gizmo_gpu_time = 0;
+		float mask_gpu_time = 0;
+		// Mask split (q4, written after the first recorded group):
+		// first-group = q4-q3, rest = q1-q4. Localizes GPU outliers
+		// to one group's chain (per-pass cost) vs the whole span
+		// (preemption/contention inflates both halves together).
+		float mask_first_gpu_time = 0;
+		float mask_rest_gpu_time = 0;
 	};
+
+	// Last successfully polled GPU timestamps: the query readback is a
+	// poll (no eWait), so skip-frames (only q0 written) carry these
+	// over instead of stalling.
+	gpu_timestamps last_gpu_timestamps;
 
 	struct global_metric
 	{
@@ -378,6 +476,33 @@ private:
 		float cpu_time = 0;
 		float bandwidth_rx = 0;
 		float bandwidth_tx = 0;
+		// Passthrough timings (seconds, sampled per frame): fiducial
+		// detection/tracking, board solve + smoothing, placement +
+		// instance updates, then mask raster/erode/blur, gizmos and the
+		// mask GPU span. Counts are unitless.
+		float track_ms = 0;
+		float solve_ms = 0;
+		float place_ms = 0;
+		float mask_raster_ms = 0;
+		float mask_erode_ms = 0;
+		float mask_blur_ms = 0;
+		float gizmo_ms = 0;
+		float mask_gpu_ms = 0;
+		float defoveate_gpu_ms = 0;
+		float gizmo_gpu_ms = 0;
+		float mask_first_gpu_ms = 0;
+		float mask_rest_gpu_ms = 0;
+		// Frame-phase waits (seconds): fence wait at frame top, GUI,
+		// and render_end submit (end_frame IPC). Names CPU stalls the
+		// section timers above can't see.
+		float fence_wait_ms = 0;
+		float submit_ms = 0;
+		float gui_ms = 0;
+		float gui_build_ms = 0;
+		float gui_submit_ms = 0;
+		float feat_votes = 0;
+		float feat_tags = 0;
+		float mask_draws = 0;
 	};
 
 	struct plot
@@ -422,6 +547,81 @@ private:
 	float compact_cpu_time = 0;
 	float compact_gpu_time = 0;
 
+	// Mask stacks grouped by (feather-px, union): union A holds the
+	// surface-projected content (drives the projected layer), union B
+	// the rest (drives the flat layer). The single dst-alpha
+	// channel carries one union at a time: A is consumed by projected,
+	// then B REPLACEs the alpha (color preserved) and is consumed by
+	// flat, so flat wins overlaps. Render thread only.
+	struct mask_group
+	{
+		float feather_px = 24;
+		// True = union A (projected), false = union B (flat).
+		bool projected = false;
+		std::unique_ptr<feather_mask_renderer> renderer;
+		// Dedicated member swapchain (explicit acquire/release pairing,
+		// never the shared pool).
+		xr::swapchain swapchain;
+		bool acquired = false;
+		bool wait_warned = false; // image-wait timeout already reported
+		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
+		bool active = false; // submitting this frame
+		bool had_draws = false; // draws present last frame (edge forensics)
+		XrTime last_draws_log = 0; // throttle for the edge log below
+		// Uploaded object soups by object id (hash compare avoids
+		// re-upload; renderer mirrors).
+		std::map<std::string, std::string> mesh_hashes;
+	};
+	// Mask stacks grouped by (feather-px, union): union A holds the
+	// surface-projected objects (drives the projected layer), union B
+	// the rest (drives the flat layer). Same feather value with mixed
+	// flags is two groups (two swapchains/blur stacks). The single
+	// dst-alpha channel carries one union at a time: A is consumed by
+	// projected, then B REPLACEs the alpha (color preserved) and is
+	// consumed by flat, so flat wins overlaps. Render thread only.
+	// Exact float equality groups identical parsed values; the bool
+	// splits projected (A) from flat (B). Iteration order is
+	// feather-ascending within each union; submit does one pass per
+	// union (A then B).
+	std::map<std::pair<float, bool>, mask_group> mask_groups;
+	// Local debug cutout group (union B): QR windows punched at full
+	// alpha. Standalone member, not in the map: debug never keys off
+	// server feather values. Claimed only while cutouts exist and no B
+	// group does (real B groups punch cutouts themselves).
+	mask_group debug_group;
+	// Set when the record phase built marker-window cutouts this frame
+	// (they punch camera with no geometry to map it onto, so the flat
+	// feed must stay submitted). Read by the submit phase below.
+	bool cutouts_punched = false;
+
+	// QR debug gizmos (Passthrough tab, session-scoped, render thread
+	// only). Raw sighting poses while visible with a 3s stale fade;
+	// the orange set re-projects fused poses with authored offsets.
+	bool debug_overlays = false; // master toggle
+	bool debug_matched = true;   // green: configured payload
+	bool debug_unmatched = true; // red: anything else sighted
+	bool debug_axes = true;      // RGB XYZ tripod on sighted tags
+	bool debug_corrected = true; // orange: fused-corrected tag boxes
+	bool debug_origin = true;    // larger tripod + center square at board origins
+	bool debug_smoothed = true;  // twin tripod (smaller, cyan square) at the smoothed pose
+	float debug_opacity = 0.5f;  // overlay alpha, 0..1
+	// Marker window cutout, mm past the marker edge punched through
+	// the flat union's mask (-1 = disabled). Gated on the master toggle.
+	int debug_window_mm = 50;
+	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
+	std::unique_ptr<debug_lines_renderer> gizmo_lines;
+
+	// Stale-hold multiplier for debug visuals: full presence on fresh
+	// data, smooth 3s fade-out on hold. Returns 0 (gone) .. 1 (fresh).
+	static constexpr double kStaleFadeS = 3.0;
+	static float stale_hold(XrTime now, XrTime last_seen)
+	{
+		if (last_seen == 0)
+			return 0;
+		double t = std::clamp((now - last_seen) * 1e-9 / kStaleFadeS, 0.0, 1.0);
+		return (float)(1.0 - t * t * (3 - 2 * t));
+	}
+
 	void accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> & blit_handles, const gpu_timestamps & timestamps);
 	void gui_performance_metrics();
 	void gui_compact_view();
@@ -440,6 +640,7 @@ private:
 	void request_spatial_permissions();
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
 	void update_fiducial_passthrough(XrTime predicted_display_time);
+	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
 	bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
 	                   const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
 	void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,

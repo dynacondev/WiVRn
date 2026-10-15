@@ -718,6 +718,13 @@ struct stop_application
 	uint32_t id;
 };
 
+struct fiducial_model_request
+{
+	// Content hash from to_headset::fiducial_map, hex string.
+	// Sent by the client for each model missing from its local cache.
+	std::string model_hash;
+};
+
 // when changing this, also make sure there are handlers in wivrn_session, etc. or compilation will fail
 using packets = std::variant<
         crypto_handshake,
@@ -747,6 +754,7 @@ using packets = std::variant<
         get_application_list,
         start_app,
         get_running_applications,
+        fiducial_model_request,
         set_active_application,
         hid::input,
         stop_application>;
@@ -972,8 +980,10 @@ struct fiducial_marker
 	std::string marker_data;
 	// Physical marker size in meters (needed for pose scale)
 	float marker_size_m;
-	// Marker-to-fiducial offset: fiducialPose = observedMarkerPose *
-	// offset. Position in meters, orientation as xyzw quaternion.
+	// Marker-to-fiducial offset, authored tag-in-board: position is
+	// the tag center in fiducial meters, orientation the tag axes
+	// relative to fiducial axes (parsed from [rx, ry, rz] degrees).
+	// Position in meters, orientation as xyzw quaternion.
 	std::array<float, 3> position;
 	std::array<float, 4> orientation;
 };
@@ -998,9 +1008,54 @@ struct fiducial_entry
 	std::vector<fiducial_marker> markers;
 };
 
+struct passthrough_object
+{
+	// Behavior type. "3d-passthrough" renders the model as a
+	// surface-projected passthrough cutout; "3d-passthrough-reversed"
+	// reverse-cuts the model from every mask layer instead (game video
+	// shows through, depth-tested against the windows covering each
+	// pixel). Unknown types are skipped client-side (forward-compat).
+	std::string type = "3d-passthrough";
+	std::string id;
+	std::string tag;
+	// Referenced fiducial ids (one instance per visible pairing).
+	std::vector<std::string> fiducial;
+	// Hex content hash of the glB model, empty when no model is configured
+	std::string model_hash;
+	// Full model size in bytes (client pre-allocates reassembly buffer)
+	uint64_t model_size;
+	// Fiducial-to-object offset: objectPose = solvedFiducialPose *
+	// offset. Position in meters, orientation as xyzw quaternion, uniform
+	// scale applied last (objects only).
+	std::array<float, 3> position;
+	std::array<float, 4> orientation;
+	float scale;
+	// Passthrough window feather width in screen pixels (alpha-gradient
+	// blend band around the mesh silhouette). Mask stacks group by this
+	// value so each object feathers independently. 0 disables feathering.
+	// Not accepted for 3d-passthrough-reversed (warned + ignored on the
+	// server).
+	float feather_px = 24;
+	// Surface-projected mapping: the headset projects camera imagery
+	// onto this object's mesh instead of the flat reconstruction feed.
+	// Enabled by default; opt out per object with false (plus a live
+	// in-headset override). Ignored for 3d-passthrough-reversed (warned).
+	bool surface_projected = true;
+};
+
 struct fiducial_map
 {
 	std::vector<fiducial_entry> fiducials;
+	std::vector<passthrough_object> objects;
+};
+
+struct fiducial_model_chunk
+{
+	std::string model_hash;
+	uint32_t chunk_index;
+	uint32_t chunk_count;
+	// Raw glB bytes for this chunk (chunk size capped server-side)
+	std::vector<std::byte> data;
 };
 
 using packets = std::variant<
@@ -1022,7 +1077,8 @@ using packets = std::variant<
         application_list,
         application_icon,
         running_applications,
-        fiducial_map>;
+        fiducial_map,
+        fiducial_model_chunk>;
 } // namespace to_headset
 } // namespace wivrn
 

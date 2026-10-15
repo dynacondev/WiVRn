@@ -32,7 +32,6 @@
 
 #include "application.h"
 #include "audio/audio.h"
-#include "boost/pfr/core.hpp"
 #include "decoder/shard_accumulator.h"
 #include "inplace_vector.hpp"
 #include "spdlog/spdlog.h"
@@ -41,6 +40,7 @@
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -871,27 +871,49 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		application::pop_scene();
 	}
 
-	if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
-		throw std::runtime_error("Vulkan fence timeout");
+	// Deliberately blocking: with a single in-flight command buffer
+	// the CPU cannot usefully run ahead of the GPU, so this wait is
+	// the correct backpressure (not a bug). Instrumented: when GPU
+	// work overruns, the stall surfaces here as CPU time, and
+	// fence_wait_ms names it.
+	{
+		auto fence_t0 = std::chrono::steady_clock::now();
+		if (device.waitForFences(*fence, VK_TRUE, UINT64_MAX) == vk::Result::eTimeout)
+			throw std::runtime_error("Vulkan fence timeout");
+		fence_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_t0).count();
+	}
 
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
 
-	gpu_timestamps timestamps;
+	// Poll, never wait (no eWait): the fence above already guarantees
+	// last frame's queries on the common path, so this completes
+	// immediately; on a skip-frame (only q0 written) the range reads
+	// not-ready and last frame's values carry over instead of stalling
+	// the render thread.
 	if (query_pool_filled)
 	{
+		// Only the five written queries (0..4): the pool is sized for
+		// the whole struct but the spare queries are never written,
+		// and waiting on an unwritten query blocks forever (black
+		// screen: the render thread stalls here after exactly one
+		// frame).
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
-		        size_gpu_timestamps,
-		        size_gpu_timestamps * sizeof(uint64_t),
+		        5,
+		        5 * sizeof(uint64_t),
 		        sizeof(uint64_t),
-		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+		        vk::QueryResultFlagBits::e64);
 
 		if (res == vk::Result::eSuccess)
 		{
-			boost::pfr::for_each_field(timestamps, [n = 1, &timestamps2](float & t) mutable {
-				t = (timestamps2[n++] - timestamps2[0]) * application::get_physical_device_properties().limits.timestampPeriod / 1e9;
-			});
+			float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
+			last_gpu_timestamps.gpu_time = (timestamps2[1] - timestamps2[0]) * period;
+			last_gpu_timestamps.defoveate_gpu_time = (timestamps2[2] - timestamps2[0]) * period;
+			last_gpu_timestamps.gizmo_gpu_time = (timestamps2[3] - timestamps2[2]) * period;
+			last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
+			last_gpu_timestamps.mask_first_gpu_time = (timestamps2[4] - timestamps2[3]) * period;
+			last_gpu_timestamps.mask_rest_gpu_time = (timestamps2[1] - timestamps2[4]) * period;
 		}
 	}
 
@@ -1038,6 +1060,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
+	// Mask record/submit views: located live at predicted display time,
+	// not the video frame's pose. The video layer keeps its own pose (and
+	// its own runtime warp); masks warped from a stale video pose trail
+	// live geometry (projected instances) and live camera under head
+	// motion (black trailing edge). Each layer warps independently, so a
+	// fresher mask pose strictly reduces warp error. Falls back to the
+	// video pose when locating fails.
+	std::array<XrPosef, view_count> mask_pose = pose;
+	std::array<XrFovf, view_count> mask_fov = fov;
+	{
+		XrSpace live_space = application::space(xr::spaces::world);
+		auto [view_flags, live_views] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, live_space);
+		if (live_views.size() == view_count and (view_flags & XR_VIEW_STATE_POSITION_VALID_BIT) and
+		    (view_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+		{
+			for (size_t i = 0; i < view_count; ++i)
+			{
+				mask_pose[i] = live_views[i].pose;
+				mask_fov[i] = live_views[i].fov;
+			}
+		}
+	}
+
 	// Allow the headset to time warp if we are redisplaying a frame
 	if ((not application::get_hmd_traits().discard_frame) or
 	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
@@ -1081,7 +1126,32 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		assert(swapchain);
 		// defoveate the image, apply scale/bias
 		int image_index = swapchain.acquire();
-		swapchain.wait();
+		if (not swapchain.wait(100'000'000))
+		{
+			// Never park forever on an unavailable video image: the
+			// command buffer so far holds only the query reset + q0
+			// stamp, so end it and submit bare to keep the fence
+			// cycling, hand the acquired image back, and submit an
+			// empty frame. Next frame's query poll carries the GPU
+			// numbers over the unwritten q1..q3.
+			if (not video_wait_warned)
+			{
+				video_wait_warned = true;
+				spdlog::warn("Video swapchain image wait timed out, skipping frame");
+			}
+			command_buffer.end();
+			vk::SubmitInfo skip_submit;
+			skip_submit.setCommandBuffers(*command_buffer);
+			device.resetFences(*fence);
+			queue.lock()->submit(skip_submit, *fence);
+#if WIVRN_FEATURE_RENDERDOC
+			renderdoc_end(*vk_instance);
+#endif
+			swapchain.release();
+			session.end_frame(frame_state.predictedDisplayTime, {});
+			return;
+		}
+		video_wait_warned = false;
 
 		switch (gui_status)
 		{
@@ -1111,6 +1181,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		                      {scale, scale, scale, 1.},
 		                      {bias, bias, bias, 0.},
 		                      image_index);
+		// GPU span point: closes the defoveate span (q2-q0), opens the
+		// gizmo gap below. Unconditional (defoveate runs every frame).
+		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 2);
 
 #if WIVRN_USE_V4L2
 		// the blit handles keep CAPTURE buffers alive until this cmd buffer's fence has completed
@@ -1147,6 +1220,707 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 #endif
 
+		// Marker tracking runs every frame: solved frames feed the
+		// record phase below (cutouts, gizmos) and the status UI.
+		update_fiducial_passthrough(frame_state.predictedDisplayTime);
+
+		// Fresh frame accumulators for the Statistics plots (filled by
+		// the gizmo and mask record phases below, sampled by
+		// accumulate_metrics). fence_wait_ms is measured at frame top
+		// above, so it is not reset here; gui_ms/submit_ms are
+		// measured after this point and reset for freshness.
+		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
+		mask_draws = 0;
+		gui_ms = submit_ms = 0;
+
+		// View-only transforms, shared by the mask record and the debug
+		// gizmos below. Live predicted views (mask_pose/mask_fov), not the
+		// video frame's pose: see the mask_pose block above.
+		std::array<glm::mat4, view_count> world_mvp;
+		for (uint32_t view = 0; view < view_count; ++view)
+			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
+
+		// QR debug gizmos: tag boxes (green = configured, red = other),
+		// axes tripods, orange fused-corrected boxes, board origin +
+		// smoothed tripods. One transparent projection layer, staged
+		// here and submitted after the camera layers below.
+		int dbg_image = -1;
+		if (debug_overlays)
+		{
+			auto gizmo_t0 = std::chrono::steady_clock::now();
+			if (not gizmo_lines)
+				gizmo_lines = std::make_unique<debug_lines_renderer>(device);
+			// Reset the append cursor: all records in a frame share one
+			// upload, and without the reset later memcpys would clobber
+			// earlier draws' data (same buffer, draw at submit). Missing
+			// this freezes the layer once the staging cap trips.
+			gizmo_lines->begin_frame();
+			using vtx = debug_lines_renderer::vertex;
+			std::vector<vtx> tris;
+			tris.reserve(512);
+			XrTime dbg_now = instance.now();
+			// Single map latch for the whole gizmo build below
+			// (was one lock per section per frame).
+			auto fid_map = fiducial_map.lock();
+			auto tri = [&](glm::vec3 a, glm::vec3 b, glm::vec3 c, float r, float g, float bl, float al) {
+				tris.push_back({{a.x, a.y, a.z}, {r, g, bl, al}});
+				tris.push_back({{b.x, b.y, b.z}, {r, g, bl, al}});
+				tris.push_back({{c.x, c.y, c.z}, {r, g, bl, al}});
+			};
+			// Filled quad (double-sided: cull is off, so no facing math).
+			auto box_fill = [&](glm::vec3 c, glm::vec3 r, glm::vec3 u, float hw, float hh, float cr, float cg, float cb, float ca) {
+				glm::vec3 v0 = c - r * hw - u * hh, v1 = c + r * hw - u * hh;
+				glm::vec3 v2 = c + r * hw + u * hh, v3 = c - r * hw + u * hh;
+				tri(v0, v1, v2, cr, cg, cb, ca);
+				tri(v0, v2, v3, cr, cg, cb, ca);
+			};
+			// Shaft from o along dir, width across wdir (flat quad, 2 tris).
+			auto shaft = [&](glm::vec3 o, glm::vec3 dir, glm::vec3 wdir, float len, float wdt, float cr, float cg, float cb, float ca) {
+				glm::vec3 e = o + dir * len, s = wdir * (wdt * 0.5f);
+				tri(o - s, o + s, e + s, cr, cg, cb, ca);
+				tri(o - s, e + s, e - s, cr, cg, cb, ca);
+			};
+			auto tripod = [&](glm::vec3 o, glm::vec3 x, glm::vec3 y, glm::vec3 z, float len, float wdt, float a) {
+				shaft(o, x, y, len, wdt, 1.f, 0.f, 0.f, a);
+				shaft(o, y, x, len, wdt, 0.f, 1.f, 0.f, a);
+				shaft(o, z, x, len, wdt, 0.f, 0.f, 1.f, a);
+			};
+			auto tag_frame = [&](const XrPosef & p, glm::vec3 & o, glm::vec3 & x, glm::vec3 & y, glm::vec3 & z) {
+				glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+				o = glm::vec3(p.position.x, p.position.y, p.position.z);
+				x = q * glm::vec3(1, 0, 0);
+				y = q * glm::vec3(0, 1, 0);
+				z = q * glm::vec3(0, 0, 1);
+			};
+			// Configured payloads, for green vs red.
+			auto is_configured = [&](const std::string & payload) {
+				for (const auto & f: fid_map->fiducials)
+				{
+					for (const auto & m: f.markers)
+					{
+						if (m.marker_data == payload)
+							return true;
+					}
+				}
+				return false;
+			};
+			// Green boxes come from votes (one sighting per marker via
+			// its own group's tracker, duplicates collapsed): the same
+			// physical code is reported by every group tracker, so raw
+			// sightings would draw it N times at N slightly different
+			// poses. Red boxes (unmatched codes, no correct group) use
+			// deduped raw sightings, newest wins.
+			if (debug_matched)
+			{
+				for (const auto & v: fiducial_votes)
+				{
+					if (v.extents.width <= 0 or v.extents.height <= 0)
+						continue;
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, v.time);
+					if (a <= 0.01f)
+						continue;
+					glm::vec3 c, x, y, z;
+					tag_frame(v.observed, c, x, y, z);
+					box_fill(c, x, y, v.extents.width * 0.5f, v.extents.height * 0.5f, 0.f, 1.f, 0.f, a);
+					++dbg_boxes;
+					if (debug_axes and v.extents.width > 0)
+						tripod(c, x, y, z, v.extents.width, v.extents.width * 0.08f, a);
+				}
+			}
+			if (debug_unmatched)
+			{
+				// Newest sighting per unmatched payload across all
+				// trackers (group trackers plus the no-config discovery
+				// vehicle): one physical code, one red box.
+				struct red_code
+				{
+					XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+					XrExtent2Df extents{0, 0};
+					XrTime time = 0;
+				};
+				std::map<std::string, red_code> red;
+				for (auto & [tkey, tr]: fiducial_trackers)
+				{
+					(void)tkey;
+					for (const auto & s: tr.sightings())
+					{
+						if (is_configured(s.payload))
+							continue;
+						auto it = red.find(s.payload);
+						if (it == red.end() or s.time > it->second.time)
+							red[s.payload] = {s.pose, s.extents, s.time};
+					}
+				}
+				for (const auto & [payload, rc]: red)
+				{
+					(void)payload;
+					if (rc.extents.width <= 0 or rc.extents.height <= 0)
+						continue;
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, rc.time);
+					if (a <= 0.01f)
+						continue;
+					glm::vec3 c, x, y, z;
+					tag_frame(rc.pose, c, x, y, z);
+					box_fill(c, x, y, rc.extents.width * 0.5f, rc.extents.height * 0.5f, 1.f, 0.f, 0.f, a);
+					++dbg_boxes;
+					if (debug_axes and rc.extents.width > 0)
+						tripod(c, x, y, z, rc.extents.width, rc.extents.width * 0.08f, a);
+				}
+			}
+			if (debug_corrected)
+			{
+				// Orange fused-corrected boxes: each configured marker
+				// re-projected from its fiducial's smoothed pose with the
+				// authored offset (the inverse of the vote path). Green
+				// raw vs orange corrected shows disagreement at a glance.
+				for (const auto & f: fid_map->fiducials)
+				{
+					auto bpit = board_poses.find(f.id);
+					if (bpit == board_poses.end() or not bpit->second.live)
+						continue;
+					for (const auto & m: f.markers)
+					{
+						if (m.marker_size_m <= 0)
+							continue;
+						float a = std::clamp(debug_opacity, 0.f, 1.f) *
+						          stale_hold(dbg_now, bpit->second.time);
+						if (a <= 0.01f)
+							continue;
+						glm::quat bq(bpit->second.pose.orientation.w, bpit->second.pose.orientation.x, bpit->second.pose.orientation.y, bpit->second.pose.orientation.z);
+						glm::vec3 bp_(bpit->second.pose.position.x, bpit->second.pose.position.y, bpit->second.pose.position.z);
+						glm::quat oq(m.orientation[3], m.orientation[0], m.orientation[1], m.orientation[2]);
+						glm::vec3 op(m.position[0], m.position[1], m.position[2]);
+						// Authored offsets are tag-in-board: tag = board *
+						// offset directly (the vote path inverts once).
+						glm::quat tq = bq * oq;
+						glm::vec3 c = bp_ + bq * op;
+						glm::vec3 x = tq * glm::vec3(1, 0, 0);
+						glm::vec3 y = tq * glm::vec3(0, 1, 0);
+						glm::vec3 z = tq * glm::vec3(0, 0, 1);
+						box_fill(c, x, y, m.marker_size_m * 0.5f, m.marker_size_m * 0.5f, 1.f, 0.55f, 0.f, a);
+						++dbg_boxes;
+					}
+				}
+			}
+			if (debug_origin or debug_smoothed)
+			{
+				for (const auto & [fid, bp]: board_poses)
+				{
+					(void)fid;
+					float a = std::clamp(debug_opacity, 0.f, 1.f) * stale_hold(dbg_now, bp.time);
+					if (a <= 0.01f)
+						continue;
+					// Board origin: use the largest configured tag as the
+					// scale reference (offsets are meaningless without one).
+					float ref_size = 0;
+					for (const auto & f: fid_map->fiducials)
+					{
+						if (f.id != fid)
+							continue;
+						for (const auto & m: f.markers)
+							ref_size = std::max(ref_size, m.marker_size_m);
+					}
+					if (ref_size <= 0)
+						continue;
+					if (debug_origin)
+					{
+						// Fused origin tripod + white square (offset check).
+						glm::vec3 o, x, y, z;
+						tag_frame(bp.pose, o, x, y, z);
+						float len = ref_size * 1.5f;
+						tripod(o, x, y, z, len, len * 0.05f, a);
+						float d = len * 0.25f;
+						box_fill(o, x, y, d, d, 1.f, 1.f, 1.f, a);
+						++dbg_boxes;
+					}
+					if (debug_smoothed)
+					{
+						// Smoothed twin (smaller, cyan square).
+						glm::vec3 o, x, y, z;
+						tag_frame(bp.pose, o, x, y, z);
+						float len = ref_size * 1.0f;
+						tripod(o, x, y, z, len, len * 0.06f, a);
+						float d = len * 0.25f;
+						box_fill(o, x, y, d, d, 0.f, 1.f, 1.f, a);
+						++dbg_boxes;
+					}
+				}
+			}
+			dbg_tris = tris.size() / 3;
+						// Own swapchain: acquire once when gizmos will record. Skip
+			// the frame on timeout (paired release inside, like masks).
+			if (not tris.empty())
+			{
+				gizmo_lines->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+				dbg_image = gizmo_lines->acquire();
+			}
+			if (dbg_image >= 0 and not tris.empty())
+			{
+				std::array<vk::Extent2D, 2> eye_ext;
+				std::array<glm::mat4, 2> eye_mvp;
+				for (uint32_t view = 0; view < view_count; ++view)
+				{
+					eye_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+					eye_mvp[view] = world_mvp[view];
+				}
+				gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
+			}
+			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
+		}
+
+		// Debug mask record: the local debug group (union B) carries the
+		// marker-window cutouts. No silhouette raster yet (no objects):
+		// clear + hard cutout punch at full alpha.
+		cutouts_punched = false;
+		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
+		std::vector<mask_group *> acquired_groups;
+		// GPU span point: closes the gizmo gap (q3-q2), opens the mask
+		// span (closed by query 1 after the phase). Unconditional so no
+		// validity tracking is needed; without mask work the span just
+		// measures submit prep.
+		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 3);
+		// q4 splits the mask span after the first recorded group (set
+		// below; fallback write after the loop keeps the poll range
+		// valid on group-less frames). Groups record sequentially, so
+		// first = q4-q3 localizes one group's chain, rest = q1-q4.
+		bool mask_split_written = false;
+		if (mask_frame)
+		{
+			int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
+			int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
+			// Member swapchains submit below full (tiered): tier-0 stays
+			// full (exact hard edge), tier-1 submits half, tiered submits
+			// quarter (V writes the submitted size, the compositor
+			// upscales). Intermediates stay keyed off full mw/mh.
+			int hw = std::max(64, mw / 2);
+			int hh = std::max(64, mh / 2);
+			int qw = std::max(64, mw / 4);
+			int qh = std::max(64, mh / 4);
+			// Marker window cutouts: raw pose of every live vote,
+			// expanded by the debug window. Fully manual path (no blur):
+			// the punch below is hard-edged by construction.
+			std::vector<std::array<glm::vec3, 6>> cutouts;
+			if (debug_overlays and debug_window_mm >= 0)
+			{
+				for (const auto & v: fiducial_votes)
+				{
+					if (v.extents.width <= 0 or v.extents.height <= 0)
+						continue;
+					glm::quat mq(v.observed.orientation.w, v.observed.orientation.x, v.observed.orientation.y, v.observed.orientation.z);
+					glm::vec3 c(v.observed.position.x, v.observed.position.y, v.observed.position.z);
+					glm::vec3 r = mq * glm::vec3(1, 0, 0);
+					glm::vec3 u = mq * glm::vec3(0, 1, 0);
+					float hw = v.extents.width * 0.5f + debug_window_mm / 1000.f;
+					float hh = v.extents.height * 0.5f + debug_window_mm / 1000.f;
+					glm::vec3 v0 = c - r * hw - u * hh;
+					glm::vec3 v1 = c + r * hw - u * hh;
+					glm::vec3 v2 = c + r * hw + u * hh;
+					glm::vec3 v3 = c - r * hw + u * hh;
+					cutouts.push_back({v0, v1, v2, v0, v2, v3});
+				}
+			}
+			// Fresh cutouts punch camera with no geometry to map it
+			// onto: the flat feed must stay submitted (see submit).
+			cutouts_punched = not cutouts.empty();
+			// Claim groups + sync member soups (upload on hash change).
+			// Groups are keyed (feather, union): A (true) drives the
+			// projected layer, B (false) the flat layer. Record order
+			// is A ascending, then B ascending (submit matches).
+			std::set<float> live_a, live_b;
+			// Pre-warmed (map-known, not necessarily placed) combos.
+			// Kept by the stale-erase below alongside live_groups, but
+			// kept OUT of live_a/live_b: those drive record order and
+			// the debug-cutout fallback, which must reflect placed
+			// objects only.
+			std::set<std::pair<float, bool>> prewarmed_keys;
+			// Pre-warm pass (first-visible-frame hitch fix): claim
+			// renderer + swapchain + intermediates for every (feather,
+			// union) combo in the map, before anything is placed or
+			// uploaded. Placement frames then only rasterize. Combos
+			// with nothing placed record no draws and stay inactive.
+			// Mirrors the storage blocks in the record loop (which
+			// become no-ops once pre-warmed).
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough")
+					continue;
+				float pf = ost.def.feather_px;
+				bool pproj = surface_projected_effective(oid, ost);
+				prewarmed_keys.emplace(pf, pproj);
+				auto pkey = std::make_pair(pf, pproj);
+				auto & pg = mask_groups[pkey];
+				pg.feather_px = pf;
+				pg.projected = pproj;
+				if (not pg.renderer)
+				{
+					pg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+				}
+				int ptier = feather_mask_renderer::tier_for_feather(pf);
+				int pgw = (ptier == 0) ? mw : (ptier == 1) ? hw : qw;
+				int pgh = (ptier == 0) ? mh : (ptier == 1) ? hh : qh;
+				if (not pg.swapchain or pg.swapchain.width() != pgw or pg.swapchain.height() != pgh)
+				{
+					device.waitIdle();
+					pg.swapchain = xr::swapchain(instance, session, device, swapchain.format(), pgw, pgh, 1, view_count);
+					pg.renderer->reset_targets();
+					spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", pgw, pgh, pf, pproj ? "A" : "B", pg.swapchain.image_count());
+				}
+				pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+			}
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				float f = ost.def.feather_px;
+				bool proj = surface_projected_effective(oid, ost);
+				(proj ? live_a : live_b).insert(f);
+				auto key = std::make_pair(f, proj);
+				auto & g = mask_groups[key];
+				g.feather_px = f;
+				g.projected = proj;
+				if (not g.renderer)
+				{
+					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+				}
+				auto mh = g.mesh_hashes.find(oid);
+				if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
+				{
+					g.renderer->set_mesh(oid, ost.soup);
+					g.mesh_hashes[oid] = ost.soup_hash;
+				}
+			}
+			// Reversed objects (negatives) cut every group of both
+			// unions: appended after all positives (the renderer
+			// resolves positives first, then depth-tested MIN cuts).
+			std::vector<std::pair<float, bool>> live_groups;
+			for (float f: live_a)
+				live_groups.emplace_back(f, true);
+			for (float f: live_b)
+				live_groups.emplace_back(f, false);
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				for (auto & key: live_groups)
+				{
+					auto git = mask_groups.find(key);
+					if (git == mask_groups.end() or not git->second.renderer)
+						continue;
+					auto & g = git->second;
+					auto mh = g.mesh_hashes.find(oid);
+					if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
+					{
+						g.renderer->set_mesh(oid, ost.soup);
+						g.mesh_hashes[oid] = ost.soup_hash;
+					}
+				}
+			}
+			// Debug-only cutout group (no objects): lets the marker
+			// window punch with a fiducials-only config. Claimed
+			// whenever cutouts exist but no B group does (real B groups
+			// punch cutouts themselves, so no extra group then).
+			if (live_b.empty() and not cutouts.empty())
+			{
+				auto & g = debug_group;
+				if (not g.renderer)
+					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+			}
+			else
+				debug_group.active = false;
+			// Permanent record-order log: group costs are positional, so
+			// the per-group loop order below is load-bearing diagnostics.
+			// Logged on change only (config/map edits, anchor flapping).
+			{
+				static std::vector<std::pair<float, bool>> last_live_feathers;
+				if (live_groups != last_live_feathers)
+				{
+					last_live_feathers = live_groups;
+					std::string order;
+					for (auto [f, proj]: live_groups)
+						order += std::to_string(f) + (proj ? "A " : "B ");
+					spdlog::info("Fiducial mask groups order: {}", order);
+				}
+			}
+			// Drop stale groups + stale member meshes. Use-then-advance:
+			// touching git->second after ++git reads past end().
+			for (auto git = mask_groups.begin(); git != mask_groups.end();)
+			{
+				// Pre-warmed combos are kept like live ones (they become
+				// live on placement without re-creating storage).
+				if (std::ranges::find(live_groups, git->first) == live_groups.end() and
+				    prewarmed_keys.find(git->first) == prewarmed_keys.end())
+				{
+					// Rare path: swapchain images may be in flight.
+					device.waitIdle();
+					git = mask_groups.erase(git);
+					continue;
+				}
+				auto & g = git->second;
+				for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					// Reversed objects live in every group (no feather of
+					// their own): evict on removal/unready only, never on
+					// feather/union mismatch. Positives must match both
+					// feather and union: a flag flip evicts from the old
+					// union's group (remove_mesh) so no frame ever
+					// rasterizes the object in both unions (ghost).
+					bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
+					        oit->second.fused.placed and
+					        (oit->second.def.type == "3d-passthrough-reversed" or
+					         (oit->second.def.feather_px == g.feather_px and
+					          surface_projected_effective(oit->first, oit->second) == g.projected));
+					if (not member)
+					{
+						g.renderer->remove_mesh(hit->first);
+						hit = g.mesh_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				++git;
+			}
+			// Record per group: draws from placed objects (union-scoped),
+			// full opacity. Cutouts punch union B only (flat): no geometry
+			// exists to map them onto, so A must never see them.
+			static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+			for (auto [f, proj]: live_groups)
+			{
+				auto & g = mask_groups[{f, proj}];
+				// Eager setup: member swapchain + intermediates ready
+				// before first draws, so first-visible frames pay
+				// record+submit only. Tier-0 groups keep a full-res
+				// swapchain (exact hard edge); tier-1 submits half,
+				// tiered submits quarter (V writes the submitted size,
+				// the compositor upscales). g.extent tracks the submitted
+				// size; record() still works intermediates at full.
+				int tier = feather_mask_renderer::tier_for_feather(f);
+				int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
+				int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
+				if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
+				{
+					// Rare path (first frame, feather/config change):
+					// nothing outstanding (previous images released last
+					// frame), mirroring setup_reprojection_swapchain.
+					device.waitIdle();
+					g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), gw, gh, 1, view_count);
+					g.renderer->reset_targets();
+					spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
+				}
+				g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+				std::vector<feather_mask_renderer::instance_draw> draws;
+				// Frustum skip: drop draws fully outside both eyes (the
+				// empty-draws path below then skips acquire/record for
+				// fully-culled groups, which cost nothing). Conservative
+				// and exact: per eye, skip only if every corner is either
+				// behind the camera or outside a common side; straddles
+				// are always kept. The NDC box grows by the feather bleed
+				// + 1px so blur contributions survive culling.
+				float margin_x = (f * 0.5f + 1.f) / ((float)mw * 0.5f);
+				float margin_y = (f * 0.5f + 1.f) / ((float)mh * 0.5f);
+				auto draw_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
+					auto bounds = g.renderer->mesh_bounds(mesh);
+					if (not bounds)
+						return true;
+					for (uint32_t view = 0; view < 2; ++view)
+					{
+						bool any_front = false, any_behind = false, any_inside = false;
+						for (int corner = 0; corner < 8; ++corner)
+						{
+							glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
+							            (corner & 2) ? bounds->second.y : bounds->first.y,
+							            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+							glm::vec4 c = draw_mvp[view] * q;
+							if (c.w < 0)
+							{
+								any_behind = true;
+								continue;
+							}
+							any_front = true;
+							if (glm::abs(c.x) <= c.w * (1.f + margin_x) and
+							    glm::abs(c.y) <= c.w * (1.f + margin_y) and c.z >= 0 and c.z <= c.w)
+								any_inside = true;
+						}
+						bool skip_eye = not any_front or (not any_behind and not any_inside);
+						if (not skip_eye)
+							return true;
+					}
+					return false;
+				};
+				// One draw per placed object: model matrix from the fused
+				// placement, per-eye MVPs, full opacity. Polarity rides
+				// the draw (false = fill, true = cut); the renderer pushes
+				// full cut strength for reversed.
+				auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed) {
+					const auto & fu = ost.fused;
+					if (not fu.placed)
+						return;
+					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+					std::array<glm::mat4, 2> mvp;
+					for (uint32_t view = 0; view < view_count; ++view)
+						mvp[view] = world_mvp[view] * model;
+					constexpr float op = 1;
+					if (not draw_visible(oid, mvp))
+						return;
+					draws.push_back({oid, mvp, op, reversed});
+				};
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f or
+					    surface_projected_effective(oid, ost) != proj)
+						continue;
+					append_draw(oid, ost, false);
+				}
+				// Reversed objects (negatives) cut every group of both
+				// unions: appended after all positives (the renderer
+				// resolves positives first, then depth-tested MIN cuts).
+				// Same mvp/frustum path, full cut strength.
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					append_draw(oid, ost, true);
+				}
+				// Reversed-only draws rasterize to a provable no-op, so a
+				// group with no positive draws is skipped exactly like an
+				// empty one.
+				bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
+				if (draws.empty() or not any_positive)
+				{
+					g.active = false;
+					// Mesh-pipeline edge forensics: draws present ->
+					// absent means the object stopped rasterizing
+					// (frustum-culled out of view vs state loss).
+					// Throttled: frame-edge flicker would spam.
+					if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+					{
+						g.last_draws_log = instance.now();
+						spdlog::info("Fiducial mask draws lost (feather {}px union {})", f, proj ? "A" : "B");
+					}
+					g.had_draws = false;
+					continue;
+				}
+				g.had_draws = true;
+				int mask_index = g.swapchain.acquire();
+				// Paired from acquisition: the group joins the release
+				// list immediately, so wait/record throws release its
+				// image instead of leaking it (one leaked image per frame
+				// drains the pool in pool-depth frames, then acquires fail
+				// permanently).
+				acquired_groups.push_back(&g);
+				if (not g.swapchain.wait(100'000'000))
+				{
+					// Never park forever on an unavailable image: release
+					// the untouched acquisition to keep pairing and skip
+					// the group this frame.
+					g.swapchain.release();
+					acquired_groups.pop_back();
+					g.active = false;
+					if (not g.wait_warned)
+					{
+						g.wait_warned = true;
+						spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px union {})", f, proj ? "A" : "B");
+					}
+					continue;
+				}
+				g.wait_warned = false;
+				g.acquired = true;
+				g.active = true;
+				g.extent = {(int32_t)gw, (int32_t)gh};
+				feather_mask_renderer::mask_stage_cpu mstats{};
+				try
+				{
+					g.renderer->record(command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
+					                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh});
+				}
+				catch (std::exception & e)
+				{
+					spdlog::warn("Fiducial mask record failed: {} (feather {}px union {})", e.what(), f, proj ? "A" : "B");
+					g.swapchain.release();
+					acquired_groups.pop_back();
+					g.acquired = false;
+					g.active = false;
+				}
+				// Cutout punch (debug-only) folds into raster.
+				mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+				mask_erode_ms += mstats.erode_ms;
+				mask_blur_ms += mstats.blur_ms;
+				mask_draws += (int)mstats.draws;
+				if (not mask_split_written)
+				{
+					mask_split_written = true;
+					command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 4);
+				}
+			}
+			if (not mask_split_written)
+			{
+				// No group recorded (all culled/skipped): zero-length
+				// first span, so the poll range stays valid and mask
+				// numbers carry over instead of going stale.
+				mask_split_written = true;
+				command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 4);
+			}
+			// Debug group record (cutouts only, full-res, clear + hard
+			// punch): runs only while claimed above.
+			if (live_b.empty() and not cutouts.empty())
+			{
+				auto & g = debug_group;
+				if (g.extent.width != mw or g.extent.height != mh)
+				{
+					g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
+					g.extent = {(int32_t)mw, (int32_t)mh};
+					g.renderer->reset_targets();
+				}
+				int mask_index = g.swapchain.acquire();
+				if (not g.swapchain.wait(100'000'000))
+				{
+					g.swapchain.release();
+					g.active = false;
+					cutouts_punched = false;
+					if (not g.wait_warned)
+					{
+						g.wait_warned = true;
+						spdlog::warn("Debug mask image wait timed out, skipping frame");
+					}
+				}
+				else
+				{
+					g.wait_warned = false;
+					g.acquired = true;
+					g.active = true;
+					acquired_groups.push_back(&g);
+					feather_mask_renderer::mask_stage_cpu mstats{};
+					try
+					{
+						// Full-res submit (feather 0 = tier 0): the hard
+						// punch needs no blur intermediates.
+						vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
+						g.renderer->record(command_buffer, g.swapchain.image(mask_index), mex, {}, true, 0,
+						                   cutouts, world_mvp, &mstats, mex);
+					}
+					catch (std::exception & e)
+					{
+						spdlog::warn("Debug mask record failed: {}", e.what());
+						g.swapchain.release();
+						acquired_groups.erase(std::remove(acquired_groups.begin(), acquired_groups.end(), &g), acquired_groups.end());
+						g.acquired = false;
+						g.active = false;
+						cutouts_punched = false;
+					}
+					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+					mask_erode_ms += mstats.erode_ms;
+					mask_blur_ms += mstats.blur_ms;
+					mask_draws += (int)mstats.draws;
+				}
+			}
+			else
+				debug_group.active = false;
+		}
+
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
 		command_buffer.end();
@@ -1180,13 +1954,34 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		renderdoc_end(*vk_instance);
 #endif
 		swapchain.release();
+		// Paired with the group acquires above: the compositor takes
+		// the last released image, so release right after submit and
+		// reference the swapchains in the layers below.
+		for (auto * g: acquired_groups)
+		{
+			g->acquired = false;
+			g->swapchain.release();
+		}
+		acquired_groups.clear();
 
-		if (use_alpha)
+		bool have_fiducial_map = false;
+		{
+			auto map = fiducial_map.lock();
+			have_fiducial_map = not map->fiducials.empty() or not map->objects.empty();
+		}
+		// The debug window cutout needs a live passthrough to reveal,
+		// map or not (it punches every live vote).
+		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
+		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
 
-		render_start(use_alpha, frame_state.predictedDisplayTime);
+		// Mask path owns the display when the alpha-blend extension is
+		// present (stereo only, like the mask targets): video, then one
+		// union pass each (A projected, B flat), then debug/GUI. Without
+		// it, previous behavior is untouched (flat auto-submit).
+		render_start(mask_frame ? false : use_alpha, frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
 		std::array<XrCompositionLayerProjectionView, view_count> layer_view;
@@ -1209,33 +2004,242 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			        };
 		}
 		add_projection_layer(
-		        use_alpha ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
+		        // Mask-blend mode drives the window from the feather mask;
+		        // server alpha (if any) is ignored so the two never double-cut.
+		        (use_alpha and not mask_frame) ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0,
 		        application::space(xr::spaces::world),
 		        layer_view);
 
-	// Marker tracking runs every frame: the solved frames feed the
-	// status UI and downstream passthrough consumers.
-	update_fiducial_passthrough(frame_state.predictedDisplayTime);
+		if (mask_frame)
+		{
+			// Split-union compositing: union A (projected content) drives
+			// the projected layer, union B (the rest) drives the flat
+			// layer, composited projected-below-flat so flat wins overlaps.
+			// Video (opaque) was already added above, then each union's
+			// masks, then the camera layers, then debug/GUI. The single
+			// dst-alpha channel carries one union at a time: the first mask
+			// of each union REPLACEs destination alpha (color preserved),
+			// the rest ADD (saturating union). B's REPLACE resets the alpha
+			// the projected layer consumed, so flat reads only B.
+			//
+			// EITHER/OR camera layers: co-submitting flat reconstruction and
+			// projected mapping breaks video compositing on current runtimes
+			// (video goes black; instantly reversible), so exactly one camera
+			// layer submits per frame.
+			//
+			// This branch has no window groups yet (no objects, no blur):
+			// union A is empty, union B holds only the debug cutout group.
+			// Debug cutouts punch union B only (no geometry to map onto),
+			// so the flat feed must stay submitted.
+			//
+			// With objects: union A holds the surface-projected windows
+			// (drives the projected layer), union B the rest (drives the
+			// flat layer). Flat wins whenever anything needs it:
+			// unprojected windows, debug cutouts (camera with no geometry
+			// to map it onto). Otherwise the projected layer alone carries
+			// every projected window.
+			bool need_flat = cutouts_punched;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				if (not surface_projected_effective(oid, ost))
+				{
+					need_flat = true;
+					break;
+				}
+			}
+			if (cutouts_punched)
+				need_flat = true;
+			bool have_projected = session.has_projected_instances();
+			size_t a_active = 0, b_active = 0;
+			for (auto & [key, g]: mask_groups)
+			{
+				if (not g.active)
+					continue;
+				if (key.second)
+					++a_active;
+				else
+					++b_active;
+			}
+			if (debug_group.active)
+				++b_active;
+			bool submit_projected = have_projected and a_active > 0;
+			bool submit_flat = need_flat and b_active > 0;
+			// Forensic submit decisions (change-triggered): which camera layer
+			// submits and why. Permanent: coexistence bugs read as wrong output
+			// with no error, so the decision itself must be in the log.
+			{
+				static bool last_submit_flat = true;
+				static bool last_submit_projected = false;
+				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected)
+				{
+					last_submit_flat = submit_flat;
+					last_submit_projected = submit_projected;
+					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={})",
+					             (submit_flat and submit_projected) ? "projected+flat"
+					             : submit_flat                      ? "flat"
+					             : submit_projected                 ? "projected"
+					                                                : "video-only",
+					             need_flat,
+					             have_projected,
+					             a_active,
+					             b_active,
+					             cutouts_punched);
+				}
+			}
+			// One mask submit pass per union (A then B): each union's first
+			// active group REPLACEs, the rest ADD.
+			for (bool proj_union: {true, false})
+			{
+				bool first_group = true;
+				// Union A: window groups with projected=true (none yet).
+				for (auto & [key, g]: mask_groups)
+				{
+					if (key.second != proj_union)
+						continue;
+					if (not g.active)
+						continue;
+					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+					for (uint32_t view = 0; view < view_count; ++view)
+					{
+						mask_views[view] = {
+						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+						        .pose = mask_pose[view],
+						        .fov = mask_fov[view],
+						        .subImage = {
+						                .swapchain = g.swapchain,
+						                .imageRect = {
+						                        .offset = {0, 0},
+						                        .extent = {g.extent.width, g.extent.height},
+						                },
+						                .imageArrayIndex = view,
+						        },
+						};
+					}
+					// imageIndex is implicit: the compositor uses the last
+					// released image, which record() acquired above.
+					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+					                     application::space(xr::spaces::world),
+					                     mask_views);
+					if (first_group)
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					else
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+					first_group = false;
+				}
+				// Union B also carries the local debug cutout group.
+				if (not proj_union and debug_group.active)
+				{
+					auto & g = debug_group;
+					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+					for (uint32_t view = 0; view < view_count; ++view)
+					{
+						mask_views[view] = {
+						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+						        .pose = mask_pose[view],
+						        .fov = mask_fov[view],
+						        .subImage = {
+						                .swapchain = g.swapchain,
+						                .imageRect = {
+						                        .offset = {0, 0},
+						                        .extent = {g.extent.width, g.extent.height},
+						                },
+						                .imageArrayIndex = view,
+						        },
+						};
+					}
+					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+					                     application::space(xr::spaces::world),
+					                     mask_views);
+					if (first_group)
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					else
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+				}
+				// Each union's camera layer consumes its own alpha: A feeds
+				// projected, then B REPLACEs the alpha and feeds flat, so
+				// flat wins overlaps.
+				if (proj_union)
+				{
+					if (submit_projected)
+					{
+						add_projected_passthrough_layer();
+						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					}
+				}
+				else
+				{
+					if (submit_flat)
+					{
+						add_passthrough_layer();
+						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					}
+				}
+			}
+		}
 
-	if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
+		// Debug gizmo layer: ONE transparent projection layer for all debug
+		// geometry (standard alpha blend: no FB extensions, works wherever
+		// the old quads did). Always exactly one layer: maxLayerCount can
+		// never overflow. Above passthrough (it annotates real-world tags),
+		// below the GUI.
+		if (dbg_image >= 0)
+		{
+			std::array<XrCompositionLayerProjectionView, view_count> dbg_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				dbg_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = mask_pose[view],
+				        .fov = mask_fov[view],
+				        .subImage = {
+				                .swapchain = gizmo_lines->swapchain(),
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = extents[view],
+				                },
+				                .imageArrayIndex = view,
+				        },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     dbg_views);
+			// Paired with the acquire in the record phase above: the
+			// compositor takes the last released image; release after submit.
+			gizmo_lines->release();
+		}
+
+		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;
 		    (openxr_post_processing.sharpening | openxr_post_processing.super_sampling) > 0)
 			set_layer_settings(openxr_post_processing.sharpening | openxr_post_processing.super_sampling);
 
-		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, timestamps);
+		{
+			auto gui_t0 = std::chrono::steady_clock::now();
+			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+			gui_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_t0).count();
+		}
 
-		draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
-
+		// render_end (submit + end_frame IPC) is the remaining
+		// uninstrumented span inside the cpu= measurement: time it so
+		// compositor-side stalls are named instead of unattributed.
+		auto submit_t0 = std::chrono::steady_clock::now();
 		try
 		{
 			render_end();
 		}
 		catch (std::system_error & e)
 		{
-			if (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID)
-				spdlog::info("Invalid pose submitted");
-			else
+			if (not (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID))
 				throw;
+			spdlog::info("Invalid pose submitted");
 		}
+		submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_t0).count();
+
+		// Sampled after render_end so gui_ms/submit_ms above are this
+		// frame's, not last frame's.
+		accumulate_metrics(frame_state.predictedDisplayTime, current_blit_handles, last_gpu_timestamps);
 	}
 
 	// Network operations may be blocking, do them once everything was submitted
@@ -1385,6 +2389,14 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	        swapchain.images(),
 	        extent,
 	        swapchain.format());
+
+	// Retain the shared mask-pipeline cache for the session, then
+	// force-build it now (first video swapchain, before any map exists).
+	// Without this the first feather_mask_renderer pays ~85ms of driver
+	// compiles on the first visible frame (later groups hit the cache
+	// anyway).
+	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
+	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()

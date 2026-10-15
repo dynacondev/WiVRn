@@ -23,6 +23,8 @@
 #include "utils/i18n.h"
 #include "utils/named_thread.h"
 
+#include <algorithm>
+#include <fstream>
 #include <spdlog/spdlog.h>
 #include <uni_algo/case.h>
 
@@ -171,13 +173,153 @@ void scenes::stream::operator()(to_headset::running_applications && apps)
 
 void scenes::stream::operator()(to_headset::fiducial_map && map)
 {
-	spdlog::info("Received fiducial map with {} fiducials", map.fiducials.size());
+	spdlog::info("Received fiducial map with {} fiducials, {} passthrough objects", map.fiducials.size(), map.objects.size());
 	for (const auto & fid: map.fiducials)
 	{
 		std::string label = fid.tag.empty() ? fid.id : fid.tag;
 		spdlog::info("Fiducial \"{}\": {} marker(s) ({})", label, fid.markers.size(), fid.is_static ? "static" : "moving");
 	}
+	for (const auto & obj: map.objects)
+	{
+		std::string label = obj.tag.empty() ? obj.id : obj.tag;
+		if (obj.model_hash.empty())
+			spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
+		else
+			spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes)",
+			             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size);
+	}
 	*fiducial_map.lock() = std::move(map);
+
+	// Request models missing from the local cache
+	std::error_code ec;
+	auto cache_dir = application::get_config_path() / "fiducial_models";
+	static bool cache_dir_logged = false;
+	if (not cache_dir_logged)
+	{
+		cache_dir_logged = true;
+		spdlog::info("Fiducial model cache dir: {}", cache_dir.string());
+	}
+	std::filesystem::create_directories(cache_dir, ec);
+	if (ec)
+	{
+		spdlog::warn("Cannot create fiducial model cache dir: {}", ec.message());
+		return;
+	}
+
+	std::vector<std::pair<std::string, uint64_t>> missing;
+	size_t cached = 0;
+	{
+		auto map = fiducial_map.lock();
+		for (const auto & obj: map->objects)
+		{
+			if (obj.model_hash.empty() or obj.model_size == 0)
+				continue;
+			if (std::filesystem::exists(fiducial_model_path(obj.model_hash), ec))
+			{
+				++cached;
+				continue;
+			}
+			if (fiducial_downloads.contains(obj.model_hash))
+				continue;
+			missing.emplace_back(obj.model_hash, obj.model_size);
+		}
+	}
+
+	if (cached)
+		spdlog::info("Fiducial models already cached: {}", cached);
+
+	for (const auto & [hash, size]: missing)
+	{
+		fiducial_downloads[hash] = fiducial_download{};
+		network_session->send_control(from_headset::fiducial_model_request{
+		        .model_hash = hash,
+		});
+		spdlog::info("Requesting fiducial model {} ({} bytes)", hash, size);
+	}
+}
+
+std::filesystem::path scenes::stream::fiducial_model_path(const std::string & hash)
+{
+	return application::get_config_path() / "fiducial_models" / (hash + ".glb");
+}
+
+void scenes::stream::operator()(to_headset::fiducial_model_chunk && chunk)
+{
+	// Sanity caps: chunk counts larger than a 64MB model in 1-byte chunks
+	if (chunk.chunk_count == 0 or chunk.chunk_count > 65536 or chunk.data.empty())
+	{
+		spdlog::warn("Ignoring invalid fiducial model chunk for {}", chunk.model_hash);
+		return;
+	}
+	if (chunk.chunk_index >= chunk.chunk_count)
+	{
+		spdlog::warn("Ignoring out-of-range fiducial model chunk for {}", chunk.model_hash);
+		return;
+	}
+
+	uint64_t expected_size = 0;
+	{
+		auto map = fiducial_map.lock();
+		auto obj = std::ranges::find(map->objects, chunk.model_hash, &to_headset::passthrough_object::model_hash);
+		if (obj == map->objects.end() or obj->model_size == 0)
+		{
+			spdlog::warn("Ignoring fiducial model chunk for unknown hash {}", chunk.model_hash);
+			return;
+		}
+		expected_size = obj->model_size;
+	}
+
+	auto & download = fiducial_downloads[chunk.model_hash];
+	if (download.chunk_count == 0)
+		download.chunk_count = chunk.chunk_count;
+	else if (download.chunk_count != chunk.chunk_count)
+	{
+		spdlog::warn("Ignoring fiducial model chunk with mismatched count for {}", chunk.model_hash);
+		return;
+	}
+
+	if (download.chunks.contains(chunk.chunk_index))
+		return;
+	download.chunks[chunk.chunk_index] = std::move(chunk.data);
+
+	if (download.chunks.size() < download.chunk_count)
+		return;
+
+	// All chunks received: assemble in order
+	std::vector<std::byte> data;
+	data.reserve(expected_size);
+	for (uint32_t i = 0; i < download.chunk_count; ++i)
+	{
+		auto it = download.chunks.find(i);
+		if (it == download.chunks.end())
+			return;
+		data.insert(data.end(), it->second.begin(), it->second.end());
+	}
+
+	if (data.size() != expected_size)
+	{
+		spdlog::warn("Fiducial model {} size mismatch (got {}, expected {}), discarding",
+		             chunk.model_hash,
+		             data.size(),
+		             expected_size);
+		fiducial_downloads.erase(chunk.model_hash);
+		return;
+	}
+
+	std::error_code ec;
+	auto path = fiducial_model_path(chunk.model_hash);
+	std::filesystem::create_directories(path.parent_path(), ec);
+	std::ofstream file(path, std::ios::binary | std::ios::trunc);
+	if (not file)
+	{
+		spdlog::warn("Cannot write fiducial model cache file {}", path.string());
+		fiducial_downloads.erase(chunk.model_hash);
+		return;
+	}
+	file.write(reinterpret_cast<const char *>(data.data()), data.size());
+	file.close();
+	spdlog::info("Cached fiducial model {} ({} bytes) at {}", chunk.model_hash, data.size(), path.string());
+	fiducial_downloads.erase(chunk.model_hash);
 }
 
 void scenes::stream::start_application(std::string appid)

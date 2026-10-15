@@ -64,9 +64,10 @@ struct configuration
 		// Exact decoded payload identifying the marker (required).
 		std::string marker_data;
 		float marker_size_m = 0;
-		// Marker-to-fiducial offset: fiducialPose = observedMarkerPose
-		// * offset. Position in meters, orientation as xyzw quaternion
-		// (parsed from [rx, ry, rz] degrees).
+		// Marker-to-fiducial offset, authored tag-in-board: position is
+		// the tag center in fiducial meters, orientation the tag axes
+		// relative to fiducial axes. Position in meters, orientation as
+		// xyzw quaternion (parsed from [rx, ry, rz] degrees).
 		std::array<float, 3> position = {0, 0, 0};
 		std::array<float, 4> orientation = {0, 0, 0, 1};
 	};
@@ -89,6 +90,41 @@ struct configuration
 		std::vector<fiducial_marker> markers;
 	};
 	std::vector<fiducial_entry> fiducials;
+	// Behavior objects placed from solved fiducial frames. Instances fan
+	// out per sighted marker entity: the same QR seen twice places the
+	// object twice; one object may reference several fiducials (one
+	// instance per visible pairing, never fused).
+	struct passthrough_object
+	{
+		// Behavior type. "3d-passthrough" renders the model as a
+		// surface-projected passthrough cutout. "3d-passthrough-reversed"
+		// reverse-cuts the model from every mask layer instead (game video
+		// shows through, depth-tested against the windows covering each
+		// pixel). Unknown types are skipped with a warning.
+		std::string type = "3d-passthrough";
+		std::string id;
+		std::string tag;
+		// Referenced fiducial ids (dangling refs skip the object).
+		std::vector<std::string> fiducial;
+		std::string model_path;
+		// Fiducial-to-object offset: objectPose = solvedFiducialPose *
+		// offset. Uniform scale applies last, objects only.
+		std::array<float, 3> position = {0, 0, 0};
+		std::array<float, 4> orientation = {0, 0, 0, 1};
+		float scale = 1;
+		// Passthrough window feather width in screen pixels (render-only,
+		// applied live). Mask stacks group by this value so each object
+		// feathers independently. Not accepted for
+		// 3d-passthrough-reversed (warned + ignored).
+		float feather_px = 24;
+		// Surface-projected mapping: the headset projects camera imagery
+		// onto this object's mesh instead of the flat reconstruction feed.
+		// Enabled by default; opt out per object with false (plus a live
+		// in-headset override). Ignored for 3d-passthrough-reversed
+		// (warned).
+		bool surface_projected = true;
+	};
+	std::vector<passthrough_object> passthrough_objects;
 
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;

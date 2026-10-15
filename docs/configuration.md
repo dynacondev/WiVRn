@@ -214,14 +214,19 @@ Each `fiducials` entry has:
   - `marker-data`: exact QR payload string to match, byte-for-byte (required)
   - `marker-size-m`: physical marker size in meters (required for pose
     scale; measure the printed QR's outer edge)
-  - `position`: `[x, y, z]` marker-to-fiducial offset in meters
-    (default `[0,0,0]`)
-  - `orientation`: `[rx, ry, rz]` marker-to-fiducial rotation in degrees
-    (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
-    single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
+  - `position`: `[x, y, z]` tag center in fiducial meters, i.e.
+    where the tag sits on the board (default `[0,0,0]`). Position
+    edits move along world axes regardless of angles.
+  - `orientation`: `[rx, ry, rz]` tag orientation relative to fiducial
+    axes, in degrees (default `[0,0,0]`). Orientation tweaks pivot
+    about the tag (the tag stays glued). Fixed-frame rotations about
+    X, then Y, then Z, so single-axis values do the obvious thing
+    (e.g. `[0,90,0]` yaws 90°)
 
+Marker offsets are authored tag-in-board and inverted once at load —
+never hand-invert in config. (Identity case: negate position.)
 Poses compose as
-`fiducialPose = observedMarkerPose * markerToFiducialOffset`.
+`fiducialPose = observedMarkerPose * invert(markerOffset)`.
 Print the QR encoding exactly the `marker-data` string, e.g.
 `qrencode -o marker11.png -s 10 "wivrn:11"`. Matching is exact and
 case-sensitive; any other QR code in view is reported in the headset
@@ -238,8 +243,60 @@ residuals, range/incidence/settle inputs and the filter state for each
 fiducial, and the server log carries the same detail (`board solve:`,
 `board tags:`, `board pop:`, `board flip:` lines).
 
+The Passthrough tab also hosts the QR debug overlays (off by default):
+green boxes on configured codes, red on anything else sighted, RGB axes
+tripods, orange fused-corrected boxes, and board origin/smoothed
+tripods, all with a 3s stale fade. `Marker window cutout` punches a live
+passthrough window at every sighted code through the flat mask (works
+with no map: enable overlays and every code in view reports red, ready
+to copy verbatim into the config).
+
 > [!NOTE]
 > A QR payload is a single identity: printing the *same* payload twice
 > does not create two trackables. The runtime reports one jumping track
 > for identical prints. For multi-location coverage, print distinct
 > payloads and configure one fiducial per location.
+
+## `passthrough`
+Default value: unset (no objects)
+
+Behavior objects placed from solved fiducial frames. Each entry
+references fiducials by id and places one instance per visible
+pairing (never fused); objects persist once placed and follow every
+frame, live or held.
+
+Each `passthrough` entry has:
+
+- `type`: behavior type (required). `"3d-passthrough"` renders the
+  model as a surface-projected passthrough cutout; unknown types are
+  skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
+  the model from every mask layer instead (game video shows through
+  the silhouette, depth-tested against the windows covering each
+  pixel).
+- `id`: stable identifier (required, must be unique); `tag`:
+  display-only label (optional)
+- `fiducial`: referenced fiducial id, or list of ids (required;
+  dangling references are dropped with a warning, and an object left
+  with none is skipped)
+- `model-path`: path to a `.glb`/`.gltf` file on the server (optional,
+  models larger than 64MB are skipped). May be a host absolute path:
+  under flatpak the server reads it from outside the sandbox. Served
+  to the headset on demand and cached by content hash.
+- `position`: `[x, y, z]` fiducial-to-object offset in meters
+  (default `[0,0,0]`)
+- `orientation`: `[rx, ry, rz]` fiducial-to-object rotation in degrees
+  (default `[0,0,0]`, same fixed-frame convention as markers)
+- `scale`: uniform object scale, number or single-element array
+  (default `1`, applied last)
+- `feather-px`: passthrough window feather width in screen pixels
+  (default `24`; `0` disables feathering). Mask stacks group by this
+  value so each object feathers independently; applied live. Not
+  accepted for `3d-passthrough-reversed` (warned + ignored).
+- `surface-projected`: the headset projects camera imagery onto this
+  object's mesh instead of the flat reconstruction feed (default
+  `true`; opt out per object with `false`, plus a live in-headset
+  override in the Passthrough tab). Ignored for
+  `3d-passthrough-reversed` (warned).
+
+Poses compose as
+`objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

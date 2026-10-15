@@ -48,14 +48,22 @@
 #include "b_system.h"
 #include "target_builder_helpers.h"
 #include "util/u_logging.h"
+#include "utils/flatpak.h"
 #include "xrt/xrt_defines.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_session.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <magic_enum.hpp>
 #include <multi/comp_multi_interface.h>
+#include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string.h>
 #include <utility>
@@ -425,16 +433,95 @@ void wivrn_session::pause_session()
 	wivrn::trace::flush_session();
 }
 
+// The client caches models by content hash and requests missing ones.
+namespace
+{
+// Max model size served to the headset
+constexpr uint64_t fiducial_model_max_size = 64ull * 1024 * 1024;
+constexpr size_t fiducial_model_chunk_size = 512 * 1024;
+
+uint64_t fnv1a64(std::span<const std::byte> data)
+{
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (std::byte b: data)
+	{
+		hash ^= static_cast<uint64_t>(b);
+		hash *= 0x100000001b3ull;
+	}
+	return hash;
+}
+
+std::string hash_hex(uint64_t hash)
+{
+	std::ostringstream oss;
+	oss << std::hex << std::setw(16) << std::setfill('0') << hash;
+	return oss.str();
+}
+
+// Reads the whole file, returns nullopt when missing/unreadable/oversize
+std::optional<std::vector<std::byte>> read_model_file_direct(const std::string & path)
+{
+	std::error_code ec;
+	uint64_t size = std::filesystem::file_size(path, ec);
+	if (ec or size == 0 or size > fiducial_model_max_size)
+		return std::nullopt;
+
+	std::ifstream file(path, std::ios::binary);
+	if (not file)
+		return std::nullopt;
+
+	std::vector<std::byte> data(size);
+	if (not file.read(reinterpret_cast<char *>(data.data()), size))
+		return std::nullopt;
+
+	return data;
+}
+
+// Flatpak fallback: the server runs sandboxed, so a host-absolute
+// model-path from the user's config is invisible to direct reads.
+// Re-read it from outside the sandbox via `flatpak-spawn --host cat`
+// (shared helper, output capped at fiducial_model_max_size).
+std::optional<std::vector<std::byte>> read_model_file_via_host(const std::string & path)
+{
+	return wivrn::read_file_via_host(path, fiducial_model_max_size);
+}
+
+struct model_file
+{
+	std::vector<std::byte> data;
+	// True when the bytes came from outside the sandbox via
+	// flatpak-spawn --host (log-only, same content semantics).
+	bool via_host = false;
+};
+
+// Reads the whole file, returns nullopt when missing/unreadable/oversize.
+// Inside a flatpak sandbox, falls back to reading the host path via
+// `flatpak-spawn --host cat` so hand-edited host-absolute model-paths keep
+// working without widening sandbox filesystem permissions.
+std::optional<model_file> read_model_file(const std::string & path)
+{
+	if (auto direct = read_model_file_direct(path))
+		return model_file{std::move(*direct), false};
+
+	if (auto host = read_model_file_via_host(path))
+		return model_file{std::move(*host), true};
+
+	return std::nullopt;
+}
+} // namespace
+
 void wivrn_session::send_fiducial_map()
 {
 	configuration config;
-	if (config.fiducials.empty())
+	// Always sent, even empty: objects-only configs still need the map.
+	if (config.fiducials.empty() and config.passthrough_objects.empty())
 	{
 		U_LOG_I("Fiducial map: no entries configured");
 		return;
 	}
 
-	U_LOG_I("Fiducial map: sending %u fiducials", (unsigned)config.fiducials.size());
+	U_LOG_I("Fiducial map: sending %u fiducials, %u passthrough objects",
+	        (unsigned)config.fiducials.size(), (unsigned)config.passthrough_objects.size());
 	to_headset::fiducial_map msg;
 	for (const auto & entry: config.fiducials)
 	{
@@ -458,6 +545,47 @@ void wivrn_session::send_fiducial_map()
 		const char * label = entry.tag.empty() ? entry.id.c_str() : entry.tag.c_str();
 		U_LOG_I("Fiducial \"%s\" (%s): %u markers", label, entry.is_static ? "static" : "moving", (unsigned)e.markers.size());
 		msg.fiducials.push_back(std::move(e));
+	}
+	for (const auto & entry: config.passthrough_objects)
+	{
+		to_headset::passthrough_object o{
+		        .type = entry.type,
+		        .id = entry.id,
+		        .tag = entry.tag,
+		        .fiducial = entry.fiducial,
+		        .position = entry.position,
+		        .orientation = entry.orientation,
+		        .scale = entry.scale,
+		        .feather_px = entry.feather_px,
+		        .surface_projected = entry.surface_projected,
+		};
+
+		// Display label: the tag, or the id when untagged.
+		const char * label = entry.tag.empty() ? entry.id.c_str() : entry.tag.c_str();
+		if (not entry.model_path.empty())
+		{
+			if (auto model = read_model_file(entry.model_path))
+			{
+				o.model_hash = hash_hex(fnv1a64(model->data));
+				o.model_size = model->data.size();
+				U_LOG_I("Passthrough object \"%s\" (%s): model %s (%llu bytes) from %s%s",
+				        label, o.type.c_str(),
+				        o.model_hash.c_str(), (unsigned long long)o.model_size,
+				        entry.model_path.c_str(),
+				        model->via_host ? " (via host)" : "");
+			}
+			else
+			{
+				U_LOG_W("Passthrough object \"%s\": cannot serve model %s, entry will have no model",
+				        label, entry.model_path.c_str());
+			}
+		}
+		else
+		{
+			U_LOG_I("Passthrough object \"%s\" (%s): no model configured", label, o.type.c_str());
+		}
+
+		msg.objects.push_back(std::move(o));
 	}
 
 	send_control(std::move(msg));
@@ -1009,6 +1137,39 @@ void wivrn_session::operator()(const from_headset::set_active_application & req)
 	ipc_server_update_state(mnd_ipc_server);
 	// Send a refreshed application list
 	(*this)(from_headset::get_running_applications{});
+}
+
+void wivrn_session::operator()(from_headset::fiducial_model_request && request)
+{
+	U_LOG_I("Fiducial model requested: %s", request.model_hash.c_str());
+	configuration config;
+	for (const auto & entry: config.passthrough_objects)
+	{
+		if (entry.model_path.empty())
+			continue;
+
+		auto model = read_model_file(entry.model_path);
+		if (not model or hash_hex(fnv1a64(model->data)) != request.model_hash)
+			continue;
+
+		const auto & data = model->data;
+		uint32_t chunk_count = (data.size() + fiducial_model_chunk_size - 1) / fiducial_model_chunk_size;
+		U_LOG_I("Fiducial model %s: sending %u chunks (%llu bytes)",
+		        request.model_hash.c_str(), chunk_count, (unsigned long long)data.size());
+		for (uint32_t i = 0; i < chunk_count; ++i)
+		{
+			size_t begin = size_t(i) * fiducial_model_chunk_size;
+			size_t end = std::min(begin + fiducial_model_chunk_size, data.size());
+			send_control(to_headset::fiducial_model_chunk{
+			        .model_hash = request.model_hash,
+			        .chunk_index = i,
+			        .chunk_count = chunk_count,
+			        .data = {data.data() + begin, data.data() + end},
+			});
+		}
+		return;
+	}
+	U_LOG_W("Fiducial model requested but not found: %s", request.model_hash.c_str());
 }
 
 void wivrn_session::operator()(const from_headset::stop_application & req)

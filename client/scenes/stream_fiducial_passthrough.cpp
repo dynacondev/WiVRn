@@ -34,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <glm/gtc/quaternion.hpp>
@@ -113,13 +114,48 @@ std::string tuning_key_for(const to_headset::fiducial_entry & f)
 	        std::to_string(f.hold_inner_deg);
 }
 
+// Authored marker offsets are tag-in-board: position = tag center in
+// fiducial meters, orientation = tag orientation relative to fiducial
+// axes. Votes need the inverse (board-in-tag). Inverted here, once per
+// sighting (nanoseconds, K tiny) — never hand-invert in config. Unit
+// quaternions: conjugate is the inverse.
+void effective_offset(const std::array<float, 3> & p, const std::array<float, 4> & q,
+                      std::array<float, 3> & op, std::array<float, 4> & oq)
+{
+	glm::quat bq(q[3], q[0], q[1], q[2]);
+	glm::vec3 bp(p[0], p[1], p[2]);
+	glm::quat iq = glm::conjugate(bq);
+	glm::vec3 ip = iq * -bp;
+	oq = {iq.x, iq.y, iq.z, iq.w};
+	op = {ip.x, ip.y, ip.z};
+}
+
 // Group key for the shared tracker: marker size is context-global, so one
 // context serves all payloads with the same (size, static).
 std::string group_key_for(float size_m, bool is_static)
 {
 	return std::to_string(size_m) + (is_static ? 'S' : 'M');
 }
+
+// base * offset (translation unaffected by scale). Offset quaternion stored xyzw.
+// Object offsets apply directly (fiducial-to-object); marker offsets go
+// through effective_offset() above.
+XrPosef compose_pose(const XrPosef & base, const std::array<float, 3> & p, const std::array<float, 4> & q)
+{
+	glm::quat bq(base.orientation.w, base.orientation.x, base.orientation.y, base.orientation.z);
+	glm::vec3 bp(base.position.x, base.position.y, base.position.z);
+	glm::quat oq(q[3], q[0], q[1], q[2]);
+	glm::vec3 op(p[0], p[1], p[2]);
+	glm::quat rq = bq * oq;
+	glm::vec3 rp = bp + bq * op;
+	return {.orientation = {rq.x, rq.y, rq.z, rq.w}, .position = {rp.x, rp.y, rp.z}};
+}
 } // namespace
+
+// No-config discovery vehicle payload: a sentinel no real QR payload will
+// equal (leading control char), so every sighting through the vehicle
+// reports unmatched (red). Never inserted into the map union.
+const std::string kDiscoveryVehiclePayload = "\x01__wivrn_discovery__";
 
 void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map)
 {
@@ -143,6 +179,16 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 		key += gk;
 		key += ';';
 	}
+	// No-config discovery vehicle: with an empty map there is nothing to
+	// match against, yet the debug gizmos/cutouts report raw sightings
+	// (all unmatched/red) whenever the debug toggle is on. One discovering
+	// context suffices: every tracker already reports all codes in view,
+	// and with configured trackers present this is redundant, so the
+	// vehicle exists only while the union is empty. Folded into the
+	// fingerprint so toggle/map transitions re-sync deterministically.
+	bool want_vehicle = groups.empty() and debug_overlays;
+	if (want_vehicle)
+		key += "V;";
 
 	if (key != last_tracker_key)
 	{
@@ -181,6 +227,18 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 		std::string tag = "group " + gk;
 		it->second.configure(size, "", tag, is_static);
 	}
+	if (want_vehicle)
+	{
+		// Discovery vehicle only (see above): size unspecified so no
+		// fixed-size hint is chained (the runtime measures codes itself),
+		// not static so no static-marker assumption either. The sentinel
+		// never matches: every sighting stays unmatched (red), and the
+		// resolver below finds no fiducials, so no fusion engages.
+		auto [it, _] = fiducial_trackers.try_emplace(kDiscoveryVehiclePayload, instance, session, system);
+		it->second.configure(0.f, kDiscoveryVehiclePayload, "discovery", false);
+	}
+	else
+		fiducial_trackers.erase(kDiscoveryVehiclePayload);
 }
 
 // K==1 jump guard: the passthrough path is residual-blind (a lone
@@ -192,6 +250,13 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 // downstream (hold-last) and the warm reference never advances to
 // garbage. Release on resolve / K>=2 consensus / teleport-silence.
 // First sighting (no reference) always accepts: unknowable without history.
+bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
+{
+	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
+		return it->second;
+	return ost.def.surface_projected;
+}
+
 bool scenes::stream::guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
                                       const std::optional<XrPosef> & warm, XrTime now, double & dt_out)
 {
@@ -412,6 +477,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 {
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto map = fiducial_map.lock();
+	auto fid_t0 = std::chrono::steady_clock::now();
+	auto fid_elapsed_ms = [&] {
+		return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fid_t0).count();
+	};
 
 	// Fingerprint: tracking identity. Tags excluded (display-only): a
 	// rename must not disturb tracking. Any other change resets the
@@ -439,6 +508,22 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			map_key += ';';
 		}
 	}
+	// Fingerprint: object identity (id/type/flags/model). Tags excluded
+	// (display-only); geometry/pose ride the soup + placements below.
+	for (const auto & o: map->objects)
+	{
+		map_key += 'O';
+		map_key += o.type;
+		map_key += ';';
+		map_key += o.id;
+		map_key += ';';
+		map_key += o.model_hash;
+		map_key += ';';
+		map_key += o.surface_projected ? 'P' : 'F';
+		map_key += ';';
+		map_key += std::to_string(o.feather_px);
+		map_key += ';';
+	}
 	// Trackers run every frame, independent of consumers (their state
 	// feeds the status UI below).
 	sync_fiducial_trackers(*map);
@@ -457,6 +542,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		fiducial_votes.clear();
 		board_poses.clear();
 		board_warm_start.clear();
+		passthrough_objects.clear();
+		// Projected instances are rebuilt from placements below (the
+		// per-frame sync destroys stale ones, the map wipe clears the
+		// rest).
+		projected_failed.clear();
+		session.clear_projected_instances();
 		// `board config:` makes every future log self-describing:
 		// marker sizes, offsets and tuning, so tuning sessions never
 		// guess what geometry produced the data.
@@ -491,6 +582,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			auto tr = fiducial_trackers.find(group_key_for(m.marker_size_m, f.is_static));
 			if (tr == fiducial_trackers.end())
 				continue;
+			std::array<float, 3> ep;
+			std::array<float, 4> eq;
+			effective_offset(m.position, m.orientation, ep, eq);
 			for (const auto & s: tr->second.sightings())
 			{
 				if (s.payload != m.marker_data)
@@ -499,9 +593,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 				v.fiducial_id = f.id;
 				v.payload = s.payload;
 				v.observed = s.pose;
+				v.extents = s.extents;
 				v.tag_size_m = m.marker_size_m;
-				v.offset_pos = m.position;
-				v.offset_quat = m.orientation;
+				v.offset_pos = ep;
+				v.offset_quat = eq;
 				v.latch_time = s.latch_time;
 				v.time = s.time;
 				v.novel = s.novel;
@@ -542,6 +637,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		head_pos = head->first;
 		have_head = true;
 	}
+	fid_detect_ms = fid_elapsed_ms();
+	fid_votes = (int)fiducial_votes.size();
+	fid_t0 = std::chrono::steady_clock::now();
 
 	for (auto it = board_poses.begin(); it != board_poses.end();)
 	{
@@ -557,6 +655,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			++it;
 		}
 	}
+	int tags_total = 0;
 	for (const auto & f: map->fiducials)
 	{
 		std::vector<xr::board_vote> bv;
@@ -638,7 +737,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		double fdt = bp.time != 0 and now >= bp.time ? (now - bp.time) * 1e-9 : 1.0 / 72.0;
 		double adt = bp.last_predicted > 0 ? (now - bp.last_predicted) * 1e-9 : fdt;
 		bp.last_predicted = now;
-		auto r = bp.filter.advance(std::clamp(adt, 0.0, 0.25));
+		// Predict to display time, not now: the pose is consumed at
+		// predictedDisplayTime (mask raster, projected instances), so
+		// advancing only to now leaves ~1 frame of lag on moving boards.
+		// advance() converges without overshoot, so the extra horizon is
+		// safe; static boards are unaffected.
+		double horizon = predicted_display_time > now ? (predicted_display_time - now) * 1e-9 : 0.0;
+		auto r = bp.filter.advance(std::clamp(adt + horizon, 0.0, 0.25));
 		bp.pose = {
 		        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
 		        .position = {r.pos.x, r.pos.y, r.pos.z},
@@ -655,6 +760,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		bp.tags_used = 0;
 		for (const auto & t: sol.tags)
 			bp.tags_used += t.used;
+		tags_total += bp.tags_used;
 		bp.tags_visible = (int)sol.tags.size();
 		bp.tag_stats = std::move(sol.tags);
 		bp.last_votes = bv;
@@ -662,12 +768,184 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		double horizon_ms = (predicted_display_time - now) * 1e-6;
 		log_board_tuning(f.id, bv, sol, bp, horizon_ms, now, solve_dt, have_head, head_pos);
 	}
+	fid_solve_ms = fid_elapsed_ms();
+	fid_tags = tags_total;
+	fid_t0 = std::chrono::steady_clock::now();
+
+	// ---- behavior objects: first referenced board pose wins ----
+	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
+	{
+		if (std::ranges::any_of(map->objects, [&](const to_headset::passthrough_object & o) { return o.id == oit->first; }))
+			++oit;
+		else
+			oit = passthrough_objects.erase(oit);
+	}
+	for (const auto & def: map->objects)
+	{
+		// Reversed objects place exactly like normal ones (fused board
+		// pose, mesh); only the mask raster treats them as cuts. The
+		// binary projected fallback has no hole vocabulary, so only
+		// normal objects drive it (not carried: mask path only).
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed")
+		{
+			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
+			continue;
+		}
+		auto & ost = passthrough_objects[def.id];
+		ost.def = def;
+		// Model geometry upload (shared across this object's instances).
+		if (not def.model_hash.empty())
+		{
+			std::error_code ec;
+			if (std::filesystem::exists(fiducial_model_path(def.model_hash), ec) and ost.soup_hash != def.model_hash)
+			{
+				ost.soup_hash = def.model_hash;
+				ost.soup_ready = false;
+				try
+				{
+					ost.soup = passthrough_mesh::flatten_gltf(fiducial_model_path(def.model_hash));
+					ost.soup_ready = true;
+					ost.vertex_count = ost.soup.vertices.size();
+					ost.triangle_count = ost.soup.indices.size() / 3;
+					ost.status = "mesh ready";
+					spdlog::info("Passthrough object \"{}\": mesh ready: {} triangles", def.id, ost.triangle_count);
+				}
+				catch (std::exception & e)
+				{
+					ost.status = std::string("mesh error: ") + e.what();
+					spdlog::warn("Passthrough object \"{}\": mesh failed: {}", def.id, e.what());
+				}
+			}
+		}
+		// Placement: first referenced fiducial with a pose (live or
+		// held) wins. Held poses keep rendering through occlusion.
+		// Objects persist once placed (map wipe excepted): the pose
+		// follows every frame, never un-places.
+		for (const auto & fid: def.fiducial)
+		{
+			auto bpit = board_poses.find(fid);
+			if (bpit == board_poses.end())
+				continue;
+			auto & fu = ost.fused;
+			fu.world_pose = compose_pose(bpit->second.pose, def.position, def.orientation);
+			fu.world_scale = {def.scale, def.scale, def.scale};
+			if (not fu.placed)
+			{
+				fu.placed = true;
+				spdlog::info("Passthrough object \"{}\" placed on fiducial \"{}\"", def.id, fid);
+			}
+			fu.last_solve = now;
+			break;
+		}
+	}
+
+	// ---- surface-projected instances: one geometry instance per placed,
+	// flagged object on the shared projected layer. Created on placement
+	// from the smoothed pose, updated every frame, destroyed on
+	// unselect/unplace. Reversed objects never qualify (they show game,
+	// not camera).
+	if (composition_layer_alpha_blend_supported)
+	{
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			bool want = ost.def.type == "3d-passthrough" and ost.soup_ready and ost.fused.placed and
+			        surface_projected_effective(oid, ost) and session.projected_passthrough_supported() and
+			        not projected_failed.contains(oid);
+			bool have = session.has_projected_instance(oid);
+			if (want and not have)
+			{
+				try
+				{
+					session.set_projected_instance_mesh(oid, ost.soup.vertices, ost.soup.indices, world_space,
+					                                    ost.fused.world_pose, ost.fused.world_scale);
+				}
+				catch (std::exception & e)
+				{
+					// Persistent per mesh (too big, runtime refused): skip
+					// retry so one bad mesh can't spam every frame. Cleared
+					// on map change with everything else.
+					projected_failed.insert(oid);
+					spdlog::warn("Projected instance \"{}\": upload failed (falling back to flat): {}", oid, e.what());
+				}
+			}
+			else if (have and not want)
+			{
+				session.remove_projected_instance(oid);
+				spdlog::info("Projected instance \"{}\" removed", oid);
+			}
+			if (want and session.has_projected_instance(oid))
+			{
+				try
+				{
+					session.update_projected_instance_transform(oid, world_space, predicted_display_time,
+					                                            ost.fused.world_pose, ost.fused.world_scale);
+				}
+				catch (std::exception & e)
+				{
+					// Throttled: a persistently bad transform keeps last
+					// good state instead of spamming every frame.
+					static XrTime last_transform_warn = 0;
+					if (now - last_transform_warn > 5'000'000'000LL)
+					{
+						last_transform_warn = now;
+						spdlog::warn("Projected instance \"{}\": transform update failed: {}", oid, e.what());
+					}
+				}
+			}
+		}
+	}
+	fid_place_ms = fid_elapsed_ms();
 }
 
 void scenes::stream::gui_passthrough()
 {
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR marker tracking and alignment."));
 	gui_fiducial_status();
+
+	ImGui::SeparatorText(_S("Fiducial marker debugging"));
+	ImGui::Checkbox(_S("Marker debug overlays"), &debug_overlays);
+	ImGui::BeginDisabled(not debug_overlays);
+	ImGui::Checkbox(_S("Matched markers (green)"), &debug_matched);
+	ImGui::Checkbox(_S("Unmatched codes (red)"), &debug_unmatched);
+	ImGui::Checkbox(_S("Corrected tags (orange)"), &debug_corrected);
+	ImGui::Checkbox(_S("Axes gizmo (RGB=XYZ)"), &debug_axes);
+	ImGui::Checkbox(_S("Origin tripod (offset boards)"), &debug_origin);
+	ImGui::Checkbox(_S("Smoothed tripod (cyan, filtered pose)"), &debug_smoothed);
+	float pct = debug_opacity * 100;
+	if (ImGui::SliderFloat(_S("Debug overlay opacity"), &pct, 0, 100, "%.0f%%"))
+		debug_opacity = std::clamp(pct / 100, 0.f, 1.f);
+	if (ImGui::SliderInt(_S("Marker window cutout"), &debug_window_mm, -1, 512, debug_window_mm < 0 ? "Disabled" : "%d mm"))
+		debug_window_mm = std::clamp(debug_window_mm, -1, 512);
+	ImGui::EndDisabled();
+
+	ImGui::SeparatorText(_S("Surface-projected mapping"));
+	if (not composition_layer_alpha_blend_supported)
+		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));
+	for (auto & [oid, ost]: passthrough_objects)
+	{
+		if (ost.def.type != "3d-passthrough")
+			continue;
+		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
+		// Three-way state, cycled per click: as configured (no override
+		// stored) -> force on -> force off -> as configured ...
+		auto oit = projected_overrides.find(oid);
+		std::string mode = (oit == projected_overrides.end())
+		        ? (ost.def.surface_projected ? _S("As configured (on)") : _S("As configured (off)"))
+		        : (oit->second ? _S("Forced on") : _S("Forced off"));
+		std::string title = label + ": " + mode + "##projected_" + oid;
+		if (ImGui::Button(title.c_str()))
+		{
+			if (oit == projected_overrides.end())
+				projected_overrides[oid] = true;
+			else if (oit->second)
+				oit->second = false;
+			else
+				projected_overrides.erase(oit);
+			auto nit = projected_overrides.find(oid);
+			spdlog::info("Projected override \"{}\" {}", oid,
+			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
+		}
+	}
 }
 
 void scenes::stream::gui_fiducial_status()
@@ -677,6 +955,10 @@ void scenes::stream::gui_fiducial_status()
 	if (map->fiducials.empty())
 	{
 		ImGui::Text("%s", _S("No fiducial map from server"));
+	}
+	if (fiducial_trackers.contains(kDiscoveryVehiclePayload))
+	{
+		ImGui::Text("%s", _S("Discovering QR codes (no map: all codes unmatched)"));
 	}
 	for (const auto & f: map->fiducials)
 	{
@@ -817,6 +1099,32 @@ void scenes::stream::gui_fiducial_status()
 				ImGui::Text("%.32s: %s", m.marker_data.substr(0, 32).c_str(), _S("unseen"));
 		}
 	}
+	for (const auto & [oid, ost]: passthrough_objects)
+	{
+		(void)oid;
+		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
+		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed")
+		{
+			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
+			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
+			continue;
+		}
+		bool reversed = ost.def.type == "3d-passthrough-reversed";
+		if (not ost.soup_ready)
+		{
+			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
+			continue;
+		}
+		if (not ost.fused.placed)
+		{
+			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), _S("seeking"));
+			continue;
+		}
+		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
+		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
+		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+	}
 	if (fiducial_trackers.empty())
 	{
 		ImGui::Text("%s: %s", _S("Marker tracking"), _S("unavailable"));
@@ -825,7 +1133,7 @@ void scenes::stream::gui_fiducial_status()
 		// extensions. On Quest that means the manifest permissions (fixed) and
 		// the USE_SCENE runtime grant; extensions enumerate at instance
 		// creation, so a late grant needs an app restart to take effect.
-		if (not scene_permission_granted and not map->fiducials.empty())
+		if (not scene_permission_granted and (not map->fiducials.empty() or debug_overlays))
 			ImGui::Text("%s", _S("On Quest, grant the Scene permission, then restart the app"));
 #endif
 	}
