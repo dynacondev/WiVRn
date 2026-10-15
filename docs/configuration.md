@@ -182,3 +182,54 @@ Change the TCP/UDP port used for the connection.
 Default value: unset
 
 If set, overrides the name displayed in the server list.
+
+## `fiducials`
+Default value: unset (feature disabled)
+
+Quest fiducial tracking. Each entry resolves its markers to one 6DoF
+frame, smoothed with its own tuning; frames are reported in the
+headset Passthrough tab.
+
+The Quest runtime tracks **QR codes** (its AprilTag capability
+is not exposed to third-party apps), so each marker is identified by
+the exact decoded QR payload string. The server sends the map to the
+headset on connect.
+
+Each `fiducials` entry has:
+
+- `id`: stable key linking config, protocol and headset UI (required,
+  must be unique)
+- `tag`: display-only label shown in the headset status UI (optional;
+  renaming never affects tracking or linkage)
+- `static`: `true` (default) or `false`. Maps to the runtime's
+  `optimizeForStaticMarker`: keep `true` for a stationary rig, set `false`
+  for a moving reference marker. Toggling recreates the client spatial
+  context (brief tracking hitch).
+- Resolver/smoothing tuning (all optional): `window-size` (default `12`),
+  `min-samples` (default `4`), `sigma-k` (default `3`),
+  `pos-gain`/`rot-gain` (default `24`, per-second proportional catch-up),
+  `euro-min-cutoff` (default `0.4`), `euro-beta` (default `0.07`),
+  `knee-inner-mm`/`knee-outer-mm` (defaults `1`/`5`),
+  `knee-inner-deg`/`knee-outer-deg` (defaults `0.1`/`0.5`).
+- `markers`: list of markers resolving to the one fiducial frame, each with:
+  - `marker-data`: exact QR payload string to match, byte-for-byte (required)
+  - `marker-size-m`: physical marker size in meters (required for pose
+    scale; measure the printed QR's outer edge)
+  - `position`: `[x, y, z]` marker-to-fiducial offset in meters
+    (default `[0,0,0]`)
+  - `orientation`: `[rx, ry, rz]` marker-to-fiducial rotation in degrees
+    (default `[0,0,0]`). Fixed-frame rotations about X, then Y, then Z, so
+    single-axis values do the obvious thing (e.g. `[0,90,0]` yaws 90°)
+
+Poses compose as
+`fiducialPose = observedMarkerPose * markerToFiducialOffset`.
+Print the QR encoding exactly the `marker-data` string, e.g.
+`qrencode -o marker11.png -s 10 "wivrn:11"`. Matching is exact and
+case-sensitive; any other QR code in view is reported in the headset
+Passthrough tab (red) to help you copy it verbatim into the config.
+
+> [!NOTE]
+> A QR payload is a single identity: printing the *same* payload twice
+> does not create two trackables. The runtime reports one jumping track
+> for identical prints. For multi-location coverage, print distinct
+> payloads and configure one fiducial per location.

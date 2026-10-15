@@ -55,6 +55,47 @@ struct configuration
 	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;
+
+	// Fiducial tracking markers (Quest only). Each fiducial resolves its
+	// sighted markers to one 6DoF frame, identified by id and placed by
+	// the per-instance smoothing filters.
+	struct fiducial_marker
+	{
+		// Exact decoded payload identifying the marker (required).
+		std::string marker_data;
+		float marker_size_m = 0;
+		// Marker-to-fiducial offset: fiducialPose = observedMarkerPose
+		// * offset. Position in meters, orientation as xyzw quaternion
+		// (parsed from [rx, ry, rz] degrees).
+		std::array<float, 3> position = {0, 0, 0};
+		std::array<float, 4> orientation = {0, 0, 0, 1};
+	};
+	struct fiducial_entry
+	{
+		// Stable id linking config, protocol and headset UI (required,
+		// must be unique).
+		std::string id;
+		// Display-only label for the headset status UI. Never used for
+		// matching or linkage.
+		std::string tag;
+		bool is_static = true;
+		// Resolver/smoothing tuning, carried through to the per-instance
+		// filters.
+		int window_size = 12;
+		int min_samples = 4;
+		float sigma_k = 3;
+		float pos_gain = 24;
+		float rot_gain = 24;
+		float euro_min_cutoff = 0.4f;
+		float euro_beta = 0.07f;
+		float knee_inner_mm = 1;
+		float knee_outer_mm = 5;
+		float knee_inner_deg = 0.1f;
+		float knee_outer_deg = 0.5f;
+		std::vector<fiducial_marker> markers;
+	};
+	std::vector<fiducial_entry> fiducials;
+
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;

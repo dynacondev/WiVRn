@@ -32,10 +32,14 @@
 #include "wifi_lock.h"
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
+#include "xr/fiducial_filter.h"
+#include "xr/marker_tracker.h"
 #include "xr/space.h"
+#include <map>
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <shared_mutex>
 #include <thread>
 #include <vulkan/vulkan_core.h>
@@ -153,6 +157,7 @@ private:
 		post_processing,
 		devices,
 		tracking,
+		passthrough,
 		theme,
 		system,
 	};
@@ -201,8 +206,63 @@ private:
 	// Keep a reference to the resources needed to blit the images until vkWaitForFences
 	std::array<std::shared_ptr<wivrn::shard_accumulator::blit_handle>, decoder_count> current_blit_handles;
 
+	// Video stall detection (render thread only). When the decoders stop
+	// delivering frames the compositor keeps submitting an empty layer,
+	// which reads as unexplained grey: surface an explicit toast instead.
+	// ever_received_video latches on the first displayed frame so a slow
+	// first frame doesn't false-positive.
+	XrTime video_starved_since = 0;
+	bool video_stall_toasted = false;
+	bool ever_received_video = false;
+	void update_video_stall_status(bool starved);
+
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
+
+	// Fiducial tracking markers (Quest only, see docs/configuration.md).
+	// Latest map from the server.
+	thread_safe<to_headset::fiducial_map> fiducial_map;
+
+	// One runtime tracker per unique marker payload (shared across
+	// fiducials listing it). Synced from the map every frame; stale
+	// trackers are destroyed. Render thread only (all trackers run there).
+	std::map<std::string, xr::marker_tracker> fiducial_trackers;
+	std::string last_tracker_key; // union fingerprint; re-sync + warn on change
+	std::string last_frame_key;   // map fingerprint for the smoothed frames; reset on change
+	// Union of configured marker payloads (any fiducial). Green vs red.
+	std::set<std::string> configured_marker_payloads;
+	// Set once: the runtime hides spatial tracking without its grant.
+	bool marker_support_logged = false;
+
+	// Solved fiducial frame per (fiducial, entity): observed marker pose
+	// composed with the marker-to-fiducial offset. Single-marker resolve
+	// only; multi-marker averaging is future work (first marker used).
+	// Rebuilt every frame; render thread only.
+	struct fiducial_sighting
+	{
+		std::string fiducial_id;
+		std::string payload;
+		XrPosef solved{{0, 0, 0, 1}, {0, 0, 0}};
+		XrExtent2Df extents{0, 0};
+		XrTime time = 0;
+	};
+	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_sighting> fiducial_sightings;
+
+	// Smoothed fiducial frame per (fiducial, entity): the resolver's raw
+	// solved pose ingested every live frame, predicted forward for render.
+	// Kept 60s unseen (the runtime recycles long-gone entity ids: without
+	// expiry a return would leave a frozen ghost beside the fresh frame).
+	// Render thread only.
+	struct fiducial_frame
+	{
+		xr::fiducial_filter filter;
+		std::string tuning_key; // filter tuning source; re-configure on change
+		XrPosef pose{{0, 0, 0, 1}, {0, 0, 0}};
+		XrTime last_seen = 0;
+		XrTime last_predicted = 0;
+		uint64_t samples_ingested = 0;
+	};
+	std::map<std::pair<std::string, XrSpatialEntityIdEXT>, fiducial_frame> fiducial_frames;
 
 	stream(std::string server_name, scene & parent_scene);
 
@@ -246,6 +306,7 @@ public:
 	void operator()(to_headset::application_list &&);
 	void operator()(to_headset::application_icon &&);
 	void operator()(to_headset::running_applications &&);
+	void operator()(to_headset::fiducial_map &&);
 	void operator()(audio_data &&);
 
 	void push_blit_handle(wivrn::shard_accumulator * decoder, std::shared_ptr<wivrn::shard_accumulator::blit_handle> handle);
@@ -353,6 +414,15 @@ private:
 	void gui_foveation_settings(float predicted_display_period);
 	void gui_applications();
 	void gui_toasts();
+	void gui_passthrough();
+	void gui_fiducial_status();
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period);
+
+	// Eager USE_SCENE runtime-permission request (Android): manifest presence
+	// makes the spatial extensions enumerable, but tracking data needs the
+	// user grant. Process-once; the result feeds the status-tab hint.
+	void request_spatial_permissions();
+	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
+	void update_fiducial_passthrough(XrTime predicted_display_time);
 };
 } // namespace scenes
