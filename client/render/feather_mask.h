@@ -30,9 +30,10 @@
 // feather-px maps to
 // tap spread, recommended range 4-12 (see docs/configuration.md).
 //
-// Feathering is internal-only: a box-min erosion (3x3 or 5x5 selected
-// from the blur spread) runs on the blur input, so the blur band lands
-// inside the silhouette instead of straddling it. Tier-0 hard edges skip
+// Feathering is internal-only: a separable box-min erosion runs on the
+// blur input, so the blur band lands inside the silhouette instead of
+// straddling it — exact inset for any feather width (two 1D min passes
+// compose a (2r+1)^2 box, r = ceil bleed). Tier-0 hard edges skip
 // erosion (already exact); reversed cuts erode consistently with fills
 // (coverage erosion grows holes, shrinks fills).
 //
@@ -224,12 +225,13 @@ private:
 	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
 	// reads the push block's src_texel prefix).
 	vk::raii::Pipeline downsample_pipeline{nullptr};
-	// Morphological erosion (fullscreen min-filter) for internal-only
-	// feathering: 3x3 (≈1 texel) and 5x5 (≈2 texels) box variants, same
-	// shaders/layout as blur (format-free, push prefix only), selected per
-	// record() from the blur spread. R8 throughout (blur inputs only).
-	vk::raii::Pipeline erode3_pipeline{nullptr};
-	vk::raii::Pipeline erode5_pipeline{nullptr};
+	// Separable box-min erosion for internal-only feathering at any
+	// width: two 1D min passes (H then V, radius = ceil bleed) compose an
+	// exact (2r+1)^2 box. Same fullscreen vertex shader/layout as blur
+	// (24-byte push) and R8 standalone shape as the downsample pass, so
+	// it records into any single-attachment R8 framebuffer (A/B blur_fbs,
+	// eblur blur_fbs) with no new renderpasses or targets.
+	vk::raii::Pipeline erode_pipeline{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// One set per (pass, eye): descriptor updates are host-side writes
@@ -237,8 +239,10 @@ private:
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
 	// Index: 0,1 = blur-H eyes 0,1; 2,3 = blur-V eyes 0,1; 4..9 =
-	// downsample levels 1..3 x eyes 0,1; 10,11 = erode eyes 0,1 (written
-	// once per frame like the rest).
+	// downsample levels 1..3 x eyes 0,1; 10,11 = erode-H eyes 0,1; 12,13
+	// = erode-V eyes 0,1. Erosion needs two sets because its H and V
+	// passes sample different images in the same command buffer (one
+	// host-side write per set per frame, like the rest).
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
 	vk::raii::Sampler sampler{nullptr};
 

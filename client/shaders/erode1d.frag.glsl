@@ -23,27 +23,30 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D src;
 
-// 3x3 box minimum (morphological erosion, ~1 texel): shrinks bright
-// regions, used to pull the blur band inside the silhouette for
-// internal-only feathering. Push layout matches the blur shader (only
-// src_texel is read), so all pipelines share one layout object.
+// One axis of a separable box-minimum erosion (morphological erosion):
+// minimum over [-radius, +radius] working texels along dir. Two passes
+// (dir = (1,0) then (0,1)) compose an exact (2r+1)^2 box erosion for any
+// radius, so the blur band below lands inside the silhouette at any
+// feather width. Push layout matches the blur shader (24 bytes), so all
+// pipelines share one layout object.
 layout(push_constant) uniform Push
 {
-	vec2 src_texel;
+	vec2 texel;
+	vec2 dir;
+	float radius;
+	float pad;
 }
 pc;
 
 void main()
 {
-	vec2 t = pc.src_texel;
+	int r = int(pc.radius + 0.5);
 	float m = texture(src, uv).r;
-	m = min(m, texture(src, uv + vec2(-t.x, -t.y)).r);
-	m = min(m, texture(src, uv + vec2(0.0, -t.y)).r);
-	m = min(m, texture(src, uv + vec2(t.x, -t.y)).r);
-	m = min(m, texture(src, uv + vec2(-t.x, 0.0)).r);
-	m = min(m, texture(src, uv + vec2(t.x, 0.0)).r);
-	m = min(m, texture(src, uv + vec2(-t.x, t.y)).r);
-	m = min(m, texture(src, uv + vec2(0.0, t.y)).r);
-	m = min(m, texture(src, uv + vec2(t.x, t.y)).r);
+	for (int i = -8; i <= 8; ++i)
+	{
+		if (i == 0 || abs(i) > r)
+			continue;
+		m = min(m, texture(src, uv + pc.dir * pc.texel * float(i)).r);
+	}
 	out_color = vec4(m);
 }

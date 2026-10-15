@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
@@ -56,26 +57,34 @@ struct raster_push
 	float opacity = 1;
 };
 
-// Erosion push block: source texel size only (prefix-matches blur_push
-// like the downsample shader, so all fullscreen passes share one layout).
+// Erosion push block: source texel size, pass direction and box radius
+// (matches blur_push at 24 bytes, so all fullscreen passes share one
+// layout).
 struct erode_push
 {
 	float texel[2];
+	float dir[2];
+	float radius = 0;
+	float pad = 0;
 };
+static_assert(sizeof(erode_push) == 24);
 
-// Erosion kernel selector for internal-only feathering: the blur support
+// Erosion radius selector for internal-only feathering: the blur support
 // reaches ~2*spread past the silhouette (spread is defined in blur-input
-// texels), so eroding by that much pulls the band inside. Returns 0 (skip:
-// sub-pixel band, erosion would only shrink windows), 3 (3x3 box ≈ 1
-// texel) or 5 (5x5 box ≈ 2 texels). Always rounds outward: a sliver of
-// inset beats any outward halo for mapped windows. Past ~2 texels the
-// single min5 pass under-erodes (huge feathers); tune from photos — the
-// formula stays within a texel by construction everywhere else.
-int erode_select(float spread, float fullpx_per_texel)
+// texels), so eroding by that much pulls the band inside. Returns 0
+// (skip: sub-full-pixel band, erosion would only shrink windows) or
+// ceil(2*spread) otherwise (always rounds outward: a sliver of inset
+// beats any outward halo for mapped windows). Two separable 1D min
+// passes compose the exact box, so any feather width stays within a
+// texel of the ideal inset by construction. Clamped to the shader's
+// tap range (8).
+int erode_radius(float spread, float fullpx_per_texel)
 {
-	if (2.f * spread * fullpx_per_texel < 1.f)
+	float bleed = 2.f * spread;
+	if (bleed * fullpx_per_texel < 1.f)
 		return 0;
-	return (2.f * spread <= 1.f) ? 3 : 5;
+	int r = (int)std::ceil(bleed - 1e-6f);
+	return std::clamp(r, 0, 8);
 }
 
 // RAII section timer for the record() diagnostics (mask_stage_cpu): adds
@@ -615,43 +624,38 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	downsample_pipeline = vk::raii::Pipeline(device, nullptr, downsample_pipeline_info);
 
-	// Erosion pipelines (see header): same fullscreen vertex shader, layout
-	// (push prefix only) and R8 standalone shape as the downsample pass;
-	// created against the shared R8 blur pass like every other R8 pipe, so
-	// they record into any single-attachment R8 framebuffer (A/B blur_fbs,
-	// eblur blur_fbs) with no new renderpasses or targets.
-	auto erode3_frag = load_shader(device, "erode3.frag");
-	auto erode5_frag = load_shader(device, "erode5.frag");
-	auto make_erode_pipeline = [&](const std::shared_ptr<shader> & frag) {
-		vk::PipelineShaderStageCreateInfo erode_stages[2] = {
-		        {
-		                .stage = vk::ShaderStageFlagBits::eVertex,
-		                .module = **blur_vert,
-		                .pName = "main",
-		        },
-		        {
-		                .stage = vk::ShaderStageFlagBits::eFragment,
-		                .module = **frag,
-		                .pName = "main",
-		        },
-		};
-		vk::GraphicsPipelineCreateInfo erode_pipeline_info{
-		        .stageCount = 2,
-		        .pStages = erode_stages,
-		        .pVertexInputState = &downsample_vertex_input,
-		        .pInputAssemblyState = &blur_input_assembly,
-		        .pViewportState = &blur_viewport_state,
-		        .pRasterizationState = &blur_rasterization,
-		        .pMultisampleState = &blur_multisample,
-		        .pColorBlendState = &blur_blend,
-		        .pDynamicState = &blur_dynamic,
-		        .layout = *blur_layout,
-		        .renderPass = *blur_r8_renderpass,
-		};
-		return vk::raii::Pipeline(device, nullptr, erode_pipeline_info);
+	// Erosion pipeline (see header): same fullscreen vertex shader,
+	// layout (24-byte push) and R8 standalone shape as the downsample
+	// pass; created against the shared R8 blur pass like every other R8
+	// pipe, so it records into any single-attachment R8 framebuffer (A/B
+	// blur_fbs, eblur blur_fbs) with no new renderpasses or targets.
+	auto erode_frag = load_shader(device, "erode1d.frag");
+	vk::PipelineShaderStageCreateInfo erode_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **blur_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **erode_frag,
+	                .pName = "main",
+	        },
 	};
-	erode3_pipeline = make_erode_pipeline(erode3_frag);
-	erode5_pipeline = make_erode_pipeline(erode5_frag);
+	vk::GraphicsPipelineCreateInfo erode_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = erode_stages,
+	        .pVertexInputState = &downsample_vertex_input,
+	        .pInputAssemblyState = &blur_input_assembly,
+	        .pViewportState = &blur_viewport_state,
+	        .pRasterizationState = &blur_rasterization,
+	        .pMultisampleState = &blur_multisample,
+	        .pColorBlendState = &blur_blend,
+	        .pDynamicState = &blur_dynamic,
+	        .layout = *blur_layout,
+	        .renderPass = *blur_r8_renderpass,
+	};
+	erode_pipeline = vk::raii::Pipeline(device, nullptr, erode_pipeline_info);
 
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
@@ -670,15 +674,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 12,
+	        .descriptorCount = 14,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
-	        .maxSets = 12,
+	        .maxSets = 14,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
 	};
 	descriptor_pool = vk::raii::DescriptorPool(device, pool_info);
-	for (int i = 0; i < 12; ++i)
+	for (int i = 0; i < 14; ++i)
 	{
 		vk::DescriptorSetAllocateInfo set_alloc_info{
 		        .descriptorPool = *descriptor_pool,
@@ -1347,12 +1351,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		cmd.endRenderPass();
 	};
 
-	// Erosion helper (internal-only feather, see header): fullscreen MIN
-	// over src_view into dst_fb at extent e (R8, DONT_CARE load, fully
-	// overwritten). Barriers stay caller-side like every other pass here;
-	// the caller also owns H-input bookkeeping (which image holds what
-	// after this runs).
-	auto erode_once = [&](vk::ImageView src_view, uint32_t src_set, vk::Framebuffer dst_fb, vk::Extent2D e, bool use_min5) {
+	// Erosion helpers (internal-only feather, see header): one 1D
+	// box-min pass over src_view into dst_fb at extent e (R8, DONT_CARE
+	// load, fully overwritten), then the separable pair below. Two passes
+	// (H then V, radius = ceil bleed) compose the exact box for any
+	// feather width. Each pass uses its own descriptor set per eye
+	// (10+eye for H, 12+eye for V): descriptor updates are host-side
+	// writes, so sharing one set across passes in the same command buffer
+	// would make every pass sample the last write. Barriers stay
+	// caller-side like every other pass here.
+	auto erode_1d = [&](vk::ImageView src_view, uint32_t src_set, vk::Framebuffer dst_fb, vk::Extent2D e,
+	                        float dx, float dy, int radius) {
 		update_source(src_view, src_set);
 		vk::RenderPassBeginInfo begin_erode{
 		        .renderPass = *blur_r8_renderpass,
@@ -1363,10 +1372,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(begin_erode, vk::SubpassContents::eInline);
 		set_full_viewport(e);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, use_min5 ? *erode5_pipeline : *erode3_pipeline);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *erode_pipeline);
 		std::array<vk::DescriptorSet, 1> sets_e{*descriptor_sets[src_set]};
 		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_e, no_offsets);
-		erode_push push{{1.f / e.width, 1.f / e.height}};
+		erode_push push{{1.f / e.width, 1.f / e.height}, {dx, dy}, (float)radius, 0};
 		cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 		cmd.draw(3, 1, 0, 0);
 		cmd.endRenderPass();
@@ -1468,9 +1477,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		        .texel = {1.f / half_extent.width, 1.f / half_extent.height},
 		        .spread = spread,
 		};
-		// Internal-only feather (see header): erode at half res (the blur
-		// input here), so the band below lands inside the silhouette.
-		int erode = erode_select(spread, 2.f);
+		// Internal-only feather (see header): separable box-min erode
+		// at half res (the blur input here), so the band below lands
+		// inside the silhouette for any feather width.
+		int erode = erode_radius(spread, 2.f);
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			{
@@ -1480,17 +1490,22 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*target_a.image);
 			if (erode > 0)
 			{
-				// Erode A into B; H below then reads B and writes back
-				// into A, V reads A: H/V bodies stay untouched.
-				erode_once(*target_a.views[eye], 10 + eye, *target_b.blur_fbs[eye], half_extent, erode == 5);
+				// Erode A into B (H) and back into A (V): the eroded
+				// field ends where the raster started, so H below reads
+				// A and writes B exactly like the uneroded path — H/V
+				// bodies stay untouched either way.
+				erode_1d(*target_a.views[eye], 10 + eye, *target_b.blur_fbs[eye], half_extent, 1, 0, erode);
 				make_readable(*target_b.image);
+				erode_1d(*target_b.views[eye], 12 + eye, *target_a.blur_fbs[eye], half_extent, 0, 1, erode);
+				make_readable(*target_a.image);
 			}
 			section_clock blur_clk(&ms_blur);
-			// H input/output swap when eroding (eroded field lives in B).
-			update_source(erode > 0 ? *target_b.views[eye] : *target_a.views[eye], eye);
+			// H reads A (eroded or raster) and writes B; V reads B:
+			// identical bodies either way.
+			update_source(*target_a.views[eye], eye);
 			vk::RenderPassBeginInfo begin_h{
 			        .renderPass = *blur_r8_renderpass,
-			        .framebuffer = erode > 0 ? *target_a.blur_fbs[eye] : *target_b.blur_fbs[eye],
+			        .framebuffer = *target_b.blur_fbs[eye],
 			        .renderArea = {.offset = {0, 0}, .extent = half_extent},
 			        .clearValueCount = 1,
 			        .pClearValues = &clear,
@@ -1506,8 +1521,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
-			make_readable(erode > 0 ? *target_a.image : *target_b.image);
-			update_source(erode > 0 ? *target_a.views[eye] : *target_b.views[eye], 2 + eye);
+			make_readable(*target_b.image);
+			update_source(*target_b.views[eye], 2 + eye);
 			vk::RenderPassBeginInfo begin_v{
 			        .renderPass = *blur_renderpass,
 			        .framebuffer = *it->second.framebuffers[eye],
@@ -1550,9 +1565,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        .texel = {1.f / te.width, 1.f / te.height},
 			        .spread = spread,
 			};
-			// Internal-only feather (see header): erode at the blur level
-			// (te texels), so the band below lands inside the silhouette.
-			int erode = erode_select(spread, (float)(1 << blur_level));
+			// Internal-only feather (see header): separable box-min
+			// erode at the blur level (te texels), so the band below
+			// lands inside the silhouette for any feather width.
+			int erode = erode_radius(spread, (float)(1 << blur_level));
 			for (int eye = 0; eye < 2; ++eye)
 			{
 				{
@@ -1597,16 +1613,22 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}
 				if (erode > 0)
 				{
-					// Internal-only feather (see header): erode the H input
-					// into eblur, then H writes back into the down image it
-					// just consumed; V below is untouched.
-					erode_once(down_src, 10 + eye, *eblur.blur_fbs[eye], te, erode == 5);
+					// Erode the H input (down_src) into eblur (H) and back
+					// into the down image it just came from (V): the eroded
+					// field ends where the downsample chain left it, so H
+					// below reads the down image and writes eblur exactly
+					// like the uneroded path — H/V bodies stay untouched.
+					blur_target & h_src = down_targets[h_src_level - 1];
+					erode_1d(down_src, 10 + eye, *eblur.blur_fbs[eye], te, 1, 0, erode);
 					make_readable(*eblur.image);
+					erode_1d(*eblur.views[eye], 12 + eye, *h_src.blur_fbs[eye], te, 0, 1, erode);
+					make_readable(*h_src.image);
+					down_src = *h_src.views[eye];
 				}
-				update_source(erode > 0 ? *eblur.views[eye] : down_src, eye);
+				update_source(down_src, eye);
 				vk::RenderPassBeginInfo begin_h{
 				        .renderPass = *blur_r8_renderpass,
-				        .framebuffer = erode > 0 ? *down_targets[h_src_level - 1].blur_fbs[eye] : *eblur.blur_fbs[eye],
+				        .framebuffer = *eblur.blur_fbs[eye],
 				        .renderArea = {.offset = {0, 0}, .extent = te},
 				        .clearValueCount = 1,
 				        .pClearValues = &clear,
@@ -1622,8 +1644,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				make_readable(erode > 0 ? *down_targets[h_src_level - 1].image : *eblur.image);
-				update_source(erode > 0 ? *down_targets[h_src_level - 1].views[eye] : *eblur.views[eye], 2 + eye);
+				make_readable(*eblur.image);
+				update_source(*eblur.views[eye], 2 + eye);
 				vk::RenderPassBeginInfo begin_v{
 				        .renderPass = *blur_renderpass,
 				        .framebuffer = *it->second.framebuffers[eye],
