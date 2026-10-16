@@ -27,6 +27,7 @@
 #include <array>
 #include <glm/glm.hpp>
 #include <glm/gtx/quaternion.hpp>
+#include <spdlog/spdlog.h>
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_raii.hpp>
@@ -318,6 +319,18 @@ void stream_defoveator::defoveate(vk::raii::CommandBuffer & command_buffer,
 	for (size_t view = 0; view < view_count; ++view)
 	{
 		const auto out_size = defoveated_size(foveation[view]);
+		{
+			static XrExtent2Di last_out[2] = {};
+			if (out_size.width != last_out[view].width or out_size.height != last_out[view].height)
+			{
+				last_out[view] = out_size;
+				// Source pixels covered per output pixel axis (density
+				// profile length); short profiles = mild foveation.
+				spdlog::info("Defoveate: view {} output {}x{} (density x:{} y:{})",
+				             view, out_size.width, out_size.height,
+				             foveation[view].x.size(), foveation[view].y.size());
+			}
+		}
 		auto vertices = get_vertices(view);
 		const auto & [px, py] = foveation[view];
 		assert(px.size() % 2 == 1);

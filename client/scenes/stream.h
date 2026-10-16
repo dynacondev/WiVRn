@@ -111,6 +111,19 @@ private:
 
 	vk::raii::Fence fence = nullptr;
 	vk::raii::CommandBuffer command_buffer = nullptr;
+	// Split-submit mask submission (masks record+submit before the
+	// video wait so GPU mask work overlaps CPU network stalls; the
+	// compositor joins via swapchain release, so no semaphore is
+	// needed). Single slot: reused when its fence reads signaled,
+	// otherwise the frame falls back to inline recording. Results
+	// feed the mask spans (q0 start, q1 after first group, q2 end).
+	vk::raii::Fence mask_fence = nullptr;
+	vk::raii::CommandBuffer mask_command_buffer = nullptr;
+	vk::raii::QueryPool mask_query_pool = nullptr;
+	// True when the freshest mask numbers live in the mask pool (last
+	// mask submission went async); false selects the main pool
+	// (inline frame or nothing submitted yet).
+	bool mask_results_in_mask_pool = false;
 
 	struct haptics_action
 	{

@@ -414,6 +414,14 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 
 	self->fence = self->device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled});
 
+	self->mask_command_buffer = std::move(self->device.allocateCommandBuffers({
+	        .commandPool = *self->commandpool,
+	        .level = vk::CommandBufferLevel::ePrimary,
+	        .commandBufferCount = 1,
+	})[0]);
+
+	self->mask_fence = self->device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled});
+
 	// Look up the XrActions for haptics
 	for (auto [id, path, output]: {
 	             std::tuple(device_id::LEFT_CONTROLLER_HAPTIC, "/user/hand/left", "/output/haptic"),
@@ -461,6 +469,13 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	        vk::QueryPoolCreateInfo{
 	                .queryType = vk::QueryType::eTimestamp,
 	                .queryCount = size_gpu_timestamps,
+	        });
+
+	self->mask_query_pool = vk::raii::QueryPool(
+	        self->device,
+	        vk::QueryPoolCreateInfo{
+	                .queryType = vk::QueryType::eTimestamp,
+	                .queryCount = 3,
 	        });
 
 	self->wifi = application::get_wifi_lock().get_wifi_lock();
@@ -883,6 +898,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		fence_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_t0).count();
 	}
 
+	// Split-submit decision: reuse the mask slot when its fence reads
+	// signaled (previous mask work retired, descriptors safe to
+	// rewrite); otherwise this frame records inline exactly like
+	// before. Poll only, never wait: the inline fallback is always
+	// available.
+	bool use_async_masks = device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
+	// Set when this frame's mask CB is submitted (release gating +
+	// results-source tracking below).
+	bool mask_async_submitted = false;
+
 	// We don't need those after vkWaitForFences
 	current_blit_handles.fill(nullptr);
 
@@ -898,10 +923,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// and waiting on an unwritten query blocks forever (black
 		// screen: the render thread stalls here after exactly one
 		// frame).
+		// q4 (post-first-group) is written only on inline frames; on
+		// async frames the mask spans come from the mask pool below.
+		// Either way only written queries are read (never wait on an
+		// unwritten query).
+		uint32_t main_qcount = use_async_masks ? 4 : 5;
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
-		        5,
-		        5 * sizeof(uint64_t),
+		        main_qcount,
+		        main_qcount * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64);
 
@@ -911,9 +941,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			last_gpu_timestamps.gpu_time = (timestamps2[1] - timestamps2[0]) * period;
 			last_gpu_timestamps.defoveate_gpu_time = (timestamps2[2] - timestamps2[0]) * period;
 			last_gpu_timestamps.gizmo_gpu_time = (timestamps2[3] - timestamps2[2]) * period;
-			last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
-			last_gpu_timestamps.mask_first_gpu_time = (timestamps2[4] - timestamps2[3]) * period;
-			last_gpu_timestamps.mask_rest_gpu_time = (timestamps2[1] - timestamps2[4]) * period;
+			if (not use_async_masks)
+			{
+				last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
+				last_gpu_timestamps.mask_first_gpu_time = (timestamps2[4] - timestamps2[3]) * period;
+				last_gpu_timestamps.mask_rest_gpu_time = (timestamps2[1] - timestamps2[4]) * period;
+			}
+		}
+	}
+
+	// Mask-pool results (async path): q0 start, q1 after first group,
+	// q2 end. Read only when the last mask submission went async (else
+	// the pool holds older data); not-ready carries like the main pool.
+	if (mask_results_in_mask_pool)
+	{
+		auto [mres, mtimestamps] = mask_query_pool.getResults<uint64_t>(
+		        0,
+		        3,
+		        3 * sizeof(uint64_t),
+		        sizeof(uint64_t),
+		        vk::QueryResultFlagBits::e64);
+
+		if (mres == vk::Result::eSuccess)
+		{
+			float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
+			last_gpu_timestamps.mask_gpu_time = (mtimestamps[2] - mtimestamps[0]) * period;
+			last_gpu_timestamps.mask_first_gpu_time = (mtimestamps[1] - mtimestamps[0]) * period;
+			last_gpu_timestamps.mask_rest_gpu_time = (mtimestamps[2] - mtimestamps[1]) * period;
 		}
 	}
 
@@ -1123,6 +1177,526 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 			}
 		}
+		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
+		std::vector<mask_group *> acquired_groups;
+		std::vector<std::array<glm::vec3, 6>> cutouts;
+
+		// Marker tracking runs every frame: solved frames feed the
+		// record phase below (cutouts, gizmos) and the status UI.
+		update_fiducial_passthrough(frame_state.predictedDisplayTime);
+
+		// Fresh frame accumulators for the Statistics plots (filled by
+		// the gizmo and mask record phases below, sampled by
+		// accumulate_metrics). fence_wait_ms is measured at frame top
+		// above, so it is not reset here; gui_ms/submit_ms are
+		// measured after this point and reset for freshness.
+		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
+		mask_draws = 0;
+		gui_ms = submit_ms = 0;
+		cutouts_punched = false;
+
+		// View-only transforms for the mask record below. Live
+		// predicted views (mask_pose/mask_fov), not the video frame's
+		// pose: see the mask_pose block above.
+		std::array<glm::mat4, view_count> world_mvp;
+		for (uint32_t view = 0; view < view_count; ++view)
+			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
+
+		// Mask record phase, factored to run at two points: async on
+		// its own command buffer ahead of the video wait (masks need
+		// only tracking + live views, not video), or inline exactly
+		// where it always ran. Only the recording CB, query pool and
+		// split-stamp index vary. The main CB never touches mask
+		// outputs, so no cross-submit semaphore is needed: the
+		// compositor joins via swapchain release (gated on the mask
+		// fence below).
+		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit) {
+			// q4 splits the mask span after the first recorded group (set
+			// below; fallback write after the loop keeps the poll range
+			// valid on group-less frames). Groups record sequentially, so
+			// first = q4-q3 localizes one group's chain, rest = q1-q4.
+			bool mask_split_written = false;
+			if (mask_frame)
+			{
+				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
+				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
+				// Member swapchains submit below full (tiered): tier-0 stays
+				// full (exact hard edge), tier-1 submits half, tiered submits
+				// quarter (V writes the submitted size, the compositor
+				// upscales). Intermediates stay keyed off full mw/mh.
+				int hw = std::max(64, mw / 2);
+				int hh = std::max(64, mh / 2);
+				int qw = std::max(64, mw / 4);
+				int qh = std::max(64, mh / 4);
+				// Marker window cutouts: raw pose of every live vote,
+				// expanded by the debug window. Fully manual path (no blur):
+				// the punch below is hard-edged by construction. Fills
+				// the hoisted cutouts vector (read at submit below).
+				if (debug_overlays and debug_window_mm >= 0)
+				{
+					for (const auto & v: fiducial_votes)
+					{
+						if (v.extents.width <= 0 or v.extents.height <= 0)
+							continue;
+						glm::quat mq(v.observed.orientation.w, v.observed.orientation.x, v.observed.orientation.y, v.observed.orientation.z);
+						glm::vec3 c(v.observed.position.x, v.observed.position.y, v.observed.position.z);
+						glm::vec3 r = mq * glm::vec3(1, 0, 0);
+						glm::vec3 u = mq * glm::vec3(0, 1, 0);
+						float hw = v.extents.width * 0.5f + debug_window_mm / 1000.f;
+						float hh = v.extents.height * 0.5f + debug_window_mm / 1000.f;
+						glm::vec3 v0 = c - r * hw - u * hh;
+						glm::vec3 v1 = c + r * hw - u * hh;
+						glm::vec3 v2 = c + r * hw + u * hh;
+						glm::vec3 v3 = c - r * hw + u * hh;
+						cutouts.push_back({v0, v1, v2, v0, v2, v3});
+					}
+				}
+				// Fresh cutouts punch camera with no geometry to map it
+				// onto: the flat feed must stay submitted (see submit).
+				cutouts_punched = not cutouts.empty();
+				// Claim groups + sync member soups (upload on hash change).
+				// Groups are keyed (feather, union): A (true) drives the
+				// projected layer, B (false) the flat layer. Record order
+				// is A ascending, then B ascending (submit matches).
+				std::set<float> live_a, live_b;
+				// Pre-warmed (map-known, not necessarily placed) combos.
+				// Kept by the stale-erase below alongside live_groups, but
+				// kept OUT of live_a/live_b: those drive record order and
+				// the debug-cutout fallback, which must reflect placed
+				// objects only.
+				std::set<std::pair<float, bool>> prewarmed_keys;
+				// Pre-warm pass (first-visible-frame hitch fix): claim
+				// renderer + swapchain + intermediates for every (feather,
+				// union) combo in the map, before anything is placed or
+				// uploaded. Placement frames then only rasterize. Combos
+				// with nothing placed record no draws and stay inactive.
+				// Mirrors the storage blocks in the record loop (which
+				// become no-ops once pre-warmed).
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough")
+						continue;
+					float pf = ost.def.feather_px;
+					bool pproj = surface_projected_effective(oid, ost);
+					prewarmed_keys.emplace(pf, pproj);
+					auto pkey = std::make_pair(pf, pproj);
+					auto & pg = mask_groups[pkey];
+					pg.feather_px = pf;
+					pg.projected = pproj;
+					if (not pg.renderer)
+					{
+						pg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+					}
+					int ptier = feather_mask_renderer::tier_for_feather(pf);
+					int pgw = (ptier == 0) ? mw : (ptier == 1) ? hw : qw;
+					int pgh = (ptier == 0) ? mh : (ptier == 1) ? hh : qh;
+					if (not pg.swapchain or pg.swapchain.width() != pgw or pg.swapchain.height() != pgh)
+					{
+						device.waitIdle();
+						pg.swapchain = xr::swapchain(instance, session, device, swapchain.format(), pgw, pgh, 1, view_count);
+						pg.renderer->reset_targets();
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", pgw, pgh, pf, pproj ? "A" : "B", pg.swapchain.image_count());
+					}
+					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+				}
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					float f = ost.def.feather_px;
+					bool proj = surface_projected_effective(oid, ost);
+					(proj ? live_a : live_b).insert(f);
+					auto key = std::make_pair(f, proj);
+					auto & g = mask_groups[key];
+					g.feather_px = f;
+					g.projected = proj;
+					if (not g.renderer)
+					{
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+					}
+					auto mh = g.mesh_hashes.find(oid);
+					if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
+					{
+						g.renderer->set_mesh(oid, ost.soup);
+						g.mesh_hashes[oid] = ost.soup_hash;
+					}
+				}
+				// Reversed objects (negatives) cut every group of both
+				// unions: appended after all positives (the renderer
+				// resolves positives first, then depth-tested MIN cuts).
+				std::vector<std::pair<float, bool>> live_groups;
+				for (float f: live_a)
+					live_groups.emplace_back(f, true);
+				for (float f: live_b)
+					live_groups.emplace_back(f, false);
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					for (auto & key: live_groups)
+					{
+						auto git = mask_groups.find(key);
+						if (git == mask_groups.end() or not git->second.renderer)
+							continue;
+						auto & g = git->second;
+						auto mh = g.mesh_hashes.find(oid);
+						if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
+						{
+							g.renderer->set_mesh(oid, ost.soup);
+							g.mesh_hashes[oid] = ost.soup_hash;
+						}
+					}
+				}
+				// Debug-only cutout group (no objects): lets the marker
+				// window punch with a fiducials-only config. Claimed
+				// whenever cutouts exist but no B group does (real B groups
+				// punch cutouts themselves, so no extra group then).
+				if (live_b.empty() and not cutouts.empty())
+				{
+					auto & g = debug_group;
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+				}
+				else
+					debug_group.active = false;
+				// Permanent record-order log: group costs are positional, so
+				// the per-group loop order below is load-bearing diagnostics.
+				// Logged on change only (config/map edits, anchor flapping).
+				{
+					static std::vector<std::pair<float, bool>> last_live_feathers;
+					if (live_groups != last_live_feathers)
+					{
+						last_live_feathers = live_groups;
+						std::string order;
+						for (auto [f, proj]: live_groups)
+							order += std::to_string(f) + (proj ? "A " : "B ");
+						spdlog::info("Fiducial mask groups order: {}", order);
+					}
+				}
+				// Drop stale groups + stale member meshes. Use-then-advance:
+				// touching git->second after ++git reads past end().
+				for (auto git = mask_groups.begin(); git != mask_groups.end();)
+				{
+					// Pre-warmed combos are kept like live ones (they become
+					// live on placement without re-creating storage).
+					if (std::ranges::find(live_groups, git->first) == live_groups.end() and
+					    prewarmed_keys.find(git->first) == prewarmed_keys.end())
+					{
+						// Rare path: swapchain images may be in flight.
+						device.waitIdle();
+						git = mask_groups.erase(git);
+						continue;
+					}
+					auto & g = git->second;
+					for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
+					{
+						auto oit = passthrough_objects.find(hit->first);
+						// Reversed objects live in every group (no feather of
+						// their own): evict on removal/unready only, never on
+						// feather/union mismatch. Positives must match both
+						// feather and union: a flag flip evicts from the old
+						// union's group (remove_mesh) so no frame ever
+						// rasterizes the object in both unions (ghost).
+						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
+						        oit->second.fused.placed and
+						        (oit->second.def.type == "3d-passthrough-reversed" or
+						         (oit->second.def.feather_px == g.feather_px and
+						          surface_projected_effective(oit->first, oit->second) == g.projected));
+						if (not member)
+						{
+							g.renderer->remove_mesh(hit->first);
+							hit = g.mesh_hashes.erase(hit);
+						}
+						else
+							++hit;
+					}
+					++git;
+				}
+				// Record per group: draws from placed objects (union-scoped),
+				// full opacity. Cutouts punch union B only (flat): no geometry
+				// exists to map them onto, so A must never see them.
+				static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+				// Box-coverage diagnostics share one 5s window: the flag is
+				// latched before the loop so every group reports in the same
+				// frame (a per-group throttle starves all but the first).
+				static XrTime last_box_log = 0;
+				bool log_boxes = false;
+				if (instance.now() - last_box_log > 5'000'000'000LL)
+				{
+					last_box_log = instance.now();
+					log_boxes = true;
+				}
+				for (auto [f, proj]: live_groups)
+				{
+					auto & g = mask_groups[{f, proj}];
+					// Eager setup: member swapchain + intermediates ready
+					// before first draws, so first-visible frames pay
+					// record+submit only. Tier-0 groups keep a full-res
+					// swapchain (exact hard edge); tier-1 submits half,
+					// tiered submits quarter (V writes the submitted size,
+					// the compositor upscales). g.extent tracks the submitted
+					// size; record() still works intermediates at full.
+					int tier = feather_mask_renderer::tier_for_feather(f);
+					int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
+					int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
+					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
+					{
+						// Rare path (first frame, feather/config change):
+						// nothing outstanding (previous images released last
+						// frame), mirroring setup_reprojection_swapchain.
+						device.waitIdle();
+						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), gw, gh, 1, view_count);
+						g.renderer->reset_targets();
+						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
+					}
+					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+					std::vector<feather_mask_renderer::instance_draw> draws;
+					// Frustum skip: drop draws fully outside both eyes (the
+					// empty-draws path below then skips acquire/record for
+					// fully-culled groups, which cost nothing). Conservative
+					// and exact: per eye, skip only if every corner is either
+					// behind the camera or outside a common side; straddles
+					// are always kept. The NDC box grows by the feather bleed
+					// + 1px so blur contributions survive culling.
+					float margin_x = (f * 0.5f + 1.f) / ((float)mw * 0.5f);
+					float margin_y = (f * 0.5f + 1.f) / ((float)mh * 0.5f);
+					auto draw_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
+						auto bounds = g.renderer->mesh_bounds(mesh);
+						if (not bounds)
+							return true;
+						for (uint32_t view = 0; view < 2; ++view)
+						{
+							bool any_front = false, any_behind = false, any_inside = false;
+							for (int corner = 0; corner < 8; ++corner)
+							{
+								glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
+								            (corner & 2) ? bounds->second.y : bounds->first.y,
+								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+								glm::vec4 c = draw_mvp[view] * q;
+								if (c.w < 0)
+								{
+									any_behind = true;
+									continue;
+								}
+								any_front = true;
+								if (glm::abs(c.x) <= c.w * (1.f + margin_x) and
+								    glm::abs(c.y) <= c.w * (1.f + margin_y) and c.z >= 0 and c.z <= c.w)
+									any_inside = true;
+							}
+							bool skip_eye = not any_front or (not any_behind and not any_inside);
+							if (not skip_eye)
+								return true;
+						}
+						return false;
+					};
+					// One draw per placed object: model matrix from the fused
+					// placement, per-eye MVPs, full opacity. Polarity rides
+					// the draw (false = fill, true = cut); the renderer pushes
+					// full cut strength for reversed.
+					auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed) {
+						const auto & fu = ost.fused;
+						if (not fu.placed)
+							return;
+						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						std::array<glm::mat4, 2> mvp;
+						for (uint32_t view = 0; view < view_count; ++view)
+							mvp[view] = world_mvp[view] * model;
+						constexpr float op = 1;
+						if (not draw_visible(oid, mvp))
+							return;
+						draws.push_back({oid, mvp, op, reversed});
+					};
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f or
+						    surface_projected_effective(oid, ost) != proj)
+							continue;
+						append_draw(oid, ost, false);
+					}
+					// Reversed objects (negatives) cut every group of both
+					// unions: appended after all positives (the renderer
+					// resolves positives first, then depth-tested MIN cuts).
+					// Same mvp/frustum path, full cut strength.
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
+							continue;
+						append_draw(oid, ost, true);
+					}
+					// Reversed-only draws rasterize to a provable no-op, so a
+					// group with no positive draws is skipped exactly like an
+					// empty one.
+					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
+					if (draws.empty() or not any_positive)
+					{
+						g.active = false;
+						// Mesh-pipeline edge forensics: draws present ->
+						// absent means the object stopped rasterizing
+						// (frustum-culled out of view vs state loss).
+						// Throttled: frame-edge flicker would spam.
+						if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+						{
+							g.last_draws_log = instance.now();
+							spdlog::info("Fiducial mask draws lost (feather {}px union {})", f, proj ? "A" : "B");
+						}
+						g.had_draws = false;
+						continue;
+					}
+					g.had_draws = true;
+					int mask_index = g.swapchain.acquire();
+					// (wait clocked below: mask image waits are silent
+					// below timeout and sit inside the cpu measurement)
+					// Paired from acquisition: the group joins the release
+					// list immediately, so wait/record throws release its
+					// image instead of leaking it (one leaked image per frame
+					// drains the pool in pool-depth frames, then acquires fail
+					// permanently).
+					acquired_groups.push_back(&g);
+					if (not g.swapchain.wait(100'000'000))
+					{
+						// Never park forever on an unavailable image: release
+						// the untouched acquisition to keep pairing and skip
+						// the group this frame.
+						g.swapchain.release();
+						acquired_groups.pop_back();
+						g.active = false;
+						if (not g.wait_warned)
+						{
+							g.wait_warned = true;
+							spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px union {})", f, proj ? "A" : "B");
+						}
+						continue;
+					}
+					g.wait_warned = false;
+					g.acquired = true;
+					g.active = true;
+					g.extent = {(int32_t)gw, (int32_t)gh};
+					feather_mask_renderer::mask_stage_cpu mstats{};
+					try
+					{
+						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
+						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh});
+					}
+					catch (std::exception & e)
+					{
+						spdlog::warn("Fiducial mask record failed: {} (feather {}px union {})", e.what(), f, proj ? "A" : "B");
+						g.swapchain.release();
+						acquired_groups.pop_back();
+						g.acquired = false;
+						g.active = false;
+					}
+					// Cutout punch (debug-only) folds into raster.
+					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+					mask_erode_ms += mstats.erode_ms;
+					mask_blur_ms += mstats.blur_ms;
+					mask_draws += (int)mstats.draws;
+					// Box-coverage diagnostics for the scissor cull (see
+					// flag above; tier-0 has no scissored passes to report).
+					if (log_boxes and mstats.tier > 0)
+					{
+						spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {}",
+						             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
+					}
+					if (not mask_split_written)
+					{
+						mask_split_written = true;
+						rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qsplit);
+					}
+				}
+				if (not mask_split_written)
+				{
+					// No group recorded (all culled/skipped): zero-length
+					// first span, so the poll range stays valid and mask
+					// numbers carry over instead of going stale.
+					mask_split_written = true;
+					rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qsplit);
+				}
+				// Debug group record (cutouts only, full-res, clear + hard
+				// punch): runs only while claimed above.
+				if (live_b.empty() and not cutouts.empty())
+				{
+					auto & g = debug_group;
+					if (g.extent.width != mw or g.extent.height != mh)
+					{
+						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
+						g.extent = {(int32_t)mw, (int32_t)mh};
+						g.renderer->reset_targets();
+					}
+					int mask_index = g.swapchain.acquire();
+					if (not g.swapchain.wait(100'000'000))
+					{
+						g.swapchain.release();
+						g.active = false;
+						cutouts_punched = false;
+						if (not g.wait_warned)
+						{
+							g.wait_warned = true;
+							spdlog::warn("Debug mask image wait timed out, skipping frame");
+						}
+					}
+					else
+					{
+						g.wait_warned = false;
+						g.acquired = true;
+						g.active = true;
+						acquired_groups.push_back(&g);
+						feather_mask_renderer::mask_stage_cpu mstats{};
+						try
+						{
+							// Full-res submit (feather 0 = tier 0): the hard
+							// punch needs no blur intermediates.
+							vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
+							g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, {}, true, 0,
+							                   cutouts, world_mvp, &mstats, mex);
+						}
+						catch (std::exception & e)
+						{
+							spdlog::warn("Debug mask record failed: {}", e.what());
+							g.swapchain.release();
+							acquired_groups.erase(std::remove(acquired_groups.begin(), acquired_groups.end(), &g), acquired_groups.end());
+							g.acquired = false;
+							g.active = false;
+							cutouts_punched = false;
+						}
+						mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+						mask_erode_ms += mstats.erode_ms;
+						mask_blur_ms += mstats.blur_ms;
+						mask_draws += (int)mstats.draws;
+					}
+				}
+				else
+					debug_group.active = false;
+			}
+		};
+
+		// Split-submit the mask phase ahead of the video wait when the
+		// slot is free (fence polled at frame top): GPU mask work then
+		// overlaps the CPU video stall instead of idling through it,
+		// and the post-video tail is only defoveate + submit. Uniform
+		// submit (even empty: stamps only) keeps the fence cycling and
+		// the mask queries fresh.
+		if (mask_frame && use_async_masks)
+		{
+			mask_command_buffer.reset();
+			mask_command_buffer.begin(vk::CommandBufferBeginInfo{
+			        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+			});
+			mask_command_buffer.resetQueryPool(*mask_query_pool, 0, 3);
+			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *mask_query_pool, 0);
+			record_masks_phase(mask_command_buffer, mask_query_pool, 1);
+			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *mask_query_pool, 2);
+			mask_command_buffer.end();
+			vk::SubmitInfo mask_submit_info;
+			mask_submit_info.setCommandBuffers(*mask_command_buffer);
+			device.resetFences(*mask_fence);
+			queue.lock()->submit(mask_submit_info, *mask_fence);
+			mask_async_submitted = true;
+			mask_results_in_mask_pool = true;
+		}
 		assert(swapchain);
 		// defoveate the image, apply scale/bias
 		int image_index = swapchain.acquire();
@@ -1148,6 +1722,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			renderdoc_end(*vk_instance);
 #endif
 			swapchain.release();
+			// Masks already went out async ahead of the video wait:
+			// release immediately (submission-before-release is the
+			// runtime contract; completion is never waited on the
+			// frame path) so the degraded frame still ends promptly.
+			if (mask_async_submitted)
+			{
+				for (auto * g: acquired_groups)
+				{
+					g->acquired = false;
+					g->swapchain.release();
+				}
+				acquired_groups.clear();
+			}
 			session.end_frame(frame_state.predictedDisplayTime, {});
 			return;
 		}
@@ -1219,26 +1806,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			                               foreign_release_barriers);
 		}
 #endif
-
-		// Marker tracking runs every frame: solved frames feed the
-		// record phase below (cutouts, gizmos) and the status UI.
-		update_fiducial_passthrough(frame_state.predictedDisplayTime);
-
-		// Fresh frame accumulators for the Statistics plots (filled by
-		// the gizmo and mask record phases below, sampled by
-		// accumulate_metrics). fence_wait_ms is measured at frame top
-		// above, so it is not reset here; gui_ms/submit_ms are
-		// measured after this point and reset for freshness.
-		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
-		mask_draws = 0;
-		gui_ms = submit_ms = 0;
-
-		// View-only transforms, shared by the mask record and the debug
-		// gizmos below. Live predicted views (mask_pose/mask_fov), not the
-		// video frame's pose: see the mask_pose block above.
-		std::array<glm::mat4, view_count> world_mvp;
-		for (uint32_t view = 0; view < view_count; ++view)
-			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
 
 		// QR debug gizmos: tag boxes (green = configured, red = other),
 		// axes tripods, orange fused-corrected boxes, board origin +
@@ -1471,471 +2038,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Debug mask record: the local debug group (union B) carries the
 		// marker-window cutouts. No silhouette raster yet (no objects):
 		// clear + hard cutout punch at full alpha.
-		cutouts_punched = false;
-		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
-		std::vector<mask_group *> acquired_groups;
-		// GPU span point: closes the gizmo gap (q3-q2), opens the mask
-		// span (closed by query 1 after the phase). Unconditional so no
-		// validity tracking is needed; without mask work the span just
-		// measures submit prep.
+		// GPU span point: closes the gizmo gap (q3-q2). On inline
+		// frames it also opens the mask span (closed by query 1 after
+		// the phase); on async frames the mask spans live in the mask
+		// pool and this just measures submit prep. Unconditional so no
+		// validity tracking is needed.
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 3);
-		// q4 splits the mask span after the first recorded group (set
-		// below; fallback write after the loop keeps the poll range
-		// valid on group-less frames). Groups record sequentially, so
-		// first = q4-q3 localizes one group's chain, rest = q1-q4.
-		bool mask_split_written = false;
-		if (mask_frame)
+		if (!mask_async_submitted)
 		{
-			int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
-			int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
-			// Member swapchains submit below full (tiered): tier-0 stays
-			// full (exact hard edge), tier-1 submits half, tiered submits
-			// quarter (V writes the submitted size, the compositor
-			// upscales). Intermediates stay keyed off full mw/mh.
-			int hw = std::max(64, mw / 2);
-			int hh = std::max(64, mh / 2);
-			int qw = std::max(64, mw / 4);
-			int qh = std::max(64, mh / 4);
-			// Marker window cutouts: raw pose of every live vote,
-			// expanded by the debug window. Fully manual path (no blur):
-			// the punch below is hard-edged by construction.
-			std::vector<std::array<glm::vec3, 6>> cutouts;
-			if (debug_overlays and debug_window_mm >= 0)
+			// Inline fallback (mask fence busy): identical work on the
+			// main command buffer. Throttled note — persistent fallback
+			// means the GPU never drains between frames.
+			if (mask_frame && !use_async_masks)
 			{
-				for (const auto & v: fiducial_votes)
+				static XrTime last_async_fallback_log = 0;
+				XrTime now = instance.now();
+				if (now - last_async_fallback_log > 5'000'000'000LL)
 				{
-					if (v.extents.width <= 0 or v.extents.height <= 0)
-						continue;
-					glm::quat mq(v.observed.orientation.w, v.observed.orientation.x, v.observed.orientation.y, v.observed.orientation.z);
-					glm::vec3 c(v.observed.position.x, v.observed.position.y, v.observed.position.z);
-					glm::vec3 r = mq * glm::vec3(1, 0, 0);
-					glm::vec3 u = mq * glm::vec3(0, 1, 0);
-					float hw = v.extents.width * 0.5f + debug_window_mm / 1000.f;
-					float hh = v.extents.height * 0.5f + debug_window_mm / 1000.f;
-					glm::vec3 v0 = c - r * hw - u * hh;
-					glm::vec3 v1 = c + r * hw - u * hh;
-					glm::vec3 v2 = c + r * hw + u * hh;
-					glm::vec3 v3 = c - r * hw + u * hh;
-					cutouts.push_back({v0, v1, v2, v0, v2, v3});
+					last_async_fallback_log = now;
+					spdlog::info("Mask submit: inline fallback (mask fence busy)");
 				}
 			}
-			// Fresh cutouts punch camera with no geometry to map it
-			// onto: the flat feed must stay submitted (see submit).
-			cutouts_punched = not cutouts.empty();
-			// Claim groups + sync member soups (upload on hash change).
-			// Groups are keyed (feather, union): A (true) drives the
-			// projected layer, B (false) the flat layer. Record order
-			// is A ascending, then B ascending (submit matches).
-			std::set<float> live_a, live_b;
-			// Pre-warmed (map-known, not necessarily placed) combos.
-			// Kept by the stale-erase below alongside live_groups, but
-			// kept OUT of live_a/live_b: those drive record order and
-			// the debug-cutout fallback, which must reflect placed
-			// objects only.
-			std::set<std::pair<float, bool>> prewarmed_keys;
-			// Pre-warm pass (first-visible-frame hitch fix): claim
-			// renderer + swapchain + intermediates for every (feather,
-			// union) combo in the map, before anything is placed or
-			// uploaded. Placement frames then only rasterize. Combos
-			// with nothing placed record no draws and stay inactive.
-			// Mirrors the storage blocks in the record loop (which
-			// become no-ops once pre-warmed).
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				if (ost.def.type != "3d-passthrough")
-					continue;
-				float pf = ost.def.feather_px;
-				bool pproj = surface_projected_effective(oid, ost);
-				prewarmed_keys.emplace(pf, pproj);
-				auto pkey = std::make_pair(pf, pproj);
-				auto & pg = mask_groups[pkey];
-				pg.feather_px = pf;
-				pg.projected = pproj;
-				if (not pg.renderer)
-				{
-					pg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-				}
-				int ptier = feather_mask_renderer::tier_for_feather(pf);
-				int pgw = (ptier == 0) ? mw : (ptier == 1) ? hw : qw;
-				int pgh = (ptier == 0) ? mh : (ptier == 1) ? hh : qh;
-				if (not pg.swapchain or pg.swapchain.width() != pgw or pg.swapchain.height() != pgh)
-				{
-					device.waitIdle();
-					pg.swapchain = xr::swapchain(instance, session, device, swapchain.format(), pgw, pgh, 1, view_count);
-					pg.renderer->reset_targets();
-					spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", pgw, pgh, pf, pproj ? "A" : "B", pg.swapchain.image_count());
-				}
-				pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
-			}
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
-					continue;
-				float f = ost.def.feather_px;
-				bool proj = surface_projected_effective(oid, ost);
-				(proj ? live_a : live_b).insert(f);
-				auto key = std::make_pair(f, proj);
-				auto & g = mask_groups[key];
-				g.feather_px = f;
-				g.projected = proj;
-				if (not g.renderer)
-				{
-					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-				}
-				auto mh = g.mesh_hashes.find(oid);
-				if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
-				{
-					g.renderer->set_mesh(oid, ost.soup);
-					g.mesh_hashes[oid] = ost.soup_hash;
-				}
-			}
-			// Reversed objects (negatives) cut every group of both
-			// unions: appended after all positives (the renderer
-			// resolves positives first, then depth-tested MIN cuts).
-			std::vector<std::pair<float, bool>> live_groups;
-			for (float f: live_a)
-				live_groups.emplace_back(f, true);
-			for (float f: live_b)
-				live_groups.emplace_back(f, false);
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
-					continue;
-				for (auto & key: live_groups)
-				{
-					auto git = mask_groups.find(key);
-					if (git == mask_groups.end() or not git->second.renderer)
-						continue;
-					auto & g = git->second;
-					auto mh = g.mesh_hashes.find(oid);
-					if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
-					{
-						g.renderer->set_mesh(oid, ost.soup);
-						g.mesh_hashes[oid] = ost.soup_hash;
-					}
-				}
-			}
-			// Debug-only cutout group (no objects): lets the marker
-			// window punch with a fiducials-only config. Claimed
-			// whenever cutouts exist but no B group does (real B groups
-			// punch cutouts themselves, so no extra group then).
-			if (live_b.empty() and not cutouts.empty())
-			{
-				auto & g = debug_group;
-				if (not g.renderer)
-					g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-			}
-			else
-				debug_group.active = false;
-			// Permanent record-order log: group costs are positional, so
-			// the per-group loop order below is load-bearing diagnostics.
-			// Logged on change only (config/map edits, anchor flapping).
-			{
-				static std::vector<std::pair<float, bool>> last_live_feathers;
-				if (live_groups != last_live_feathers)
-				{
-					last_live_feathers = live_groups;
-					std::string order;
-					for (auto [f, proj]: live_groups)
-						order += std::to_string(f) + (proj ? "A " : "B ");
-					spdlog::info("Fiducial mask groups order: {}", order);
-				}
-			}
-			// Drop stale groups + stale member meshes. Use-then-advance:
-			// touching git->second after ++git reads past end().
-			for (auto git = mask_groups.begin(); git != mask_groups.end();)
-			{
-				// Pre-warmed combos are kept like live ones (they become
-				// live on placement without re-creating storage).
-				if (std::ranges::find(live_groups, git->first) == live_groups.end() and
-				    prewarmed_keys.find(git->first) == prewarmed_keys.end())
-				{
-					// Rare path: swapchain images may be in flight.
-					device.waitIdle();
-					git = mask_groups.erase(git);
-					continue;
-				}
-				auto & g = git->second;
-				for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
-				{
-					auto oit = passthrough_objects.find(hit->first);
-					// Reversed objects live in every group (no feather of
-					// their own): evict on removal/unready only, never on
-					// feather/union mismatch. Positives must match both
-					// feather and union: a flag flip evicts from the old
-					// union's group (remove_mesh) so no frame ever
-					// rasterizes the object in both unions (ghost).
-					bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
-					        oit->second.fused.placed and
-					        (oit->second.def.type == "3d-passthrough-reversed" or
-					         (oit->second.def.feather_px == g.feather_px and
-					          surface_projected_effective(oit->first, oit->second) == g.projected));
-					if (not member)
-					{
-						g.renderer->remove_mesh(hit->first);
-						hit = g.mesh_hashes.erase(hit);
-					}
-					else
-						++hit;
-				}
-				++git;
-			}
-			// Record per group: draws from placed objects (union-scoped),
-			// full opacity. Cutouts punch union B only (flat): no geometry
-			// exists to map them onto, so A must never see them.
-			static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
-			// Box-coverage diagnostics share one 5s window: the flag is
-			// latched before the loop so every group reports in the same
-			// frame (a per-group throttle starves all but the first).
-			static XrTime last_box_log = 0;
-			bool log_boxes = false;
-			if (instance.now() - last_box_log > 5'000'000'000LL)
-			{
-				last_box_log = instance.now();
-				log_boxes = true;
-			}
-			for (auto [f, proj]: live_groups)
-			{
-				auto & g = mask_groups[{f, proj}];
-				// Eager setup: member swapchain + intermediates ready
-				// before first draws, so first-visible frames pay
-				// record+submit only. Tier-0 groups keep a full-res
-				// swapchain (exact hard edge); tier-1 submits half,
-				// tiered submits quarter (V writes the submitted size,
-				// the compositor upscales). g.extent tracks the submitted
-				// size; record() still works intermediates at full.
-				int tier = feather_mask_renderer::tier_for_feather(f);
-				int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
-				int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
-				if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
-				{
-					// Rare path (first frame, feather/config change):
-					// nothing outstanding (previous images released last
-					// frame), mirroring setup_reprojection_swapchain.
-					device.waitIdle();
-					g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), gw, gh, 1, view_count);
-					g.renderer->reset_targets();
-					spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
-				}
-				g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
-				std::vector<feather_mask_renderer::instance_draw> draws;
-				// Frustum skip: drop draws fully outside both eyes (the
-				// empty-draws path below then skips acquire/record for
-				// fully-culled groups, which cost nothing). Conservative
-				// and exact: per eye, skip only if every corner is either
-				// behind the camera or outside a common side; straddles
-				// are always kept. The NDC box grows by the feather bleed
-				// + 1px so blur contributions survive culling.
-				float margin_x = (f * 0.5f + 1.f) / ((float)mw * 0.5f);
-				float margin_y = (f * 0.5f + 1.f) / ((float)mh * 0.5f);
-				auto draw_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & draw_mvp) {
-					auto bounds = g.renderer->mesh_bounds(mesh);
-					if (not bounds)
-						return true;
-					for (uint32_t view = 0; view < 2; ++view)
-					{
-						bool any_front = false, any_behind = false, any_inside = false;
-						for (int corner = 0; corner < 8; ++corner)
-						{
-							glm::vec4 q((corner & 1) ? bounds->second.x : bounds->first.x,
-							            (corner & 2) ? bounds->second.y : bounds->first.y,
-							            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
-							glm::vec4 c = draw_mvp[view] * q;
-							if (c.w < 0)
-							{
-								any_behind = true;
-								continue;
-							}
-							any_front = true;
-							if (glm::abs(c.x) <= c.w * (1.f + margin_x) and
-							    glm::abs(c.y) <= c.w * (1.f + margin_y) and c.z >= 0 and c.z <= c.w)
-								any_inside = true;
-						}
-						bool skip_eye = not any_front or (not any_behind and not any_inside);
-						if (not skip_eye)
-							return true;
-					}
-					return false;
-				};
-				// One draw per placed object: model matrix from the fused
-				// placement, per-eye MVPs, full opacity. Polarity rides
-				// the draw (false = fill, true = cut); the renderer pushes
-				// full cut strength for reversed.
-				auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed) {
-					const auto & fu = ost.fused;
-					if (not fu.placed)
-						return;
-					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
-					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
-					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-					std::array<glm::mat4, 2> mvp;
-					for (uint32_t view = 0; view < view_count; ++view)
-						mvp[view] = world_mvp[view] * model;
-					constexpr float op = 1;
-					if (not draw_visible(oid, mvp))
-						return;
-					draws.push_back({oid, mvp, op, reversed});
-				};
-				for (auto & [oid, ost]: passthrough_objects)
-				{
-					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f or
-					    surface_projected_effective(oid, ost) != proj)
-						continue;
-					append_draw(oid, ost, false);
-				}
-				// Reversed objects (negatives) cut every group of both
-				// unions: appended after all positives (the renderer
-				// resolves positives first, then depth-tested MIN cuts).
-				// Same mvp/frustum path, full cut strength.
-				for (auto & [oid, ost]: passthrough_objects)
-				{
-					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
-						continue;
-					append_draw(oid, ost, true);
-				}
-				// Reversed-only draws rasterize to a provable no-op, so a
-				// group with no positive draws is skipped exactly like an
-				// empty one.
-				bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-				if (draws.empty() or not any_positive)
-				{
-					g.active = false;
-					// Mesh-pipeline edge forensics: draws present ->
-					// absent means the object stopped rasterizing
-					// (frustum-culled out of view vs state loss).
-					// Throttled: frame-edge flicker would spam.
-					if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
-					{
-						g.last_draws_log = instance.now();
-						spdlog::info("Fiducial mask draws lost (feather {}px union {})", f, proj ? "A" : "B");
-					}
-					g.had_draws = false;
-					continue;
-				}
-				g.had_draws = true;
-				int mask_index = g.swapchain.acquire();
-				// Paired from acquisition: the group joins the release
-				// list immediately, so wait/record throws release its
-				// image instead of leaking it (one leaked image per frame
-				// drains the pool in pool-depth frames, then acquires fail
-				// permanently).
-				acquired_groups.push_back(&g);
-				if (not g.swapchain.wait(100'000'000))
-				{
-					// Never park forever on an unavailable image: release
-					// the untouched acquisition to keep pairing and skip
-					// the group this frame.
-					g.swapchain.release();
-					acquired_groups.pop_back();
-					g.active = false;
-					if (not g.wait_warned)
-					{
-						g.wait_warned = true;
-						spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px union {})", f, proj ? "A" : "B");
-					}
-					continue;
-				}
-				g.wait_warned = false;
-				g.acquired = true;
-				g.active = true;
-				g.extent = {(int32_t)gw, (int32_t)gh};
-				feather_mask_renderer::mask_stage_cpu mstats{};
-				try
-				{
-					g.renderer->record(command_buffer, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-					                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh});
-				}
-				catch (std::exception & e)
-				{
-					spdlog::warn("Fiducial mask record failed: {} (feather {}px union {})", e.what(), f, proj ? "A" : "B");
-					g.swapchain.release();
-					acquired_groups.pop_back();
-					g.acquired = false;
-					g.active = false;
-				}
-				// Cutout punch (debug-only) folds into raster.
-				mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
-				mask_erode_ms += mstats.erode_ms;
-				mask_blur_ms += mstats.blur_ms;
-				mask_draws += (int)mstats.draws;
-				// Box-coverage diagnostics for the scissor cull (see
-				// flag above; tier-0 has no scissored passes to report).
-				if (log_boxes and mstats.tier > 0)
-				{
-					spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {}",
-					             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
-				}
-				if (not mask_split_written)
-				{
-					mask_split_written = true;
-					command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 4);
-				}
-			}
-			if (not mask_split_written)
-			{
-				// No group recorded (all culled/skipped): zero-length
-				// first span, so the poll range stays valid and mask
-				// numbers carry over instead of going stale.
-				mask_split_written = true;
-				command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 4);
-			}
-			// Debug group record (cutouts only, full-res, clear + hard
-			// punch): runs only while claimed above.
-			if (live_b.empty() and not cutouts.empty())
-			{
-				auto & g = debug_group;
-				if (g.extent.width != mw or g.extent.height != mh)
-				{
-					g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
-					g.extent = {(int32_t)mw, (int32_t)mh};
-					g.renderer->reset_targets();
-				}
-				int mask_index = g.swapchain.acquire();
-				if (not g.swapchain.wait(100'000'000))
-				{
-					g.swapchain.release();
-					g.active = false;
-					cutouts_punched = false;
-					if (not g.wait_warned)
-					{
-						g.wait_warned = true;
-						spdlog::warn("Debug mask image wait timed out, skipping frame");
-					}
-				}
-				else
-				{
-					g.wait_warned = false;
-					g.acquired = true;
-					g.active = true;
-					acquired_groups.push_back(&g);
-					feather_mask_renderer::mask_stage_cpu mstats{};
-					try
-					{
-						// Full-res submit (feather 0 = tier 0): the hard
-						// punch needs no blur intermediates.
-						vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
-						g.renderer->record(command_buffer, g.swapchain.image(mask_index), mex, {}, true, 0,
-						                   cutouts, world_mvp, &mstats, mex);
-					}
-					catch (std::exception & e)
-					{
-						spdlog::warn("Debug mask record failed: {}", e.what());
-						g.swapchain.release();
-						acquired_groups.erase(std::remove(acquired_groups.begin(), acquired_groups.end(), &g), acquired_groups.end());
-						g.acquired = false;
-						g.active = false;
-						cutouts_punched = false;
-					}
-					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
-					mask_erode_ms += mstats.erode_ms;
-					mask_blur_ms += mstats.blur_ms;
-					mask_draws += (int)mstats.draws;
-				}
-			}
-			else
-				debug_group.active = false;
+			record_masks_phase(command_buffer, query_pool, 4);
+			mask_results_in_mask_pool = false;
 		}
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
@@ -1971,6 +2096,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		renderdoc_end(*vk_instance);
 #endif
 		swapchain.release();
+		// Release immediately after submit: submission-before-release
+		// is the runtime contract (device-side sync is the runtime's
+		// job — the pre-split code released here with mask work still
+		// in flight). Never wait for mask completion on the frame
+		// path: parking the thread here delays end_frame past vsync
+		// on spike frames (single black frames). Slot safety comes
+		// from the frame-top fence poll, not from this wait.
 		// Paired with the group acquires above: the compositor takes
 		// the last released image, so release right after submit and
 		// reference the swapchains in the layers below.
