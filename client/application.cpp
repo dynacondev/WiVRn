@@ -1403,6 +1403,11 @@ void application::initialize()
 	        XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME,
 	        XR_META_LOCAL_DIMMING_EXTENSION_NAME,
 	        XR_META_BOUNDARY_VISIBILITY_EXTENSION_NAME,
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+	        // Environment-depth debug overlay (Quest 3/3S): probed like
+	        // all opt extensions; absent runtimes/headers are unaffected.
+	        XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME,
+#endif
 	};
 
 	for (const auto & i: interaction_profiles)
