@@ -2047,6 +2047,66 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
+		// Environment-depth debug overlay: acquire the runtime D16 frame
+		// (once per frame, between begin/end) and record the fullscreen
+		// false-color viz into its own transparent swapchain. Provider
+		// cost is bound to the toggle: turning it off stops it below.
+		int depth_image = -1;
+		if (debug_depth_overlay)
+		{
+			if (not env_depth_probed)
+			{
+				env_depth_probed = true;
+				env_depth_supported = xr::environment_depth::supported(instance, system);
+				if (env_depth_supported)
+					env_depth = std::make_unique<xr::environment_depth>(instance, session, system, device);
+				else
+					depth_status = "environment depth unsupported on this headset";
+			}
+			if (env_depth)
+			{
+				env_depth->ensure();
+				if (env_depth->ready())
+				{
+					env_depth->start();
+					xr::environment_depth::frame depth_frame;
+					if (env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, depth_frame))
+					{
+						if (not depth_overlay)
+							depth_overlay = std::make_unique<depth_overlay_renderer>(device);
+						depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+						depth_image = depth_overlay->acquire();
+						if (depth_image >= 0)
+						{
+							depth_overlay_renderer::frame_params params;
+							params.near_z = depth_frame.near_z;
+							params.far_z = depth_frame.far_z;
+							params.opacity = debug_depth_opacity;
+							std::array<vk::Extent2D, 2> depth_ext;
+							for (uint32_t view = 0; view < view_count; ++view)
+								depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
+							                      env_depth->depth_view(depth_frame.swapchain_index), params);
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
+							                           env_depth->depth_width(), env_depth->depth_height(),
+							                           (double)depth_frame.near_z, (double)depth_frame.far_z);
+						}
+						else
+							depth_status = "overlay swapchain busy, skipped frame";
+					}
+					else
+						depth_status = "waiting for depth data";
+				}
+				else
+					depth_status = "depth provider unavailable";
+			}
+		}
+		else if (env_depth and env_depth->started())
+		{
+			env_depth->stop();
+			depth_status.clear();
+		}
+
 		// Debug mask record: the local debug group (union B) carries the
 		// marker-window cutouts. No silhouette raster yet (no objects):
 		// clear + hard cutout punch at full alpha.
@@ -2413,6 +2473,36 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// Paired with the acquire in the record phase above: the
 			// compositor takes the last released image; release after submit.
 			gizmo_lines->release();
+		}
+
+		// Depth overlay: ONE transparent projection layer, above the
+		// gizmos and below the GUI quads (submitted here, before
+		// draw_gui). Same discipline as the debug lines: standard
+		// alpha blend, no FB extensions.
+		if (depth_image >= 0 and depth_overlay)
+		{
+			std::array<XrCompositionLayerProjectionView, view_count> depth_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				depth_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = mask_pose[view],
+				        .fov = mask_fov[view],
+				        .subImage = {
+				                .swapchain = depth_overlay->swapchain(),
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = extents[view],
+				                },
+				                .imageArrayIndex = view,
+				        },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     depth_views);
+			// Paired with the acquire above: release after submit.
+			depth_overlay->release();
 		}
 
 		if (const configuration::openxr_post_processing_settings openxr_post_processing = application::get_config().openxr_post_processing;

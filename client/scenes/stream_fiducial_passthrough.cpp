@@ -1139,6 +1139,18 @@ void scenes::stream::gui_passthrough()
 	if (ImGui::Button(_S("Run boundary self-test")))
 		xr::boundary_selftest();
 
+	ImGui::SeparatorText(_S("Depth overlay"));
+	if (env_depth_probed and not env_depth_supported)
+		ImGui::Text("%s", _S("Environment depth not supported on this headset"));
+	ImGui::Checkbox(_S("Depth overlay"), &debug_depth_overlay);
+	ImGui::BeginDisabled(not debug_depth_overlay or (env_depth_probed and not env_depth_supported));
+	float depth_pct = debug_depth_opacity * 100;
+	if (ImGui::SliderFloat(_S("Overlay opacity"), &depth_pct, 0, 100, "%.0f%%"))
+		debug_depth_opacity = std::clamp(depth_pct / 100, 0.f, 1.f);
+	ImGui::EndDisabled();
+	if (not depth_status.empty())
+		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
+
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)
 		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));

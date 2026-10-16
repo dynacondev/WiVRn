@@ -25,6 +25,7 @@
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
 #include "render/debug_lines.h"
+#include "render/depth_overlay.h"
 #include "render/feather_mask.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
@@ -36,6 +37,7 @@
 #include "wivrn_client.h"
 #include "wivrn_packets.h"
 #include "xr/board_solver.h"
+#include "xr/environment_depth.h"
 #include "xr/fiducial_filter.h"
 #include "xr/boundary.h"
 #include "xr/marker_tracker.h"
@@ -673,6 +675,18 @@ private:
 	int debug_window_mm = 50;
 	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
 	std::unique_ptr<debug_lines_renderer> gizmo_lines;
+
+	// Environment-depth debug overlay (Quest 3/3S, Passthrough tab,
+	// session-scoped, render thread only): fullscreen false-color of the
+	// runtime D16 (green = nearZ, red = farZ) with a global opacity.
+	// Provider cost is bound to the toggle (off = zero cost).
+	std::unique_ptr<depth_overlay_renderer> depth_overlay;
+	std::unique_ptr<xr::environment_depth> env_depth;
+	bool env_depth_probed = false;   // supported() queried once, cached below
+	bool env_depth_supported = false;
+	bool debug_depth_overlay = false; // master toggle (starts the provider)
+	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1
+	std::string depth_status;         // UI status line, refreshed per frame
 
 	// Stale-hold multiplier for debug visuals: full presence on fresh
 	// data, smooth 3s fade-out on hold. Returns 0 (gone) .. 1 (fresh).
