@@ -275,8 +275,8 @@ void scenes::stream::handle_user_presence(bool present)
 	// Unmount: arm a soft reseat per tracked fiducial and hide every
 	// placement until its code is sighted again (as if freshly started,
 	// but filters and warm starts are kept so the correction glides
-	// instead of popping). Until-lock re-arms when set, putting the user
-	// back into fullscreen passthrough until the code re-locks.
+	// instead of popping). The passthrough-until-lock latch is left
+	// untouched, so remount goes straight back into VR.
 	size_t n = 0;
 	for (auto & [fid, bp]: board_poses)
 	{
@@ -293,14 +293,7 @@ void scenes::stream::handle_user_presence(bool present)
 	// the stale pose. Meshes re-upload from the retained soups on
 	// re-placement via the per-frame instance sync below.
 	session.clear_projected_instances();
-	if (not until_lock_target.empty())
-	{
-		until_lock_found = false;
-		spdlog::info("user presence lost: reseat armed for {} fiducial(s), passthrough-until-lock waiting for \"{}\" again",
-		             n, until_lock_target);
-	}
-	else
-		spdlog::info("user presence lost: reseat armed for {} fiducial(s)", n);
+	spdlog::info("user presence lost: reseat armed for {} fiducial(s)", n);
 }
 
 void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, XrTime now)
