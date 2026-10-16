@@ -756,7 +756,7 @@ void scenes::stream::gui_toasts()
 	ImGui::Text("%s", (*toast)->content.c_str());
 }
 
-void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period)
+void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views)
 {
 	// Parts measured below (build vs submit); the caller still clocks
 	// the whole call, so the remainder names locate/hand overhead.
@@ -827,7 +827,14 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 	bool interactable = true;
 	XrSpace world_space = application::space(xr::spaces::world);
-	auto views = session.locate_views(viewconfig, predicted_display_time, world_space).second;
+	// Reuse the frame's live locate from render() when available (same
+	// time + space): a second locate_views is the same IPC twice. The
+	// copy is 2 views; the IPC it replaces costs more.
+	std::vector<XrView> views;
+	if (not live_views.empty())
+		views.assign(live_views.begin(), live_views.end());
+	else
+		views = session.locate_views(viewconfig, predicted_display_time, world_space).second;
 
 	switch (gui_status)
 	{

@@ -1123,6 +1123,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// video pose when locating fails.
 	std::array<XrPosef, view_count> mask_pose = pose;
 	std::array<XrFovf, view_count> mask_fov = fov;
+	// Located once per frame and reused by draw_gui below (same time +
+	// space): a second locate_views is the same IPC twice.
+	std::vector<XrView> live_views_for_gui;
 	{
 		XrSpace live_space = application::space(xr::spaces::world);
 		auto [view_flags, live_views] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, live_space);
@@ -1135,6 +1138,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				mask_fov[i] = live_views[i].fov;
 			}
 		}
+		live_views_for_gui = std::move(live_views);
 	}
 
 	// Allow the headset to time warp if we are redisplaying a frame
@@ -2366,7 +2370,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		{
 			auto gui_t0 = std::chrono::steady_clock::now();
-			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod, live_views_for_gui);
 			gui_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_t0).count();
 		}
 

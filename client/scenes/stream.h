@@ -48,6 +48,7 @@
 #include <queue>
 #include <set>
 #include <shared_mutex>
+#include <span>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -645,7 +646,7 @@ private:
 	void gui_toasts();
 	void gui_passthrough();
 	void gui_fiducial_status();
-	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period);
+	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});
 
 	// Eager USE_SCENE runtime-permission request (Android): manifest presence
 	// makes the spatial extensions enumerable, but tracking data needs the
