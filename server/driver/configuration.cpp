@@ -624,6 +624,21 @@ configuration::configuration()
 			passthrough_until_lock.clear();
 		}
 
+		if (auto it = json.find("passthrough-fade-time"); it != json.end())
+		{
+			if (not it->is_number())
+				U_LOG_W("passthrough-fade-time must be a number of seconds, ignoring");
+			else
+			{
+				passthrough_fade_time_s = it->get<float>();
+				if (passthrough_fade_time_s < 0)
+				{
+					U_LOG_W("passthrough-fade-time negative, clamping to 0");
+					passthrough_fade_time_s = 0;
+				}
+			}
+		}
+
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;
 

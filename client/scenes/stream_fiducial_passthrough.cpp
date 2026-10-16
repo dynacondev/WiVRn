@@ -291,13 +291,23 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 {
 	// Full-passthrough-until-lock latch: first live solve for the target
 	// latches forever (never reset on loss; cleared on map change above).
+	// On lock a smoothstep fade starts (passthrough-fade-time seconds);
+	// 0 = instant release.
 	if (not until_lock_target.empty() and not until_lock_found)
 	{
 		auto it = board_poses.find(until_lock_target);
 		if (it != board_poses.end() and it->second.live)
 		{
 			until_lock_found = true;
-			spdlog::info("passthrough-until-lock: \"{}\" locked, fading to normal", until_lock_target);
+			if (until_lock_fade_s > 0)
+			{
+				until_lock_fading = true;
+				until_lock_time = now;
+				spdlog::info("passthrough-until-lock: \"{}\" locked, fading to normal over {:.1f}s",
+				             until_lock_target, (double)until_lock_fade_s);
+			}
+			else
+				spdlog::info("passthrough-until-lock: \"{}\" locked, fading to normal", until_lock_target);
 		}
 	}
 	xr::boundary_mix mix;
@@ -334,23 +344,40 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 		any_valid = true;
 	}
 	// No live zone: fail open to game video.
-	float s = any_valid ? mix.result() : 1;
+	float s_zone = any_valid ? mix.result() : 1;
+	float s = s_zone;
 	// Until-lock overrides everything while waiting: full passthrough via
-	// the same B floor lift, no geometry involved. Combines as OR: either
-	// source can demand passthrough.
+	// the same B floor lift, no geometry involved. After lock the veil
+	// fades out over passthrough-fade-time (smoothstep 0->1). Combines
+	// as OR (min): either source can demand passthrough, so zones still
+	// hold fullscreen even mid-fade.
 	bool waiting_lock = not until_lock_target.empty() and not until_lock_found;
+	bool fading_lock = false;
 	if (waiting_lock)
 		s = 0;
+	else if (until_lock_fading)
+	{
+		double elapsed = (now - until_lock_time) * 1e-9;
+		double t = until_lock_fade_s > 0 ? std::clamp(elapsed / until_lock_fade_s, 0.0, 1.0) : 1.0;
+		float s_lock = (float)(t * t * (3 - 2 * t));
+		s = std::min(s_zone, s_lock);
+		fading_lock = t < 1.0;
+		if (not fading_lock)
+		{
+			until_lock_fading = false;
+			spdlog::info("passthrough-until-lock: fade complete");
+		}
+	}
 	boundary_any = any_placed;
 	boundary_s = s;
-	bool veil = waiting_lock or (any_valid and s < 0.999f);
+	bool veil = waiting_lock or fading_lock or (any_valid and s < 0.999f);
 	// Transition edges always log (a swimming cutout is the felt
 	// defect); steady state gets a 5s heartbeat while zones are placed.
 	bool was_veil = boundary_veil;
 	boundary_veil = veil;
 	if (veil != was_veil)
 		spdlog::info("boundary veil: {} (s {:.3f})", veil ? "active" : "released", (double)s);
-	if ((any_placed or waiting_lock) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
+	if ((any_placed or waiting_lock or fading_lock) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
 	{
 		last_boundary_log = now;
 		spdlog::info("boundary fade: s {:.3f} veil {} head ({:.2f},{:.2f},{:.2f})", (double)s, veil,
@@ -637,6 +664,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;
 	map_key += ';';
+	map_key += std::to_string(map->passthrough_fade_time_s);
+	map_key += ';';
 	// Trackers run every frame, independent of consumers (their state
 	// feeds the status UI below).
 	sync_fiducial_trackers(*map);
@@ -666,6 +695,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// for mixed-version pairs). Latch cleared with everything else.
 		until_lock_target.clear();
 		until_lock_found = false;
+		until_lock_fading = false;
+		until_lock_time = 0;
+		until_lock_fade_s = std::max(0.f, map->passthrough_fade_time_s);
 		if (not map->passthrough_until_lock.empty())
 		{
 			bool known = std::ranges::any_of(map->fiducials, [&](const to_headset::fiducial_entry & f) {
@@ -674,7 +706,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			if (known)
 			{
 				until_lock_target = map->passthrough_until_lock;
-				spdlog::info("passthrough-until-lock: armed, full passthrough until \"{}\" locks", until_lock_target);
+				spdlog::info("passthrough-until-lock: armed, full passthrough until \"{}\" locks (fade {:.1f}s)",
+				             until_lock_target, (double)until_lock_fade_s);
 			}
 			else
 				spdlog::info("passthrough-until-lock \"{}\": no such fiducial id, ignoring", map->passthrough_until_lock);
@@ -1150,7 +1183,13 @@ void scenes::stream::gui_fiducial_status()
 	}
 	if (not until_lock_target.empty())
 	{
-		if (until_lock_found)
+		if (until_lock_fading)
+		{
+			double elapsed = (instance.now() - until_lock_time) * 1e-9;
+			double t = until_lock_fade_s > 0 ? std::clamp(elapsed / until_lock_fade_s, 0.0, 1.0) : 1.0;
+			ImGui::Text("%s %.40s (%.0f%%)", _S("Fading to VR from"), until_lock_target.c_str(), t * 100);
+		}
+		else if (until_lock_found)
 			ImGui::Text("%s %.40s", _S("Passthrough unlocked by"), until_lock_target.c_str());
 		else
 			ImGui::Text("%s %.40s (%s)", _S("Full passthrough until"), until_lock_target.c_str(), _S("waiting"));

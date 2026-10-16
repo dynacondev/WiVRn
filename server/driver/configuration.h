@@ -150,6 +150,11 @@ struct configuration
 	// dangling values warn + ignore.
 	std::string passthrough_until_lock;
 
+	// Smoothstep fade from full passthrough to VR once the until-lock
+	// target latches, in seconds (default 2). 0 = instant release.
+	// Applies to the until-lock transition only, nothing else.
+	float passthrough_fade_time_s = 2.0f;
+
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;

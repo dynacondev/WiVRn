@@ -523,6 +523,7 @@ void wivrn_session::send_fiducial_map()
 	to_headset::fiducial_map msg;
 	msg.suppress_meta_boundary = config.suppress_meta_boundary;
 	msg.passthrough_until_lock = config.passthrough_until_lock;
+	msg.passthrough_fade_time_s = config.passthrough_fade_time_s;
 	for (const auto & entry: config.fiducials)
 	{
 		to_headset::fiducial_entry e{

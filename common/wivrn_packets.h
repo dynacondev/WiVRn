@@ -1064,6 +1064,9 @@ struct fiducial_map
 	// (default) disables. Only applies when it matches a fiducial id in
 	// this map (server warns + ignores dangling values).
 	std::string passthrough_until_lock;
+	// Smoothstep fade from full passthrough to VR once the until-lock
+	// target latches, in seconds (default 2). 0 = instant release.
+	float passthrough_fade_time_s = 2.0f;
 };
 
 struct fiducial_model_chunk

@@ -642,10 +642,15 @@ private:
 	// solve latches, never reset on loss; cleared on map change). Empty
 	// target disables. Armed only when the target matches a fiducial id
 	// in the map. While waiting (armed && !locked) the veil is forced to
-	// fullscreen via the same B floor lift, no geometry involved.
-	// Render thread only.
+	// fullscreen via the same B floor lift, no geometry involved. On lock
+	// the veil fades to normal over passthrough-fade-time seconds
+	// (smoothstep, min-combined with boundary zones so zones still hold
+	// passthrough independently). Render thread only.
 	std::string until_lock_target;
 	bool until_lock_found = false;
+	float until_lock_fade_s = 2.0f;
+	XrTime until_lock_time = 0; // latch time; 0 = not fading
+	bool until_lock_fading = false;
 	// Headset presence (XR_EXT_user_presence, render thread only): true
 	// while worn. Loss arms a soft filter reseat per fiducial (see
 	// handle_user_presence); transitions only, repeats ignored.

@@ -255,6 +255,15 @@ remount goes straight back into VR; placements hold their last pose
 while fiducial filters reseat smoothly on the next sighting (next solve
 taken as truth, glided to without popping).
 
+## `passthrough-fade-time`
+Default value: `2` (seconds)
+
+Smoothstep fade from full passthrough to VR once the
+`passthrough-until-lock` target latches. Applies to that transition
+only — boundary zones and everything else are untouched (zones still
+hold passthrough independently via min-combine: either source can
+demand it). `0` releases instantly.
+
 A fiducial with several markers fuses them into one 6DoF frame: every
 sighted marker votes its board hypothesis (observed pose composed with
 its offset), and a robust estimator (Cauchy IRLS with leave-one-out
