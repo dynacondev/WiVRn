@@ -687,6 +687,15 @@ private:
 	bool debug_depth_overlay = false; // master toggle (starts the provider)
 	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1
 	std::string depth_status;         // UI status line, refreshed per frame
+	// Fullscreen flat passthrough while depth debugging: the B floor
+	// lifts to full alpha under the viz (same lift as the boundary
+	// veil). True from the toggle frame (pre-probe optimistic) so the B
+	// canvas exists when the probe lands; runtimes without depth support
+	// drop out once probing reports unsupported.
+	bool depth_fullscreen_passthrough() const
+	{
+		return debug_depth_overlay and (not env_depth_probed or env_depth_supported);
+	}
 
 	// Stale-hold multiplier for debug visuals: full presence on fresh
 	// data, smooth 3s fade-out on hold. Returns 0 (gone) .. 1 (fresh).

@@ -1358,9 +1358,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Promoted to the boundary-veil carrier while the veil is
 				// active: claimed whenever veiled so a B canvas always
 				// exists to lift to the uniform floor (boundary-only /
-				// projected-only / all-culled configs). Empty draws
+				// projected-only / all-culled configs). The depth debug
+				// fullscreen claims it the same way. Empty draws
 				// (clear-only record); the submit-time bias lifts it.
-				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil;
+				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough();
 				if (need_debug)
 				{
 					auto & g = debug_group;
@@ -1626,10 +1627,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qsplit);
 				}
 				// Debug group record (cutouts only, full-res, clear + hard
-				// punch): runs while claimed above. During the veil it
-				// also runs with empty cutouts (clear-only): the promoted
-				// carrier lifted to the uniform floor at submit.
-				if ((live_b.empty() and not cutouts.empty()) or boundary_veil)
+				// punch): runs while claimed above. During the veil (or
+				// the depth debug fullscreen) it also runs with empty
+				// cutouts (clear-only): the promoted carrier lifted to
+				// the uniform floor at submit.
+				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough())
 				{
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
@@ -2191,9 +2193,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			have_fiducial_map = not map->fiducials.empty() or not map->objects.empty();
 		}
 		// The debug window cutout needs a live passthrough to reveal,
-		// map or not (it punches every live vote).
+		// map or not (it punches every live vote). The depth debug
+		// overlay needs fullscreen passthrough underneath it.
 		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
-		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout)
+		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough())
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
@@ -2203,7 +2206,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// union pass each (A projected, B flat), then debug/GUI. Without
 		// it, previous behavior is untouched (flat auto-submit), except the
 		// boundary veil hard switch forces passthrough when outside.
-		bool veil_hard_nomask = boundary_veil and boundary_s < 0.5f and not mask_frame;
+		bool veil_hard_nomask = ((boundary_veil and boundary_s < 0.5f) or depth_fullscreen_passthrough()) and not mask_frame;
 		render_start(mask_frame ? false : (use_alpha or veil_hard_nomask), frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
@@ -2296,16 +2299,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// degrades to a hard switch at s = 0.5 (opaque fullscreen flat
 			// when outside, no masks needed).
 			float veil_s = std::clamp(boundary_s, 0.f, 1.f);
-			bool veil_lift = boundary_veil and veil_s < 0.999f and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported;
-			bool veil_hard_out = boundary_veil and not composition_layer_color_scale_bias_supported and veil_s < 0.5f;
+			// Depth debug fullscreen: full passthrough under the viz via
+			// the same B floor lift (scale 0 + bias 1), no geometry.
+			bool depth_full = depth_fullscreen_passthrough();
+			if (depth_full)
+				veil_s = 0;
+			bool veil_lift = (boundary_veil or depth_full) and veil_s < 0.999f and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported;
+			bool veil_hard_out = ((boundary_veil or depth_full) and veil_s < 0.5f) and not composition_layer_color_scale_bias_supported;
 			// No-mask-path runtimes have no alpha control to ramp through
 			// either: hard switch there too (forced in render_start below
 			// for the non-mask branch; here for the mask branch without
 			// colorScaleBias).
-			if (boundary_veil and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
+			if ((boundary_veil or depth_full) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
 				veil_hard_out = true;
 			bool submit_projected = have_projected and a_active > 0;
-			bool submit_flat = (need_flat or (boundary_veil and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
+			bool submit_flat = (need_flat or ((boundary_veil or depth_full) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
 			        (b_active > 0 or veil_hard_out);
 			// Forensic submit decisions (change-triggered): which camera layer
 			// submits and why. Permanent: coexistence bugs read as wrong output
@@ -2317,7 +2325,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					last_submit_flat = submit_flat;
 					last_submit_projected = submit_projected;
-					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={})",
+					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={} depth_full={})",
 					             (submit_flat and submit_projected) ? "projected+flat"
 					             : submit_flat                      ? "flat"
 					             : submit_projected                 ? "projected"
@@ -2326,7 +2334,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					             have_projected,
 					             a_active,
 					             b_active,
-					             cutouts_punched);
+					             cutouts_punched,
+					             depth_full);
 				}
 			}
 			// One mask submit pass per union (A then B): each union's first
