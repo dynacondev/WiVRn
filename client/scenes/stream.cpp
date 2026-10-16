@@ -1355,7 +1355,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// window punch with a fiducials-only config. Claimed
 				// whenever cutouts exist but no B group does (real B groups
 				// punch cutouts themselves, so no extra group then).
-				if (live_b.empty() and not cutouts.empty())
+				// Promoted to the boundary-veil carrier while the veil is
+				// active: claimed whenever veiled so a B canvas always
+				// exists to lift to the uniform floor (boundary-only /
+				// projected-only / all-culled configs). Empty draws
+				// (clear-only record); the submit-time bias lifts it.
+				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil;
+				if (need_debug)
 				{
 					auto & g = debug_group;
 					if (not g.renderer)
@@ -1620,8 +1626,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qsplit);
 				}
 				// Debug group record (cutouts only, full-res, clear + hard
-				// punch): runs only while claimed above.
-				if (live_b.empty() and not cutouts.empty())
+				// punch): runs while claimed above. During the veil it
+				// also runs with empty cutouts (clear-only): the promoted
+				// carrier lifted to the uniform floor at submit.
+				if ((live_b.empty() and not cutouts.empty()) or boundary_veil)
 				{
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
@@ -2133,8 +2141,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Mask path owns the display when the alpha-blend extension is
 		// present (stereo only, like the mask targets): video, then one
 		// union pass each (A projected, B flat), then debug/GUI. Without
-		// it, previous behavior is untouched (flat auto-submit).
-		render_start(mask_frame ? false : use_alpha, frame_state.predictedDisplayTime);
+		// it, previous behavior is untouched (flat auto-submit), except the
+		// boundary veil hard switch forces passthrough when outside.
+		bool veil_hard_nomask = boundary_veil and boundary_s < 0.5f and not mask_frame;
+		render_start(mask_frame ? false : (use_alpha or veil_hard_nomask), frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
 		std::array<XrCompositionLayerProjectionView, view_count> layer_view;
@@ -2217,8 +2227,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			if (debug_group.active)
 				++b_active;
+			// Boundary veil (fresh values: update_fiducial_passthrough ran
+			// just above): lift the flat union's floor by (1 - s) through
+			// colorScaleBias on the B masks (first submitted B mask gets
+			// scale+lift, the rest scale-only: ADD would multi-add the lift).
+			// Skipped at full-inside so steady state stays bit-identical.
+			// Without colorScaleBias (or without the mask path) the veil
+			// degrades to a hard switch at s = 0.5 (opaque fullscreen flat
+			// when outside, no masks needed).
+			float veil_s = std::clamp(boundary_s, 0.f, 1.f);
+			bool veil_lift = boundary_veil and veil_s < 0.999f and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported;
+			bool veil_hard_out = boundary_veil and not composition_layer_color_scale_bias_supported and veil_s < 0.5f;
+			// No-mask-path runtimes have no alpha control to ramp through
+			// either: hard switch there too (forced in render_start below
+			// for the non-mask branch; here for the mask branch without
+			// colorScaleBias).
+			if (boundary_veil and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
+				veil_hard_out = true;
 			bool submit_projected = have_projected and a_active > 0;
-			bool submit_flat = need_flat and b_active > 0;
+			bool submit_flat = (need_flat or (boundary_veil and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
+			        (b_active > 0 or veil_hard_out);
 			// Forensic submit decisions (change-triggered): which camera layer
 			// submits and why. Permanent: coexistence bugs read as wrong output
 			// with no error, so the decision itself must be in the log.
@@ -2245,6 +2273,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// active group REPLACEs, the rest ADD.
 			for (bool proj_union: {true, false})
 			{
+				// Opaque hard-outside flat needs no masks at all.
+				if (veil_hard_out and not proj_union)
+					continue;
 				bool first_group = true;
 				// Union A: window groups with projected=true (none yet).
 				for (auto & [key, g]: mask_groups)
@@ -2279,6 +2310,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					else
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+					if (veil_lift and not proj_union)
+					{
+						// Coverage·s + (1−s): window interiors stay ~1, empty
+						// areas lift to the uniform veil floor, feather bands
+						// interpolate. RGB untouched (ignored downstream anyway).
+						if (first_group)
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
+						else
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
+					}
 					first_group = false;
 				}
 				// Union B also carries the local debug cutout group.
@@ -2309,6 +2350,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					else
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+					if (veil_lift and not proj_union)
+					{
+						if (first_group)
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
+						else
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
+					}
+					first_group = false;
 				}
 				// Each union's camera layer consumes its own alpha: A feeds
 				// projected, then B REPLACEs the alpha and feeds flat, so
@@ -2326,7 +2375,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					if (submit_flat)
 					{
 						add_passthrough_layer();
-						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+						// Hard-outside veil is opaque fullscreen: no blend.
+						if (not veil_hard_out)
+							set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					}
 				}
 			}
@@ -2676,12 +2727,15 @@ void scenes::stream::on_xr_event(const xr::event & event)
 				        .state = event.state_changed.state,
 				});
 			break;
-		case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT:
+		case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT: {
+			bool present = (bool)event.user_presence_changed.isUserPresent;
+			handle_user_presence(present);
 			network_session->send_control(from_headset::user_presence_changed{
-			        .present = (bool)event.user_presence_changed.isUserPresent,
+			        .present = present,
 			        .change_time = instance.now(),
 			});
 			break;
+		}
 		case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
 			on_interaction_profile_changed(event.interaction_profile_changed);
 			break;

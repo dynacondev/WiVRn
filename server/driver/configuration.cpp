@@ -498,7 +498,8 @@ configuration::configuration()
 				passthrough_object o;
 				if (item.contains("type"))
 					o.type = item["type"];
-				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed")
+				bool is_boundary = o.type == "3d-boundary" or o.type == "3d-boundary-reversed";
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary)
 				{
 					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
 					        item.value("id", o.type).c_str(), o.type.c_str());
@@ -538,6 +539,11 @@ configuration::configuration()
 				}
 				if (item.contains("model-path"))
 					o.model_path = item["model-path"];
+				if (o.model_path.empty() and is_boundary)
+				{
+					U_LOG_W("passthrough object \"%s\": %s needs model-path (a zone without geometry), skipping", o.id.c_str(), o.type.c_str());
+					continue;
+				}
 				if (item.contains("position"))
 					o.position = item["position"];
 				if (item.contains("orientation"))
@@ -551,17 +557,31 @@ configuration::configuration()
 				}
 				if (item.contains("feather-px"))
 				{
-					if (o.type == "3d-passthrough-reversed")
+					if (o.type == "3d-passthrough-reversed" or is_boundary)
 						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
 						o.feather_px = item["feather-px"];
 				}
 				if (item.contains("surface-projected"))
 				{
-					if (o.type == "3d-passthrough-reversed")
+					if (o.type == "3d-passthrough-reversed" or is_boundary)
 						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
 						o.surface_projected = item["surface-projected"];
+				}
+				if (item.contains("transition-distance"))
+				{
+					if (not is_boundary)
+						U_LOG_W("passthrough object \"%s\": transition-distance is only accepted for 3d-boundary(-reversed), ignoring", o.id.c_str());
+					else
+					{
+						o.transition_distance_m = item["transition-distance"];
+						if (o.transition_distance_m < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative transition-distance, clamping to 0", o.id.c_str());
+							o.transition_distance_m = 0;
+						}
+					}
 				}
 				if (std::ranges::any_of(passthrough_objects, [&](const passthrough_object & p) { return p.id == o.id; }))
 				{
@@ -586,6 +606,38 @@ configuration::configuration()
 
 		if (auto it = json.find("bit-depth"); it != json.end())
 			bit_depth = *it;
+
+		if (auto it = json.find("suppress-meta-boundary"); it != json.end())
+			suppress_meta_boundary = *it;
+
+		if (auto it = json.find("passthrough-until-lock"); it != json.end())
+		{
+			if (not it->is_string())
+				U_LOG_W("passthrough-until-lock must be a fiducial id string, ignoring");
+			else
+				passthrough_until_lock = it->get<std::string>();
+		}
+		if (not passthrough_until_lock.empty() and
+		    not std::ranges::any_of(fiducials, [&](const fiducial_entry & e) { return e.id == passthrough_until_lock; }))
+		{
+			U_LOG_W("passthrough-until-lock \"%s\" matches no fiducial id, ignoring", passthrough_until_lock.c_str());
+			passthrough_until_lock.clear();
+		}
+
+		if (auto it = json.find("passthrough-fade-time"); it != json.end())
+		{
+			if (not it->is_number())
+				U_LOG_W("passthrough-fade-time must be a number of seconds, ignoring");
+			else
+			{
+				passthrough_fade_time_s = it->get<float>();
+				if (passthrough_fade_time_s < 0)
+				{
+					U_LOG_W("passthrough-fade-time negative, clamping to 0");
+					passthrough_fade_time_s = 0;
+				}
+			}
+		}
 
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;

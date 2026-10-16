@@ -99,8 +99,13 @@ struct configuration
 		// Behavior type. "3d-passthrough" renders the model as a
 		// surface-projected passthrough cutout. "3d-passthrough-reversed"
 		// reverse-cuts the model from every mask layer instead (game video
-		// shows through, depth-tested against the windows covering each
-		// pixel). Unknown types are skipped with a warning.
+		// shows through the silhouette, depth-tested against the windows
+		// covering each pixel). "3d-boundary" shows game video only
+		// inside the model volume and passthrough outside it (Quest
+		// guardian style, adjustable size/shape/fade);
+		// "3d-boundary-reversed" inverts it (passthrough inside, game
+		// outside: exclusion zones). Unknown types are skipped with a
+		// warning (forward-compat for 3d-depth).
 		std::string type = "3d-passthrough";
 		std::string id;
 		std::string tag;
@@ -115,16 +120,40 @@ struct configuration
 		// Passthrough window feather width in screen pixels (render-only,
 		// applied live). Mask stacks group by this value so each object
 		// feathers independently. Not accepted for
-		// 3d-passthrough-reversed (warned + ignored).
+		// 3d-passthrough-reversed and 3d-boundary(-reversed)
+		// (warned + ignored).
 		float feather_px = 24;
 		// Surface-projected mapping: the headset projects camera imagery
 		// onto this object's mesh instead of the flat reconstruction feed.
 		// Enabled by default; opt out per object with false (plus a live
-		// in-headset override). Ignored for 3d-passthrough-reversed
-		// (warned).
+		// in-headset override). Ignored for 3d-passthrough-reversed and
+		// 3d-boundary(-reversed) (warned).
 		bool surface_projected = true;
+		// Boundary fade width in meters (3d-boundary(-reversed) only):
+		// the scene cross-fades over +/- this distance around the mesh
+		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard
+		// step at the surface. Ignored for other types (warned).
+		float transition_distance_m = 0.3f;
 	};
 	std::vector<passthrough_object> passthrough_objects;
+
+	// Meta (OS) boundary visibility while our passthrough is shown: true
+	// (default) requests suppression, false leaves the OS boundary
+	// visible. Pushed to the headset (no in-headset toggle); a request
+	// only, the runtime may refuse. The boundary always shows in opaque
+	// VR regardless of this setting.
+	bool suppress_meta_boundary = true;
+
+	// Full flat passthrough until the named fiducial locks (first live
+	// solve latches, never reset on loss). Empty (default) disables.
+	// Only applies when it matches a fiducial id in the config;
+	// dangling values warn + ignore.
+	std::string passthrough_until_lock;
+
+	// Smoothstep fade from full passthrough to VR once the until-lock
+	// target latches, in seconds (default 2). 0 = instant release.
+	// Applies to the until-lock transition only, nothing else.
+	float passthrough_fade_time_s = 2.0f;
 
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;

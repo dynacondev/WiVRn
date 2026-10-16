@@ -42,9 +42,25 @@ void fiducial_filter::reset()
 	recent.clear();
 	last_weight = 1;
 	rendered_valid = false;
+	reseat_trust = false;
+	reseat_frames = 0;
 	vel_hat = glm::vec3(0);
 	omega_hat = 0;
 	prev_target_valid = false;
+}
+
+void fiducial_filter::begin_reseat()
+{
+	// Keep held/smoothed (the glide starts from the live estimate, no
+	// pop); drop everything that would read the relocalized truth as a
+	// spike: predecessor spread, stale velocity, and the last weight.
+	recent.clear();
+	last_weight = 1;
+	vel_hat = glm::vec3(0);
+	omega_hat = 0;
+	prev_target_valid = false;
+	reseat_trust = true;
+	reseat_frames = 0;
 }
 
 static float angle_between(const glm::quat & a, const glm::quat & b)
@@ -178,10 +194,13 @@ fiducial_filter::pose fiducial_filter::advance(double dt_s)
 
 	// One Euro cutoffs from the accepted-target speed. Shared params for
 	// position and rotation; angular speeds are numerically smaller so
-	// rotation keeps the historical x10 weight (no extra knob).
-	float cutoff_pos = cfg.euro_min_cutoff + cfg.euro_beta * glm::length(vel_hat);
+	// rotation keeps the historical x10 weight (no extra knob). The
+	// reseat trust window raises the floor so the correction glides
+	// briskly instead of at the at-rest cutoff.
+	float base_cutoff = reseat_trust ? std::max(cfg.euro_min_cutoff, reseat_cutoff_hz) : cfg.euro_min_cutoff;
+	float cutoff_pos = base_cutoff + cfg.euro_beta * glm::length(vel_hat);
 	float alpha_pos = alpha_for(cutoff_pos, dt);
-	float cutoff_rot = cfg.euro_min_cutoff + cfg.euro_beta * omega_hat * 10.f;
+	float cutoff_rot = base_cutoff + cfg.euro_beta * omega_hat * 10.f;
 	float alpha_rot = alpha_for(cutoff_rot, dt);
 
 	glm::vec3 dpos = held->pos - smoothed.pos;
@@ -242,10 +261,29 @@ fiducial_filter::pose fiducial_filter::advance(double dt_s)
 	trot = trot * trot * (3 - 2 * trot);
 
 	float fpos = std::clamp(alpha_pos * wpos * tpos, 0.f, 1.f);
-	smoothed.pos += dpos * fpos;
 	float frot = std::clamp(alpha_rot * wrot * trot, 0.f, 1.f);
+	if (reseat_trust)
+	{
+		// Relocalized truth: glide with the brisk cutoff only (unity
+		// weights, no Cauchy/hold gating), so the correction always
+		// completes instead of sticking part-way like a gated spike.
+		fpos = std::clamp(alpha_pos, 0.f, 1.f);
+		frot = std::clamp(alpha_rot, 0.f, 1.f);
+	}
+	smoothed.pos += dpos * fpos;
 	smoothed.quat = glm::normalize(glm::slerp(smoothed.quat, qheld, frot));
-	last_weight = std::min(wpos, wrot);
+	last_weight = reseat_trust ? 1 : std::min(wpos, wrot);
+	if (reseat_trust)
+	{
+		// Adaptive end: residual back inside the outer hold knee. Frame
+		// cap terminates the window even if it never settles.
+		float post_mm = glm::length(held->pos - smoothed.pos) * 1000.f;
+		float post_deg = angle_between(qheld, smoothed.quat) * rad_to_deg;
+		++reseat_frames;
+		if ((post_mm <= std::max(outer_mm, 1e-3f) and post_deg <= std::max(outer_deg, 1e-3f)) or
+		    reseat_frames >= reseat_frame_cap)
+			reseat_trust = false;
+	}
 	return smoothed;
 }
 
@@ -255,6 +293,8 @@ bool fiducial_filter::snap()
 		return false;
 	smoothed = *held;
 	rendered_valid = true;
+	reseat_trust = false;
+	reseat_frames = 0;
 	vel_hat = glm::vec3(0);
 	omega_hat = 0;
 	last_weight = 1;

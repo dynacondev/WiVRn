@@ -166,7 +166,22 @@ void xr::session::end_frame(XrTime display_time, const std::vector<XrComposition
 		CHECK_XR(xrEndFrame(id, &end_info));
 	}
 
-	update_boundary_visibility();
+	// Gate suppression on layers actually submitted this frame, not just
+	// the passthrough handle being active: the runtime refuses suppression
+	// (SUPPRESSION_NOT_ALLOWED) and forces visible when the app fully
+	// obscures reality (opaque video-only), so video-only must expect
+	// visible. Projected counts too: camera imagery is showing.
+	bool passthrough_visible = (blend_mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND);
+	for (auto * l: layers)
+	{
+		if (l->type == XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB ||
+		    l->type == XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_HTC)
+		{
+			passthrough_visible = true;
+			break;
+		}
+	}
+	update_boundary_visibility(passthrough_visible);
 }
 
 void xr::session::begin_session(XrViewConfigurationType view_config)
@@ -436,6 +451,7 @@ void xr::session::set_passthrough_boundary_enabled(bool enabled)
 {
 	passthrough_boundary_enabled = enabled;
 	boundary_request_failed = false;
+	last_suppress_attempt = {};
 }
 
 void xr::session::on_boundary_visibility_changed(XrBoundaryVisibilityMETA v)
@@ -443,23 +459,42 @@ void xr::session::on_boundary_visibility_changed(XrBoundaryVisibilityMETA v)
 	runtime_boundary_visibility = v;
 }
 
-// the runtime only allows suppression while passthrough is shown and restores
-// the boundary when it stops, so this re-requests every time passthrough comes back
-void xr::session::update_boundary_visibility()
+// Suppression is only eligible while passthrough layers are actually
+// submitted: the runtime refuses (SUPPRESSION_NOT_ALLOWED) and forces
+// visible when opaque. A refusal backs off to a 2s retry instead of a
+// per-frame hot loop; unsuppress requests are never throttled.
+void xr::session::update_boundary_visibility(bool passthrough_visible)
 {
 	if (not xrRequestBoundaryVisibilityMETA)
 		return;
 
-	auto v = not passthrough_boundary_enabled and not std::holds_alternative<std::monostate>(passthrough)
+	auto v = not passthrough_boundary_enabled and passthrough_visible
 	                 ? XR_BOUNDARY_VISIBILITY_SUPPRESSED_META
 	                 : XR_BOUNDARY_VISIBILITY_NOT_SUPPRESSED_META;
 	if (v == runtime_boundary_visibility)
 		return;
 
+	if (v == XR_BOUNDARY_VISIBILITY_SUPPRESSED_META and boundary_request_failed)
+	{
+		auto now = std::chrono::steady_clock::now();
+		if (now - last_suppress_attempt < std::chrono::seconds(2))
+			return;
+		last_suppress_attempt = now;
+	}
+
 	if (auto res = xrRequestBoundaryVisibilityMETA(id, v); res == XR_SUCCESS)
 	{
 		runtime_boundary_visibility = v;
 		boundary_request_failed = false;
+	}
+	else if (res == XR_BOUNDARY_VISIBILITY_SUPPRESSION_NOT_ALLOWED_META)
+	{
+		// Expected while opaque / outside guardian: stay visible, retry
+		// on backoff. Info, not warn: fighting it every frame is what
+		// made the ring flicker.
+		last_suppress_attempt = std::chrono::steady_clock::now();
+		boundary_request_failed = true;
+		spdlog::info("Boundary suppression not allowed (opaque or outside guardian), staying visible");
 	}
 	else if (not boundary_request_failed)
 	{

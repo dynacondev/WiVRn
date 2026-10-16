@@ -21,6 +21,7 @@
 
 #include "utils/handle.h"
 #include "utils/thread_safe.h"
+#include <chrono>
 #include <span>
 #include <string>
 #include <vector>
@@ -52,8 +53,12 @@ class session : public utils::handle<XrSession, xrDestroySession>
 	XrBoundaryVisibilityMETA runtime_boundary_visibility = XR_BOUNDARY_VISIBILITY_NOT_SUPPRESSED_META;
 	bool passthrough_boundary_enabled = true;
 	bool boundary_request_failed = false;
+	// Last suppression attempt after a refusal (throttles the hot
+	// retry loop: the runtime refuses while opaque and forces visible,
+	// so retry at most every 2s instead of every frame).
+	std::chrono::steady_clock::time_point last_suppress_attempt{};
 
-	void update_boundary_visibility();
+	void update_boundary_visibility(bool passthrough_visible);
 
 public:
 	session() = default;

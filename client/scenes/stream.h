@@ -37,6 +37,7 @@
 #include "wivrn_packets.h"
 #include "xr/board_solver.h"
 #include "xr/fiducial_filter.h"
+#include "xr/boundary.h"
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <array>
@@ -309,6 +310,11 @@ private:
 		std::string tuning_key; // filter tuning source; re-configure on change
 		uint64_t samples_ingested = 0;
 		XrTime last_predicted = 0; // last advance time (advance dt source)
+		// Resume reseat (headset remount): armed on user-presence loss,
+		// cleared on the first post-resume ingest. While armed the object
+		// placement below holds its last pose instead of following the
+		// stale fiducial, gliding to truth once sighted again.
+		bool needs_reseat = false;
 	};
 	std::map<std::string /*fiducial id*/, board_fused> board_poses;
 	// Warm starts for the solver (fiducial id -> last smoothed pose).
@@ -336,6 +342,13 @@ private:
 		size_t triangle_count = 0;
 		std::string status = "waiting for fiducial map";
 		fused_placement fused;
+		// Boundary-zone display state (3d-boundary(-reversed) only):
+		// last per-frame signed distance / opacity / verdict. Render
+		// thread only, refreshed with the fused placements above.
+		bool boundary_valid = false;
+		bool boundary_inside = false;
+		float boundary_signed_m = 0;
+		float boundary_opacity = 1;
 	};
 	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
 	// Live in-headset surface-projection overrides (Passthrough tab,
@@ -600,13 +613,49 @@ private:
 	std::map<std::pair<float, bool>, mask_group> mask_groups;
 	// Local debug cutout group (union B): QR windows punched at full
 	// alpha. Standalone member, not in the map: debug never keys off
-	// server feather values. Claimed only while cutouts exist and no B
-	// group does (real B groups punch cutouts themselves).
+	// server feather values. Claimed while cutouts exist and no B group
+	// does (real B groups punch cutouts themselves), and promoted to the
+	// boundary-veil carrier while the veil is active with no B group to
+	// carry its floor (boundary-only / projected-only configs). Empty
+	// draws (clear-only record), tier 0; the submit-time bias lifts the
+	// cleared image to a uniform floor.
 	mask_group debug_group;
 	// Set when the record phase built marker-window cutouts this frame
 	// (they punch camera with no geometry to map it onto, so the flat
 	// feed must stay submitted). Read by the submit phase below.
 	bool cutouts_punched = false;
+
+	// Global boundary-veil state (3d-boundary(-reversed) zones):
+	// scene opacity from the headset distance to placed zone meshes
+	// (union: inside ANY normal AND outside ALL reversed; unplaced
+	// zones ignored, fail-open to game). boundary_s = 1 means no
+	// effect (no zones, or fully inside). veil = s < ~1 with a placed
+	// zone: the submit lifts the flat union's floor by (1 - s).
+	// Render thread only; refreshed in update_fiducial_passthrough,
+	// consumed one frame stale by record/submit like the placements.
+	float boundary_s = 1;
+	bool boundary_veil = false;
+	bool boundary_any = false; // any boundary object placed
+	XrTime last_boundary_log = 0; // heartbeat throttle for the fade line
+
+	// Full flat passthrough until the named fiducial locks (first live
+	// solve latches, never reset on loss; cleared on map change). Empty
+	// target disables. Armed only when the target matches a fiducial id
+	// in the map. While waiting (armed && !locked) the veil is forced to
+	// fullscreen via the same B floor lift, no geometry involved. On lock
+	// the veil fades to normal over passthrough-fade-time seconds
+	// (smoothstep, min-combined with boundary zones so zones still hold
+	// passthrough independently). Render thread only.
+	std::string until_lock_target;
+	bool until_lock_found = false;
+	float until_lock_fade_s = 2.0f;
+	XrTime until_lock_time = 0; // latch time; 0 = not fading
+	bool until_lock_fading = false;
+	// Headset presence (XR_EXT_user_presence, render thread only): true
+	// while worn. Loss arms a soft filter reseat per fiducial (see
+	// handle_user_presence); transitions only, repeats ignored.
+	bool user_present = true;
+	void handle_user_presence(bool present);
 
 	// QR debug gizmos (Passthrough tab, session-scoped, render thread
 	// only). Raw sighting poses while visible with a 3s stale fade;
@@ -655,6 +704,10 @@ private:
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
+	// update_boundary_fade: per-frame scene opacity from placed boundary
+	// zones (head point in world space). Writes boundary_s/veil/any plus
+	// the per-object display state; render thread only.
+	void update_boundary_fade(glm::vec3 head_pos, bool have_head, XrTime now);
 	bool guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
 	                   const std::optional<XrPosef> & warm, XrTime now, double & dt_out);
 	void log_board_tuning(const std::string & fid, const std::vector<xr::board_vote> & bv,

@@ -252,9 +252,146 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 // First sighting (no reference) always accepts: unknowable without history.
 bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
 {
+	// Boundary zones never map camera onto geometry: they drive the
+	// global scene fade through the flat union's floor instead.
+	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed")
+		return false;
 	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
 		return it->second;
 	return ost.def.surface_projected;
+}
+
+void scenes::stream::handle_user_presence(bool present)
+{
+	// Transitions only: the runtime may repeat the event.
+	if (present == user_present)
+		return;
+	user_present = present;
+	if (present)
+	{
+		spdlog::info("user presence: headset mounted, awaiting re-sight for smooth reseat");
+		return;
+	}
+	// Unmount: arm a soft reseat per tracked fiducial. Placements hold
+	// their last pose (placement below skips reseat-pending fiducials)
+	// and glide to truth once its code is sighted again. The
+	// passthrough-until-lock latch is left untouched, so remount goes
+	// straight back into VR.
+	size_t n = 0;
+	for (auto & [fid, bp]: board_poses)
+	{
+		(void)fid;
+		bp.needs_reseat = true;
+		++n;
+	}
+	spdlog::info("user presence lost: reseat armed for {} fiducial(s), placements holding", n);
+}
+
+void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, XrTime now)
+{
+	// Full-passthrough-until-lock latch: first live solve for the target
+	// latches forever (never reset on loss; cleared on map change above).
+	// On lock a smoothstep fade starts (passthrough-fade-time seconds);
+	// 0 = instant release.
+	if (not until_lock_target.empty() and not until_lock_found)
+	{
+		auto it = board_poses.find(until_lock_target);
+		if (it != board_poses.end() and it->second.live)
+		{
+			until_lock_found = true;
+			if (until_lock_fade_s > 0)
+			{
+				until_lock_fading = true;
+				until_lock_time = now;
+				spdlog::info("passthrough-until-lock: \"{}\" locked, fading to normal over {:.1f}s",
+				             until_lock_target, (double)until_lock_fade_s);
+			}
+			else
+				spdlog::info("passthrough-until-lock: \"{}\" locked, fading to normal", until_lock_target);
+		}
+	}
+	xr::boundary_mix mix;
+	bool any_placed = false;
+	bool any_valid = false;
+	for (auto & [oid, ost]: passthrough_objects)
+	{
+		(void)oid;
+		bool normal = ost.def.type == "3d-boundary";
+		bool reversed = ost.def.type == "3d-boundary-reversed";
+		if (not normal and not reversed)
+			continue;
+		ost.boundary_valid = false;
+		if (not ost.soup_ready or not ost.fused.placed)
+			continue;
+		any_placed = true;
+		if (not have_head)
+			continue;
+		float t = std::max(0.f, ost.def.transition_distance_m);
+		xr::boundary_query q = xr::boundary_signed_distance(
+		        ost.soup.vertices, ost.soup.indices,
+		        ost.fused.world_pose, ost.fused.world_scale.x,
+		        head_pos.x, head_pos.y, head_pos.z);
+		if (not q.valid)
+			continue;
+		float op = xr::boundary_smoothstep(q.signed_m, t);
+		if (reversed)
+			op = 1 - op;
+		ost.boundary_valid = true;
+		ost.boundary_inside = q.inside;
+		ost.boundary_signed_m = q.signed_m;
+		ost.boundary_opacity = op;
+		mix.add(op, reversed);
+		any_valid = true;
+	}
+	// No live zone: fail open to game video.
+	float s_zone = any_valid ? mix.result() : 1;
+	float s = s_zone;
+	// Until-lock overrides everything while waiting: full passthrough via
+	// the same B floor lift, no geometry involved. After lock the veil
+	// fades out over passthrough-fade-time (smoothstep 0->1). Combines
+	// as OR (min): either source can demand passthrough, so zones still
+	// hold fullscreen even mid-fade.
+	bool waiting_lock = not until_lock_target.empty() and not until_lock_found;
+	bool fading_lock = false;
+	if (waiting_lock)
+		s = 0;
+	else if (until_lock_fading)
+	{
+		double elapsed = (now - until_lock_time) * 1e-9;
+		double t = until_lock_fade_s > 0 ? std::clamp(elapsed / until_lock_fade_s, 0.0, 1.0) : 1.0;
+		float s_lock = (float)(t * t * (3 - 2 * t));
+		s = std::min(s_zone, s_lock);
+		fading_lock = t < 1.0;
+		if (not fading_lock)
+		{
+			until_lock_fading = false;
+			spdlog::info("passthrough-until-lock: fade complete");
+		}
+	}
+	boundary_any = any_placed;
+	boundary_s = s;
+	bool veil = waiting_lock or fading_lock or (any_valid and s < 0.999f);
+	// Transition edges always log (a swimming cutout is the felt
+	// defect); steady state gets a 5s heartbeat while zones are placed.
+	bool was_veil = boundary_veil;
+	boundary_veil = veil;
+	if (veil != was_veil)
+		spdlog::info("boundary veil: {} (s {:.3f})", veil ? "active" : "released", (double)s);
+	if ((any_placed or waiting_lock or fading_lock) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
+	{
+		last_boundary_log = now;
+		spdlog::info("boundary fade: s {:.3f} veil {} head ({:.2f},{:.2f},{:.2f})", (double)s, veil,
+		             (double)head_pos.x, (double)head_pos.y, (double)head_pos.z);
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			(void)oid;
+			if (not ost.boundary_valid)
+				continue;
+			spdlog::info("boundary zone: \"{}\" {} {:+.0f}mm op {:.3f}", ost.def.id,
+			             ost.boundary_inside ? "in" : "out",
+			             (double)(ost.boundary_signed_m * 1000.f), (double)ost.boundary_opacity);
+		}
+	}
 }
 
 bool scenes::stream::guard_k1_jump(const std::string & fid, const xr::board_solution & sol,
@@ -524,6 +661,11 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
 	}
+	map_key += 'L';
+	map_key += map->passthrough_until_lock;
+	map_key += ';';
+	map_key += std::to_string(map->passthrough_fade_time_s);
+	map_key += ';';
 	// Trackers run every frame, independent of consumers (their state
 	// feeds the status UI below).
 	sync_fiducial_trackers(*map);
@@ -548,6 +690,28 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// rest).
 		projected_failed.clear();
 		session.clear_projected_instances();
+		// Full-passthrough-until-lock target: armed only when it names a
+		// fiducial id in this map (server validates too; belt and braces
+		// for mixed-version pairs). Latch cleared with everything else.
+		until_lock_target.clear();
+		until_lock_found = false;
+		until_lock_fading = false;
+		until_lock_time = 0;
+		until_lock_fade_s = std::max(0.f, map->passthrough_fade_time_s);
+		if (not map->passthrough_until_lock.empty())
+		{
+			bool known = std::ranges::any_of(map->fiducials, [&](const to_headset::fiducial_entry & f) {
+				return f.id == map->passthrough_until_lock;
+			});
+			if (known)
+			{
+				until_lock_target = map->passthrough_until_lock;
+				spdlog::info("passthrough-until-lock: armed, full passthrough until \"{}\" locks (fade {:.1f}s)",
+				             until_lock_target, (double)until_lock_fade_s);
+			}
+			else
+				spdlog::info("passthrough-until-lock \"{}\": no such fiducial id, ignoring", map->passthrough_until_lock);
+		}
 		// `board config:` makes every future log self-describing:
 		// marker sizes, offsets and tuning, so tuning sessions never
 		// guess what geometry produced the data.
@@ -699,10 +863,17 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		xr::board_solution sol = xr::solve_board(bv, warm);
 		if (not sol.ok)
 			continue;
+		// Resume reseat (headset remount): the next solve is relocalized
+		// truth, not a flip. Skips the K1 hold once; the filter trust
+		// window below takes it at full weight and glides there smoothly.
+		// Lookup without creating: unseen fiducials never need reseat.
+		bool reseat_armed = false;
+		if (auto rit = board_poses.find(f.id); rit != board_poses.end() and rit->second.needs_reseat)
+			reseat_armed = true;
 		// Residual-blind singletons hold last-good instead of displaying
 		// flips (guard_k1_jump above); held frames skip all state writes.
 		double solve_dt = 0;
-		if (guard_k1_jump(f.id, sol, warm, now, solve_dt))
+		if (not reseat_armed and guard_k1_jump(f.id, sol, warm, now, solve_dt))
 			continue;
 		auto & bp = board_poses[f.id];
 		// Post-resolution smoothing (robust-Euro filter; multi and
@@ -731,8 +902,41 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			glm::vec3 tp(sol.board_pose.position.x, sol.board_pose.position.y, sol.board_pose.position.z);
 			glm::quat tq(sol.board_pose.orientation.w, sol.board_pose.orientation.x, sol.board_pose.orientation.y,
 			             sol.board_pose.orientation.z);
+			if (reseat_armed)
+			{
+				// Log the jump against the stale reference, then take the
+				// solve as truth: trust window glides instead of popping.
+				glm::vec3 refp(tp);
+				glm::quat refq(tq);
+				if (warm)
+				{
+					refp = glm::vec3(warm->position.x, warm->position.y, warm->position.z);
+					refq = glm::quat(warm->orientation.w, warm->orientation.x, warm->orientation.y, warm->orientation.z);
+				}
+				else
+				{
+					refp = glm::vec3(bp.pose.position.x, bp.pose.position.y, bp.pose.position.z);
+					refq = glm::quat(bp.pose.orientation.w, bp.pose.orientation.x, bp.pose.orientation.y, bp.pose.orientation.z);
+				}
+				float dpos = glm::length(tp - refp) * 1000.f;
+				float dot = std::abs(glm::dot(tq, refq));
+				float dang = 2.f * std::acos(std::clamp(dot, 0.f, 1.f)) * 57.29577951308232f;
+				spdlog::info("board reseat: fid \"{}\" jump {:.1f}mm {:.2f}deg (accepted as truth, smooth correction)",
+				             f.id, (double)dpos, (double)dang);
+				bp.filter.begin_reseat();
+			}
 			bp.filter.ingest(tp, tq, now);
 			bp.samples_ingested++;
+			if (reseat_armed)
+			{
+				bp.needs_reseat = false;
+				// Restart the filter clock: the sleep gap must not enter
+				// the advance dt below (a huge dt steps ~80% in one frame:
+				// a snap, not a glide). The first trusted step then uses a
+				// normal frame dt and the correction glides from there.
+				bp.time = now;
+				bp.last_predicted = now;
+			}
 		}
 		double fdt = bp.time != 0 and now >= bp.time ? (now - bp.time) * 1e-9 : 1.0 / 72.0;
 		double adt = bp.last_predicted > 0 ? (now - bp.last_predicted) * 1e-9 : fdt;
@@ -743,7 +947,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// advance() converges without overshoot, so the extra horizon is
 		// safe; static boards are unaffected.
 		double horizon = predicted_display_time > now ? (predicted_display_time - now) * 1e-9 : 0.0;
+		bool was_trust = bp.filter.in_reseat_trust();
 		auto r = bp.filter.advance(std::clamp(adt + horizon, 0.0, 0.25));
+		if (was_trust and not bp.filter.in_reseat_trust())
+			spdlog::info("board reseat settled: fid \"{}\"", f.id);
 		bp.pose = {
 		        .orientation = {r.quat.x, r.quat.y, r.quat.z, r.quat.w},
 		        .position = {r.pos.x, r.pos.y, r.pos.z},
@@ -783,16 +990,19 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	for (const auto & def: map->objects)
 	{
 		// Reversed objects place exactly like normal ones (fused board
-		// pose, mesh); only the mask raster treats them as cuts. The
-		// binary projected fallback has no hole vocabulary, so only
-		// normal objects drive it (not carried: mask path only).
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed")
+		// pose, mesh, fade); only the mask raster treats them as cuts.
+		// Boundary zones place identically too (fused pose + mesh for
+		// the distance query); only the veil submit uses them.
+		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
 		}
 		auto & ost = passthrough_objects[def.id];
 		ost.def = def;
+		if (is_boundary and def.model_hash.empty())
+			ost.status = "no model configured (boundary needs model-path)";
 		// Model geometry upload (shared across this object's instances).
 		if (not def.model_hash.empty())
 		{
@@ -820,11 +1030,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// Placement: first referenced fiducial with a pose (live or
 		// held) wins. Held poses keep rendering through occlusion.
 		// Objects persist once placed (map wipe excepted): the pose
-		// follows every frame, never un-places.
+		// follows every frame, never un-places. Fiducials awaiting a
+		// post-resume reseat are skipped, so placements hold their last
+		// pose and glide to truth once sighted again.
 		for (const auto & fid: def.fiducial)
 		{
 			auto bpit = board_poses.find(fid);
-			if (bpit == board_poses.end())
+			if (bpit == board_poses.end() or bpit->second.needs_reseat)
 				continue;
 			auto & fu = ost.fused;
 			fu.world_pose = compose_pose(bpit->second.pose, def.position, def.orientation);
@@ -838,6 +1050,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			break;
 		}
 	}
+
+	// ---- boundary veil: global scene opacity from placed zones ----
+	// Runs on the smoothed placements above (same frame as the mask
+	// record's one-frame-stale inputs: record consumes last frame's
+	// boundary_* while submit uses these fresh values; the lag is
+	// one frame, same class as the window staleness).
+	update_boundary_fade(head_pos, have_head, now);
 
 	// ---- surface-projected instances: one geometry instance per placed,
 	// flagged object on the shared projected layer. Created on placement
@@ -917,6 +1136,8 @@ void scenes::stream::gui_passthrough()
 	if (ImGui::SliderInt(_S("Marker window cutout"), &debug_window_mm, -1, 512, debug_window_mm < 0 ? "Disabled" : "%d mm"))
 		debug_window_mm = std::clamp(debug_window_mm, -1, 512);
 	ImGui::EndDisabled();
+	if (ImGui::Button(_S("Run boundary self-test")))
+		xr::boundary_selftest();
 
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)
@@ -959,6 +1180,19 @@ void scenes::stream::gui_fiducial_status()
 	if (fiducial_trackers.contains(kDiscoveryVehiclePayload))
 	{
 		ImGui::Text("%s", _S("Discovering QR codes (no map: all codes unmatched)"));
+	}
+	if (not until_lock_target.empty())
+	{
+		if (until_lock_fading)
+		{
+			double elapsed = (instance.now() - until_lock_time) * 1e-9;
+			double t = until_lock_fade_s > 0 ? std::clamp(elapsed / until_lock_fade_s, 0.0, 1.0) : 1.0;
+			ImGui::Text("%s %.40s (%.0f%%)", _S("Fading to VR from"), until_lock_target.c_str(), t * 100);
+		}
+		else if (until_lock_found)
+			ImGui::Text("%s %.40s", _S("Passthrough unlocked by"), until_lock_target.c_str());
+		else
+			ImGui::Text("%s %.40s (%s)", _S("Full passthrough until"), until_lock_target.c_str(), _S("waiting"));
 	}
 	for (const auto & f: map->fiducials)
 	{
@@ -1103,13 +1337,15 @@ void scenes::stream::gui_fiducial_status()
 	{
 		(void)oid;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
-		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed")
+		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
+		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
 			continue;
 		}
 		bool reversed = ost.def.type == "3d-passthrough-reversed";
+		bool boundary = ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed";
 		if (not ost.soup_ready)
 		{
 			ImGui::Text("%s %.40s: %s", _S("Object"), label.c_str(), ost.status.c_str());
@@ -1121,6 +1357,19 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		double stale_s = (instance.now() - ost.fused.last_solve) * 1e-9;
+		if (boundary)
+		{
+			if (ost.boundary_valid)
+				ImGui::Text("%s %.40s%s: %s %s %+.0fmm op %.2f (stale %.1fs)",
+				            _S("Object"), label.c_str(),
+				            ost.def.type == "3d-boundary-reversed" ? _S(" (reversed)") : "",
+				            _S("zone"), ost.boundary_inside ? _S("in") : _S("out"),
+				            (double)(ost.boundary_signed_m * 1000.f), (double)ost.boundary_opacity, stale_s);
+			else
+				ImGui::Text("%s %.40s: %s (stale %.1fs)",
+				            _S("Object"), label.c_str(), _S("zone, no solution"), stale_s);
+			continue;
+		}
 		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
 		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
 		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
