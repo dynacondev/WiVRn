@@ -465,7 +465,10 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	vk::AttachmentDescription blur_attachment{
 	        .format = format,
 	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eDontCare,
+	        // CLEAR: the V draw is scissored to the content box, so the
+	        // exterior must be defined here (mask 0). Interior and band
+	        // are fully overwritten by the draw below.
+	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	        .finalLayout = vk::ImageLayout::eGeneral,
@@ -1332,6 +1335,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 {
 	auto t_total0 = std::chrono::steady_clock::now();
 	double ms_raster = 0, ms_erode = 0, ms_blur = 0, ms_punch = 0;
+	float box_frac = 1;
 	size_t n_draws = 0;
 	int tier_out = -1;
 	bool has_reversed = std::ranges::any_of(draws, [](const instance_draw & d) { return d.reverse; });
@@ -1350,6 +1354,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cpu_stats->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total0).count();
 			cpu_stats->tier = tier_out;
 			cpu_stats->draws = n_draws;
+			cpu_stats->box_frac = box_frac;
 		}
 	};
 
@@ -1712,6 +1717,84 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// extent is 64-quantized upstream, hence evenly divisible).
 		vk::Extent2D half_extent = level_extent(extent, 1);
 
+		// Group content box (full working pixels): NDC bounds of every
+		// draw, both eyes, grown by a conservative support margin. The
+		// fullscreen image passes (erode/blur/downsample) scissor to it;
+		// scissor clips writes only, reads still see full neighborhoods,
+		// and the box covers total downstream support by construction.
+		// Raster and the V upscale stay fullscreen (coverage-defining and
+		// submit-defining respectively: zero risk there). Any
+		// behind-camera corner falls back to fullscreen for the group.
+		struct content_box
+		{
+			float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
+			bool behind = false;
+			bool empty = true;
+		};
+		content_box eye_box[2];
+		for (const auto & d: draws)
+		{
+			auto mit = meshes.find(d.mesh);
+			if (mit == meshes.end())
+				continue;
+			const glm::vec3 & mn = mit->second.aabb_min;
+			const glm::vec3 & mx = mit->second.aabb_max;
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				for (int corner = 0; corner < 8; ++corner)
+				{
+					glm::vec4 q((corner & 1) ? mx.x : mn.x, (corner & 2) ? mx.y : mn.y,
+					            (corner & 4) ? mx.z : mn.z, 1);
+					glm::vec4 c = d.mvp[eye] * q;
+					if (c.w <= 0)
+					{
+						eye_box[eye].behind = true;
+						continue;
+					}
+					float nx = c.x / c.w, ny = c.y / c.w;
+					eye_box[eye].minx = std::min(eye_box[eye].minx, nx);
+					eye_box[eye].miny = std::min(eye_box[eye].miny, ny);
+					eye_box[eye].maxx = std::max(eye_box[eye].maxx, nx);
+					eye_box[eye].maxy = std::max(eye_box[eye].maxy, ny);
+					eye_box[eye].empty = false;
+				}
+			}
+		}
+		// Support margin (full working pixels, conservative): the feather
+		// bleed itself plus blur/erode/downsample support at any tier plus
+		// rounding. Over-wide just costs area; under-wide would clip.
+		float box_margin = feather_px + 8.f * spread + 8.f;
+		// Scissor rect for a pass extent: the both-eyes union mapped down
+		// from full working pixels, padded in pass texels. Degenerate or
+		// behind-camera groups fall back to fullscreen.
+		auto pass_scissor = [&](vk::Extent2D pe) {
+			float uminx = 1e30f, uminy = 1e30f, umaxx = -1e30f, umaxy = -1e30f;
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				if (eye_box[eye].behind or eye_box[eye].empty)
+					return vk::Rect2D{{0, 0}, pe};
+				uminx = std::min(uminx, eye_box[eye].minx);
+				uminy = std::min(uminy, eye_box[eye].miny);
+				umaxx = std::max(umaxx, eye_box[eye].maxx);
+				umaxy = std::max(umaxy, eye_box[eye].maxy);
+			}
+			float sx = (float)pe.width / (float)extent.width;
+			float sy = (float)pe.height / (float)extent.height;
+			// Mapped in two steps for clarity: full-px box, then scale.
+			float fx0 = (uminx * 0.5f + 0.5f) * (float)extent.width - box_margin;
+			float fy0 = (uminy * 0.5f + 0.5f) * (float)extent.height - box_margin;
+			float fx1 = (umaxx * 0.5f + 0.5f) * (float)extent.width + box_margin;
+			float fy1 = (umaxy * 0.5f + 0.5f) * (float)extent.height + box_margin;
+			int32_t px0 = std::max<int32_t>(0, (int32_t)(fx0 * sx) - 2);
+			int32_t py0 = std::max<int32_t>(0, (int32_t)(fy0 * sy) - 2);
+			int32_t px1 = std::min<int32_t>((int32_t)pe.width, (int32_t)(fx1 * sx) + 2);
+			int32_t py1 = std::min<int32_t>((int32_t)pe.height, (int32_t)(fy1 * sy) + 2);
+			if (px1 <= px0 or py1 <= py0)
+				return vk::Rect2D{{0, 0}, pe};
+			box_frac = std::min(box_frac, (float)(px1 - px0) * (float)(py1 - py0) / ((float)pe.width * (float)pe.height));
+			return vk::Rect2D{{px0, py0}, {(uint32_t)(px1 - px0), (uint32_t)(py1 - py0)}};
+		};
+
 		// Raster happens inside each path's own eye loop below (tier 1
 		// into half-res A, tiered as a level seed, tier 0 direct into the
 		// swapchain image).
@@ -1764,6 +1847,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(begin_triple, vk::SubpassContents::eInline);
 		set_full_viewport(half_extent);
+		cmd.setScissor(0, pass_scissor(half_extent));
 		{
 			section_clock erode_clk(&ms_erode);
 			update_source(*target_a.view_array, 10, true, vk::ImageLayout::eGeneral);
@@ -1809,6 +1893,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
 		set_full_viewport(out_extent);
+		cmd.setScissor(0, pass_scissor(out_extent));
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline_mv);
 		std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2]};
 		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);
@@ -1876,6 +1961,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				};
 				cmd.beginRenderPass(begin_down, vk::SubpassContents::eInline);
 				set_full_viewport(de);
+				cmd.setScissor(0, pass_scissor(de));
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *downsample_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> sets_d{*descriptor_sets[4 + (l - 1) * 2]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_d, no_offsets);
@@ -1908,6 +1994,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			};
 			cmd.beginRenderPass(begin_triple, vk::SubpassContents::eInline);
 			set_full_viewport(te);
+			cmd.setScissor(0, pass_scissor(te));
 			{
 				section_clock erode_clk(&ms_erode);
 				update_source(*h_src.view_array, 10, true, vk::ImageLayout::eGeneral);
@@ -1950,6 +2037,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			};
 			cmd.beginRenderPass(begin_v, vk::SubpassContents::eInline);
 			set_full_viewport(out_extent);
+			cmd.setScissor(0, pass_scissor(out_extent));
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_pipeline_mv);
 			std::array<vk::DescriptorSet, 1> sets_v{*descriptor_sets[2]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_v, no_offsets);

@@ -140,6 +140,9 @@ public:
 		double total_ms = 0;  // whole record() body, incl. target setup
 		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
 		size_t draws = 0;     // silhouette drawIndexed calls (both eyes)
+		float box_frac = 1;   // scissor-box area fraction (0-1) at working
+		                      // res; 1 = fullscreen fallback. Diagnostic for
+		                      // cull effectiveness (log only, no plot).
 	};
 
 	// Record silhouettes + blur chain for both eyes into the layers of an
