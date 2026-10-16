@@ -895,7 +895,15 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			bp.filter.ingest(tp, tq, now);
 			bp.samples_ingested++;
 			if (reseat_armed)
+			{
 				bp.needs_reseat = false;
+				// Restart the filter clock: the sleep gap must not enter
+				// the advance dt below (a huge dt steps ~80% in one frame:
+				// a snap, not a glide). The first trusted step then uses a
+				// normal frame dt and the correction glides from there.
+				bp.time = now;
+				bp.last_predicted = now;
+			}
 		}
 		double fdt = bp.time != 0 and now >= bp.time ? (now - bp.time) * 1e-9 : 1.0 / 72.0;
 		double adt = bp.last_predicted > 0 ? (now - bp.last_predicted) * 1e-9 : fdt;
