@@ -69,6 +69,20 @@ public:
 	void configure(const tuning & t);
 	void reset();
 
+	// Resume reseat (headset remount): the next ingested solve is SLAM-
+	// relocalized truth, not a spike. Keeps held/smoothed (no pop) but
+	// clears the spike-vs-motion history, zeroes the velocity estimate
+	// and opens a trust window: advance() glides toward held with unity
+	// weights and a brisk cutoff until the residual is back inside the
+	// outer hold knee (adaptive end) or a frame cap. The correction is
+	// smooth (One-Euro alpha, no overshoot) yet always completes, unlike
+	// a spike-gated jump which can stick part-way.
+	void begin_reseat();
+	bool in_reseat_trust() const
+	{
+		return reseat_trust;
+	}
+
 	// Ingest one mesh-target sample (world space). Only novel detector
 	// output: the caller must filter on marker_tracker::sighting::novel,
 	// echoes (repeated poses) carry no information and must not enter.
@@ -122,6 +136,11 @@ private:
 	// Outer hold knee is a fixed multiple of the inner (config carries the
 	// inner only): sub-inner residuals hold, outer and beyond pass fully.
 	static constexpr float hold_outer_ratio = 5.f;
+	// Reseat trust window: brisk but smooth correction cutoff, and a frame
+	// cap so trust always terminates even if the residual never settles
+	// (the adaptive outer-knee check below is the normal exit).
+	static constexpr float reseat_cutoff_hz = 2.5f;
+	static constexpr int reseat_frame_cap = 120;
 	// Adaptive-scale divisor: the Cauchy scale is the recent predecessor
 	// spread / this (floored at the nominal noise floor), so consistent
 	// motion widens its own gate. ~1.5 migrates a continuing step with
@@ -138,6 +157,10 @@ private:
 
 	pose smoothed{};
 	bool rendered_valid = false;
+	// Resume-reseat trust window (see begin_reseat): while true, advance()
+	// glides with unity weights and the brisk reseat cutoff.
+	bool reseat_trust = false;
+	int reseat_frames = 0;
 	// Filtered target speed from accepted novel samples (spikes frozen out).
 	glm::vec3 vel_hat{0};
 	float omega_hat = 0;

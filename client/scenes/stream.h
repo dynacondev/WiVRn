@@ -310,6 +310,11 @@ private:
 		std::string tuning_key; // filter tuning source; re-configure on change
 		uint64_t samples_ingested = 0;
 		XrTime last_predicted = 0; // last advance time (advance dt source)
+		// Resume reseat (headset remount): armed on user-presence loss,
+		// cleared on the first post-resume ingest. While armed the object
+		// placement below skips this fiducial, so nothing stale submits
+		// until the code is sighted again.
+		bool needs_reseat = false;
 	};
 	std::map<std::string /*fiducial id*/, board_fused> board_poses;
 	// Warm starts for the solver (fiducial id -> last smoothed pose).
@@ -641,6 +646,11 @@ private:
 	// Render thread only.
 	std::string until_lock_target;
 	bool until_lock_found = false;
+	// Headset presence (XR_EXT_user_presence, render thread only): true
+	// while worn. Loss arms a soft filter reseat per fiducial (see
+	// handle_user_presence); transitions only, repeats ignored.
+	bool user_present = true;
+	void handle_user_presence(bool present);
 
 	// QR debug gizmos (Passthrough tab, session-scoped, render thread
 	// only). Raw sighting poses while visible with a 3s stale fade;

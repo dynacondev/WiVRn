@@ -250,6 +250,10 @@ The first live solve for that fiducial latches and never resets on loss
 (map change clears it). While waiting, the flat feed saturates to
 fullscreen through the same veil floor as boundary zones (no geometry);
 combines with zones as OR: either source can demand passthrough.
+Headset removal (user-presence loss) clears the lock so the user returns
+to full passthrough until the code is re-sighted; all fiducial filters
+reseat smoothly on the next sighting (next solve taken as truth, glided
+to without popping) and nothing stale reappears before that.
 
 A fiducial with several markers fuses them into one 6DoF frame: every
 sighted marker votes its board hypothesis (observed pose composed with

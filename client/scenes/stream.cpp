@@ -2727,12 +2727,15 @@ void scenes::stream::on_xr_event(const xr::event & event)
 				        .state = event.state_changed.state,
 				});
 			break;
-		case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT:
+		case XR_TYPE_EVENT_DATA_USER_PRESENCE_CHANGED_EXT: {
+			bool present = (bool)event.user_presence_changed.isUserPresent;
+			handle_user_presence(present);
 			network_session->send_control(from_headset::user_presence_changed{
-			        .present = (bool)event.user_presence_changed.isUserPresent,
+			        .present = present,
 			        .change_time = instance.now(),
 			});
 			break;
+		}
 		case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
 			on_interaction_profile_changed(event.interaction_profile_changed);
 			break;
