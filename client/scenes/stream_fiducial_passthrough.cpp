@@ -272,11 +272,11 @@ void scenes::stream::handle_user_presence(bool present)
 		spdlog::info("user presence: headset mounted, awaiting re-sight for smooth reseat");
 		return;
 	}
-	// Unmount: arm a soft reseat per tracked fiducial and hide every
-	// placement until its code is sighted again (as if freshly started,
-	// but filters and warm starts are kept so the correction glides
-	// instead of popping). The passthrough-until-lock latch is left
-	// untouched, so remount goes straight back into VR.
+	// Unmount: arm a soft reseat per tracked fiducial. Placements hold
+	// their last pose (placement below skips reseat-pending fiducials)
+	// and glide to truth once its code is sighted again. The
+	// passthrough-until-lock latch is left untouched, so remount goes
+	// straight back into VR.
 	size_t n = 0;
 	for (auto & [fid, bp]: board_poses)
 	{
@@ -284,16 +284,7 @@ void scenes::stream::handle_user_presence(bool present)
 		bp.needs_reseat = true;
 		++n;
 	}
-	for (auto & [oid, ost]: passthrough_objects)
-	{
-		(void)oid;
-		ost.fused.placed = false;
-	}
-	// Drop runtime-side projected geometry too: it would keep rendering
-	// the stale pose. Meshes re-upload from the retained soups on
-	// re-placement via the per-frame instance sync below.
-	session.clear_projected_instances();
-	spdlog::info("user presence lost: reseat armed for {} fiducial(s)", n);
+	spdlog::info("user presence lost: reseat armed for {} fiducial(s), placements holding", n);
 }
 
 void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, XrTime now)
@@ -999,8 +990,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// held) wins. Held poses keep rendering through occlusion.
 		// Objects persist once placed (map wipe excepted): the pose
 		// follows every frame, never un-places. Fiducials awaiting a
-		// post-resume reseat are skipped, so nothing stale reappears
-		// until its code is sighted again.
+		// post-resume reseat are skipped, so placements hold their last
+		// pose and glide to truth once sighted again.
 		for (const auto & fid: def.fiducial)
 		{
 			auto bpit = board_poses.find(fid);

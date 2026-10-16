@@ -251,9 +251,9 @@ The first live solve for that fiducial latches and never resets on loss
 fullscreen through the same veil floor as boundary zones (no geometry);
 combines with zones as OR: either source can demand passthrough.
 Headset removal (user-presence loss) leaves the lock untouched, so
-remount goes straight back into VR; all fiducial filters still reseat
-smoothly on the next sighting (next solve taken as truth, glided to
-without popping) and nothing stale reappears before that.
+remount goes straight back into VR; placements hold their last pose
+while fiducial filters reseat smoothly on the next sighting (next solve
+taken as truth, glided to without popping).
 
 A fiducial with several markers fuses them into one 6DoF frame: every
 sighted marker votes its board hypothesis (observed pose composed with

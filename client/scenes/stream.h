@@ -312,8 +312,8 @@ private:
 		XrTime last_predicted = 0; // last advance time (advance dt source)
 		// Resume reseat (headset remount): armed on user-presence loss,
 		// cleared on the first post-resume ingest. While armed the object
-		// placement below skips this fiducial, so nothing stale submits
-		// until the code is sighted again.
+		// placement below holds its last pose instead of following the
+		// stale fiducial, gliding to truth once sighted again.
 		bool needs_reseat = false;
 	};
 	std::map<std::string /*fiducial id*/, board_fused> board_poses;
