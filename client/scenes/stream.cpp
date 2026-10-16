@@ -1684,6 +1684,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// full opacity. Cutouts punch union B only (flat): no geometry
 			// exists to map them onto, so A must never see them.
 			static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+			// Box-coverage diagnostics share one 5s window: the flag is
+			// latched before the loop so every group reports in the same
+			// frame (a per-group throttle starves all but the first).
+			static XrTime last_box_log = 0;
+			bool log_boxes = false;
+			if (instance.now() - last_box_log > 5'000'000'000LL)
+			{
+				last_box_log = instance.now();
+				log_boxes = true;
+			}
 			for (auto [f, proj]: live_groups)
 			{
 				auto & g = mask_groups[{f, proj}];
@@ -1850,6 +1860,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				mask_erode_ms += mstats.erode_ms;
 				mask_blur_ms += mstats.blur_ms;
 				mask_draws += (int)mstats.draws;
+				// Box-coverage diagnostics for the scissor cull (see
+				// flag above; tier-0 has no scissored passes to report).
+				if (log_boxes and mstats.tier > 0)
+				{
+					spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {}",
+					             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
+				}
 				if (not mask_split_written)
 				{
 					mask_split_written = true;
