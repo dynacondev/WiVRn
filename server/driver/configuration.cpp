@@ -610,6 +610,20 @@ configuration::configuration()
 		if (auto it = json.find("suppress-meta-boundary"); it != json.end())
 			suppress_meta_boundary = *it;
 
+		if (auto it = json.find("passthrough-until-lock"); it != json.end())
+		{
+			if (not it->is_string())
+				U_LOG_W("passthrough-until-lock must be a fiducial id string, ignoring");
+			else
+				passthrough_until_lock = it->get<std::string>();
+		}
+		if (not passthrough_until_lock.empty() and
+		    not std::ranges::any_of(fiducials, [&](const fiducial_entry & e) { return e.id == passthrough_until_lock; }))
+		{
+			U_LOG_W("passthrough-until-lock \"%s\" matches no fiducial id, ignoring", passthrough_until_lock.c_str());
+			passthrough_until_lock.clear();
+		}
+
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;
 

@@ -633,6 +633,15 @@ private:
 	bool boundary_any = false; // any boundary object placed
 	XrTime last_boundary_log = 0; // heartbeat throttle for the fade line
 
+	// Full flat passthrough until the named fiducial locks (first live
+	// solve latches, never reset on loss; cleared on map change). Empty
+	// target disables. Armed only when the target matches a fiducial id
+	// in the map. While waiting (armed && !locked) the veil is forced to
+	// fullscreen via the same B floor lift, no geometry involved.
+	// Render thread only.
+	std::string until_lock_target;
+	bool until_lock_found = false;
+
 	// QR debug gizmos (Passthrough tab, session-scoped, render thread
 	// only). Raw sighting poses while visible with a 3s stale fade;
 	// the orange set re-projects fused poses with authored offsets.

@@ -1059,6 +1059,11 @@ struct fiducial_map
 	// Server-pushed (top-level config, no in-headset toggle); a request
 	// only, the runtime may refuse. Always sent, even with an empty map.
 	bool suppress_meta_boundary = true;
+	// Full flat passthrough until the named fiducial locks (first live
+	// solve latches, never reset on loss; cleared on map change). Empty
+	// (default) disables. Only applies when it matches a fiducial id in
+	// this map (server warns + ignores dangling values).
+	std::string passthrough_until_lock;
 };
 
 struct fiducial_model_chunk

@@ -144,6 +144,12 @@ struct configuration
 	// VR regardless of this setting.
 	bool suppress_meta_boundary = true;
 
+	// Full flat passthrough until the named fiducial locks (first live
+	// solve latches, never reset on loss). Empty (default) disables.
+	// Only applies when it matches a fiducial id in the config;
+	// dangling values warn + ignore.
+	std::string passthrough_until_lock;
+
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;

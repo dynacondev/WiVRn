@@ -241,6 +241,16 @@ this). This is a request: the runtime may refuse, and the boundary is
 always shown in opaque VR regardless. The headset logs which verdict
 the server sent on every map receipt.
 
+## `passthrough-until-lock`
+Default value: unset (disabled)
+
+Full flat passthrough until the named fiducial locks. Set to a fiducial
+`id` from this config; any other value (including unset) disables it.
+The first live solve for that fiducial latches and never resets on loss
+(map change clears it). While waiting, the flat feed saturates to
+fullscreen through the same veil floor as boundary zones (no geometry);
+combines with zones as OR: either source can demand passthrough.
+
 A fiducial with several markers fuses them into one 6DoF frame: every
 sighted marker votes its board hypothesis (observed pose composed with
 its offset), and a robust estimator (Cauchy IRLS with leave-one-out
