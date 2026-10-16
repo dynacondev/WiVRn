@@ -182,13 +182,43 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 	for (const auto & obj: map.objects)
 	{
 		std::string label = obj.tag.empty() ? obj.id : obj.tag;
-		if (obj.model_hash.empty())
+		if (obj.type == "3d-boundary" or obj.type == "3d-boundary-reversed")
+		{
+			if (obj.model_hash.empty())
+				spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
+			else
+				spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes) transition {:.2f}m",
+				             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size,
+				             (double)obj.transition_distance_m);
+		}
+		else if (obj.model_hash.empty())
 			spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
 		else
 			spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes)",
 			             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size);
 	}
 	*fiducial_map.lock() = std::move(map);
+
+	// Server-pushed Meta boundary default (top-level config, no
+	// in-headset toggle): applied live on every map receipt. Startup
+	// default comes from the untouched client setting until the first map
+	// arrives; the map is always sent, even empty.
+	{
+		bool suppress;
+		{
+			auto locked = fiducial_map.lock();
+			suppress = locked->suppress_meta_boundary;
+		}
+		static bool last_suppress = false;
+		static bool have_last = false;
+		if (not have_last or suppress != last_suppress)
+		{
+			have_last = true;
+			last_suppress = suppress;
+			session.set_passthrough_boundary_enabled(not suppress);
+			spdlog::info("Meta boundary in passthrough: {}", suppress ? "suppressed (server)" : "shown (server)");
+		}
+	}
 
 	// Request models missing from the local cache
 	std::error_code ec;

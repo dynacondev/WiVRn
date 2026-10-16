@@ -232,6 +232,15 @@ Print the QR encoding exactly the `marker-data` string, e.g.
 case-sensitive; any other QR code in view is reported in the headset
 Passthrough tab (red) to help you copy it verbatim into the config.
 
+## `suppress-meta-boundary`
+Default value: `true`
+
+Suppress the Meta (OS) boundary while WiVRn passthrough is shown.
+Pushed to the headset on connect (there is no in-headset toggle for
+this). This is a request: the runtime may refuse, and the boundary is
+always shown in opaque VR regardless. The headset logs which verdict
+the server sent on every map receipt.
+
 A fiducial with several markers fuses them into one 6DoF frame: every
 sighted marker votes its board hypothesis (observed pose composed with
 its offset), and a robust estimator (Cauchy IRLS with leave-one-out
@@ -272,7 +281,18 @@ Each `passthrough` entry has:
   skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
-  pixel).
+  pixel). `"3d-boundary"` shows game video only *inside* the model
+  volume and passthrough outside it — a Quest-guardian-style zone with
+  adjustable size, shape and fade. `"3d-boundary-reversed"` inverts it
+  (passthrough inside, game outside: exclusion zones around e.g. a
+  desk). Zones combine as a union: game video shows iff the headset is
+  inside ANY normal zone (or no normal zone is placed) AND outside ALL
+  reversed zones; unplaced zones are ignored (fail-open to game, so
+  tracking loss never flashes passthrough). Boundary meshes must be
+  **closed volumes** (inside/outside comes from ray parity, undefined
+  for open meshes); keep them simple (room-size boxes are ideal, ~5k
+  triangles budget). Both eyes fade together from a single per-frame
+  headset distance.
 - `id`: stable identifier (required, must be unique); `tag`:
   display-only label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required;
@@ -291,12 +311,22 @@ Each `passthrough` entry has:
 - `feather-px`: passthrough window feather width in screen pixels
   (default `24`; `0` disables feathering). Mask stacks group by this
   value so each object feathers independently; applied live. Not
-  accepted for `3d-passthrough-reversed` (warned + ignored).
+  accepted for `3d-passthrough-reversed` or `3d-boundary(-reversed)`
+  (warned + ignored): negatives cut every layer and inherit each
+  layer's feathering, while zones fade by distance instead (see
+  `transition-distance`).
+- `transition-distance`: boundary fade width in meters
+  (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
+  scene cross-fades over ± this distance around the zone surface
+  (symmetric smoothstep, 0.5 at the surface); `0` is a hard step.
+  Composited by lifting the flat union's mask floor, so no extra layers
+  or swapchains: exiting saturates the existing flat feed to fullscreen.
 - `surface-projected`: the headset projects camera imagery onto this
   object's mesh instead of the flat reconstruction feed (default
   `true`; opt out per object with `false`, plus a live in-headset
   override in the Passthrough tab). Ignored for
-  `3d-passthrough-reversed` (warned).
+  `3d-passthrough-reversed` or `3d-boundary(-reversed)` (warned +
+  ignored): zones never map camera onto geometry.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
