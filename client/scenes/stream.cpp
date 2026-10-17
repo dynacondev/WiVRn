@@ -1189,12 +1189,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// record phase below (cutouts, gizmos) and the status UI.
 		update_fiducial_passthrough(frame_state.predictedDisplayTime);
 
+		// Depth-volume objects (3d-depth-passthrough) need the runtime
+		// depth feed this frame: placed + mesh ready, any feather. The
+		// sensor acquire runs at the top of the mask record phase below
+		// (both async and inline paths), gated on the mask path: without
+		// alpha blend there is no mask to merge into.
+		bool need_volume_depth = false;
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			if (ost.def.type == "3d-depth-passthrough" and ost.soup_ready and ost.fused.placed)
+			{
+				need_volume_depth = true;
+				break;
+			}
+		}
+		vk::ImageView volume_sensor = nullptr;
+		float volume_near = 0.1f, volume_far = 10.f;
+		bool have_volume_sensor = false;
+
 		// Fresh frame accumulators for the Statistics plots (filled by
 		// the gizmo and mask record phases below, sampled by
 		// accumulate_metrics). fence_wait_ms is measured at frame top
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
+		volume_ms = 0;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -1215,6 +1234,39 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// compositor joins via swapchain release (gated on the mask
 		// fence below).
 		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit) {
+			// Depth-volume sensor acquire (once per frame, ahead of the
+			// group loop): the provider starts on first volume need and
+			// idles otherwise. The debug overlay block below re-acquires
+			// when armed; two acquires in one frame just return the
+			// latest image twice.
+			if (need_volume_depth and mask_frame)
+			{
+				if (not env_depth_probed)
+				{
+					env_depth_probed = true;
+					env_depth_supported = xr::environment_depth::supported(instance, system);
+					if (env_depth_supported)
+						env_depth = std::make_unique<xr::environment_depth>(instance, session, device);
+					else
+						spdlog::info("environment depth unsupported on this headset");
+				}
+				if (env_depth)
+				{
+					env_depth->ensure();
+					if (env_depth->ready())
+					{
+						env_depth->start();
+						xr::environment_depth::frame depth_frame;
+						if (env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, depth_frame))
+						{
+							volume_sensor = env_depth->depth_view(depth_frame.swapchain_index);
+							volume_near = depth_frame.near_z;
+							volume_far = depth_frame.far_z;
+							have_volume_sensor = volume_sensor != vk::ImageView{};
+						}
+					}
+				}
+			}
 			// q4 splits the mask span after the first recorded group (set
 			// below; fallback write after the loop keeps the poll range
 			// valid on group-less frames). Groups record sequentially, so
@@ -1278,7 +1330,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// become no-ops once pre-warmed).
 				for (auto & [oid, ost]: passthrough_objects)
 				{
-					if (ost.def.type != "3d-passthrough")
+					// Depth volumes share their feather's flat group (they
+					// merge into its seed; surface projection never applies).
+					bool pdepth = ost.def.type == "3d-depth-passthrough";
+					if (ost.def.type != "3d-passthrough" and not pdepth)
 						continue;
 					float pf = ost.def.feather_px;
 					bool pproj = surface_projected_effective(oid, ost);
@@ -1305,7 +1360,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				for (auto & [oid, ost]: passthrough_objects)
 				{
-					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+					bool is_depth_vol = ost.def.type == "3d-depth-passthrough";
+					if ((ost.def.type != "3d-passthrough" and not is_depth_vol) or not ost.soup_ready or not ost.fused.placed)
 						continue;
 					float f = ost.def.feather_px;
 					bool proj = surface_projected_effective(oid, ost);
@@ -1412,7 +1468,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						        oit->second.fused.placed and
 						        (oit->second.def.type == "3d-passthrough-reversed" or
 						         (oit->second.def.feather_px == g.feather_px and
-						          surface_projected_effective(oit->first, oit->second) == g.projected));
+						          surface_projected_effective(oit->first, oit->second) == g.projected) or
+						         (oit->second.def.type == "3d-depth-passthrough" and
+						          oit->second.def.feather_px == g.feather_px and not g.projected));
 						if (not member)
 						{
 							g.renderer->remove_mesh(hit->first);
@@ -1504,7 +1562,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// placement, per-eye MVPs, full opacity. Polarity rides
 					// the draw (false = fill, true = cut); the renderer pushes
 					// full cut strength for reversed.
-					auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed) {
+					auto append_draw = [&](const std::string & oid, const passthrough_object_state & ost, bool reversed,
+					                       std::vector<feather_mask_renderer::instance_draw> & out) {
 						const auto & fu = ost.fused;
 						if (not fu.placed)
 							return;
@@ -1519,14 +1578,30 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						constexpr float op = 1;
 						if (not draw_visible(oid, mvp))
 							return;
-						draws.push_back({oid, mvp, op, reversed});
+						out.push_back({oid, mvp, op, reversed});
 					};
 					for (auto & [oid, ost]: passthrough_objects)
 					{
 						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f or
 						    surface_projected_effective(oid, ost) != proj)
 							continue;
-						append_draw(oid, ost, false);
+						append_draw(oid, ost, false, draws);
+					}
+					// Depth volumes for this feather's flat group: same
+					// eye-space MVPs, no reversed polarity (the renderer
+					// MAXes them over the cuts instead of cutting).
+					std::vector<feather_mask_renderer::instance_draw> volume_draws;
+					bool any_volume = false;
+					if (have_volume_sensor and not proj)
+					{
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-depth-passthrough" or not ost.soup_ready or not ost.fused.placed or
+							    ost.def.feather_px != f)
+								continue;
+							append_draw(oid, ost, false, volume_draws);
+						}
+						any_volume = not volume_draws.empty();
 					}
 					// Reversed objects (negatives) cut every group of both
 					// unions: appended after all positives (the renderer
@@ -1536,13 +1611,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
 							continue;
-						append_draw(oid, ost, true);
+						append_draw(oid, ost, true, draws);
 					}
 					// Reversed-only draws rasterize to a provable no-op, so a
 					// group with no positive draws is skipped exactly like an
 					// empty one.
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					if (draws.empty() or not any_positive)
+					if ((draws.empty() or not any_positive) and not any_volume)
 					{
 						g.active = false;
 						// Mesh-pipeline edge forensics: draws present ->
@@ -1589,8 +1664,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					feather_mask_renderer::mask_stage_cpu mstats{};
 					try
 					{
+						feather_mask_renderer::volume_input vol_in;
+						if (any_volume)
+						{
+							vol_in.draws = volume_draws;
+							vol_in.sensor_view = volume_sensor;
+							vol_in.near_z = volume_near;
+							vol_in.far_z = volume_far;
+						}
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh});
+						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
+						                   any_volume ? &vol_in : nullptr);
 					}
 					catch (std::exception & e)
 					{
@@ -1604,6 +1688,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 					mask_erode_ms += mstats.erode_ms;
 					mask_blur_ms += mstats.blur_ms;
+					volume_ms += mstats.volume_raster_ms + mstats.volume_compare_ms + mstats.volume_merge_ms;
 					mask_draws += (int)mstats.draws;
 					// Box-coverage diagnostics for the scissor cull (see
 					// flag above; tier-0 has no scissored passes to report).
@@ -1679,6 +1764,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 						mask_erode_ms += mstats.erode_ms;
 						mask_blur_ms += mstats.blur_ms;
+						volume_ms += mstats.volume_raster_ms + mstats.volume_compare_ms + mstats.volume_merge_ms;
 						mask_draws += (int)mstats.draws;
 					}
 				}
@@ -2103,7 +2189,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					depth_status = "depth provider unavailable";
 			}
 		}
-		else if (env_depth and env_depth->started())
+		// The volume layer owns the provider while depth objects are
+		// placed: only stop it when neither the debug toggle nor the
+		// volume chain needs it.
+		else if (env_depth and env_depth->started() and not need_volume_depth)
 		{
 			env_depth->stop();
 			depth_status.clear();

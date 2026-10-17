@@ -456,6 +456,7 @@ private:
 	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
+	double volume_ms = 0; // depth-volume raster+compare+merge (3d-depth-passthrough)
 	int mask_draws = 0;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned
@@ -515,6 +516,7 @@ private:
 		float mask_raster_ms = 0;
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
+		float volume_ms = 0;
 		float gizmo_ms = 0;
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;

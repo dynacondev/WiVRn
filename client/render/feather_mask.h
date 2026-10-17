@@ -143,6 +143,13 @@ public:
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
 		                      // res; 1 = fullscreen fallback. Diagnostic for
 		                      // cull effectiveness (log only, no plot).
+		// Depth-volume stages (3d-depth-passthrough objects in this
+		// group): furthest-point raster at 320px, strict sensor<render
+		// flatten, upscale+MAX merge into the seed ahead of erode.
+		// Zero when the group carries no volume draws.
+		double volume_raster_ms = 0;
+		double volume_compare_ms = 0;
+		double volume_merge_ms = 0;
 	};
 
 	// Record silhouettes + blur chain for both eyes into the layers of an
@@ -157,6 +164,21 @@ public:
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Mask path only (the binary projected layer has
 	// no alpha control to punch through).
+	// Depth-volume layer (3d-depth-passthrough): furthest-point draws in
+	// display-eye MVP space plus the runtime D16 sensor view they test
+	// against (strict sensor < render, far hidden). Null = no volume in
+	// this group: the seed passes through untouched. Non-null with draws
+	// and a valid sensor view rasterizes at 320px, flattens to binary R8,
+	// and upscales+MAXes into the tier seed AFTER the reversed MIN cuts
+	// (the volume overlays everything, including VR cutthroughs) and
+	// BEFORE erode/blur, so it feathers exactly like silhouettes.
+	struct volume_input
+	{
+		std::vector<instance_draw> draws; // depth objects, eye MVP space
+		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
+		float near_z = 0.1f; // depth frustum the raster must match
+		float far_z = 10.f;
+	};
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -166,7 +188,8 @@ public:
 	            const std::vector<std::array<glm::vec3, 6>> & cutouts,
 	            const std::array<glm::mat4, 2> & cutout_mvp,
 	            mask_stage_cpu * cpu_stats,
-	            vk::Extent2D out_extent);
+	            vk::Extent2D out_extent,
+	            const volume_input * volume = nullptr);
 
 	bool has_mesh() const
 	{
@@ -269,8 +292,9 @@ private:
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0 = blur-H, 2 = blur-V upscale; 4,6,8 = downsample
-	// levels 1..3; 10 = erode-H, 12 = erode-V. One set per pass (not
+	// Index: 0 = blur-H, 1 = volume upscale+MAX merge, 2 = blur-V
+	// upscale; 4,6,8 = downsample levels 1..3; 10 = erode-H, 12 = erode-V.
+	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so eye-1
 	// slots stay unused. Erosion needs two sets because its H and V
 	// passes sample different images in the same command buffer (one
@@ -326,6 +350,45 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
+
+	// Depth-volume chain (3d-depth-passthrough, fixed 320px working
+	// size regardless of mask extent). Raster outputs R16 sensor-D,
+	// compare flattens to binary R8, merge upscales+MAXes into the tier
+	// seed. Created once in the constructor (format-fixed); targets are
+	// extent-fixed, so no rebuilds ever (unlike the mask intermediates).
+	static constexpr uint32_t volume_size = 320;
+	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
+	struct volume_push
+	{
+		glm::mat4 mvp;
+		float near_z = 0.1f;
+		float far_z = 10.f;
+	};
+	vk::raii::RenderPass volume_raster_renderpass{nullptr};
+	vk::raii::PipelineLayout volume_raster_layout{nullptr};
+	vk::raii::Pipeline volume_raster_pipeline{nullptr};
+	// Compare (fullscreen _mv, 2 samplers: sensor D16 + volume R16).
+	// Reuses blur_r8_renderpass_mv + volume_bin.blur_fb_mv: the R8
+	// DONT_CARE shape is identical, only the fragment shader differs.
+	vk::raii::DescriptorSetLayout compare_set_layout{nullptr};
+	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
+	vk::raii::DescriptorPool compare_pool{nullptr};
+	vk::raii::DescriptorSet compare_set{nullptr};
+	vk::raii::Pipeline compare_pipeline_mv{nullptr};
+	vk::raii::Sampler volume_sampler_nearest{nullptr};
+	// Upscale+MAX merge into the tier seed (LOAD, preserves the
+	// silhouette + reversed-cut result, sets 1 where the sensor is
+	// inside). Reuses the blur shaders with spread 0 (the linear
+	// sampler is the upscale) under MAX blending; framebuffers are the
+	// seed's own MV target (loadOp is not part of compatibility).
+	vk::raii::RenderPass volume_max_r8_renderpass{nullptr};
+	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
+	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
+	vk::raii::Pipeline volume_max_rgb8_pipeline{nullptr};
+	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
+	blur_target volume_bin; // R8 binary canvas (320, 2 layers)
+	bool volume_targets_ready = false;
+	void ensure_volume_targets();
 	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
 	                     vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 
