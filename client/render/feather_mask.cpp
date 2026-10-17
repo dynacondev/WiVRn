@@ -2481,52 +2481,34 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_bin.image);
 			{
 				section_clock merge_clk(&ms_volume_merge);
-				// Presmooth the 320px coverage field H+V (wide kernel):
-				// stairs smaller than the blur radius vanish into a stable
-				// gradient instead of shimmering through the upscale. CPU
-				// and GPU cost land in the merge spans by construction.
-				// H: bin -> smooth. CLEAR zeroes outside the box (same
-				// discipline as the compare pass), so edge taps read
-				// defined 0 instead of tile garbage.
+				// Presmooth the 320px coverage field (wide kernel): H here,
+				// V folded into the merge upscale below. Stairs smaller than
+				// the blur radius vanish into a stable gradient instead of
+				// shimmering through the upscale. CPU and GPU cost land in
+				// the merge spans by construction.
+				// H: bin -> smooth. Box-sized render area (like the merge
+				// below): LOAD/STORE skip tiles outside the footprint, so
+				// presmooth scales with object area. CLEAR zeroes outside
+				// the box (same discipline as the compare pass), so edge
+				// taps read defined 0 instead of tile garbage.
+				vk::Rect2D smooth_box = pass_scissor(ve);
 				update_source(*volume_bin.view_array, 0);
 				make_writable(*volume_smooth.image);
 				vk::RenderPassBeginInfo begin_smooth_h{
 					        .renderPass = *blur_r8_renderpass_mv,
 					        .framebuffer = *volume_smooth.blur_fb_mv,
-					        .renderArea = {.offset = {0, 0}, .extent = ve},
+					        .renderArea = smooth_box,
 					        .clearValueCount = 1,
 					        .pClearValues = &clear,
 				};
 				cmd.beginRenderPass(begin_smooth_h, vk::SubpassContents::eInline);
 				set_full_viewport(ve);
-				cmd.setScissor(0, pass_scissor(ve));
+				cmd.setScissor(0, smooth_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[0]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
 				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, volume_smooth_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
-				cmd.draw(3, 1, 0, 0);
-				cmd.endRenderPass();
-				make_readable(*volume_smooth.image);
-				// V: smooth -> bin. CLEAR + box draw fully restores the
-				// canvas, so the merge below reads defined data everywhere.
-				update_source(*volume_smooth.view_array, 2);
-				make_writable(*volume_bin.image);
-				vk::RenderPassBeginInfo begin_smooth_v{
-					        .renderPass = *blur_r8_renderpass_mv,
-					        .framebuffer = *volume_bin.blur_fb_mv,
-					        .renderArea = {.offset = {0, 0}, .extent = ve},
-					        .clearValueCount = 1,
-					        .pClearValues = &clear,
-				};
-				cmd.beginRenderPass(begin_smooth_v, vk::SubpassContents::eInline);
-				set_full_viewport(ve);
-				cmd.setScissor(0, pass_scissor(ve));
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
-				std::array<vk::DescriptorSet, 1> smooth_v_sets{*descriptor_sets[2]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_v_sets, no_offsets);
-				blur_push smooth_v{{1.f / ve.width, 1.f / ve.height}, {0, 1}, volume_smooth_spread, 0};
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_v);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 				make_readable(*volume_bin.image);
@@ -2570,12 +2552,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(seed_ext);
 				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *volume_max_rgb8_pipeline : *volume_max_r8_pipeline);
-				update_source(*volume_bin.view_array, 1);
+				// V-blur folded into the upscale: same taps as the deleted
+				// standalone V pass (source texel 1/320, V direction), executed
+				// while upscaling under the existing MAX blend. Separable with
+				// the H pass above by linearity.
+				update_source(*volume_smooth.view_array, 1);
 				std::array<vk::DescriptorSet, 1> max_sets{*descriptor_sets[1]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, max_sets, no_offsets);
-				// Spread 0: every tap reads the same texel, so the blur
-				// shader degenerates to a bilinear copy = the upscale.
-				blur_push max_push{{1.f / ve.width, 1.f / ve.height}, {1, 0}, 0, 0};
+				blur_push max_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, volume_smooth_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, max_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();

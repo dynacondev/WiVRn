@@ -370,15 +370,16 @@ private:
 
 	// Depth-volume chain (3d-depth-passthrough, fixed 320px working
 	// size regardless of mask extent). Raster outputs R16 sensor-D,
-	// compare flattens to 4-level coverage R8, presmooth blurs H+V at
-	// 320, merge upscales+MAXes into the tier seed. Created once in the
-	// constructor (format-fixed); targets are extent-fixed, so no
-	// rebuilds ever (unlike the mask intermediates).
+	// compare flattens to 4-level coverage R8, presmooth H blurs at 320
+	// with V folded into the merge upscale, merge upscales+MAXes into
+	// the tier seed. Created once in the constructor (format-fixed);
+	// targets are extent-fixed, so no rebuilds ever (unlike the mask
+	// intermediates).
 	static constexpr uint32_t volume_size = 320;
 	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
 	// Presmooth radius (blur-spread units = texels at 320): stairs
 	// smaller than ~2x this vanish into a stable gradient. 4 -> ~8px.
-	static constexpr float volume_smooth_spread = 4.f;
+	static constexpr float volume_smooth_spread = 1.4f;
 	struct volume_push
 	{
 		glm::mat4 mvp;
@@ -430,7 +431,7 @@ private:
 	blur_target volume_bin; // R8 coverage canvas (320, 2 layers):
 	// compare output, presmoothed in place before the merge upscale
 	blur_target volume_smooth; // R8 presmooth workspace (320, 2 layers):
-	// H destination, V source (ping-pong with volume_bin)
+	// H destination, read directly by the merge upscale (V folded in)
 	bool volume_targets_ready = false;
 	void ensure_volume_targets();
 	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
