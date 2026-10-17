@@ -1307,12 +1307,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
 
-		// Rotation reprojection homographies (one per eye, shared by all
-		// groups): H = Suv Qd Rcw Rew^-1 Qe^-1 E1 mapping eye UV to sensor
-		// UV, exact for rotation. Built from the renderer's own matrices
-		// (P rows straight out of scene::projection_matrix, R from the view
-		// matrices) so no NDC/fov-sign convention is assumed: whatever the
-		// house projection does, the raster and the remap agree by
+		// Rotation + B1 translation homographies (one per eye, shared by all
+		// groups): H = Suv (Qd Rcw Rew^-1 Qe^-1 E1 + qt/Z0 e3^T) mapping
+		// eye UV to sensor UV. Rotation part exact; translation is the
+		// plane-induced term for a fronto-parallel eye plane at Z0
+		// (B1 test: hardcoded 0.3m, hand range). Built from the
+		// renderer's own matrices (P rows straight out of
+		// scene::projection_matrix, R from the view matrices) so no
+		// NDC/fov-sign convention is assumed: whatever the house
+		// projection does, the raster and the remap agree by
 		// construction. Wd carries the validated sensor flip (identity
 		// reproduces today's direct tap). Default is that flip matrix, so a
 		// degenerate frustum degrades to unrotated instead of breaking.
@@ -1357,6 +1360,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
 				glm::mat3 Rcw = glm::mat3(scene::view_matrix(shared_depth.pose[view]));
 				glm::mat3 H = Suv * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * E1;
+				// B1 translation: plane-induced term for an eye-parallel
+				// plane at Z0 (test: 0.3m). Exact for points on that plane,
+				// first-order elsewhere; error scales with (1/Z - 1/Z0).
+				// H' ~ H + (Suv Qd tc / Z0) e3^T, tc = eye - capture in
+				// capture camera space. Sign checked: eye right of capture
+				// samples sensor right of center (validated algebra).
+				{
+					constexpr float kB1PlaneM = 0.3f;
+					const auto & pe = mask_pose[view].position;
+					const auto & pc = shared_depth.pose[view].position;
+					glm::vec3 dw(pe.x - pc.x, pe.y - pc.y, pe.z - pc.z);
+					glm::vec3 tc = Rcw * dw;
+					glm::vec3 shift = Suv * (Qd * tc) / kB1PlaneM;
+					H[2] += shift;
+				}
 				for (int c = 0; c < 3; ++c)
 					volume_remap[3 * view + c] = glm::vec4(H[c], 0);
 			}
