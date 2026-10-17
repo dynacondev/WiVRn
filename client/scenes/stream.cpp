@@ -1246,7 +1246,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					env_depth_probed = true;
 					env_depth_supported = xr::environment_depth::supported(instance, system);
 					if (env_depth_supported)
-						env_depth = std::make_unique<xr::environment_depth>(instance, session, device);
+						env_depth = std::make_unique<xr::environment_depth>(instance, session, system, device);
 					else
 						spdlog::info("environment depth unsupported on this headset");
 				}

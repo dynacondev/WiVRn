@@ -925,7 +925,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vk::DynamicState volume_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 		vk::PipelineDynamicStateCreateInfo volume_dynamic{
-		        .dynamicCount = 2,
+		        .dynamicStateCount = 2,
 		        .pDynamicStates = volume_dynamics,
 		};
 		vk::PushConstantRange volume_push_range{
@@ -1063,7 +1063,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vk::DynamicState compare_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 		vk::PipelineDynamicStateCreateInfo compare_dynamic{
-		        .dynamicCount = 2,
+		        .dynamicStateCount = 2,
 		        .pDynamicStates = compare_dynamics,
 		};
 		vk::GraphicsPipelineCreateInfo compare_pipeline_info{
