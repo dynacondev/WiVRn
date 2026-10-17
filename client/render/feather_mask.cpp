@@ -889,7 +889,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// (MAX blend over a 0 clear, no MIN cuts); compare flattens to binary
 	// R8; merge upscales+MAXes into the tier seed ahead of erode/blur.
 	static_assert(sizeof(volume_push) == 72);
-	static_assert(sizeof(compare_push) == 96);
+	static_assert(sizeof(volume_homography) == 96);
 	{
 		auto volume_vert = load_shader(device, "volume.vert");
 		auto volume_frag = load_shader(device, "volume_raster.frag");
@@ -1029,7 +1029,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .pName = "main",
 		        },
 		};
-		vk::DescriptorSetLayoutBinding compare_bindings[3] = {
+		vk::DescriptorSetLayoutBinding compare_bindings[2] = {
 		        {
 		                .binding = 0,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -1042,21 +1042,22 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .descriptorCount = 1,
 		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
 		        },
-		        {
-		                .binding = 2,
-		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		                .descriptorCount = 1,
-		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-		        },
 		};
 		vk::DescriptorSetLayoutCreateInfo compare_set_info{
-		        .bindingCount = 3,
+		        .bindingCount = 2,
 		        .pBindings = compare_bindings,
 		};
 		compare_set_layout = vk::raii::DescriptorSetLayout(device, compare_set_info);
+		vk::PushConstantRange compare_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(volume_homography),
+		};
 		vk::PipelineLayoutCreateInfo compare_pipe_layout_info{
 		        .setLayoutCount = 1,
 		        .pSetLayouts = &*compare_set_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &compare_push_range,
 		};
 		compare_pipe_layout = vk::raii::PipelineLayout(device, compare_pipe_layout_info);
 		vk::DescriptorPoolSize compare_pool_size{
@@ -1124,49 +1125,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 			compare_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
 			}
-	// Homography upload path: host-visible staging, sampled image,
-	// texelFetch in the shader. Every link (staging upload,
-	// buffer->image copy, sampler read) is used elsewhere; only this
-	// combination is new.
-	{
-		remap_stage = buffer_allocation{
-		        device,
-		        vk::BufferCreateInfo{
-		                .size = sizeof(compare_push),
-		                .usage = vk::BufferUsageFlagBits::eTransferSrc,
-		        },
-		        VmaAllocationCreateInfo{
-		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-		                .usage = VMA_MEMORY_USAGE_AUTO,
-		        },
-		        "volume remap staging",
-		};
-		remap_img = image_allocation{
-		        device,
-		        vk::ImageCreateInfo{
-		                .imageType = vk::ImageType::e2D,
-		                .format = vk::Format::eR32G32B32A32Sfloat,
-		                .extent = {8, 1, 1},
-		                .mipLevels = 1,
-		                .arrayLayers = 1,
-		                .samples = vk::SampleCountFlagBits::e1,
-		                .tiling = vk::ImageTiling::eOptimal,
-		                .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eSampled,
-		                .sharingMode = vk::SharingMode::eExclusive,
-		                .initialLayout = vk::ImageLayout::eTransferDstOptimal,
-		        },
-		        VmaAllocationCreateInfo{
-		                .usage = VMA_MEMORY_USAGE_AUTO,
-		        },
-		        "volume remap",
-		};
-		remap_view = vk::raii::ImageView(device, vk::ImageViewCreateInfo{
-		        .image = vk::Image(remap_img),
-		        .viewType = vk::ImageViewType::e2D,
-		        .format = vk::Format::eR32G32B32A32Sfloat,
-		        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1},
-		});
-	}
+	// Homography rides push constants (named vec4 members, see header);
+	// no buffers, views, copies or barriers per frame.
 	// Exact-texel sampler for the compare taps (sensor + volume depth),
 	// same discipline as the depth overlay: filtering would smear texel
 	// edges into false inside/outside votes.
@@ -2429,42 +2389,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_depth.image);
 			{
 				section_clock compare_clk(&ms_volume_compare);
-				// H upload through a sampled image: memcpy+flush into staging,
-				// barrier, copy, barrier to SHADER_READ (before the compare
-				// renderpass below).
-				compare_push remap{};
+				// Homography push fill (96B named vec4s). Pushed just before
+				// the draw below.
+				volume_homography hom{};
 				for (int i = 0; i < 6; ++i)
-					remap.h[i] = volume->remap_cols[i];
-				std::memcpy(remap_stage.map(), &remap, sizeof(remap));
-				remap_stage.unmap();
-				vmaFlushAllocation(vk_allocator::instance(), remap_stage, 0, sizeof(remap));
-				if (remap_img_live)
-				{
-					vk::ImageMemoryBarrier to_copy{
-					        .srcAccessMask = vk::AccessFlagBits::eShaderRead,
-					        .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
-					        .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-					        .newLayout = vk::ImageLayout::eTransferDstOptimal,
-					        .image = vk::Image(remap_img),
-					        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1},
-					};
-					cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eTransfer, {}, {}, {}, to_copy);
-				}
-				vk::BufferImageCopy h_copy{
-				        .imageSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 1},
-				        .imageExtent = {8, 1, 1},
-				};
-				cmd.copyBufferToImage(vk::Buffer(remap_stage), vk::Image(remap_img), vk::ImageLayout::eTransferDstOptimal, h_copy);
-				vk::ImageMemoryBarrier to_readable{
-				        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-				        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-				        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-				        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-				        .image = vk::Image(remap_img),
-				        .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor, .levelCount = 1, .layerCount = 1},
-				};
-				cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, to_readable);
-				remap_img_live = true;
+					hom.col[i] = volume->remap_cols[i];
 				vk::DescriptorImageInfo sensor_info{
 					        .sampler = *volume_sampler_nearest,
 					        .imageView = volume->sensor_view,
@@ -2478,12 +2407,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 					};
 				std::array<vk::CopyDescriptorSet, 0> no_compare_copies{};
-								vk::DescriptorImageInfo remap_img_info{
-				        .sampler = *volume_sampler_nearest,
-				        .imageView = *remap_view,
-				        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-				};
-				std::array<vk::WriteDescriptorSet, 3> compare_writes = {{
+				std::array<vk::WriteDescriptorSet, 2> compare_writes = {{
 					{
 					        .dstSet = *compare_set,
 					        .dstBinding = 0,
@@ -2497,13 +2421,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .descriptorCount = 1,
 					        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 					        .pImageInfo = &volume_info,
-					},
-					{
-					        .dstSet = *compare_set,
-					        .dstBinding = 2,
-					        .descriptorCount = 1,
-					        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-					        .pImageInfo = &remap_img_info,
 					},
 				}};
 				device.updateDescriptorSets(compare_writes, no_compare_copies);
@@ -2523,6 +2440,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *compare_pipe_layout, 0, cmp_sets, no_offsets);
+				cmd.pushConstants<volume_homography>(*compare_pipe_layout, vk::ShaderStageFlagBits::eFragment, 0, hom);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}

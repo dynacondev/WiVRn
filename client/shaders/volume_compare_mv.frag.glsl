@@ -29,12 +29,24 @@ layout(location = 0) out vec4 out_color;
 // reproduces the direct tap. Strict sensor < render, far / no-data
 // hidden, out-of-frustum hidden.
 //
-// The remap rides a tiny sampled image (8x1 RGBA32F, texels 0..5 = H
-// columns), updated per volume record. The homography is spelled out in
-// scalars (no mat3 constructor: the Adreno compiler miscompiles
-// mat3-from-vec4s in this pass). Per-eye columns: eye e uses texels
-// [3e..3e+2]; the eye base needs no branching as gl_ViewIndex is 0/1.
-layout(set = 0, binding = 2) uniform sampler2D h_img;
+// The remap rides push constants as 6 NAMED vec4 members (not a GLSL
+// array: push-constant arrays have driver-defined packing, while
+// consecutive vec4 members lay out exactly like mat4 columns — 16B
+// each, 96B total). Per-eye homography columns: eye e uses h[3e..3e+2].
+// (History: the original failure was the mat3 constructor in the math
+// below, never the transport — UBO, texel-buffer and sampled-image
+// variants all behaved identically once mat3 was gone. Push is kept as
+// the simplest form: no buffers, views, copies or barriers per frame.)
+layout(push_constant) uniform Push
+{
+	vec4 h0;
+	vec4 h1;
+	vec4 h2;
+	vec4 h3;
+	vec4 h4;
+	vec4 h5;
+}
+pc;
 
 layout(set = 0, binding = 0) uniform sampler2DArray sensor_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
@@ -42,10 +54,15 @@ layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
 void main()
 {
 	vec2 suv = vec2(uv.x, 1.0 - uv.y);
-	int e = gl_ViewIndex * 3;
-	vec4 c0 = texelFetch(h_img, ivec2(e + 0, 0), 0);
-	vec4 c1 = texelFetch(h_img, ivec2(e + 1, 0), 0);
-	vec4 c2 = texelFetch(h_img, ivec2(e + 2, 0), 0);
+	vec4 c0 = pc.h0;
+	vec4 c1 = pc.h1;
+	vec4 c2 = pc.h2;
+	if (gl_ViewIndex != 0)
+	{
+		c0 = pc.h3;
+		c1 = pc.h4;
+		c2 = pc.h5;
+	}
 	float px = c0.x * uv.x + c1.x * uv.y + c2.x;
 	float py = c0.y * uv.x + c1.y * uv.y + c2.y;
 	float pz = c0.z * uv.x + c1.z * uv.y + c2.z;
