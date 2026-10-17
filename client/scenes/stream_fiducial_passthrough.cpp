@@ -1154,6 +1154,12 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (not depth_status.empty())
 		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
+	// Depth-volume rotation reprojection (remap through the capture <->
+	// display relative rotation). Off = direct tap: the flip default
+	// above is what the shader receives, unchanged.
+	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
+		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
+
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)
 		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));

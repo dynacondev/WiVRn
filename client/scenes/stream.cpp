@@ -1316,6 +1316,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// construction. Wd carries the validated sensor flip (identity
 		// reproduces today's direct tap). Default is that flip matrix, so a
 		// degenerate frustum degrades to unrotated instead of breaking.
+		// The Passthrough tab can disable the reprojection (direct tap);
+		// the default below is then what the shader receives, unchanged.
 		// Timed into the compare CPU (the warp's CPU cost lives there).
 		std::array<glm::vec4, 6> volume_remap{};
 		for (int e = 0; e < 2; ++e)
@@ -1324,7 +1326,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
 			volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
 			}
-		if (have_depth_frame and need_volume_depth and mask_frame)
+		if (have_depth_frame and need_volume_depth and mask_frame and volume_remap_enabled)
 		{
 			auto remap_t0 = std::chrono::steady_clock::now();
 			// E1 (UV->NDC): Vulkan NDC(-1,-1) is the top-left pixel

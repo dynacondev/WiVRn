@@ -484,6 +484,7 @@ private:
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
+	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
 	bool volume_remap_logged = false; // one-shot H log for convention validation
 	// Sensor-mapping forensics (Volume heartbeat): content age from the
 	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
