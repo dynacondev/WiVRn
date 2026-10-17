@@ -53,21 +53,24 @@ void main()
 	vec2 suv = vec2(uv.x, 1.0 - uv.y);
 	if (MODE == 0)
 	{
-		vec4 h0 = texelFetch(h_img, ivec2(0, 0), 0);
-		vec4 h1 = texelFetch(h_img, ivec2(1, 0), 0);
-		vec4 h2 = texelFetch(h_img, ivec2(2, 0), 0);
-		vec4 h3 = texelFetch(h_img, ivec2(3, 0), 0);
-		vec4 h4 = texelFetch(h_img, ivec2(4, 0), 0);
-		vec4 h5 = texelFetch(h_img, ivec2(5, 0), 0);
-		mat3 H = (gl_ViewIndex == 0) ? mat3(h0, h1, h2)
-		                             : mat3(h3, h4, h5);
-		vec3 p = H * vec3(uv, 1.0);
-		if (p.z <= 1e-6)
+		// Scalar-spelled homography: no mat3 constructor, no mat3
+		// ternary. (The Adreno compiler miscompiles mat3-from-vec4s in
+		// this pass, which also gated every prior transport echo behind
+		// mat3-derived guards and made them all read "black".)
+		// Eye base without branching: gl_ViewIndex is 0/1.
+		int e = gl_ViewIndex * 3;
+		vec4 c0 = texelFetch(h_img, ivec2(e + 0, 0), 0);
+		vec4 c1 = texelFetch(h_img, ivec2(e + 1, 0), 0);
+		vec4 c2 = texelFetch(h_img, ivec2(e + 2, 0), 0);
+		float px = c0.x * uv.x + c1.x * uv.y + c2.x;
+		float py = c0.y * uv.x + c1.y * uv.y + c2.y;
+		float pz = c0.z * uv.x + c1.z * uv.y + c2.z;
+		if (pz <= 1e-6)
 		{
 			out_color = vec4(0.0);
 			return;
 		}
-		vec2 s = p.xy / p.z;
+		vec2 s = vec2(px, py) / pz;
 		if (s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0)
 		{
 			out_color = vec4(0.0);
