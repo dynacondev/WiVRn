@@ -2287,6 +2287,19 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		auto run_volume = [&](vk::Image seed_img, vk::Framebuffer seed_fb, vk::Extent2D seed_ext, bool seed_is_rgb8) {
 			ensure_volume_targets();
 			vk::Extent2D ve{volume_size, volume_size};
+			// GPU brackets for the volume stages (TopOfPipe discipline,
+			// same caveat as the mask spans: a late producer inflates the
+			// following span). Null pool = no stamping (zero GPU cost).
+			// Reset per call: with several volume groups the pool holds
+			// the last group only (matches the CPU last-wins reporting).
+			bool volume_ts = volume->timestamp_pool != vk::QueryPool{};
+			auto volume_stamp = [&](uint32_t q) {
+				if (volume_ts)
+					cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, volume->timestamp_pool, q);
+				};
+			if (volume_ts)
+				cmd.resetQueryPool(volume->timestamp_pool, 0, 4);
+			volume_stamp(0);
 			{
 				section_clock raster_clk(&ms_volume_raster);
 				// Tier-0 has no flush above (direct submit raster), so
@@ -2326,6 +2339,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					cmd.endRenderPass();
 				}
 			}
+			volume_stamp(1);
 			make_readable(*volume_depth.image);
 			{
 				section_clock compare_clk(&ms_volume_compare);
@@ -2375,6 +2389,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}
+			volume_stamp(2);
 			make_readable(*volume_bin.image);
 			{
 				section_clock merge_clk(&ms_volume_merge);
@@ -2419,6 +2434,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, max_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
+				volume_stamp(3);
 			}
 		};
 

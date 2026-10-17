@@ -456,7 +456,34 @@ private:
 	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
-	double volume_ms = 0; // depth-volume raster+compare+merge (3d-depth-passthrough)
+	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
+	double volume_raster_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
+	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
+	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
+	// never read unwritten queries). volume_ts_async selects the fence
+	// that retires the writing command buffer (mask vs main).
+	vk::raii::QueryPool volume_query_pool = nullptr;
+	bool volume_ts_valid = false;
+	bool volume_ts_async = false;
+	struct volume_gpu_spans
+	{
+		float raster = 0, compare = 0, merge = 0;
+	};
+	volume_gpu_spans last_volume_gpu;
+	// Volume heartbeat snapshot (last volume group) + 5s window sums for
+	// the adb Volume: line (stable numbers under jitter).
+	int volume_last_tier = -1;
+	float volume_last_feather = 0;
+	int volume_last_draws = 0;
+	uint32_t volume_last_seed_w = 0, volume_last_seed_h = 0;
+	uint32_t volume_sensor_w = 0, volume_sensor_h = 0;
+	float volume_sensor_near = 0, volume_sensor_far = 0;
+	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
+	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
+	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
+	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
+	XrTime volume_last_log = 0;
+	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
 	int mask_draws = 0;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned
@@ -516,7 +543,13 @@ private:
 		float mask_raster_ms = 0;
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
-		float volume_ms = 0;
+		float volume_acquire_ms = 0;
+		float volume_raster_ms = 0;
+		float volume_compare_ms = 0;
+		float volume_merge_ms = 0;
+		float volume_raster_gpu_ms = 0;
+		float volume_compare_gpu_ms = 0;
+		float volume_merge_gpu_ms = 0;
 		float gizmo_ms = 0;
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;

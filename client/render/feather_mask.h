@@ -178,6 +178,10 @@ public:
 		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
 		float near_z = 0.1f; // depth frustum the raster must match
 		float far_z = 10.f;
+		// GPU timestamp sink (stream-owned, 4 queries: raster/compare/merge
+		// boundaries). Null disables stamping. Reset per record() call, so
+		// with several volume groups the pool holds the LAST group only.
+		vk::QueryPool timestamp_pool = nullptr;
 	};
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,

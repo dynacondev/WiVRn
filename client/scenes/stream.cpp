@@ -478,6 +478,16 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	                .queryCount = 3,
 	        });
 
+	// Volume GPU brackets (raster/compare/merge boundaries, 4 queries).
+	// Dedicated pool so the main/mask read discipline (never wait on an
+	// unwritten query) is untouched; volume_ts_valid gates the poll.
+	self->volume_query_pool = vk::raii::QueryPool(
+	        self->device,
+	        vk::QueryPoolCreateInfo{
+	                .queryType = vk::QueryType::eTimestamp,
+	                .queryCount = 4,
+	        });
+
 	self->wifi = application::get_wifi_lock().get_wifi_lock();
 
 	return self;
@@ -953,6 +963,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Mask-pool results (async path): q0 start, q1 after first group,
 	// q2 end. Read only when the last mask submission went async (else
 	// the pool holds older data); not-ready carries like the main pool.
+	// Volume-pool results: raster/compare/merge boundaries from the
+	// last volume group. Same poll discipline (no eWait, carry over),
+	// plus the retiring fence for the recording path: mask fence on
+	// async frames, main fence (waited above) on inline frames.
+	if (volume_ts_valid)
+	{
+		bool volume_pool_ready = not volume_ts_async or
+		        device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
+		if (volume_pool_ready)
+		{
+			auto [vres, vtimestamps] = volume_query_pool.getResults<uint64_t>(
+			        0,
+			        4,
+			        4 * sizeof(uint64_t),
+			        sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64);
+
+			if (vres == vk::Result::eSuccess)
+			{
+				float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
+				last_volume_gpu.raster = (vtimestamps[1] - vtimestamps[0]) * period;
+				last_volume_gpu.compare = (vtimestamps[2] - vtimestamps[1]) * period;
+				last_volume_gpu.merge = (vtimestamps[3] - vtimestamps[2]) * period;
+			}
+		}
+	}
+
 	if (mask_results_in_mask_pool)
 	{
 		auto [mres, mtimestamps] = mask_query_pool.getResults<uint64_t>(
@@ -1206,6 +1243,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		vk::ImageView volume_sensor = nullptr;
 		float volume_near = 0.1f, volume_far = 10.f;
 		bool have_volume_sensor = false;
+		volume_want_frame = need_volume_depth;
 
 		// Fresh frame accumulators for the Statistics plots (filled by
 		// the gizmo and mask record phases below, sampled by
@@ -1213,7 +1251,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
-		volume_ms = 0;
+		volume_acquire_ms = volume_raster_ms = volume_compare_ms = volume_merge_ms = 0;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -1257,7 +1295,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						env_depth->start();
 						xr::environment_depth::frame depth_frame;
-						if (env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, depth_frame))
+						auto acq_t0 = std::chrono::steady_clock::now();
+						bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, depth_frame);
+						volume_acquire_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acq_t0).count();
+						if (got_depth)
 						{
 							volume_sensor = env_depth->depth_view(depth_frame.swapchain_index);
 							volume_near = depth_frame.near_z;
@@ -1272,6 +1313,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// valid on group-less frames). Groups record sequentially, so
 			// first = q4-q3 localizes one group's chain, rest = q1-q4.
 			bool mask_split_written = false;
+			// Fresh validity for this frame's volume stamps (consumed at
+			// next frame top; groups set it below when volume records).
+			volume_ts_valid = false;
 			if (mask_frame)
 			{
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
@@ -1671,6 +1715,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
+							if (*volume_query_pool)
+								vol_in.timestamp_pool = *volume_query_pool;
 						}
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
 						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
@@ -1688,8 +1734,28 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 					mask_erode_ms += mstats.erode_ms;
 					mask_blur_ms += mstats.blur_ms;
-					volume_ms += mstats.volume_raster_ms + mstats.volume_compare_ms + mstats.volume_merge_ms;
+					volume_raster_ms += mstats.volume_raster_ms;
+					volume_compare_ms += mstats.volume_compare_ms;
+					volume_merge_ms += mstats.volume_merge_ms;
 					mask_draws += (int)mstats.draws;
+					if (any_volume)
+					{
+						// Last-writer-wins: matches the GPU pool, and a
+						// single feather value is the baseline case anyway.
+						volume_ts_valid = true;
+						volume_last_tier = tier;
+						volume_last_feather = f;
+						volume_last_draws = (int)volume_draws.size();
+						volume_last_seed_w = (uint32_t)gw;
+						volume_last_seed_h = (uint32_t)gh;
+						if (env_depth)
+						{
+							volume_sensor_w = env_depth->depth_width();
+							volume_sensor_h = env_depth->depth_height();
+						}
+						volume_sensor_near = volume_near;
+						volume_sensor_far = volume_far;
+					}
 					// Box-coverage diagnostics for the scissor cull (see
 					// flag above; tier-0 has no scissored passes to report).
 					if (log_boxes and mstats.tier > 0)
@@ -1764,7 +1830,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 						mask_erode_ms += mstats.erode_ms;
 						mask_blur_ms += mstats.blur_ms;
-						volume_ms += mstats.volume_raster_ms + mstats.volume_compare_ms + mstats.volume_merge_ms;
+						volume_raster_ms += mstats.volume_raster_ms;
+						volume_compare_ms += mstats.volume_compare_ms;
+						volume_merge_ms += mstats.volume_merge_ms;
 						mask_draws += (int)mstats.draws;
 					}
 				}
@@ -1796,6 +1864,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			queue.lock()->submit(mask_submit_info, *mask_fence);
 			mask_async_submitted = true;
 			mask_results_in_mask_pool = true;
+			volume_ts_async = true;
 		}
 		assert(swapchain);
 		// defoveate the image, apply scale/bias
@@ -2224,6 +2293,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			record_masks_phase(command_buffer, query_pool, 4);
 			mask_results_in_mask_pool = false;
+			volume_ts_async = false;
 		}
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
