@@ -889,7 +889,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// (MAX blend over a 0 clear, no MIN cuts); compare flattens to binary
 	// R8; merge upscales+MAXes into the tier seed ahead of erode/blur.
 	static_assert(sizeof(volume_push) == 72);
-	static_assert(sizeof(volume_homography) == 96);
+	static_assert(sizeof(volume_homography) == 128);
 	{
 		auto volume_vert = load_shader(device, "volume.vert");
 		auto volume_frag = load_shader(device, "volume_raster.frag");
@@ -2389,11 +2389,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_depth.image);
 			{
 				section_clock compare_clk(&ms_volume_compare);
-				// Homography push fill (96B named vec4s). Pushed just before
-				// the draw below.
+				// Homography + B2 corr push fill (128B named vec4s). Pushed just
+				// before the draw below.
 				volume_homography hom{};
 				for (int i = 0; i < 6; ++i)
 					hom.col[i] = volume->remap_cols[i];
+				for (int i = 0; i < 2; ++i)
+					hom.corr[i] = volume->remap_corr[i];
 				vk::DescriptorImageInfo sensor_info{
 					        .sampler = *volume_sampler_nearest,
 					        .imageView = volume->sensor_view,

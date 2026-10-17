@@ -314,8 +314,9 @@ Each `passthrough` entry has:
   work, so expect a texel of swim during fast motion. The headset
   Passthrough tab offers a Rotation reprojection toggle (default on):
   the sensor tap is remapped through the capture <-> display relative
-  rotation so the comparison tests the same world ray, falling back
-  to the direct tap when off. Meshes should be
+  rotation plus a depth-dependent lateral shift (sideways parallax;
+  forward/radial and depth-value terms excluded), so the comparison
+  tests the same world ray, falling back to the direct tap when off. Meshes should be
   **closed volumes** (far side is well-defined). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
   it — a Quest-guardian-style zone with adjustable size, shape and

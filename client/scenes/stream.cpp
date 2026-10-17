@@ -1307,22 +1307,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
 
-		// Rotation + B1 translation homographies (one per eye, shared by all
-		// groups): H = Suv (Qd Rcw Rew^-1 Qe^-1 E1 + qt/Z0 e3^T) mapping
-		// eye UV to sensor UV. Rotation part exact; translation is the
-		// plane-induced term for a fronto-parallel eye plane at Z0
-		// (B1 test: hardcoded 0.3m, hand range). Built from the
-		// renderer's own matrices (P rows straight out of
-		// scene::projection_matrix, R from the view matrices) so no
-		// NDC/fov-sign convention is assumed: whatever the house
-		// projection does, the raster and the remap agree by
-		// construction. Wd carries the validated sensor flip (identity
-		// reproduces today's direct tap). Default is that flip matrix, so a
-		// degenerate frustum degrades to unrotated instead of breaking.
+		// Rotation + B2 lateral homographies (one per eye, shared by all
+		// groups): H = Suv Qd Rcw Rew^-1 Qe^-1 E1 mapping eye UV to sensor
+		// UV, exact for rotation; plus per-eye T with 1/depth = a*D + b
+		// for sideways parallax (forward/radial + depth-value terms
+		// excluded — the experiment). Built from the renderer's own
+		// matrices (P rows straight out of scene::projection_matrix, R
+		// from the view matrices) so no NDC/fov-sign convention is
+		// assumed: whatever the house projection does, the raster and the
+		// remap agree by construction. Wd carries the validated sensor
+		// flip (identity reproduces today's direct tap). Default is that
+		// flip matrix, so a degenerate frustum degrades to unrotated
+		// instead of breaking.
 		// The Passthrough tab can disable the reprojection (direct tap);
-		// the default below is then what the shader receives, unchanged.
+		// the defaults below are then what the shader receives, unchanged.
 		// Timed into the compare CPU (the warp's CPU cost lives there).
 		std::array<glm::vec4, 6> volume_remap{};
+		std::array<glm::vec4, 2> volume_remap_corr{};
 		for (int e = 0; e < 2; ++e)
 		{
 			volume_remap[3 * e + 0] = glm::vec4(1, 0, 0, 0);
@@ -1360,23 +1361,37 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
 				glm::mat3 Rcw = glm::mat3(scene::view_matrix(shared_depth.pose[view]));
 				glm::mat3 H = Suv * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * E1;
-				// B1 translation: plane-induced term for an eye-parallel
-				// plane at Z0 (test: 0.3m). Exact for points on that plane,
-				// first-order elsewhere; error scales with (1/Z - 1/Z0).
-				// H' ~ H + (Suv Qd tc / Z0) e3^T, tc = eye - capture in
-				// capture camera space. Sign checked: eye right of capture
-				// samples sensor right of center (validated algebra).
-				{
-					constexpr float kB1PlaneM = 0.3f;
-					const auto & pe = mask_pose[view].position;
-					const auto & pc = shared_depth.pose[view].position;
-					glm::vec3 dw(pe.x - pc.x, pe.y - pc.y, pe.z - pc.z);
-					glm::vec3 tc = Rcw * dw;
-					glm::vec3 shift = Suv * (Qd * tc) / kB1PlaneM;
-					H[2] += shift;
-				}
 				for (int c = 0; c < 3; ++c)
 					volume_remap[3 * view + c] = glm::vec4(H[c], 0);
+				// B2 lateral: T maps 1/depth (1/m) to sensor-UV shift,
+				// forward (qt.z) deliberately dropped here. a, b give
+				// 1/depth = a*D + b for the sensor D encoding.
+				{
+					const auto & pe = mask_pose[view].position;
+					const auto & pcap = shared_depth.pose[view].position;
+					glm::vec3 dw(pe.x - pcap.x, pe.y - pcap.y, pe.z - pcap.z);
+					glm::vec3 tc = Rcw * dw;
+					glm::vec3 qt = Qd * tc;
+					float n = shared_depth.near_z;
+					float f = shared_depth.far_z;
+					float a = 0, b = 0;
+					if (n > 1e-6f and !(f > n))
+					{
+						a = -1.f / n;
+						b = 1.f / n;
+					}
+					else if (n > 1e-6f and f > n and f < 1e9f)
+					{
+						a = -(f - n) / (f * n);
+						b = 1.f / n;
+					}
+					else
+					{
+						h_ok = false;
+						break;
+					}
+					volume_remap_corr[view] = glm::vec4(0.5f * qt.x, -0.5f * qt.y, a, b);
+				}
 			}
 			if (not h_ok)
 			{
@@ -1385,15 +1400,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					volume_remap[3 * e + 0] = glm::vec4(1, 0, 0, 0);
 					volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
 					volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
+					volume_remap_corr[e] = glm::vec4(0, 0, 0, 0);
 				}
 			}
 			if (not volume_remap_logged)
 			{
 				volume_remap_logged = true;
-				spdlog::info("Volume remap eye0 cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f})",
+				spdlog::info("Volume remap eye0 cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) txy ({:.4f},{:.4f}) ab ({:.3f},{:.3f})",
 				             (double)volume_remap[0].x, (double)volume_remap[0].y, (double)volume_remap[0].z,
 				             (double)volume_remap[1].x, (double)volume_remap[1].y, (double)volume_remap[1].z,
-				             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z);
+				             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z,
+				             (double)volume_remap_corr[0].x, (double)volume_remap_corr[0].y,
+				             (double)volume_remap_corr[0].z, (double)volume_remap_corr[0].w);
 				}
 			volume_compare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
 		}
@@ -1847,6 +1865,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							vol_in.draws = volume_draws;
 							vol_in.remap_cols = volume_remap;
+							vol_in.remap_corr = volume_remap_corr;
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;

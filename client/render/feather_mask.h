@@ -186,6 +186,11 @@ public:
 		// [3*e .. 3*e+2], w unused) mapping eye UV to sensor UV. Identity
 		// reproduces the direct tap; computed once per frame on the CPU.
 		std::array<glm::vec4, 6> remap_cols{};
+		// B2 lateral correction: per-eye (T.xy, a, b) with
+		// 1/depth = a*D + b (a, b duplicated per eye for vec4 packing).
+		// T maps 1/depth (1/m) to sensor-UV shift; forward/radial +
+		// depth-value terms excluded.
+		std::array<glm::vec4, 2> remap_corr{};
 		// GPU timestamp sink (stream-owned, 4 queries: raster/compare/merge
 		// boundaries). Null disables stamping. Reset per record() call, so
 		// with several volume groups the pool holds the LAST group only.
@@ -391,13 +396,15 @@ private:
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
-	// Compare homography: per-eye 3x3 columns as 6 vec4s (16B each,
-	// 96B total), filled per volume record from volume_input and pushed
-	// (named members, never an array: push-constant arrays have
-	// driver-defined packing). Layout matches mat4 columns exactly.
+	// Compare homography + B2 lateral correction: per-eye 3x3 columns as
+	// 6 vec4s plus per-eye corr (T.xy, a, b), 8 vec4s / 128B total,
+	// filled per volume record from volume_input and pushed (named
+	// members, never an array: push-constant arrays have driver-defined
+	// packing). Layout matches mat4 columns exactly.
 	struct volume_homography
 	{
 		glm::vec4 col[6]{};
+		glm::vec4 corr[2]{};
 	};
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
 	vk::raii::Sampler volume_sampler_nearest{nullptr};
