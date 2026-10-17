@@ -41,7 +41,11 @@ layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
 
 void main()
 {
-	mat3 H = mat3(pc.h[3 * gl_ViewIndex + 0], pc.h[3 * gl_ViewIndex + 1], pc.h[3 * gl_ViewIndex + 2]);
+	// Static branch (constant push indices per side): dynamically
+	// indexing the push array reads as zero on some drivers. The
+	// condition is dynamically uniform, so both sides stay legal.
+	mat3 H = (gl_ViewIndex == 0) ? mat3(pc.h[0], pc.h[1], pc.h[2])
+	                            : mat3(pc.h[3], pc.h[4], pc.h[5]);
 	vec3 p = H * vec3(uv, 1.0);
 	float inside = 0.0;
 	if (p.z > 1e-6)

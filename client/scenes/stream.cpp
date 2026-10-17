@@ -1308,7 +1308,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		cutouts_punched = false;
 
 		// Rotation reprojection homographies (one per eye, shared by all
-		// groups): H = Wd Qd Rcw Rew^-1 Qe^-1 W^-1 mapping eye UV to sensor
+		// groups): H = Suv Qd Rcw Rew^-1 Qe^-1 E1 mapping eye UV to sensor
 		// UV, exact for rotation. Built from the renderer's own matrices
 		// (P rows straight out of scene::projection_matrix, R from the view
 		// matrices) so no NDC/fov-sign convention is assumed: whatever the
@@ -1327,13 +1327,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (have_depth_frame and need_volume_depth and mask_frame)
 		{
 			auto remap_t0 = std::chrono::steady_clock::now();
-			// Viewport NDC(-1,-1) = top-left pixel (rasterizer truth, same
-			// as blur.vert): NDC -> normalized UV, and its inverse.
-			const glm::mat3 W(glm::vec3(0.5f, 0, 0), glm::vec3(0, 0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
-			const glm::mat3 Winv(glm::vec3(2, 0, 0), glm::vec3(0, 2, 0), glm::vec3(-1, -1, 1));
-			// Validated sensor flip folded into the depth side.
-			const glm::mat3 J(glm::vec3(1, 0, 0), glm::vec3(0, -1, 0), glm::vec3(0, 1, 1));
-			const glm::mat3 Wd = J * W;
+			// E1 (UV->NDC): Vulkan NDC(-1,-1) is the top-left pixel
+			// (rasterizer truth, same as blur.vert; the old branch's eye
+			// mapping is v_uv*2-1 straight, no eye-side flip).
+			const glm::mat3 E1(glm::vec3(2, 0, 0), glm::vec3(0, 2, 0), glm::vec3(-1, -1, 1));
+			// Sensor UV<-NDC: the flip lives on the depth side only
+			// (anchored to validated direct sampling: overlay top samples
+			// depth row 1). Identity reproduces today's (u, 1-v) tap.
+			const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, -0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
 			bool h_ok = true;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
@@ -1353,7 +1354,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
 				glm::mat3 Rcw = glm::mat3(scene::view_matrix(shared_depth.pose[view]));
-				glm::mat3 H = Wd * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * Winv;
+				glm::mat3 H = Suv * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * E1;
 				for (int c = 0; c < 3; ++c)
 					volume_remap[3 * view + c] = glm::vec4(H[c], 0);
 			}
