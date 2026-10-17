@@ -94,11 +94,10 @@ void main()
 	float inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
 	if (MODE == 0 && uv.x > 0.5)
 	{
-		// Diagnostic split-screen (one build only): the right half
-		// echoes texel-buffer delivery as brightness (texel 0.x ~= 1.0
-		// white = matrix delivered, 0.0 black = shader reads zero)
-		// while the left half keeps the real remap result.
-		out_color = vec4(vec3(texelFetch(h_tex, 0).x), 1.0);
+		// CONTROL (one build only): hardcoded 1.0, no reads at all. If
+		// the right half still shows VR, the echo path itself (not any
+		// transport) is broken and the transport chase was miscalibrated.
+		out_color = vec4(1.0);
 		return;
 	}
 	out_color = vec4(inside);
