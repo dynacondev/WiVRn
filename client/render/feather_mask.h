@@ -397,15 +397,17 @@ private:
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
-	// UBO mirror of the compare shader's Remap block (std140: 6x vec4,
-	// no padding issues). Updated per volume record from volume_input.
-	struct volume_remap_ubo
+	// Compare homography transport: 6 NAMED vec4 push members (NOT a
+	// GLSL array — push-constant arrays and the fragment-stage UBO both
+	// read back zero on this driver). Consecutive vec4 members lay out
+	// exactly like the proven mat4 columns of volume_push above: 16B
+	// each, 96B total. Filled per volume record from volume_input.
+	struct compare_push
 	{
 		glm::vec4 h[6]{};
 	};
-	buffer_allocation remap_ubo;
 	// Debug pipelines (spec-constant MODE, selected CPU-side): 0 remap,
-	// 1 hardcoded flip (no UBO read), 2 sensor raw, 3 volume raw.
+	// 1 hardcoded flip (no homography read), 2 sensor raw, 3 volume raw.
 	std::array<vk::raii::Pipeline, 4> compare_pipelines{{nullptr, nullptr, nullptr, nullptr}};
 	vk::raii::Sampler volume_sampler_nearest{nullptr};
 	// Upscale+MAX merge into the tier seed (LOAD, preserves the

@@ -1370,7 +1370,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (not volume_remap_logged)
 			{
 				volume_remap_logged = true;
-				spdlog::info("Volume remap eye0 [ubo] cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f})",
+				spdlog::info("Volume remap eye0 [push] cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f})",
 				             (double)volume_remap[0].x, (double)volume_remap[0].y, (double)volume_remap[0].z,
 				             (double)volume_remap[1].x, (double)volume_remap[1].y, (double)volume_remap[1].z,
 				             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z);

@@ -889,6 +889,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// (MAX blend over a 0 clear, no MIN cuts); compare flattens to binary
 	// R8; merge upscales+MAXes into the tier seed ahead of erode/blur.
 	static_assert(sizeof(volume_push) == 72);
+	static_assert(sizeof(compare_push) == 96);
 	{
 		auto volume_vert = load_shader(device, "volume.vert");
 		auto volume_frag = load_shader(device, "volume_raster.frag");
@@ -1028,7 +1029,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .pName = "main",
 		        },
 		};
-		vk::DescriptorSetLayoutBinding compare_bindings[3] = {
+		vk::DescriptorSetLayoutBinding compare_bindings[2] = {
 		        {
 		                .binding = 0,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -1041,31 +1042,32 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .descriptorCount = 1,
 		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
 		        },
-		        {
-		                .binding = 2,
-		                .descriptorType = vk::DescriptorType::eUniformBuffer,
-		                .descriptorCount = 1,
-		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-		        },
 		};
 		vk::DescriptorSetLayoutCreateInfo compare_set_info{
-		        .bindingCount = 3,
+		        .bindingCount = 2,
 		        .pBindings = compare_bindings,
 		};
 		compare_set_layout = vk::raii::DescriptorSetLayout(device, compare_set_info);
+		vk::PushConstantRange compare_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(compare_push),
+		};
 		vk::PipelineLayoutCreateInfo compare_pipe_layout_info{
 		        .setLayoutCount = 1,
 		        .pSetLayouts = &*compare_set_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &compare_push_range,
 		};
 		compare_pipe_layout = vk::raii::PipelineLayout(device, compare_pipe_layout_info);
-		vk::DescriptorPoolSize compare_pool_sizes[2] = {
-		        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 2},
-		        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1},
+		vk::DescriptorPoolSize compare_pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 2,
 		};
 		vk::DescriptorPoolCreateInfo compare_pool_info{
 		        .maxSets = 1,
-		        .poolSizeCount = 2,
-		        .pPoolSizes = compare_pool_sizes,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &compare_pool_size,
 		};
 		compare_pool = vk::raii::DescriptorPool(device, compare_pool_info);
 		vk::DescriptorSetAllocateInfo compare_alloc_info{
@@ -1139,23 +1141,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 			compare_pipelines[mode] = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
 		}
 			}
-	// Remap UBO (host-visible, updated per volume record like the depth
-	// overlay's params: memcpy + unmap + explicit flush).
-	static_assert(sizeof(volume_remap_ubo) == 96);
-	{
-		remap_ubo = buffer_allocation{
-		        device,
-		        vk::BufferCreateInfo{
-		                .size = sizeof(volume_remap_ubo),
-		                .usage = vk::BufferUsageFlagBits::eUniformBuffer,
-		        },
-		        VmaAllocationCreateInfo{
-		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-		                .usage = VMA_MEMORY_USAGE_AUTO,
-		        },
-		        "volume remap",
-		};
-	}
+	// Compare homography rides push constants (named vec4 members, see
+	// header); no UBO, no per-frame upload — filled at record time.
 	// Exact-texel sampler for the compare taps (sensor + volume depth),
 	// same discipline as the depth overlay: filtering would smear texel
 	// edges into false inside/outside votes.
@@ -2418,17 +2405,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_depth.image);
 			{
 				section_clock compare_clk(&ms_volume_compare);
-				// Remap upload (96B memcpy + flush, depth-overlay idiom).
-				// Logged once on the stream side ([ubo] tag); the debug
-				// pipelines below bypass it entirely (mode 1 needs no UBO).
-				{
-					volume_remap_ubo remap{};
-					for (int i = 0; i < 6; ++i)
-						remap.h[i] = volume->remap_cols[i];
-					std::memcpy(remap_ubo.map(), &remap, sizeof(remap));
-					remap_ubo.unmap();
-					vmaFlushAllocation(vk_allocator::instance(), remap_ubo, 0, sizeof(remap));
-				}
+				// Homography push fill (96B named vec4s — push arrays and the
+				// fragment UBO both read back zero on this driver). Pushed below
+				// just before the draw.
+				compare_push cmp_push{};
+				for (int i = 0; i < 6; ++i)
+					cmp_push.h[i] = volume->remap_cols[i];
 				vk::DescriptorImageInfo sensor_info{
 					        .sampler = *volume_sampler_nearest,
 					        .imageView = volume->sensor_view,
@@ -2442,12 +2424,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 					};
 				std::array<vk::CopyDescriptorSet, 0> no_compare_copies{};
-				vk::DescriptorBufferInfo remap_info{
-				        .buffer = vk::Buffer(remap_ubo),
-				        .offset = 0,
-				        .range = sizeof(volume_remap_ubo),
-				};
-				std::array<vk::WriteDescriptorSet, 3> compare_writes = {{
+				std::array<vk::WriteDescriptorSet, 2> compare_writes = {{
 					{
 					        .dstSet = *compare_set,
 					        .dstBinding = 0,
@@ -2461,13 +2438,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .descriptorCount = 1,
 					        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 					        .pImageInfo = &volume_info,
-					},
-					{
-					        .dstSet = *compare_set,
-					        .dstBinding = 2,
-					        .descriptorCount = 1,
-					        .descriptorType = vk::DescriptorType::eUniformBuffer,
-					        .pBufferInfo = &remap_info,
 					},
 				}};
 				device.updateDescriptorSets(compare_writes, no_compare_copies);
@@ -2488,6 +2458,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipelines[mode]);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *compare_pipe_layout, 0, cmp_sets, no_offsets);
+				cmd.pushConstants<compare_push>(*compare_pipe_layout, vk::ShaderStageFlagBits::eFragment, 0, cmp_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}
