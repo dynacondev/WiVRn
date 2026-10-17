@@ -29,15 +29,15 @@ layout(location = 0) out vec4 out_color;
 // reproduces the direct tap. Strict sensor < render, far / no-data
 // hidden, out-of-frustum hidden.
 //
-// The remap rides a uniform texel buffer (6 vec4 texels): sampler-unit
-// reads are the one path proven live in this shader (fragment UBO and
-// push reads both return zero on this driver). Updated per volume
-// record with the same memcpy+flush idiom as the depth overlay.
+// The remap rides a tiny sampled image (8x1 RGBA32F, texels 0..5 =
+// H columns): sampler reads are the read unit proven live in this
+// shader (fragment UBO, push and texel-buffer reads all return zero on
+// this driver). Same descriptor type as the two working bindings.
 // Per-eye homography columns: eye e uses texels [3e..3e+2].
-layout(set = 0, binding = 2) uniform samplerBuffer h_tex;
+layout(set = 0, binding = 2) uniform sampler2D h_img;
 // MODE is a plain constant (no specialization: spec-constant pipelines
 // were also eliminated as a suspect on this build):
-// 0 = remap via texel buffer, 1 = hardcoded flip (no homography read),
+// 0 = remap via sampled image, 1 = hardcoded flip (no homography read),
 // 2 = sensor raw, 3 = volume raw. Modes 2/3 bypass the comparison to
 // localize an empty mask to the sensor input vs the volume raster.
 
@@ -53,12 +53,12 @@ void main()
 	vec2 suv = vec2(uv.x, 1.0 - uv.y);
 	if (MODE == 0)
 	{
-		vec4 h0 = texelFetch(h_tex, 0);
-		vec4 h1 = texelFetch(h_tex, 1);
-		vec4 h2 = texelFetch(h_tex, 2);
-		vec4 h3 = texelFetch(h_tex, 3);
-		vec4 h4 = texelFetch(h_tex, 4);
-		vec4 h5 = texelFetch(h_tex, 5);
+		vec4 h0 = texelFetch(h_img, ivec2(0, 0), 0);
+		vec4 h1 = texelFetch(h_img, ivec2(1, 0), 0);
+		vec4 h2 = texelFetch(h_img, ivec2(2, 0), 0);
+		vec4 h3 = texelFetch(h_img, ivec2(3, 0), 0);
+		vec4 h4 = texelFetch(h_img, ivec2(4, 0), 0);
+		vec4 h5 = texelFetch(h_img, ivec2(5, 0), 0);
 		mat3 H = (gl_ViewIndex == 0) ? mat3(h0, h1, h2)
 		                             : mat3(h3, h4, h5);
 		vec3 p = H * vec3(uv, 1.0);
@@ -92,15 +92,5 @@ void main()
 		return;
 	}
 	float inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
-	if (MODE == 0)
-	{
-		// CONTROL (one build only): hardcoded 1.0 full-canvas, no reads
-		// at all. The merge only transfers the object-footprint box, so
-		// a half-canvas echo can miss it entirely; full-canvas must stamp
-		// the box wherever it is. Patch at the object = apparatus valid;
-		// still VR = the echo path itself is broken downstream.
-		out_color = vec4(1.0);
-		return;
-	}
 	out_color = vec4(inside);
 }

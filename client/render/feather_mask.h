@@ -398,16 +398,19 @@ private:
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
 	// Compare homography staging: 6 vec4s (16B each, 96B total)
-	// filled per volume record from volume_input, uploaded to remap_ubo
-	// and read back through remap_view as a uniform texel buffer —
-	// sampler-unit reads are the only live path in the compare shader
-	// (fragment UBO and push reads return zero on this driver).
+	// filled per volume record from volume_input, uploaded through
+	// remap_stage into remap_img (8x1 RGBA32F sampled image) and read
+	// back with texelFetch. Same descriptor type as the two working
+	// sampler bindings; sampler reads are the only live path in the
+	// compare shader on this driver.
 	struct compare_push
 	{
 		glm::vec4 h[6]{};
 	};
-	buffer_allocation remap_ubo;
-	vk::raii::BufferView remap_view{nullptr};
+	buffer_allocation remap_stage;
+	image_allocation remap_img;
+	vk::raii::ImageView remap_view{nullptr};
+	bool remap_img_live = false;
 	// Debug pipelines (spec-constant MODE, selected CPU-side): 0 remap,
 	// 1 hardcoded flip (no homography read), 2 sensor raw, 3 volume raw.
 	std::array<vk::raii::Pipeline, 4> compare_pipelines{{nullptr, nullptr, nullptr, nullptr}};
