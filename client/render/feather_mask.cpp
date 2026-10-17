@@ -1758,6 +1758,36 @@ void feather_mask_renderer::ensure_volume_targets()
 	                .layers = 2,
 	        });
 
+	// Presmooth workspace (R8, same shape as volume_bin): the 2x2
+	// coverage output is blurred H+V here, then V writes back into
+	// volume_bin, so the merge below upscales an already-smooth field.
+	// Framebuffer under the same blur pass (format-identical: the only
+	// compatibility that matters).
+	std::tie(volume_smooth.image, volume_smooth.memory) = make_target_image(blur_format);
+	volume_smooth.view_array = vk::raii::ImageView(device,
+	        vk::ImageViewCreateInfo{
+	                .image = *volume_smooth.image,
+	                .viewType = vk::ImageViewType::e2DArray,
+	                .format = blur_format,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .baseMipLevel = 0,
+	                        .levelCount = 1,
+	                        .baseArrayLayer = 0,
+	                        .layerCount = 2,
+	                },
+	        });
+	vk::ImageView raw_smooth_array = *volume_smooth.view_array;
+	volume_smooth.blur_fb_mv = vk::raii::Framebuffer(device,
+	        vk::FramebufferCreateInfo{
+	                .renderPass = *blur_r8_renderpass_mv,
+	                .attachmentCount = 1,
+	                .pAttachments = &raw_smooth_array,
+	                .width = ve.width,
+	                .height = ve.height,
+	                .layers = 2,
+	        });
+
 	volume_targets_ready = true;
 	spdlog::info("Fiducial mask depth-volume targets: {}x{}", ve.width, ve.height);
 }
@@ -2451,6 +2481,55 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_bin.image);
 			{
 				section_clock merge_clk(&ms_volume_merge);
+				// Presmooth the 320px coverage field H+V (wide kernel):
+				// stairs smaller than the blur radius vanish into a stable
+				// gradient instead of shimmering through the upscale. CPU
+				// and GPU cost land in the merge spans by construction.
+				// H: bin -> smooth. CLEAR zeroes outside the box (same
+				// discipline as the compare pass), so edge taps read
+				// defined 0 instead of tile garbage.
+				update_source(*volume_bin.view_array, 0);
+				make_writable(*volume_smooth.image);
+				vk::RenderPassBeginInfo begin_smooth_h{
+					        .renderPass = *blur_r8_renderpass_mv,
+					        .framebuffer = *volume_smooth.blur_fb_mv,
+					        .renderArea = {.offset = {0, 0}, .extent = ve},
+					        .clearValueCount = 1,
+					        .pClearValues = &clear,
+				};
+				cmd.beginRenderPass(begin_smooth_h, vk::SubpassContents::eInline);
+				set_full_viewport(ve);
+				cmd.setScissor(0, pass_scissor(ve));
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
+				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[0]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
+				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, volume_smooth_spread, 0};
+				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
+				make_readable(*volume_smooth.image);
+				// V: smooth -> bin. CLEAR + box draw fully restores the
+				// canvas, so the merge below reads defined data everywhere.
+				update_source(*volume_smooth.view_array, 2);
+				make_writable(*volume_bin.image);
+				vk::RenderPassBeginInfo begin_smooth_v{
+					        .renderPass = *blur_r8_renderpass_mv,
+					        .framebuffer = *volume_bin.blur_fb_mv,
+					        .renderArea = {.offset = {0, 0}, .extent = ve},
+					        .clearValueCount = 1,
+					        .pClearValues = &clear,
+				};
+				cmd.beginRenderPass(begin_smooth_v, vk::SubpassContents::eInline);
+				set_full_viewport(ve);
+				cmd.setScissor(0, pass_scissor(ve));
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
+				std::array<vk::DescriptorSet, 1> smooth_v_sets{*descriptor_sets[2]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_v_sets, no_offsets);
+				blur_push smooth_v{{1.f / ve.width, 1.f / ve.height}, {0, 1}, volume_smooth_spread, 0};
+				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_v);
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
+				make_readable(*volume_bin.image);
 				// LOAD-after-write ordering, same as the cutout punch
 				// barrier below: without it a tile GPU may MAX against
 				// stale seed tiles.
