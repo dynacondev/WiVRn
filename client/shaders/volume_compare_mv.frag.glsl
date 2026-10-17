@@ -27,11 +27,16 @@ layout(location = 0) out vec4 out_color;
 // tap is remapped through the capture<->display relative rotation, then
 // nudged by T/depth for sideways parallax (forward/radial + depth-value
 // terms are NOT handled here — that residual is the experiment).
-// Identity reproduces the direct tap. Adaptive sensor<v band (coverage
-// AA: width follows the local depth slope, flat interiors stay binary),
-// far / no-data hidden, out-of-frustum hidden. Both taps are LINEAR-filtered
-// (host sampler): the bilinear depth ramp feeds the slope estimate.
-// Branchless by construction (derivatives need full-quad execution).
+// Identity reproduces the direct tap. Binary sensor<v test with hard
+// far / no-data guards, evaluated 2x2 per texel (quarter-texel eye-UV
+// offsets, averaged): true geometric coverage, so the contour positions
+// sub-texel and diagonals stop staircasing. 12 taps per texel (3 per
+// sub-pixel) instead of 3 -- the price of real AA. Both taps are
+// LINEAR-filtered (host sampler).
+// (History: per-texel softening — fixed and slope-adaptive e bands —
+// could only fade whole texels, never move contour vertices between
+// them, and the fixed band went transparent on thin interiors. Only a
+// finer evaluation rate fixes texel-corner stairs.)
 //
 // The remap rides push constants as 8 NAMED vec4 members (not a GLSL
 // array: push-constant arrays have driver-defined packing, while
@@ -61,8 +66,8 @@ layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
 
 void main()
 {
-	// Branchless eye select (mix, never a ternary/mat3): derivatives
-	// below need every quad lane on the same code path.
+	// Branchless eye select (mix, never a ternary/mat3): subs within a
+	// pixel diverge, so validity stays flag-folded throughout.
 	float vi = float(gl_ViewIndex);
 	float m = step(0.5, vi);
 	vec4 c0 = mix(pc.h0, pc.h3, m);
@@ -73,53 +78,43 @@ void main()
 	float ka = corr.z;
 	float kb = corr.w;
 
-	float px = c0.x * uv.x + c1.x * uv.y + c2.x;
-	float py = c0.y * uv.x + c1.y * uv.y + c2.y;
-	float pz = c0.z * uv.x + c1.z * uv.y + c2.z;
-	vec2 s = vec2(px, py) / max(pz, 1e-6);
-	// Validity folded into a flag (no early returns: dFdx/dFdy are only
-	// defined when the whole quad runs every fetch). Out-of-range
-	// fetches hit clamp-to-edge and die in the flag.
-	float ok = step(1e-6, pz)
-	         * step(0.0, s.x) * step(s.x, 1.0)
-	         * step(0.0, s.y) * step(s.y, 1.0);
+	// 2x2 supersample: the verdict is evaluated at four quarter-texel
+	// eye-UV positions and averaged, giving true geometric coverage
+	// (0/.25/.5/.75/1). Per-texel softening can only fade whole texels;
+	// only a finer evaluation rate moves contour vertices between
+	// texels, which is what de-staircases diagonals. The warp (H poly,
+	// k-guard) is per-sub: sharing center-k would reintroduce the
+	// discontinuity catch-22 at sub scale for the exact pixels this
+	// fixes.
+	const float q = 0.25 / 320.0;
+	float inside = 0.0;
+	for (int i = 0; i < 4; ++i)
+	{
+		vec2 uvi = uv + (vec2(float(i & 1), float((i >> 1) & 1)) - 0.5) * (2.0 * q);
+		float px = c0.x * uvi.x + c1.x * uvi.y + c2.x;
+		float py = c0.y * uvi.x + c1.y * uvi.y + c2.y;
+		float pz = c0.z * uvi.x + c1.z * uvi.y + c2.z;
+		float ok = step(1e-6, pz);
+		vec2 s = vec2(px, py) / max(pz, 1e-6);
+		ok *= step(0.0, s.x) * step(s.x, 1.0) * step(0.0, s.y) * step(s.y, 1.0);
 
-	// B2 lateral: one depth-dependent nudge from the rotation-only spot.
-	// T maps 1/depth (1/m) to sensor-UV; k = 1/depth from D (affine, no
-	// divide). Far/no-data (D~1) yields k~0: the second tap lands on the
-	// same texel (cache hit). Forward/radial + depth-value terms are
-	// deliberately absent here.
-	vec2 suv0 = s;
-	float d0 = texture(sensor_tex, vec3(suv0, vi)).r;
-	float v = texture(volume_tex, vec3(uv, vi)).r;
-	// k guard: at depth discontinuities the rotation-only spot can land
-	// on background (k_sens ~ 0, no shift, one-sided edge erosion). The
-	// live volume depth is always on the correct side of the edge, so
-	// fall back to it. Interior pixels are unaffected (the nearer
-	// sensor/hand depth wins the max); v == 0 contributes 0 below
-	// regardless of k. Clamped to a 5cm floor.
-	float k_sens = ka * d0 + kb;
-	float k_vol = (v > 0.0) ? ka * v + kb : 0.0;
-	float k = min(max(k_sens, k_vol), 20.0);
-	vec2 suv1 = suv0 + T * k;
-	float ok1 = ok
-	          * step(0.0, suv1.x) * step(suv1.x, 1.0)
-	          * step(0.0, suv1.y) * step(suv1.y, 1.0);
-	float d = texture(sensor_tex, vec3(suv1, vi)).r;
+		// B2 lateral: one depth-dependent nudge from the rotation-only
+		// spot (T maps 1/depth to sensor-UV, k affine in D, no divide).
+		// Forward/radial + depth-value terms deliberately absent.
+		vec2 suv0 = s;
+		float d0 = texture(sensor_tex, vec3(suv0, vi)).r;
+		float v = texture(volume_tex, vec3(uvi, vi)).r;
+		// k guard per sub (see above for why it can't be shared).
+		float k_sens = ka * d0 + kb;
+		float k_vol = (v > 0.0) ? ka * v + kb : 0.0;
+		float k = min(max(k_sens, k_vol), 20.0);
+		vec2 suv1 = suv0 + T * k;
+		ok *= step(0.0, suv1.x) * step(suv1.x, 1.0) * step(0.0, suv1.y) * step(suv1.y, 1.0);
+		float d = texture(sensor_tex, vec3(suv1, vi)).r;
 
-	// Adaptive e (screen-space AA width): the band follows the local
-	// depth slope, so flat interiors stay binary-solid (no transparency:
-	// e ~ 0 where nothing varies) while edge texels spanning a depth gap
-	// get a full-texel gradient (coverage-like, self-tuned per edge and
-	// stable across depths — a fixed D-wide e can never do both). c ~ 0.5
-	// starts the gradient at roughly the edge width; the 1e-4 floor keeps
-	// smoothstep defined on perfectly flat fields.
-	float gx = abs(dFdx(d)) + abs(dFdx(v));
-	float gy = abs(dFdy(d)) + abs(dFdy(v));
-	float e = 0.5 * (gx + gy) + 1e-4;
-	// Far (d ~= 1) and empty-volume (v == 0) stay hard-excluded; the band
-	// only feathers the d~v boundary itself.
-	float inside = (1.0 - smoothstep(v - e, v + e, d))
-	             * ok1 * step(1e-6, v) * (1.0 - step(0.9999, d));
-	out_color = vec4(inside);
+		// Binary vote, hard guards (far d, empty v): the 4-level average
+		// IS the antialiasing, no band tuning involved.
+		inside += ok * (1.0 - step(v, d)) * step(1e-6, v) * (1.0 - step(0.9999, d));
+	}
+	out_color = vec4(inside * 0.25);
 }
