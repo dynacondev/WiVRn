@@ -407,7 +407,12 @@ private:
 		glm::vec4 corr[2]{};
 	};
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
-	vk::raii::Sampler volume_sampler_nearest{nullptr};
+	// Linear sampler for the compare taps (sensor + volume depth):
+	// deliberate coverage-AA. Bilinear ramps the depth across edge texels
+	// so the d<v crossing slides sub-texel instead of stepping on the
+	// 320-grid; the upscale+blur feather then smooths an already-smooth
+	// outline. Transition verdicts stay within ~1 texel + feather.
+	vk::raii::Sampler volume_sampler_linear{nullptr};
 	// Upscale+MAX merge into the tier seed (LOAD, preserves the
 	// silhouette + reversed-cut result, sets 1 where the sensor is
 	// inside). Reuses the blur shaders with spread 0 (the linear

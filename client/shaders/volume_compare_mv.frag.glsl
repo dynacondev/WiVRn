@@ -28,7 +28,10 @@ layout(location = 0) out vec4 out_color;
 // nudged by T/depth for sideways parallax (forward/radial + depth-value
 // terms are NOT handled here — that residual is the experiment).
 // Identity reproduces the direct tap. Strict sensor < render, far /
-// no-data hidden, out-of-frustum hidden.
+// no-data hidden, out-of-frustum hidden. Both taps are LINEAR-filtered
+// (host sampler): the bilinear depth ramp is the outline pre-smoothing,
+// so the d<v crossing positions sub-texel — the blur feather then
+// smooths an already-smooth edge. Transition verdicts stay ~1 texel.
 //
 // The remap rides push constants as 8 NAMED vec4 members (not a GLSL
 // array: push-constant arrays have driver-defined packing, while

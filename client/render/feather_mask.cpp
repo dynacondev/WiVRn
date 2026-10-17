@@ -1127,14 +1127,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 			}
 	// Homography rides push constants (named vec4 members, see header);
 	// no buffers, views, copies or barriers per frame.
-	// Exact-texel sampler for the compare taps (sensor + volume depth),
-	// same discipline as the depth overlay: filtering would smear texel
-	// edges into false inside/outside votes.
+	// Linear sampler for the compare taps (sensor + volume depth),
+	// same filtering as the blur passes: the bilinear ramp is the
+	// outline pre-smoothing (see header), not a correctness hazard.
 	{
-		vk::SamplerCreateInfo volume_nearest_info{
-		        .magFilter = vk::Filter::eNearest,
-		        .minFilter = vk::Filter::eNearest,
-		        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+		vk::SamplerCreateInfo volume_linear_info{
+		        .magFilter = vk::Filter::eLinear,
+		        .minFilter = vk::Filter::eLinear,
+		        .mipmapMode = vk::SamplerMipmapMode::eLinear,
 		        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
 		        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
 		        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
@@ -1144,7 +1144,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .minLod = 0,
 		        .maxLod = 0,
 		};
-		volume_sampler_nearest = vk::raii::Sampler(device, volume_nearest_info);
+		volume_sampler_linear = vk::raii::Sampler(device, volume_linear_info);
 	}
 	// Merge: upscale the 320px binary canvas into the tier seed with MAX
 	// blending (LOAD preserves silhouettes + reversed cuts, 1s set where
@@ -2397,14 +2397,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				for (int i = 0; i < 2; ++i)
 					hom.corr[i] = volume->remap_corr[i];
 				vk::DescriptorImageInfo sensor_info{
-					        .sampler = *volume_sampler_nearest,
+					        .sampler = *volume_sampler_linear,
 					        .imageView = volume->sensor_view,
 					        // The runtime hands the acquired image ready to
 					        // sample (acquire is the sync point).
 					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 					};
 				vk::DescriptorImageInfo volume_info{
-					        .sampler = *volume_sampler_nearest,
+					        .sampler = *volume_sampler_linear,
 					        .imageView = *volume_depth.view_array,
 					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 					};
