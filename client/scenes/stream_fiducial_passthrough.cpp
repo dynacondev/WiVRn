@@ -1154,6 +1154,16 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (not depth_status.empty())
 		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
+	{
+		// Depth-volume compare debug viz (spec-constant pipelines,
+		// selected CPU-side): remap, hardcoded flip (no UBO read),
+		// sensor raw, volume raw. Localizes an empty volume mask to the
+		// remap transport vs the sensor/volume inputs.
+		const char * volume_modes[] = {"Remap", "Hardcoded flip", "Sensor raw", "Volume raw"};
+		int volume_mode = std::clamp(debug_volume_mode, 0, 3);
+		if (ImGui::Combo(_S("Depth volume debug"), &volume_mode, volume_modes, 4))
+			debug_volume_mode = std::clamp(volume_mode, 0, 3);
+	}
 
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)

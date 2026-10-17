@@ -70,15 +70,10 @@ struct erode_push
 };
 static_assert(sizeof(erode_push) == 24);
 
-// Rotation-reprojection push block (fragment only): per-eye homography
-// as 6 vec4 columns (mat3 would pack ambiguously across GLSL/C++; vec4
-// arrays are 16-byte strided on both sides). 96 bytes, well under the
-// 128-byte push limit.
-struct compare_push
-{
-	glm::vec4 h[6]{};
-};
-static_assert(sizeof(compare_push) == 96);
+// Rotation-reprojection UBO mirror (fragment only): per-eye homography
+// as 6 vec4 columns. std140 vec4 arrays are 16-byte strided on both
+// sides, so the C++ mirror packs identically (96 bytes, asserted below
+// next to the upload).
 
 // Erosion radius selector for internal-only feathering: the blur support
 // reaches ~2*spread past the silhouette (spread is defined in blur-input
@@ -1005,7 +1000,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .pName = "main",
 		        },
 		};
-		vk::DescriptorSetLayoutBinding compare_bindings[2] = {
+		vk::DescriptorSetLayoutBinding compare_bindings[3] = {
 		        {
 		                .binding = 0,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -1018,32 +1013,31 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .descriptorCount = 1,
 		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
 		        },
+		        {
+		                .binding = 2,
+		                .descriptorType = vk::DescriptorType::eUniformBuffer,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
 		};
 		vk::DescriptorSetLayoutCreateInfo compare_set_info{
-		        .bindingCount = 2,
+		        .bindingCount = 3,
 		        .pBindings = compare_bindings,
 		};
 		compare_set_layout = vk::raii::DescriptorSetLayout(device, compare_set_info);
-		vk::PushConstantRange compare_push_range{
-		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
-		        .offset = 0,
-		        .size = sizeof(compare_push),
-		};
 		vk::PipelineLayoutCreateInfo compare_pipe_layout_info{
 		        .setLayoutCount = 1,
 		        .pSetLayouts = &*compare_set_layout,
-		        .pushConstantRangeCount = 1,
-		        .pPushConstantRanges = &compare_push_range,
 		};
 		compare_pipe_layout = vk::raii::PipelineLayout(device, compare_pipe_layout_info);
-		vk::DescriptorPoolSize compare_pool_size{
-		        .type = vk::DescriptorType::eCombinedImageSampler,
-		        .descriptorCount = 2,
+		vk::DescriptorPoolSize compare_pool_sizes[2] = {
+		        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 2},
+		        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1},
 		};
 		vk::DescriptorPoolCreateInfo compare_pool_info{
 		        .maxSets = 1,
-		        .poolSizeCount = 1,
-		        .pPoolSizes = &compare_pool_size,
+		        .poolSizeCount = 2,
+		        .pPoolSizes = compare_pool_sizes,
 		};
 		compare_pool = vk::raii::DescriptorPool(device, compare_pool_info);
 		vk::DescriptorSetAllocateInfo compare_alloc_info{
@@ -1083,20 +1077,56 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .dynamicStateCount = 2,
 		        .pDynamicStates = compare_dynamics,
 		};
-		vk::GraphicsPipelineCreateInfo compare_pipeline_info{
-		        .stageCount = 2,
-		        .pStages = compare_stages,
-		        .pVertexInputState = &compare_vertex_input,
-		        .pInputAssemblyState = &compare_input_assembly,
-		        .pViewportState = &compare_viewport_state,
-		        .pRasterizationState = &compare_rasterization,
+		// One pipeline per MODE (spec constant baked in): selected
+		// CPU-side, so the debug ladder needs no runtime transport at all.
+		for (int mode = 0; mode < 4; ++mode)
+		{
+			vk::SpecializationMapEntry mode_entry{
+			        .constantID = 0,
+			        .offset = 0,
+			        .size = sizeof(int32_t),
+			};
+			int32_t mode_value = mode;
+			vk::SpecializationInfo mode_spec{
+			        .mapEntryCount = 1,
+			        .pMapEntries = &mode_entry,
+			        .dataSize = sizeof(mode_value),
+			        .pData = &mode_value,
+			};
+			vk::PipelineShaderStageCreateInfo mode_stages[2] = {compare_stages[0], compare_stages[1]};
+			mode_stages[1].pSpecializationInfo = &mode_spec;
+			vk::GraphicsPipelineCreateInfo compare_pipeline_info{
+			        .stageCount = 2,
+			        .pStages = mode_stages,
+			        .pVertexInputState = &compare_vertex_input,
+			        .pInputAssemblyState = &compare_input_assembly,
+			        .pViewportState = &compare_viewport_state,
+		                .pRasterizationState = &compare_rasterization,
 		        .pMultisampleState = &compare_multisample,
 		        .pColorBlendState = &compare_blend,
 		        .pDynamicState = &compare_dynamic,
 		        .layout = *compare_pipe_layout,
 		        .renderPass = *blur_r8_renderpass_mv,
 		};
-		compare_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
+			compare_pipelines[mode] = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
+		}
+			}
+	// Remap UBO (host-visible, updated per volume record like the depth
+	// overlay's params: memcpy + unmap + explicit flush).
+	static_assert(sizeof(volume_remap_ubo) == 96);
+	{
+		remap_ubo = buffer_allocation{
+		        device,
+		        vk::BufferCreateInfo{
+		                .size = sizeof(volume_remap_ubo),
+		                .usage = vk::BufferUsageFlagBits::eUniformBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "volume remap",
+		};
 	}
 	// Exact-texel sampler for the compare taps (sensor + volume depth),
 	// same discipline as the depth overlay: filtering would smear texel
@@ -2360,6 +2390,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_depth.image);
 			{
 				section_clock compare_clk(&ms_volume_compare);
+				// Remap upload (96B memcpy + flush, depth-overlay idiom).
+				// Logged once on the stream side ([ubo] tag); the debug
+				// pipelines below bypass it entirely (mode 1 needs no UBO).
+				{
+					volume_remap_ubo remap{};
+					for (int i = 0; i < 6; ++i)
+						remap.h[i] = volume->remap_cols[i];
+					std::memcpy(remap_ubo.map(), &remap, sizeof(remap));
+					remap_ubo.unmap();
+					vmaFlushAllocation(vk_allocator::instance(), remap_ubo, 0, sizeof(remap));
+				}
 				vk::DescriptorImageInfo sensor_info{
 					        .sampler = *volume_sampler_nearest,
 					        .imageView = volume->sensor_view,
@@ -2373,7 +2414,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 					};
 				std::array<vk::CopyDescriptorSet, 0> no_compare_copies{};
-				std::array<vk::WriteDescriptorSet, 2> compare_writes = {{
+				vk::DescriptorBufferInfo remap_info{
+				        .buffer = vk::Buffer(remap_ubo),
+				        .offset = 0,
+				        .range = sizeof(volume_remap_ubo),
+				};
+				std::array<vk::WriteDescriptorSet, 3> compare_writes = {{
 					{
 					        .dstSet = *compare_set,
 					        .dstBinding = 0,
@@ -2388,6 +2434,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 					        .pImageInfo = &volume_info,
 					},
+					{
+					        .dstSet = *compare_set,
+					        .dstBinding = 2,
+					        .descriptorCount = 1,
+					        .descriptorType = vk::DescriptorType::eUniformBuffer,
+					        .pBufferInfo = &remap_info,
+					},
 				}};
 				device.updateDescriptorSets(compare_writes, no_compare_copies);
 				vk::RenderPassBeginInfo begin_cmp{
@@ -2400,13 +2453,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.beginRenderPass(begin_cmp, vk::SubpassContents::eInline);
 				set_full_viewport(ve);
 				cmd.setScissor(0, pass_scissor(ve));
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipeline_mv);
+				int mode = std::clamp(volume_debug, 0, 3);
+					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipelines[mode]);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *compare_pipe_layout, 0, cmp_sets, no_offsets);
-				compare_push cmp_push{};
-				for (int i = 0; i < 6; ++i)
-					cmp_push.h[i] = volume->remap_cols[i];
-				cmd.pushConstants<compare_push>(*compare_pipe_layout, vk::ShaderStageFlagBits::eFragment, 0, cmp_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}

@@ -25,38 +25,61 @@ layout(location = 0) out vec4 out_color;
 
 // Depth-volume flatten with rotation reprojection: the sensor tap is
 // remapped through the capture<->display relative rotation so the
-// comparison tests the same world ray on both sides. H is the per-eye
-// homography (3x3 columns, w unused) mapping eye UV to sensor UV,
-// computed on the CPU as S_uv * A_d^-1 * D * R * S * A_e * E1 (exact
-// for rotation, any fov pair; identity reproduces the direct tap).
-// Strict sensor < render, far / no-data hidden, out-of-frustum hidden.
-layout(push_constant) uniform Push
+// comparison tests the same world ray on both sides. Identity
+// reproduces the direct tap. Strict sensor < render, far / no-data
+// hidden, out-of-frustum hidden.
+//
+// The remap lives in a UBO (push arrays read back as zero on some
+// drivers): per-eye homography columns, w unused, eye e uses [3e..3e+2].
+// MODE is a specialization constant (separate pipeline per mode,
+// selected CPU-side, zero runtime transport):
+// 0 = remap via UBO, 1 = hardcoded flip (no UBO read), 2 = sensor raw,
+// 3 = volume raw. Modes 2/3 bypass the comparison to localize an
+// empty mask to the sensor input vs the volume raster.
+layout(set = 0, binding = 2) uniform Remap
 {
 	vec4 h[6];
 }
-pc;
+u;
+
+layout(constant_id = 0) const int MODE = 0;
 
 layout(set = 0, binding = 0) uniform sampler2DArray sensor_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
 
 void main()
 {
-	// Static branch (constant push indices per side): dynamically
-	// indexing the push array reads as zero on some drivers. The
-	// condition is dynamically uniform, so both sides stay legal.
-	mat3 H = (gl_ViewIndex == 0) ? mat3(pc.h[0], pc.h[1], pc.h[2])
-	                            : mat3(pc.h[3], pc.h[4], pc.h[5]);
-	vec3 p = H * vec3(uv, 1.0);
-	float inside = 0.0;
-	if (p.z > 1e-6)
+	vec2 suv = vec2(uv.x, 1.0 - uv.y);
+	if (MODE == 0)
 	{
-		vec2 suv = p.xy / p.z;
-		if (suv.x >= 0.0 && suv.x <= 1.0 && suv.y >= 0.0 && suv.y <= 1.0)
+		mat3 H = (gl_ViewIndex == 0) ? mat3(u.h[0], u.h[1], u.h[2])
+		                             : mat3(u.h[3], u.h[4], u.h[5]);
+		vec3 p = H * vec3(uv, 1.0);
+		if (p.z <= 1e-6)
 		{
-			float s = texture(sensor_tex, vec3(suv, float(gl_ViewIndex))).r;
-			float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
-			inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
+			out_color = vec4(0.0);
+			return;
 		}
+		vec2 s = p.xy / p.z;
+		if (s.x < 0.0 || s.x > 1.0 || s.y < 0.0 || s.y > 1.0)
+		{
+			out_color = vec4(0.0);
+			return;
+		}
+		suv = s;
 	}
+	float s = texture(sensor_tex, vec3(suv, float(gl_ViewIndex))).r;
+	if (MODE == 2)
+	{
+		out_color = vec4(vec3(s), 1.0);
+		return;
+	}
+	float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
+	if (MODE == 3)
+	{
+		out_color = vec4(vec3(v), 1.0);
+		return;
+	}
+	float inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
 	out_color = vec4(inside);
 }

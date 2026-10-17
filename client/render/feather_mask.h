@@ -42,6 +42,7 @@
 
 #include "render/passthrough_mesh.h"
 
+#include <algorithm>
 #include <array>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -188,6 +189,14 @@ public:
 		// with several volume groups the pool holds the LAST group only.
 		vk::QueryPool timestamp_pool = nullptr;
 	};
+	// Debug compare pipelines (spec-constant MODE, selected CPU-side):
+	// 0 remap, 1 hardcoded flip (no UBO read), 2 sensor raw, 3 volume
+	// raw. Session-scoped (Passthrough tab); groups share the setting.
+	void set_volume_debug(int mode)
+	{
+		volume_debug = std::clamp(mode, 0, 3);
+	}
+	int volume_debug = 0;
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -383,7 +392,16 @@ private:
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
-	vk::raii::Pipeline compare_pipeline_mv{nullptr};
+	// UBO mirror of the compare shader's Remap block (std140: 6x vec4,
+	// no padding issues). Updated per volume record from volume_input.
+	struct volume_remap_ubo
+	{
+		glm::vec4 h[6]{};
+	};
+	buffer_allocation remap_ubo;
+	// Debug pipelines (spec-constant MODE, selected CPU-side): 0 remap,
+	// 1 hardcoded flip (no UBO read), 2 sensor raw, 3 volume raw.
+	std::array<vk::raii::Pipeline, 4> compare_pipelines{{nullptr, nullptr, nullptr, nullptr}};
 	vk::raii::Sampler volume_sampler_nearest{nullptr};
 	// Upscale+MAX merge into the tier seed (LOAD, preserves the
 	// silhouette + reversed-cut result, sets 1 where the sensor is
