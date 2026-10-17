@@ -1375,12 +1375,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					float n = shared_depth.near_z;
 					float f = shared_depth.far_z;
 					float a = 0, b = 0;
-					if (n > 1e-6f and !(f > n))
+					// Same infinite-far convention as volume_raster.frag:
+					// !(f > n) or huge f means D = 1 - n/d.
+					if (n > 1e-6f and (!(f > n) or f > 1e9f))
 					{
 						a = -1.f / n;
 						b = 1.f / n;
 					}
-					else if (n > 1e-6f and f > n and f < 1e9f)
+					else if (n > 1e-6f and f > n)
 					{
 						a = -(f - n) / (f * n);
 						b = 1.f / n;
