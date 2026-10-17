@@ -1246,6 +1246,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		bool have_volume_sensor = false;
 		volume_want_frame = need_volume_depth;
 
+
 		// Once-per-frame depth acquire, shared by the volume chain and the
 		// debug viz. The spec allows a single acquire per frame
 		// (XR_ERROR_LIMIT_REACHED beyond that), so both consumers read
@@ -1304,6 +1305,70 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
+
+		// Rotation reprojection homographies (one per eye, shared by all
+		// groups): H = S_uv A_d^-1 D R S A_e E1 mapping eye UV to sensor
+		// UV, exact for rotation with any fov pair. Default is the flip
+		// matrix reproducing today's direct tap, so a degenerate frustum
+		// degrades to unrotated instead of breaking. Timed into the
+		// compare CPU (the warp's CPU cost lives there in the logs).
+		std::array<glm::vec4, 6> volume_remap{};
+		for (int e = 0; e < 2; ++e)
+		{
+			volume_remap[3 * e + 0] = glm::vec4(1, 0, 0, 0);
+			volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
+			volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
+		}
+		if (have_depth_frame and need_volume_depth and mask_frame)
+		{
+			auto remap_t0 = std::chrono::steady_clock::now();
+			auto tan4 = [](const XrFovf & f) {
+				return glm::vec4(std::tan(f.angleLeft), std::tan(f.angleRight), std::tan(f.angleUp), std::tan(f.angleDown));
+			};
+			bool fov_ok = true;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				auto te = tan4(mask_fov[view]);
+				auto td = tan4(shared_depth.fov[view]);
+				if (not (te.y > te.x and te.w > te.z and td.y > td.x and td.w > td.z))
+					fov_ok = false;
+			}
+			if (fov_ok)
+			{
+				auto A_of = [](const glm::vec4 & t) {
+					return glm::mat3(glm::vec3((t.y - t.x) * 0.5f, 0, 0), glm::vec3(0, (t.w - t.z) * 0.5f, 0),
+					                   glm::vec3((t.y + t.x) * 0.5f, (t.w + t.z) * 0.5f, 1));
+				};
+				auto Ainv_of = [](const glm::vec4 & t) {
+					return glm::mat3(glm::vec3(2.f / (t.y - t.x), 0, 0), glm::vec3(0, 2.f / (t.w - t.z), 0),
+					                   glm::vec3(-(t.y + t.x) / (t.y - t.x), -(t.w + t.z) / (t.w - t.z), 1));
+				};
+				const glm::mat3 E1(glm::vec3(2, 0, 0), glm::vec3(0, -2, 0), glm::vec3(-1, 1, 1));
+				const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, 0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
+				glm::mat3 SD(1.0f);
+				SD[2][2] = -1;
+				for (uint32_t view = 0; view < view_count; ++view)
+				{
+					glm::quat qc(shared_depth.pose[view].orientation.w, shared_depth.pose[view].orientation.x,
+					             shared_depth.pose[view].orientation.y, shared_depth.pose[view].orientation.z);
+					glm::quat qe(mask_pose[view].orientation.w, mask_pose[view].orientation.x,
+					             mask_pose[view].orientation.y, mask_pose[view].orientation.z);
+					glm::mat3 R = glm::mat3_cast(glm::inverse(qc) * qe);
+					glm::mat3 H = Suv * Ainv_of(tan4(shared_depth.fov[view])) * SD * R * SD * A_of(tan4(mask_fov[view])) * E1;
+					for (int c = 0; c < 3; ++c)
+						volume_remap[3 * view + c] = glm::vec4(H[c], 0);
+				}
+				if (not volume_remap_logged)
+				{
+					volume_remap_logged = true;
+					spdlog::info("Volume remap eye0 cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f})",
+					             (double)volume_remap[0].x, (double)volume_remap[0].y, (double)volume_remap[0].z,
+					             (double)volume_remap[1].x, (double)volume_remap[1].y, (double)volume_remap[1].z,
+					             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z);
+				}
+			}
+			volume_compare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
+		}
 
 		// View-only transforms for the mask record below. Live
 		// predicted views (mask_pose/mask_fov), not the video frame's
@@ -1753,6 +1818,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (any_volume)
 						{
 							vol_in.draws = volume_draws;
+							vol_in.remap_cols = volume_remap;
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;

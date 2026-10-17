@@ -23,21 +23,36 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Depth-volume flatten: strict sensor < render per texel, per eye.
-// Binary R8 output (1 = sensor resolves inside or in front of the
-// volume's far side, 0 otherwise). Raw D compare, no epsilon: the
-// low-res texel + feather absorb the boundary. Far / no-data never
-// reveals (s >= 1 -> 0); empty volume texels (v <= 0) never reveal.
-// The sensor tap carries the depth-side v-flip (bottom-up rows vs the
-// top-down framebuffer UV, same as depth_viz); the volume raster was
-// rendered in framebuffer space, so it samples unflipped.
+// Depth-volume flatten with rotation reprojection: the sensor tap is
+// remapped through the capture<->display relative rotation so the
+// comparison tests the same world ray on both sides. H is the per-eye
+// homography (3x3 columns, w unused) mapping eye UV to sensor UV,
+// computed on the CPU as S_uv * A_d^-1 * D * R * S * A_e * E1 (exact
+// for rotation, any fov pair; identity reproduces the direct tap).
+// Strict sensor < render, far / no-data hidden, out-of-frustum hidden.
+layout(push_constant) uniform Push
+{
+	vec4 h[6];
+}
+pc;
+
 layout(set = 0, binding = 0) uniform sampler2DArray sensor_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
 
 void main()
 {
-	float s = texture(sensor_tex, vec3(uv.x, 1.0 - uv.y, float(gl_ViewIndex))).r;
-	float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
-	float inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
+	mat3 H = mat3(pc.h[3 * gl_ViewIndex + 0], pc.h[3 * gl_ViewIndex + 1], pc.h[3 * gl_ViewIndex + 2]);
+	vec3 p = H * vec3(uv, 1.0);
+	float inside = 0.0;
+	if (p.z > 1e-6)
+	{
+		vec2 suv = p.xy / p.z;
+		if (suv.x >= 0.0 && suv.x <= 1.0 && suv.y >= 0.0 && suv.y <= 1.0)
+		{
+			float s = texture(sensor_tex, vec3(suv, float(gl_ViewIndex))).r;
+			float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
+			inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
+		}
+	}
 	out_color = vec4(inside);
 }

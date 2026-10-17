@@ -70,6 +70,16 @@ struct erode_push
 };
 static_assert(sizeof(erode_push) == 24);
 
+// Rotation-reprojection push block (fragment only): per-eye homography
+// as 6 vec4 columns (mat3 would pack ambiguously across GLSL/C++; vec4
+// arrays are 16-byte strided on both sides). 96 bytes, well under the
+// 128-byte push limit.
+struct compare_push
+{
+	glm::vec4 h[6]{};
+};
+static_assert(sizeof(compare_push) == 96);
+
 // Erosion radius selector for internal-only feathering: the blur support
 // reaches ~2*spread past the silhouette (spread is defined in blur-input
 // texels), so eroding by that much pulls the band inside. Returns 0
@@ -1014,11 +1024,18 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .pBindings = compare_bindings,
 		};
 		compare_set_layout = vk::raii::DescriptorSetLayout(device, compare_set_info);
-		vk::PipelineLayoutCreateInfo compare_layout_info{
+		vk::PushConstantRange compare_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(compare_push),
+		};
+		vk::PipelineLayoutCreateInfo compare_pipe_layout_info{
 		        .setLayoutCount = 1,
 		        .pSetLayouts = &*compare_set_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &compare_push_range,
 		};
-		compare_pipe_layout = vk::raii::PipelineLayout(device, compare_layout_info);
+		compare_pipe_layout = vk::raii::PipelineLayout(device, compare_pipe_layout_info);
 		vk::DescriptorPoolSize compare_pool_size{
 		        .type = vk::DescriptorType::eCombinedImageSampler,
 		        .descriptorCount = 2,
@@ -2386,6 +2403,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *compare_pipe_layout, 0, cmp_sets, no_offsets);
+				compare_push cmp_push{};
+				for (int i = 0; i < 6; ++i)
+					cmp_push.h[i] = volume->remap_cols[i];
+				cmd.pushConstants<compare_push>(*compare_pipe_layout, vk::ShaderStageFlagBits::eFragment, 0, cmp_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}

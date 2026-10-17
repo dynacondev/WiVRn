@@ -45,6 +45,7 @@
 #include <array>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 #include <map>
 #include <memory>
 #include <openxr/openxr.h>
@@ -178,6 +179,10 @@ public:
 		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
 		float near_z = 0.1f; // depth frustum the raster must match
 		float far_z = 10.f;
+		// Rotation reprojection: per-eye homography columns (eye e uses
+		// [3*e .. 3*e+2], w unused) mapping eye UV to sensor UV. Identity
+		// reproduces the direct tap; computed once per frame on the CPU.
+		std::array<glm::vec4, 6> remap_cols{};
 		// GPU timestamp sink (stream-owned, 4 queries: raster/compare/merge
 		// boundaries). Null disables stamping. Reset per record() call, so
 		// with several volume groups the pool holds the LAST group only.
