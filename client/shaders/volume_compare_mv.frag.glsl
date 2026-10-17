@@ -50,7 +50,9 @@ layout(push_constant) uniform Push
 }
 pc;
 
-layout(constant_id = 0) const int MODE = 0;
+const int MODE = 0; // Hardcoded: no specialization (spec-constant
+// pipelines misread push/UBO data on this driver, so the mode is a
+// plain constant and behavior is selected by which build is installed).
 
 layout(set = 0, binding = 0) uniform sampler2DArray sensor_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;

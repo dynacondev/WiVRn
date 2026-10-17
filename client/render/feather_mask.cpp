@@ -1107,27 +1107,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .dynamicStateCount = 2,
 		        .pDynamicStates = compare_dynamics,
 		};
-		// One pipeline per MODE (spec constant baked in): selected
-		// CPU-side, so the debug ladder needs no runtime transport at all.
+		// No specialization constants on this build: spec-constant
+		// pipelines misread push/UBO data on this driver, so MODE is a
+		// plain constant in the shader and every slot holds the identical
+		// pipeline (mode is hardcoded to 0 for this diagnostic build).
 		for (int mode = 0; mode < 4; ++mode)
 		{
-			vk::SpecializationMapEntry mode_entry{
-			        .constantID = 0,
-			        .offset = 0,
-			        .size = sizeof(int32_t),
-			};
-			int32_t mode_value = mode;
-			vk::SpecializationInfo mode_spec{
-			        .mapEntryCount = 1,
-			        .pMapEntries = &mode_entry,
-			        .dataSize = sizeof(mode_value),
-			        .pData = &mode_value,
-			};
-			vk::PipelineShaderStageCreateInfo mode_stages[2] = {compare_stages[0], compare_stages[1]};
-			mode_stages[1].pSpecializationInfo = &mode_spec;
 			vk::GraphicsPipelineCreateInfo compare_pipeline_info{
 			        .stageCount = 2,
-			        .pStages = mode_stages,
+			        .pStages = compare_stages,
 			        .pVertexInputState = &compare_vertex_input,
 			        .pInputAssemblyState = &compare_input_assembly,
 			        .pViewportState = &compare_viewport_state,
