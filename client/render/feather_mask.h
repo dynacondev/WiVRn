@@ -386,8 +386,13 @@ private:
 	vk::raii::PipelineLayout volume_raster_layout{nullptr};
 	vk::raii::Pipeline volume_raster_pipeline{nullptr};
 	// Compare (fullscreen _mv, 2 samplers: sensor D16 + volume R16).
-	// Reuses blur_r8_renderpass_mv + volume_bin.blur_fb_mv: the R8
-	// DONT_CARE shape is identical, only the fragment shader differs.
+	// Dedicated CLEAR renderpass over volume_bin.blur_fb_mv (same R8 MV
+	// shape as the blur intermediates; loadOp is not part of render-pass
+	// compatibility, so the framebuffer is shared). CLEAR, not DONT_CARE:
+	// the merge LINEAR-upscales the whole 320 canvas, and any texel the
+	// compare draw did not write must read back deterministic 0, never
+	// undefined tile garbage.
+	vk::raii::RenderPass compare_renderpass_mv{nullptr};
 	vk::raii::DescriptorSetLayout compare_set_layout{nullptr};
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};

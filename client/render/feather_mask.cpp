@@ -535,6 +535,34 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	blur_r8_renderpass_mv = vk::raii::RenderPass(device, blur_r8_rp_mv_info);
 
+	// Dedicated compare pass (see header): same R8 MV attachment shape,
+	// loadOp=CLEAR so every texel the merge upscales is defined.
+	vk::AttachmentDescription compare_attachment{
+	        .format = blur_format,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	};
+	vk::AttachmentReference compare_ref{
+	        .attachment = 0,
+	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	};
+	vk::SubpassDescription compare_subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &compare_ref,
+	};
+	vk::RenderPassCreateInfo compare_rp_mv_info{
+	        .pNext = &mv_rp_info,
+	        .attachmentCount = 1,
+	        .pAttachments = &compare_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &compare_subpass,
+	};
+	compare_renderpass_mv = vk::raii::RenderPass(device, compare_rp_mv_info);
+
 	// Merged erode-H/erode-V/blur-H triple: one renderpass, 3
 	// subpasses, attachments [src, tmp] (tier-1: A,B; tiered:
 	// h,eblur — identical specs, shared object). src enters live
@@ -1106,7 +1134,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .pColorBlendState = &compare_blend,
 		        .pDynamicState = &compare_dynamic,
 		        .layout = *compare_pipe_layout,
-		        .renderPass = *blur_r8_renderpass_mv,
+		        .renderPass = *compare_renderpass_mv,
 		};
 			compare_pipelines[mode] = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
 		}
@@ -2444,7 +2472,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}};
 				device.updateDescriptorSets(compare_writes, no_compare_copies);
 				vk::RenderPassBeginInfo begin_cmp{
-					        .renderPass = *blur_r8_renderpass_mv,
+					        .renderPass = *compare_renderpass_mv,
 					        .framebuffer = *volume_bin.blur_fb_mv,
 					        .renderArea = {.offset = {0, 0}, .extent = ve},
 					        .clearValueCount = 1,
@@ -2452,7 +2480,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					};
 				cmd.beginRenderPass(begin_cmp, vk::SubpassContents::eInline);
 				set_full_viewport(ve);
-				cmd.setScissor(0, pass_scissor(ve));
+				// Fullscreen on purpose (see header): CLEAR zeroed the canvas and
+				// the fragment shader writes every texel, so the merge upscale
+				// reads defined data everywhere.
+				cmd.setScissor(0, vk::Rect2D{{0, 0}, ve});
 				int mode = std::clamp(volume_debug, 0, 3);
 					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipelines[mode]);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
