@@ -152,6 +152,8 @@ public:
 		double volume_raster_ms = 0;
 		double volume_compare_ms = 0;
 		double volume_merge_ms = 0;
+		float volume_box_frac = 1; // merge-box area fraction of the seed
+		// (0-1); drives the renderArea scissor economics, logged.
 	};
 
 	// Record silhouettes + blur chain for both eyes into the layers of an

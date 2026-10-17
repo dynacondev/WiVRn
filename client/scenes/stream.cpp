@@ -1863,6 +1863,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						volume_last_tier = tier;
 						volume_last_feather = f;
 						volume_last_draws = (int)volume_draws.size();
+						volume_last_box_pct = (float)(mstats.volume_box_frac * 100.0);
 						volume_last_seed_w = (uint32_t)gw;
 						volume_last_seed_h = (uint32_t)gh;
 						// Depth-vs-eye pose divergence at record time: the

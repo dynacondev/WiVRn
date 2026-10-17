@@ -2433,10 +2433,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					};
 				cmd.beginRenderPass(begin_cmp, vk::SubpassContents::eInline);
 				set_full_viewport(ve);
-				// Fullscreen on purpose (see header): CLEAR zeroed the canvas and
-				// the fragment shader writes every texel, so the merge upscale
-				// reads defined data everywhere.
-				cmd.setScissor(0, vk::Rect2D{{0, 0}, ve});
+				// Footprint box only: the output footprint is the volume raster
+				// footprint (the remap only moves the sensor read), and CLEAR
+				// zeroed the canvas so unwritten texels read back defined 0
+				// instead of tile garbage.
+				cmd.setScissor(0, pass_scissor(ve));
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *compare_pipe_layout, 0, cmp_sets, no_offsets);
@@ -2470,15 +2471,23 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				                    {},
 				                    {},
 				                    merge_barrier);
+				// Box-sized render area: LOAD/STORE skip tiles outside it, so
+				// merge bandwidth scales with object area instead of seed area.
+				// Viewport stays full (surviving pixels keep correct UVs) and
+				// degenerate boxes fall back to fullscreen, never broken.
+				vk::Rect2D merge_box = pass_scissor(seed_ext);
+				if (cpu_stats)
+				        cpu_stats->volume_box_frac = (float)merge_box.extent.width * (float)merge_box.extent.height /
+				                                     ((float)seed_ext.width * (float)seed_ext.height);
 				vk::RenderPassBeginInfo begin_max{
 					        .renderPass = seed_is_rgb8 ? *volume_max_rgb8_renderpass : *volume_max_r8_renderpass,
 					        .framebuffer = seed_fb,
-					        .renderArea = {.offset = {0, 0}, .extent = seed_ext},
+					        .renderArea = merge_box,
 					        .clearValueCount = 0,
 					};
 				cmd.beginRenderPass(begin_max, vk::SubpassContents::eInline);
 				set_full_viewport(seed_ext);
-				cmd.setScissor(0, pass_scissor(seed_ext));
+				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *volume_max_rgb8_pipeline : *volume_max_r8_pipeline);
 				update_source(*volume_bin.view_array, 1);
 				std::array<vk::DescriptorSet, 1> max_sets{*descriptor_sets[1]};

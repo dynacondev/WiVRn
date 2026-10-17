@@ -253,10 +253,11 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		double va = (double)std::max<uint64_t>(volume_win_acquired, 1);
 		double win_s = volume_win_t0 != 0 ? (double)(predicted_display_time - volume_win_t0) * 1e-9 : 5.0;
 		double win_hz = win_s > 0 ? (double)volume_win_new_content / win_s : 0;
-		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/c/m {:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{}",
+		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/c/m {:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{}",
 		             (double)volume_last_feather, volume_last_tier, volume_last_draws,
 		             volume_last_seed_w, volume_last_seed_h, volume_sensor_w, volume_sensor_h,
 		             (double)volume_sensor_near, (double)volume_sensor_far,
+		             (double)volume_last_box_pct,
 		             volume_win_age_sum / va, volume_win_age_max,
 		             volume_win_dpos_sum / va, volume_win_dang_sum / va,
 		             volume_last_index, win_hz,

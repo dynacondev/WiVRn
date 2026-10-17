@@ -475,6 +475,7 @@ private:
 	int volume_last_tier = -1;
 	float volume_last_feather = 0;
 	int volume_last_draws = 0;
+	float volume_last_box_pct = 100; // merge-box % of seed (last group)
 	uint32_t volume_last_seed_w = 0, volume_last_seed_h = 0;
 	uint32_t volume_sensor_w = 0, volume_sensor_h = 0;
 	float volume_sensor_near = 0, volume_sensor_far = 0;
