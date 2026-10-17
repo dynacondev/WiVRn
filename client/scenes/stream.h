@@ -484,7 +484,7 @@ private:
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
-	int debug_volume_mode = 2; // HARDCODED diagnostic build (combo disabled in GUI): 0 remap, 1 flip, 2 sensor, 3 volume
+	int debug_volume_mode = 1; // HARDCODED diagnostic build (combo disabled in GUI): 0 remap, 1 flip, 2 sensor, 3 volume
 	bool volume_remap_logged = false; // one-shot H log for convention validation
 	// Sensor-mapping forensics (Volume heartbeat): content age from the
 	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
