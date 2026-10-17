@@ -92,11 +92,13 @@ void main()
 		return;
 	}
 	float inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
-	if (MODE == 0 && uv.x > 0.5)
+	if (MODE == 0)
 	{
-		// CONTROL (one build only): hardcoded 1.0, no reads at all. If
-		// the right half still shows VR, the echo path itself (not any
-		// transport) is broken and the transport chase was miscalibrated.
+		// CONTROL (one build only): hardcoded 1.0 full-canvas, no reads
+		// at all. The merge only transfers the object-footprint box, so
+		// a half-canvas echo can miss it entirely; full-canvas must stamp
+		// the box wherever it is. Patch at the object = apparatus valid;
+		// still VR = the echo path itself is broken downstream.
 		out_color = vec4(1.0);
 		return;
 	}
