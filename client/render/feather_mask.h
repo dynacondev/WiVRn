@@ -189,14 +189,6 @@ public:
 		// with several volume groups the pool holds the LAST group only.
 		vk::QueryPool timestamp_pool = nullptr;
 	};
-	// Debug compare pipelines (spec-constant MODE, selected CPU-side):
-	// 0 remap, 1 hardcoded flip (no UBO read), 2 sensor raw, 3 volume
-	// raw. Session-scoped (Passthrough tab); groups share the setting.
-	void set_volume_debug(int mode)
-	{
-		volume_debug = std::clamp(mode, 0, 3);
-	}
-	int volume_debug = 0;
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -411,9 +403,7 @@ private:
 	image_allocation remap_img;
 	vk::raii::ImageView remap_view{nullptr};
 	bool remap_img_live = false;
-	// Debug pipelines (spec-constant MODE, selected CPU-side): 0 remap,
-	// 1 hardcoded flip (no homography read), 2 sensor raw, 3 volume raw.
-	std::array<vk::raii::Pipeline, 4> compare_pipelines{{nullptr, nullptr, nullptr, nullptr}};
+	vk::raii::Pipeline compare_pipeline_mv{nullptr};
 	vk::raii::Sampler volume_sampler_nearest{nullptr};
 	// Upscale+MAX merge into the tier seed (LOAD, preserves the
 	// silhouette + reversed-cut result, sets 1 where the sensor is

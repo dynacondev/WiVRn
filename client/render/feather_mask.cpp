@@ -1106,13 +1106,10 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .dynamicStateCount = 2,
 		        .pDynamicStates = compare_dynamics,
 		};
-		// No specialization constants on this build: spec-constant
-		// pipelines misread push/UBO data on this driver, so MODE is a
-		// plain constant in the shader and every slot holds the identical
-		// pipeline (mode is hardcoded to 0 for this diagnostic build).
-		for (int mode = 0; mode < 4; ++mode)
-		{
-			vk::GraphicsPipelineCreateInfo compare_pipeline_info{
+		// Single compare pipeline: the shader has no variants (no spec
+		// constants, no debug modes) — one remap path, selected by
+		// construction.
+		vk::GraphicsPipelineCreateInfo compare_pipeline_info{
 			        .stageCount = 2,
 			        .pStages = compare_stages,
 			        .pVertexInputState = &compare_vertex_input,
@@ -1125,8 +1122,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .layout = *compare_pipe_layout,
 		        .renderPass = *compare_renderpass_mv,
 		};
-			compare_pipelines[mode] = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
-		}
+			compare_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
 			}
 	// Homography upload path: host-visible staging, sampled image,
 	// texelFetch in the shader. Every link (staging upload,
@@ -2524,8 +2520,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// the fragment shader writes every texel, so the merge upscale
 				// reads defined data everywhere.
 				cmd.setScissor(0, vk::Rect2D{{0, 0}, ve});
-				int mode = std::clamp(volume_debug, 0, 3);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipelines[mode]);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *compare_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> cmp_sets{*compare_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *compare_pipe_layout, 0, cmp_sets, no_offsets);
 				cmd.draw(3, 1, 0, 0);

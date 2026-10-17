@@ -1154,24 +1154,6 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (not depth_status.empty())
 		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
-	{
-		// Depth-volume compare debug viz (spec-constant pipelines,
-		// selected CPU-side): remap, hardcoded flip (no UBO read),
-		// sensor raw, volume raw. Localizes an empty volume mask to the
-		// remap transport vs the sensor/volume inputs.
-		// HARDCODED diagnostic build: touching the live combo blanked the
-		// view, so the mode is pinned per build (debug_volume_mode in
-		// stream.h) and the selector is display-only until the ladder
-		// is done. This build: 0 = Remap + right-half UBO echo.
-		ImGui::BeginDisabled(true);
-		{
-			const char * volume_modes[] = {"Remap", "Hardcoded flip", "Sensor raw", "Volume raw"};
-			int volume_mode = std::clamp(debug_volume_mode, 0, 3);
-			ImGui::Combo(_S("Depth volume debug"), &volume_mode, volume_modes, 4);
-		}
-		ImGui::EndDisabled();
-	}
-
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)
 		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));
