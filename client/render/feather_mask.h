@@ -397,15 +397,17 @@ private:
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
-	// Compare homography transport: 6 NAMED vec4 push members (NOT a
-	// GLSL array — push-constant arrays and the fragment-stage UBO both
-	// read back zero on this driver). Consecutive vec4 members lay out
-	// exactly like the proven mat4 columns of volume_push above: 16B
-	// each, 96B total. Filled per volume record from volume_input.
+	// Compare homography staging: 6 vec4s (16B each, 96B total)
+	// filled per volume record from volume_input, uploaded to remap_ubo
+	// and read back through remap_view as a uniform texel buffer —
+	// sampler-unit reads are the only live path in the compare shader
+	// (fragment UBO and push reads return zero on this driver).
 	struct compare_push
 	{
 		glm::vec4 h[6]{};
 	};
+	buffer_allocation remap_ubo;
+	vk::raii::BufferView remap_view{nullptr};
 	// Debug pipelines (spec-constant MODE, selected CPU-side): 0 remap,
 	// 1 hardcoded flip (no homography read), 2 sensor raw, 3 volume raw.
 	std::array<vk::raii::Pipeline, 4> compare_pipelines{{nullptr, nullptr, nullptr, nullptr}};
