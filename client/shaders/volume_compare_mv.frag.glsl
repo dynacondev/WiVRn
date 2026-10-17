@@ -85,5 +85,14 @@ void main()
 		return;
 	}
 	float inside = (s < v && s < 1.0 && v > 0.0) ? 1.0 : 0.0;
+	if (MODE == 0 && uv.x > 0.5)
+	{
+		// Diagnostic split-screen (one build only): the right half
+		// echoes UBO delivery as brightness (u.h[0].x ~= 1.0 white =
+		// matrix delivered, 0.0 black = shader reads zero) while the
+		// left half keeps the real remap result for comparison.
+		out_color = vec4(vec3(u.h[0].x), 1.0);
+		return;
+	}
 	out_color = vec4(inside);
 }

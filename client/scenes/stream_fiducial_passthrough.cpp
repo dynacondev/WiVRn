@@ -1162,7 +1162,7 @@ void scenes::stream::gui_passthrough()
 		// HARDCODED diagnostic build: touching the live combo blanked the
 		// view, so the mode is pinned per build (debug_volume_mode in
 		// stream.h) and the selector is display-only until the ladder
-		// is done. This build: 0 = Remap (UBO homography, the real path).
+		// is done. This build: 0 = Remap + right-half UBO echo.
 		ImGui::BeginDisabled(true);
 		{
 			const char * volume_modes[] = {"Remap", "Hardcoded flip", "Sensor raw", "Volume raw"};
