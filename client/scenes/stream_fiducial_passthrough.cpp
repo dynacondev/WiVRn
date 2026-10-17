@@ -1159,16 +1159,17 @@ void scenes::stream::gui_passthrough()
 		// selected CPU-side): remap, hardcoded flip (no UBO read),
 		// sensor raw, volume raw. Localizes an empty volume mask to the
 		// remap transport vs the sensor/volume inputs.
-		const char * volume_modes[] = {"Remap", "Hardcoded flip", "Sensor raw", "Volume raw"};
-		int volume_mode = std::clamp(debug_volume_mode, 0, 3);
-		if (ImGui::Combo(_S("Depth volume debug"), &volume_mode, volume_modes, 4))
+		// HARDCODED diagnostic build: touching the live combo blanked the
+		// view, so the mode is pinned per build (debug_volume_mode in
+		// stream.h) and the selector is display-only until the ladder
+		// is done. This build: 3 = Volume raw.
+		ImGui::BeginDisabled(true);
 		{
-			debug_volume_mode = std::clamp(volume_mode, 0, 3);
-			// Logged at selection time, not just in the 5s heartbeat: a
-			// session teardown seconds later would otherwise leave no
-			// record of which mode was picked.
-			spdlog::info("Depth volume debug -> {} ({})", debug_volume_mode, volume_modes[debug_volume_mode]);
+			const char * volume_modes[] = {"Remap", "Hardcoded flip", "Sensor raw", "Volume raw"};
+			int volume_mode = std::clamp(debug_volume_mode, 0, 3);
+			ImGui::Combo(_S("Depth volume debug"), &volume_mode, volume_modes, 4);
 		}
+		ImGui::EndDisabled();
 	}
 
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
