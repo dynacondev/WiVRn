@@ -29,6 +29,8 @@ xr::environment_depth::environment_depth(instance & inst_, session & sess_, syst
         sess(&sess_),
         system_id(sys),
         device(&device_)
+        ,
+        ext_version(inst_.extension_version(XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME))
 #ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
         ,
         xrCreateEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrCreateEnvironmentDepthProviderMETA>("xrCreateEnvironmentDepthProviderMETA")),
@@ -221,10 +223,18 @@ bool xr::environment_depth::acquire(XrSpace space, XrTime display_time, frame & 
 	        .space = space,
 	        .displayTime = display_time,
 	};
+	// captureTime rides the output chain on ext v2+ (content-age
+	// forensics); v1 runtimes ignore the unknown struct per the chaining
+	// rules, so it stays unchained there.
+	XrEnvironmentDepthImageTimestampMETA timestamp{
+	        .type = XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_TIMESTAMP_META,
+	        .captureTime = 0,
+	};
 	// The runtime validates output structs: each views element must
 	// carry its type (same trap as XrView in locate_views).
 	XrEnvironmentDepthImageMETA image{
 	        .type = XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_META,
+	        .next = ext_version >= 2 ? &timestamp : nullptr,
 	        .views =
 	                {
 	                        XrEnvironmentDepthImageViewMETA{.type = XR_TYPE_ENVIRONMENT_DEPTH_IMAGE_VIEW_META},
@@ -258,6 +268,7 @@ bool xr::environment_depth::acquire(XrSpace space, XrTime display_time, frame & 
 	out.fov[1] = image.views[1].fov;
 	out.pose[0] = image.views[0].pose;
 	out.pose[1] = image.views[1].pose;
+	out.capture_time = timestamp.captureTime;
 	return true;
 #else
 	(void)space;

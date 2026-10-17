@@ -41,6 +41,7 @@
 #include "wivrn_packets.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -1245,6 +1246,54 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		bool have_volume_sensor = false;
 		volume_want_frame = need_volume_depth;
 
+		// Once-per-frame depth acquire, shared by the volume chain and the
+		// debug viz. The spec allows a single acquire per frame
+		// (XR_ERROR_LIMIT_REACHED beyond that), so both consumers read
+		// this one frame: volume takes the sensor view, the viz takes it
+		// whole. Runs ahead of both record paths (async + inline).
+		bool have_depth_frame = false;
+		xr::environment_depth::frame shared_depth{};
+		bool want_depth = (need_volume_depth and mask_frame) or debug_depth_overlay;
+		if (want_depth)
+		{
+			if (not env_depth_probed)
+			{
+				env_depth_probed = true;
+				env_depth_supported = xr::environment_depth::supported(instance, system);
+				if (env_depth_supported)
+					env_depth = std::make_unique<xr::environment_depth>(instance, session, system, device);
+				else
+				{
+					spdlog::info("environment depth unsupported on this headset");
+					depth_status = "environment depth unsupported on this headset";
+				}
+			}
+			if (env_depth)
+			{
+				env_depth->ensure();
+				if (env_depth->ready())
+				{
+					env_depth->start();
+					auto acq_t0 = std::chrono::steady_clock::now();
+					bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
+					double acq_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acq_t0).count();
+					if (need_volume_depth and mask_frame)
+						volume_acquire_ms += acq_ms;
+					if (got_depth)
+						have_depth_frame = true;
+					else if (debug_depth_overlay)
+						depth_status = "waiting for depth data";
+				}
+				else if (debug_depth_overlay)
+					depth_status = "depth provider unavailable";
+				}
+		}
+		else if (env_depth and env_depth->started())
+		{
+			env_depth->stop();
+			depth_status.clear();
+		}
+
 		// Fresh frame accumulators for the Statistics plots (filled by
 		// the gizmo and mask record phases below, sampled by
 		// accumulate_metrics). fence_wait_ms is measured at frame top
@@ -1272,39 +1321,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// compositor joins via swapchain release (gated on the mask
 		// fence below).
 		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit) {
-			// Depth-volume sensor acquire (once per frame, ahead of the
-			// group loop): the provider starts on first volume need and
-			// idles otherwise. The debug overlay block below re-acquires
-			// when armed; two acquires in one frame just return the
-			// latest image twice.
-			if (need_volume_depth and mask_frame)
+			// Volume sensor from the shared frame (acquired once above).
+			// Content age + index rate feed the Volume heartbeat: age is
+			// the deferred pose-correction signal, the index rate is the
+			// effective sensor Hz (the runtime republishes at a fraction
+			// of display rate, so most frames re-lock the same image).
+			if (have_depth_frame and need_volume_depth and mask_frame)
 			{
-				if (not env_depth_probed)
+				volume_sensor = env_depth->depth_view(shared_depth.swapchain_index);
+				volume_near = shared_depth.near_z;
+				volume_far = shared_depth.far_z;
+				have_volume_sensor = volume_sensor != vk::ImageView{};
+				if (have_volume_sensor)
 				{
-					env_depth_probed = true;
-					env_depth_supported = xr::environment_depth::supported(instance, system);
-					if (env_depth_supported)
-						env_depth = std::make_unique<xr::environment_depth>(instance, session, system, device);
-					else
-						spdlog::info("environment depth unsupported on this headset");
-				}
-				if (env_depth)
-				{
-					env_depth->ensure();
-					if (env_depth->ready())
+					++volume_win_acquired;
+					if (shared_depth.capture_time != 0)
 					{
-						env_depth->start();
-						xr::environment_depth::frame depth_frame;
-						auto acq_t0 = std::chrono::steady_clock::now();
-						bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, depth_frame);
-						volume_acquire_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acq_t0).count();
-						if (got_depth)
-						{
-							volume_sensor = env_depth->depth_view(depth_frame.swapchain_index);
-							volume_near = depth_frame.near_z;
-							volume_far = depth_frame.far_z;
-							have_volume_sensor = volume_sensor != vk::ImageView{};
-						}
+						double age_ms = (frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6;
+						volume_last_age_ms = (float)age_ms;
+						volume_win_age_sum += age_ms;
+						volume_win_age_max = std::max(volume_win_age_max, age_ms);
+					}
+					if (shared_depth.swapchain_index != volume_last_index)
+					{
+						volume_last_index = shared_depth.swapchain_index;
+						++volume_win_new_content;
 					}
 				}
 			}
@@ -1748,6 +1789,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						volume_last_draws = (int)volume_draws.size();
 						volume_last_seed_w = (uint32_t)gw;
 						volume_last_seed_h = (uint32_t)gh;
+						// Depth-vs-eye pose divergence at record time: the
+						// time-difference the future delay compensation
+						// must absorb (eye 0; both eyes share the warp).
+						{
+							const auto & dp = shared_depth.pose[0];
+							const auto & mp = mask_pose[0];
+							float ex = dp.position.x - mp.position.x;
+							float ey = dp.position.y - mp.position.y;
+							float ez = dp.position.z - mp.position.z;
+							volume_last_dpos_mm = std::sqrt(ex * ex + ey * ey + ez * ez) * 1000.f;
+							float odot = std::abs(dp.orientation.w * mp.orientation.w +
+							              dp.orientation.x * mp.orientation.x +
+							              dp.orientation.y * mp.orientation.y +
+							              dp.orientation.z * mp.orientation.z);
+							volume_last_dang_deg = 2.f * std::acos(std::clamp(odot, 0.f, 1.f)) * 57.29578f;
+							volume_win_dpos_sum += volume_last_dpos_mm;
+							volume_win_dang_sum += volume_last_dang_deg;
+						}
 						if (env_depth)
 						{
 							volume_sensor_w = env_depth->depth_width();
@@ -2204,68 +2263,37 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
-		// Environment-depth debug overlay: acquire the runtime D16 frame
-		// (once per frame, between begin/end) and record the fullscreen
-		// false-color viz into its own transparent swapchain. Provider
-		// cost is bound to the toggle: turning it off stops it below.
+		// Environment-depth debug overlay: records the fullscreen
+		// false-color viz from the shared frame (acquired once above) into
+		// its own transparent swapchain. Provider cost is bound to the
+		// toggle + volume need: the shared site above stops it below.
 		int depth_image = -1;
-		if (debug_depth_overlay)
+		if (debug_depth_overlay and have_depth_frame)
 		{
-			if (not env_depth_probed)
+			if (not depth_overlay)
+				depth_overlay = std::make_unique<depth_overlay_renderer>(device);
+			depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+			depth_image = depth_overlay->acquire();
+			if (depth_image >= 0)
 			{
-				env_depth_probed = true;
-				env_depth_supported = xr::environment_depth::supported(instance, system);
-				if (env_depth_supported)
-					env_depth = std::make_unique<xr::environment_depth>(instance, session, system, device);
-				else
-					depth_status = "environment depth unsupported on this headset";
+				depth_overlay_renderer::frame_params params;
+				params.near_z = shared_depth.near_z;
+				params.far_z = shared_depth.far_z;
+				params.opacity = debug_depth_opacity;
+				std::array<vk::Extent2D, 2> depth_ext;
+				for (uint32_t view = 0; view < view_count; ++view)
+					depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+				depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
+				                      env_depth->depth_view(shared_depth.swapchain_index), params);
+				depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
+				                           env_depth->depth_width(), env_depth->depth_height(),
+				                           (double)shared_depth.near_z, (double)shared_depth.far_z);
 			}
-			if (env_depth)
-			{
-				env_depth->ensure();
-				if (env_depth->ready())
-				{
-					env_depth->start();
-					xr::environment_depth::frame depth_frame;
-					if (env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, depth_frame))
-					{
-						if (not depth_overlay)
-							depth_overlay = std::make_unique<depth_overlay_renderer>(device);
-						depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
-						depth_image = depth_overlay->acquire();
-						if (depth_image >= 0)
-						{
-							depth_overlay_renderer::frame_params params;
-							params.near_z = depth_frame.near_z;
-							params.far_z = depth_frame.far_z;
-							params.opacity = debug_depth_opacity;
-							std::array<vk::Extent2D, 2> depth_ext;
-							for (uint32_t view = 0; view < view_count; ++view)
-								depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
-							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
-							                      env_depth->depth_view(depth_frame.swapchain_index), params);
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
-							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)depth_frame.near_z, (double)depth_frame.far_z);
-						}
-						else
-							depth_status = "overlay swapchain busy, skipped frame";
-					}
-					else
-						depth_status = "waiting for depth data";
-				}
-				else
-					depth_status = "depth provider unavailable";
-			}
+			else
+				depth_status = "overlay swapchain busy, skipped frame";
 		}
-		// The volume layer owns the provider while depth objects are
-		// placed: only stop it when neither the debug toggle nor the
-		// volume chain needs it.
-		else if (env_depth and env_depth->started() and not need_volume_depth)
-		{
-			env_depth->stop();
-			depth_status.clear();
-		}
+		// else: status already set by the shared acquire site above
+		// (unsupported / unavailable / waiting).
 
 		// Debug mask record: the local debug group (union B) carries the
 		// marker-window cutouts. No silhouette raster yet (no objects):

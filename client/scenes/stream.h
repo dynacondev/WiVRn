@@ -484,6 +484,17 @@ private:
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
+	// Sensor-mapping forensics (Volume heartbeat): content age from the
+	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
+	// divergence at record time, swapchain index for the effective Hz.
+	float volume_last_age_ms = 0;
+	double volume_win_age_sum = 0, volume_win_age_max = 0;
+	uint64_t volume_win_acquired = 0;
+	uint32_t volume_last_index = 0xFFFFFFFF;
+	uint64_t volume_win_new_content = 0;
+	float volume_last_dpos_mm = 0, volume_last_dang_deg = 0;
+	double volume_win_dpos_sum = 0, volume_win_dang_sum = 0;
+	XrTime volume_win_t0 = 0;
 	int mask_draws = 0;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned

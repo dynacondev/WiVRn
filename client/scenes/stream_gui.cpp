@@ -250,17 +250,27 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	{
 		volume_last_log = predicted_display_time;
 		double vf = (double)std::max<uint64_t>(volume_win_frames, 1);
-		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m acq/r/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/c/m {:.2f}/{:.2f}/{:.2f}ms sensor {}/{}",
+		double va = (double)std::max<uint64_t>(volume_win_acquired, 1);
+		double win_s = volume_win_t0 != 0 ? (double)(predicted_display_time - volume_win_t0) * 1e-9 : 5.0;
+		double win_hz = win_s > 0 ? (double)volume_win_new_content / win_s : 0;
+		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/c/m {:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{}",
 		             (double)volume_last_feather, volume_last_tier, volume_last_draws,
 		             volume_last_seed_w, volume_last_seed_h, volume_sensor_w, volume_sensor_h,
 		             (double)volume_sensor_near, (double)volume_sensor_far,
+		             volume_win_age_sum / va, volume_win_age_max,
+		             volume_win_dpos_sum / va, volume_win_dang_sum / va,
+		             volume_last_index, win_hz,
 		             volume_win_acquire_ms / vf, volume_win_raster_ms / vf, volume_win_compare_ms / vf, volume_win_merge_ms / vf,
 		             volume_win_raster_gpu / vf, volume_win_compare_gpu / vf, volume_win_merge_gpu / vf,
-		             volume_win_sensor, volume_win_frames);
-		volume_win_frames = volume_win_sensor = 0;
+		             volume_win_sensor, volume_win_acquired, volume_win_frames);
+		volume_win_frames = volume_win_sensor = volume_win_acquired = 0;
+		volume_win_new_content = 0;
 		volume_win_acquire_ms = volume_win_raster_ms = 0;
 		volume_win_compare_ms = volume_win_merge_ms = 0;
 		volume_win_raster_gpu = volume_win_compare_gpu = volume_win_merge_gpu = 0;
+		volume_win_age_sum = volume_win_age_max = 0;
+		volume_win_dpos_sum = volume_win_dang_sum = 0;
+		volume_win_t0 = predicted_display_time;
 	}
 
 	std::vector<shard_accumulator::blit_handle *> active_handles;

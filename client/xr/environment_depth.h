@@ -56,7 +56,8 @@ class environment_depth
 public:
 	// Latest acquired depth frame: index into the enumerated depth
 	// images, frustum bounds in meters (farZ < nearZ = infinite
-	// projection), per-eye depth-camera fov/pose.
+	// projection), per-eye depth-camera fov/pose, sensor capture
+	// timestamp (0 when the runtime reports ext v1 / no timestamp).
 	struct frame
 	{
 		uint32_t swapchain_index = 0;
@@ -64,6 +65,7 @@ public:
 		float far_z = 0;
 		XrFovf fov[2]{};
 		XrPosef pose[2]{};
+		XrTime capture_time = 0;
 	};
 
 	// Construct only when supported() (extension procs load in the
@@ -111,6 +113,7 @@ private:
 	session * sess = nullptr;
 	XrSystemId system_id = XR_NULL_SYSTEM_ID;
 	vk::raii::Device * device = nullptr;
+	uint32_t ext_version = 0;
 	bool logged_unsupported = false;
 	bool provider_started = false;
 	// Set on start: the runtime needs a frame to spin up, so the first
