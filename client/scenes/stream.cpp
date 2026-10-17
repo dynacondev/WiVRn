@@ -1180,6 +1180,41 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		live_views_for_gui = std::move(live_views);
 	}
 
+	// Eye velocity history for the depth time-bias test slider: finite
+	// difference of consecutive predicted mask poses (world frame).
+	// Unconditional per frame so history exists when depth needs it.
+	{
+		XrTime now = frame_state.predictedDisplayTime;
+		if (volume_have_prev_mask and now > volume_prev_mask_time)
+		{
+			double dt = (double)(now - volume_prev_mask_time) * 1e-9;
+			if (dt > 1e-3 and dt < 0.1)
+			{
+				for (uint32_t view = 0; view < view_count; ++view)
+				{
+					const auto & pp = volume_prev_mask_pose[view].position;
+					const auto & cp = mask_pose[view].position;
+					volume_eye_lin_vel[view] = glm::vec3((float)((cp.x - pp.x) / dt), (float)((cp.y - pp.y) / dt), (float)((cp.z - pp.z) / dt));
+					glm::quat q0(volume_prev_mask_pose[view].orientation.w, volume_prev_mask_pose[view].orientation.x,
+					             volume_prev_mask_pose[view].orientation.y, volume_prev_mask_pose[view].orientation.z);
+					glm::quat q1(mask_pose[view].orientation.w, mask_pose[view].orientation.x,
+					             mask_pose[view].orientation.y, mask_pose[view].orientation.z);
+					glm::quat dq = q1 * glm::inverse(q0);
+					if (dq.w < 0)
+						dq = -dq;
+					float ang = 2.f * std::acos(std::clamp(dq.w, -1.f, 1.f));
+					if (ang > 1e-6f)
+						volume_eye_ang_vel[view] = glm::vec3(dq.x, dq.y, dq.z) * (ang / (std::sin(ang * 0.5f) * (float)dt));
+					else
+						volume_eye_ang_vel[view] = glm::vec3(0);
+				}
+			}
+		}
+		volume_prev_mask_pose = mask_pose;
+		volume_prev_mask_time = now;
+		volume_have_prev_mask = true;
+	}
+
 	// Allow the headset to time warp if we are redisplaying a frame
 	if ((not application::get_hmd_traits().discard_frame) or
 	    std::ranges::any_of(current_blit_handles, [](const auto & h) { return h and h->feedback.times_displayed < 2; }) or
@@ -1342,6 +1377,41 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// depth row 1). Identity reproduces today's (u, 1-v) tap.
 			const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, -0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
 			bool h_ok = true;
+			// Time-bias test: assume the depth content is bias_ms older than
+			// its pose claims (+bias = older = larger correction, the
+			// trailing direction). Extrapolate the reported depth pose
+			// backward along head motion; bias 0 leaves it untouched.
+			// Clamps (50mm, ~11deg) bound prediction glitches, not heads.
+			std::array<XrPosef, 2> depth_pose{shared_depth.pose[0], shared_depth.pose[1]};
+			if (volume_time_bias_ms != 0.f)
+			{
+				float ds = volume_time_bias_ms * 1e-3f;
+				for (uint32_t view = 0; view < view_count; ++view)
+				{
+					glm::vec3 shift = volume_eye_lin_vel[view] * ds;
+					float shift_len = glm::length(shift);
+					if (shift_len > 0.05f)
+						shift *= 0.05f / shift_len;
+					auto & dp = depth_pose[view].position;
+					const auto & rp = shared_depth.pose[view].position;
+					dp.x = rp.x - shift.x;
+					dp.y = rp.y - shift.y;
+					dp.z = rp.z - shift.z;
+					float rate = glm::length(volume_eye_ang_vel[view]);
+					if (rate > 1e-4f)
+					{
+						float ang = rate * ds;
+						if (ang > 0.2f or ang < -0.2f)
+							ang = std::copysign(0.2f, ang);
+						glm::vec3 axis = volume_eye_ang_vel[view] / rate;
+						glm::quat dq = glm::angleAxis(-ang, axis);
+						const auto & ro = shared_depth.pose[view].orientation;
+						glm::quat qr(ro.w, ro.x, ro.y, ro.z);
+						glm::quat qu = dq * qr;
+						depth_pose[view].orientation = {qu.x, qu.y, qu.z, qu.w};
+					}
+				}
+			}
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
 				// Q maps a camera-frame direction to [clip.x, clip.y,
@@ -1359,7 +1429,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					break;
 				}
 				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
-				glm::mat3 Rcw = glm::mat3(scene::view_matrix(shared_depth.pose[view]));
+				glm::mat3 Rcw = glm::mat3(scene::view_matrix(depth_pose[view]));
 				glm::mat3 H = Suv * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * E1;
 				for (int c = 0; c < 3; ++c)
 					volume_remap[3 * view + c] = glm::vec4(H[c], 0);
@@ -1368,7 +1438,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// 1/depth = a*D + b for the sensor D encoding.
 				{
 					const auto & pe = mask_pose[view].position;
-					const auto & pcap = shared_depth.pose[view].position;
+					const auto & pcap = depth_pose[view].position;
 					glm::vec3 dw(pe.x - pcap.x, pe.y - pcap.y, pe.z - pcap.z);
 					glm::vec3 tc = Rcw * dw;
 					glm::vec3 qt = Qd * tc;

@@ -487,6 +487,21 @@ private:
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
 	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
 	bool volume_remap_logged = false; // one-shot H log for convention validation
+	// Depth time-bias test (Passthrough tab slider, ms, +/-50): assumes
+	// the depth content is bias_ms older than its pose claims (+ = older
+	// = larger correction, the trailing-lag direction). Extrapolates the
+	// reported depth pose backward along head motion; 0 = today's
+	// behavior bit-identically. Render thread only.
+	float volume_time_bias_ms = 0;
+	int volume_bias_logged_ms = 999; // debounced slider log (int ms)
+	// Eye velocity history (world frame, per-eye finite difference of
+	// consecutive predicted mask poses) feeding the bias above. Rigid
+	// head => per-eye differencing, no lever-arm approximation.
+	std::array<XrPosef, 2> volume_prev_mask_pose{};
+	XrTime volume_prev_mask_time = 0;
+	bool volume_have_prev_mask = false;
+	std::array<glm::vec3, 2> volume_eye_lin_vel{};
+	std::array<glm::vec3, 2> volume_eye_ang_vel{}; // axis * rate (rad/s)
 	// Sensor-mapping forensics (Volume heartbeat): content age from the
 	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
 	// divergence at record time, swapchain index for the effective Hz.

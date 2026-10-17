@@ -316,7 +316,9 @@ Each `passthrough` entry has:
   the sensor tap is remapped through the capture <-> display relative
   rotation plus a depth-dependent lateral shift (sideways parallax;
   forward/radial and depth-value terms excluded), so the comparison
-  tests the same world ray, falling back to the direct tap when off. Meshes should be
+  tests the same world ray, falling back to the direct tap when off.
+  A Depth time bias slider (+/-50ms) shifts the assumed content age
+  to hunt a constant sensor lag (+ = older = larger correction). Meshes should be
   **closed volumes** (far side is well-defined). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
   it — a Quest-guardian-style zone with adjustable size, shape and
