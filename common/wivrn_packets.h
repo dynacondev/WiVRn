@@ -1016,7 +1016,10 @@ struct passthrough_object
 	// shows through, depth-tested against covering windows). "3d-boundary"
 	// shows game video only inside the model volume (passthrough outside),
 	// "3d-boundary-reversed" inverts it. Boundary meshes must be closed
-	// volumes. Unknown types are skipped client-side (forward-compat).
+	// volumes. "3d-depth-passthrough" reveals the flat feed where the
+	// runtime depth map resolves inside the model volume (depth-tested
+	// volume, feathered like a normal window). Unknown types are skipped
+	// client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
 	std::string tag;

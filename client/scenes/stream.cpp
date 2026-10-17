@@ -2267,7 +2267,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			bool need_flat = cutouts_punched;
 			for (auto & [oid, ost]: passthrough_objects)
 			{
-				if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+				if (not ost.soup_ready or not ost.fused.placed)
+					continue;
+				// Depth volumes reveal the flat feed wherever the sensor
+				// resolves inside the volume: flat must stay submitted.
+				if (ost.def.type == "3d-depth-passthrough")
+				{
+					need_flat = true;
+					break;
+				}
+				if (ost.def.type != "3d-passthrough")
 					continue;
 				if (not surface_projected_effective(oid, ost))
 				{

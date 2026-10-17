@@ -97,15 +97,15 @@ struct configuration
 	struct passthrough_object
 	{
 		// Behavior type. "3d-passthrough" renders the model as a
-		// surface-projected passthrough cutout. "3d-passthrough-reversed"
+		// surface-projected passthrough cutout; "3d-passthrough-reversed"
 		// reverse-cuts the model from every mask layer instead (game video
-		// shows through the silhouette, depth-tested against the windows
-		// covering each pixel). "3d-boundary" shows game video only
-		// inside the model volume and passthrough outside it (Quest
-		// guardian style, adjustable size/shape/fade);
-		// "3d-boundary-reversed" inverts it (passthrough inside, game
-		// outside: exclusion zones). Unknown types are skipped with a
-		// warning (forward-compat for 3d-depth).
+		// shows through, depth-tested against covering windows). "3d-boundary"
+		// shows game video only inside the model volume (passthrough outside),
+		// "3d-boundary-reversed" inverts it. Boundary meshes must be closed
+		// volumes. "3d-depth-passthrough" reveals the flat feed where the
+		// runtime depth map resolves inside the model volume (depth-tested
+		// volume, feathered like a normal window). Unknown types are skipped
+		// with a warning (forward-compat).
 		std::string type = "3d-passthrough";
 		std::string id;
 		std::string tag;

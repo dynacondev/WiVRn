@@ -254,7 +254,10 @@ bool scenes::stream::surface_projected_effective(const std::string & oid, const 
 {
 	// Boundary zones never map camera onto geometry: they drive the
 	// global scene fade through the flat union's floor instead.
-	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed")
+	// Depth volumes reveal the flat reconstruction feed, never the
+	// projected layer.
+	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed" or
+	    ost.def.type == "3d-depth-passthrough")
 		return false;
 	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
 		return it->second;
@@ -994,7 +997,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// Boundary zones place identically too (fused pose + mesh for
 		// the distance query); only the veil submit uses them.
 		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary)
+		bool is_depth = def.type == "3d-depth-passthrough";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_depth)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
@@ -1350,7 +1354,8 @@ void scenes::stream::gui_fiducial_status()
 		(void)oid;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
 		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
-		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed")
+		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed" and
+		    ost.def.type != "3d-depth-passthrough")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
@@ -1383,8 +1388,9 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
-		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
+		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), depth_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{
