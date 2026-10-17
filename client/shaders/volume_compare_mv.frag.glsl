@@ -69,14 +69,18 @@ void main()
 		suv = s;
 	}
 	float s = texture(sensor_tex, vec3(suv, float(gl_ViewIndex))).r;
+	float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
 	if (MODE == 2)
 	{
-		out_color = vec4(vec3(s), 1.0);
+		// Footprint-gated: raw sensor only where the volume raster drew
+		// (v > 0). Full-canvas sensor (~1 for far scenes) would MAX the
+		// whole tier seed to 1 and wipe the working silhouette mask.
+		out_color = vec4(v > 0.0 ? vec3(s) : vec3(0.0), 1.0);
 		return;
 	}
-	float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
 	if (MODE == 3)
 	{
+		// Already footprint-safe by construction (v == 0 outside the raster).
 		out_color = vec4(vec3(v), 1.0);
 		return;
 	}

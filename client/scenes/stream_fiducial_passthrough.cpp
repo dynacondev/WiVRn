@@ -1162,7 +1162,13 @@ void scenes::stream::gui_passthrough()
 		const char * volume_modes[] = {"Remap", "Hardcoded flip", "Sensor raw", "Volume raw"};
 		int volume_mode = std::clamp(debug_volume_mode, 0, 3);
 		if (ImGui::Combo(_S("Depth volume debug"), &volume_mode, volume_modes, 4))
+		{
 			debug_volume_mode = std::clamp(volume_mode, 0, 3);
+			// Logged at selection time, not just in the 5s heartbeat: a
+			// session teardown seconds later would otherwise leave no
+			// record of which mode was picked.
+			spdlog::info("Depth volume debug -> {} ({})", debug_volume_mode, volume_modes[debug_volume_mode]);
+		}
 	}
 
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
