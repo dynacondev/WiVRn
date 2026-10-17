@@ -98,7 +98,17 @@ void main()
 		kb = pc.corr1.w;
 	}
 	float d0 = texture(sensor_tex, vec3(suv0, float(gl_ViewIndex))).r;
-	vec2 suv1 = suv0 + T * (ka * d0 + kb);
+	float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
+	// k guard: at depth discontinuities the rotation-only spot can land
+	// on background (k_sens ~ 0, no shift, one-sided edge erosion). The
+	// live volume depth is always on the correct side of the edge, so
+	// fall back to it. Interior pixels are unaffected (the nearer
+	// sensor/hand depth wins the max); v == 0 fails the test below
+	// regardless of k. Clamped to a 5cm floor.
+	float k_sens = ka * d0 + kb;
+	float k_vol = (v > 0.0) ? ka * v + kb : 0.0;
+	float k = min(max(k_sens, k_vol), 20.0);
+	vec2 suv1 = suv0 + T * k;
 	if (suv1.x < 0.0 || suv1.x > 1.0 || suv1.y < 0.0 || suv1.y > 1.0)
 	{
 		out_color = vec4(0.0);
@@ -106,7 +116,6 @@ void main()
 	}
 	suv = suv1;
 	float d = texture(sensor_tex, vec3(suv, float(gl_ViewIndex))).r;
-	float v = texture(volume_tex, vec3(uv, float(gl_ViewIndex))).r;
 	float inside = (d < v && d < 1.0 && v > 0.0) ? 1.0 : 0.0;
 	out_color = vec4(inside);
 }
