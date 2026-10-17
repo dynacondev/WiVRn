@@ -27,11 +27,14 @@ layout(location = 0) out vec4 out_color;
 // tap is remapped through the capture<->display relative rotation, then
 // nudged by T/depth for sideways parallax (forward/radial + depth-value
 // terms are NOT handled here — that residual is the experiment).
-// Identity reproduces the direct tap. Strict sensor < render, far /
-// no-data hidden, out-of-frustum hidden. Both taps are LINEAR-filtered
-// (host sampler): the bilinear depth ramp is the outline pre-smoothing,
-// so the d<v crossing positions sub-texel — the blur feather then
-// smooths an already-smooth edge. Transition verdicts stay ~1 texel.
+// Identity reproduces the direct tap. Soft sensor<v band (coverage AA),
+// far / no-data hidden, out-of-frustum hidden. Both taps are LINEAR-filtered
+// (host sampler): the bilinear depth ramp is the outline pre-smoothing.
+// The comparison itself is soft (e-band smoothstep, not a binary test),
+// turning edge-texel blends into coverage so the 50% contour positions
+// sub-texel — the blur feather then smooths an already-smooth edge.
+// Far/no-data and empty-volume guards stay hard; the band only feathers
+// the d~v boundary itself.
 //
 // The remap rides push constants as 8 NAMED vec4 members (not a GLSL
 // array: push-constant arrays have driver-defined packing, while
@@ -119,6 +122,14 @@ void main()
 	}
 	suv = suv1;
 	float d = texture(sensor_tex, vec3(suv, float(gl_ViewIndex))).r;
-	float inside = (d < v && d < 1.0 && v > 0.0) ? 1.0 : 0.0;
+	// Soft comparison (outline AA): 1-smoothstep over a fixed e-band in
+	// D turns the bilinear edge blends into coverage. e ~= 0.08 starts
+	// the gradient at roughly a half-to-one texel of depth gap: smaller
+	// stays steppy, larger halos. Guards stay hard (far d and empty v
+	// are exactly 0, as before).
+	const float e = 0.08;
+	float inside = 0.0;
+	if (d < 1.0 && v > 0.0)
+		inside = 1.0 - smoothstep(v - e, v + e, d);
 	out_color = vec4(inside);
 }
