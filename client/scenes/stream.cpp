@@ -23,6 +23,7 @@
 #include "xr/space.h"
 #include "xr/system.h"
 #include <glm/gtc/matrix_access.hpp>
+#include <glm/gtc/matrix_inverse.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <magic_enum.hpp>
 #include <openxr/openxr.h>
@@ -1307,66 +1308,72 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		cutouts_punched = false;
 
 		// Rotation reprojection homographies (one per eye, shared by all
-		// groups): H = S_uv A_d^-1 D R S A_e E1 mapping eye UV to sensor
-		// UV, exact for rotation with any fov pair. Default is the flip
-		// matrix reproducing today's direct tap, so a degenerate frustum
-		// degrades to unrotated instead of breaking. Timed into the
-		// compare CPU (the warp's CPU cost lives there in the logs).
+		// groups): H = Wd Qd Rcw Rew^-1 Qe^-1 W^-1 mapping eye UV to sensor
+		// UV, exact for rotation. Built from the renderer's own matrices
+		// (P rows straight out of scene::projection_matrix, R from the view
+		// matrices) so no NDC/fov-sign convention is assumed: whatever the
+		// house projection does, the raster and the remap agree by
+		// construction. Wd carries the validated sensor flip (identity
+		// reproduces today's direct tap). Default is that flip matrix, so a
+		// degenerate frustum degrades to unrotated instead of breaking.
+		// Timed into the compare CPU (the warp's CPU cost lives there).
 		std::array<glm::vec4, 6> volume_remap{};
 		for (int e = 0; e < 2; ++e)
 		{
 			volume_remap[3 * e + 0] = glm::vec4(1, 0, 0, 0);
 			volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
 			volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
-		}
+			}
 		if (have_depth_frame and need_volume_depth and mask_frame)
 		{
 			auto remap_t0 = std::chrono::steady_clock::now();
-			auto tan4 = [](const XrFovf & f) {
-				return glm::vec4(std::tan(f.angleLeft), std::tan(f.angleRight), std::tan(f.angleUp), std::tan(f.angleDown));
-			};
-			bool fov_ok = true;
+			// Viewport NDC(-1,-1) = top-left pixel (rasterizer truth, same
+			// as blur.vert): NDC -> normalized UV, and its inverse.
+			const glm::mat3 W(glm::vec3(0.5f, 0, 0), glm::vec3(0, 0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
+			const glm::mat3 Winv(glm::vec3(2, 0, 0), glm::vec3(0, 2, 0), glm::vec3(-1, -1, 1));
+			// Validated sensor flip folded into the depth side.
+			const glm::mat3 J(glm::vec3(1, 0, 0), glm::vec3(0, -1, 0), glm::vec3(0, 1, 1));
+			const glm::mat3 Wd = J * W;
+			bool h_ok = true;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
-				auto te = tan4(mask_fov[view]);
-				auto td = tan4(shared_depth.fov[view]);
-				if (not (te.y > te.x and te.w > te.z and td.y > td.x and td.w > td.z))
-					fov_ok = false;
+				// Q maps a camera-frame direction to [clip.x, clip.y,
+				// clip.w] using the projection's own rows (x, y, w of
+				// columns 0..2) — whatever convention P implements.
+				auto Q_of = [](const glm::mat4 & P) {
+					return glm::mat3(glm::vec3(P[0][0], P[0][1], P[0][3]), glm::vec3(P[1][0], P[1][1], P[1][3]),
+					                   glm::vec3(P[2][0], P[2][1], P[2][3]));
+				};
+				glm::mat3 Qe = Q_of(scene::projection_matrix(mask_fov[view]));
+				glm::mat3 Qd = Q_of(scene::projection_matrix(shared_depth.fov[view]));
+				if (std::abs(glm::determinant(Qe)) < 1e-9f or std::abs(glm::determinant(Qd)) < 1e-9f)
+				{
+					h_ok = false;
+					break;
+				}
+				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
+				glm::mat3 Rcw = glm::mat3(scene::view_matrix(shared_depth.pose[view]));
+				glm::mat3 H = Wd * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * Winv;
+				for (int c = 0; c < 3; ++c)
+					volume_remap[3 * view + c] = glm::vec4(H[c], 0);
 			}
-			if (fov_ok)
+			if (not h_ok)
 			{
-				auto A_of = [](const glm::vec4 & t) {
-					return glm::mat3(glm::vec3((t.y - t.x) * 0.5f, 0, 0), glm::vec3(0, (t.w - t.z) * 0.5f, 0),
-					                   glm::vec3((t.y + t.x) * 0.5f, (t.w + t.z) * 0.5f, 1));
-				};
-				auto Ainv_of = [](const glm::vec4 & t) {
-					return glm::mat3(glm::vec3(2.f / (t.y - t.x), 0, 0), glm::vec3(0, 2.f / (t.w - t.z), 0),
-					                   glm::vec3(-(t.y + t.x) / (t.y - t.x), -(t.w + t.z) / (t.w - t.z), 1));
-				};
-				const glm::mat3 E1(glm::vec3(2, 0, 0), glm::vec3(0, -2, 0), glm::vec3(-1, 1, 1));
-				const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, 0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
-				glm::mat3 SD(1.0f);
-				SD[2][2] = -1;
-				for (uint32_t view = 0; view < view_count; ++view)
+				for (int e = 0; e < 2; ++e)
 				{
-					glm::quat qc(shared_depth.pose[view].orientation.w, shared_depth.pose[view].orientation.x,
-					             shared_depth.pose[view].orientation.y, shared_depth.pose[view].orientation.z);
-					glm::quat qe(mask_pose[view].orientation.w, mask_pose[view].orientation.x,
-					             mask_pose[view].orientation.y, mask_pose[view].orientation.z);
-					glm::mat3 R = glm::mat3_cast(glm::inverse(qc) * qe);
-					glm::mat3 H = Suv * Ainv_of(tan4(shared_depth.fov[view])) * SD * R * SD * A_of(tan4(mask_fov[view])) * E1;
-					for (int c = 0; c < 3; ++c)
-						volume_remap[3 * view + c] = glm::vec4(H[c], 0);
-				}
-				if (not volume_remap_logged)
-				{
-					volume_remap_logged = true;
-					spdlog::info("Volume remap eye0 cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f})",
-					             (double)volume_remap[0].x, (double)volume_remap[0].y, (double)volume_remap[0].z,
-					             (double)volume_remap[1].x, (double)volume_remap[1].y, (double)volume_remap[1].z,
-					             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z);
+					volume_remap[3 * e + 0] = glm::vec4(1, 0, 0, 0);
+					volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
+					volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
 				}
 			}
+			if (not volume_remap_logged)
+			{
+				volume_remap_logged = true;
+				spdlog::info("Volume remap eye0 cols: ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f}) ({:.3f},{:.3f},{:.3f})",
+				             (double)volume_remap[0].x, (double)volume_remap[0].y, (double)volume_remap[0].z,
+				             (double)volume_remap[1].x, (double)volume_remap[1].y, (double)volume_remap[1].z,
+				             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z);
+				}
 			volume_compare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
 		}
 
