@@ -304,11 +304,27 @@ Each `passthrough` entry has:
   skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
-  pixel). `"3d-boundary"` shows game video only *inside* the model
-  volume and passthrough outside it — a Quest-guardian-style zone with
-  adjustable size, shape and fade. `"3d-boundary-reversed"` inverts it
-  (passthrough inside, game outside: exclusion zones around e.g. a
-  desk). Zones combine as a union: game video shows iff the headset is
+  pixel). `"3d-depth-passthrough"` reveals the flat feed where the
+  runtime depth map resolves *inside* the model volume (depth-tested
+  volume, feathered like a normal window): the volume rasterizes its
+  far side at 320px, strict `sensor < render` flattens to a binary
+  mask, and it upscales+MAXes over every layer — including reversed
+  cutthroughs — before the shared erode/blur. Per-eye display MVPs
+  keep it in sync with VR content; pose-delay correction is future
+  work, so expect a texel of swim during fast motion. The headset
+  Passthrough tab offers a Rotation reprojection toggle (default on):
+  the sensor tap is remapped through the capture <-> display relative
+  rotation plus a depth-dependent lateral shift (sideways parallax;
+  forward/radial and depth-value terms excluded), so the comparison
+  tests the same world ray, falling back to the direct tap when off.
+  A Depth time bias slider (+/-50ms) shifts the assumed content age
+  to hunt a constant sensor lag (+ = older = larger correction). Meshes should be
+  **closed volumes** (far side is well-defined). `"3d-boundary"` shows
+  game video only *inside* the model volume and passthrough outside
+  it — a Quest-guardian-style zone with adjustable size, shape and
+  fade. `"3d-boundary-reversed"` inverts it (passthrough inside, game
+  outside: exclusion zones around e.g. a desk). Zones combine as a
+  union: game video shows iff the headset is
   inside ANY normal zone (or no normal zone is placed) AND outside ALL
   reversed zones; unplaced zones are ignored (fail-open to game, so
   tracking loss never flashes passthrough). Boundary meshes must be
@@ -333,11 +349,12 @@ Each `passthrough` entry has:
   (default `1`, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
   (default `24`; `0` disables feathering). Mask stacks group by this
-  value so each object feathers independently; applied live. Not
-  accepted for `3d-passthrough-reversed` or `3d-boundary(-reversed)`
-  (warned + ignored): negatives cut every layer and inherit each
-  layer's feathering, while zones fade by distance instead (see
-  `transition-distance`).
+  value so each object feathers independently; applied live. Depth
+  volumes reuse their feather value and feather through the same
+  erode/blur chain. Not accepted for `3d-passthrough-reversed` or
+  `3d-boundary(-reversed)` (warned + ignored): negatives cut every
+  layer and inherit each layer's feathering, while zones fade by
+  distance instead (see `transition-distance`).
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface
@@ -348,8 +365,9 @@ Each `passthrough` entry has:
   object's mesh instead of the flat reconstruction feed (default
   `true`; opt out per object with `false`, plus a live in-headset
   override in the Passthrough tab). Ignored for
-  `3d-passthrough-reversed` or `3d-boundary(-reversed)` (warned +
-  ignored): zones never map camera onto geometry.
+  `3d-passthrough-reversed`, `3d-boundary(-reversed)` or
+  `3d-depth-passthrough` (warned + ignored): zones never map camera
+  onto geometry, and depth volumes always reveal the flat feed.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

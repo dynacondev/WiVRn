@@ -1,0 +1,112 @@
+/*
+ * WiVRn VR streaming
+ * Copyright (C) 2026  Guillaume Meunier <guillaume.meunier@centraliens.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include <vulkan/vulkan_raii.hpp>
+
+#include "vk/allocation.h"
+#include "xr/swapchain.h"
+
+// Fullscreen environment-depth visualizer: samples the runtime's D16
+// depth array texture and false-colors it green (nearZ) to red (farZ).
+// Composited as ONE transparent projection layer (standard alpha blend,
+// above passthrough/video, below the GUI) so maxLayerCount discipline
+// holds. Own swapchain, CLEAR-on-UNDEFINED every frame. The shader
+// samples the depth image directly per eye layer: no reprojection, no
+// history, no smoothing — a pure debug view. Render thread only.
+namespace xr
+{
+class instance;
+class session;
+} // namespace xr
+
+class depth_overlay_renderer
+{
+public:
+	// Trimmed UBO mirror of depth_viz.frag params (std140): near/far
+	// planes in meters plus the global opacity. 16 bytes, no pads.
+	struct frame_params
+	{
+		float near_z = 0.1f;
+		float far_z = 10.f;
+		float opacity = 0.3f;
+		float pad = 0;
+	};
+
+	explicit depth_overlay_renderer(vk::raii::Device & device);
+
+	// (Re)create swapchain + targets + pipelines for format/size.
+	// waitIdle inside on rebuild; no-op when unchanged.
+	void ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h);
+
+	bool ready() const
+	{
+		return (bool)swapchain_;
+	}
+
+	// Acquire + wait (100ms); -1 on timeout (pairing-safe: the untouched
+	// acquisition is released inside, skip the frame).
+	int acquire();
+
+	// Record the fullscreen viz into both eye layers of the acquired
+	// image, sampling depth_view (runtime D16 2-layer array) with params.
+	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
+	            const std::array<vk::Extent2D, 2> & extents,
+	            vk::ImageView depth_view,
+	            const frame_params & params);
+
+	// Release the acquired image (after submit, before endFrame).
+	void release();
+
+	xr::swapchain & swapchain()
+	{
+		return swapchain_;
+	}
+
+private:
+	void init_pipelines(vk::Format format);
+
+	vk::raii::Device * device = nullptr;
+
+	vk::raii::PipelineLayout pipeline_layout{nullptr};
+	vk::raii::RenderPass renderpass{nullptr};
+	vk::raii::Pipeline pipeline{nullptr}; // fullscreen triangle, blended
+	vk::raii::DescriptorSetLayout set_layout{nullptr};
+	vk::raii::DescriptorPool descriptor_pool{nullptr};
+	vk::raii::DescriptorSet descriptor_set{nullptr};
+	vk::raii::Sampler sampler{nullptr};
+	buffer_allocation ubo;
+
+	xr::swapchain swapchain_;
+	vk::Format format_ = vk::Format::eUndefined;
+	vk::Extent2D extent_{0, 0};
+
+	struct target
+	{
+		vk::raii::ImageView view{nullptr};
+		vk::raii::Framebuffer framebuffer{nullptr};
+	};
+	// [image][eye], parallel to the swapchain image list.
+	std::vector<std::array<target, 2>> targets;
+};

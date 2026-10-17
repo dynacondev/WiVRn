@@ -254,7 +254,10 @@ bool scenes::stream::surface_projected_effective(const std::string & oid, const 
 {
 	// Boundary zones never map camera onto geometry: they drive the
 	// global scene fade through the flat union's floor instead.
-	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed")
+	// Depth volumes reveal the flat reconstruction feed, never the
+	// projected layer.
+	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed" or
+	    ost.def.type == "3d-depth-passthrough")
 		return false;
 	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
 		return it->second;
@@ -994,7 +997,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		// Boundary zones place identically too (fused pose + mesh for
 		// the distance query); only the veil submit uses them.
 		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary)
+		bool is_depth = def.type == "3d-depth-passthrough";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_depth)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
@@ -1138,6 +1142,37 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (ImGui::Button(_S("Run boundary self-test")))
 		xr::boundary_selftest();
+
+	ImGui::SeparatorText(_S("Depth overlay"));
+	if (env_depth_probed and not env_depth_supported)
+		ImGui::Text("%s", _S("Environment depth not supported on this headset"));
+	ImGui::Checkbox(_S("Depth overlay"), &debug_depth_overlay);
+	ImGui::BeginDisabled(not debug_depth_overlay or (env_depth_probed and not env_depth_supported));
+	float depth_pct = debug_depth_opacity * 100;
+	if (ImGui::SliderFloat(_S("Overlay opacity"), &depth_pct, 0, 100, "%.0f%%"))
+		debug_depth_opacity = std::clamp(depth_pct / 100, 0.f, 1.f);
+	ImGui::EndDisabled();
+	if (not depth_status.empty())
+		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
+	// Depth-volume rotation reprojection (remap through the capture <->
+	// display relative rotation). Off = direct tap: the flip default
+	// above is what the shader receives, unchanged.
+	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
+		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
+	// Depth time-bias test: shifts the assumed content age to hunt a
+	// constant sensor lag (+ = content older = larger correction, the
+	// trailing direction). 0 = unshifted. Log debounced per integer ms.
+	ImGui::BeginDisabled(not volume_remap_enabled);
+	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
+	{
+		int bias_ms = (int)std::round(volume_time_bias_ms);
+		if (bias_ms != volume_bias_logged_ms)
+		{
+			volume_bias_logged_ms = bias_ms;
+			spdlog::info("Depth time bias {}ms", bias_ms);
+		}
+	}
+	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)
@@ -1338,7 +1373,8 @@ void scenes::stream::gui_fiducial_status()
 		(void)oid;
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
 		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
-		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed")
+		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed" and
+		    ost.def.type != "3d-depth-passthrough")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
@@ -1371,8 +1407,9 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
-		ImGui::Text("%s %.40s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
+		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), depth_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

@@ -42,9 +42,11 @@
 
 #include "render/passthrough_mesh.h"
 
+#include <algorithm>
 #include <array>
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
+#include <glm/vec4.hpp>
 #include <map>
 #include <memory>
 #include <openxr/openxr.h>
@@ -143,6 +145,15 @@ public:
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
 		                      // res; 1 = fullscreen fallback. Diagnostic for
 		                      // cull effectiveness (log only, no plot).
+		// Depth-volume stages (3d-depth-passthrough objects in this
+		// group): furthest-point raster at 320px, strict sensor<render
+		// flatten, upscale+MAX merge into the seed ahead of erode.
+		// Zero when the group carries no volume draws.
+		double volume_raster_ms = 0;
+		double volume_compare_ms = 0;
+		double volume_merge_ms = 0;
+		float volume_box_frac = 1; // merge-box area fraction of the seed
+		// (0-1); drives the renderArea scissor economics, logged.
 	};
 
 	// Record silhouettes + blur chain for both eyes into the layers of an
@@ -157,6 +168,34 @@ public:
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Mask path only (the binary projected layer has
 	// no alpha control to punch through).
+	// Depth-volume layer (3d-depth-passthrough): furthest-point draws in
+	// display-eye MVP space plus the runtime D16 sensor view they test
+	// against (strict sensor < render, far hidden). Null = no volume in
+	// this group: the seed passes through untouched. Non-null with draws
+	// and a valid sensor view rasterizes at 320px, flattens to binary R8,
+	// and upscales+MAXes into the tier seed AFTER the reversed MIN cuts
+	// (the volume overlays everything, including VR cutthroughs) and
+	// BEFORE erode/blur, so it feathers exactly like silhouettes.
+	struct volume_input
+	{
+		std::vector<instance_draw> draws; // depth objects, eye MVP space
+		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
+		float near_z = 0.1f; // depth frustum the raster must match
+		float far_z = 10.f;
+		// Rotation reprojection: per-eye homography columns (eye e uses
+		// [3*e .. 3*e+2], w unused) mapping eye UV to sensor UV. Identity
+		// reproduces the direct tap; computed once per frame on the CPU.
+		std::array<glm::vec4, 6> remap_cols{};
+		// B2 lateral correction: per-eye (T.xy, a, b) with
+		// 1/depth = a*D + b (a, b duplicated per eye for vec4 packing).
+		// T maps 1/depth (1/m) to sensor-UV shift; forward/radial +
+		// depth-value terms excluded.
+		std::array<glm::vec4, 2> remap_corr{};
+		// GPU timestamp sink (stream-owned, 4 queries: raster/compare/merge
+		// boundaries). Null disables stamping. Reset per record() call, so
+		// with several volume groups the pool holds the LAST group only.
+		vk::QueryPool timestamp_pool = nullptr;
+	};
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -166,7 +205,8 @@ public:
 	            const std::vector<std::array<glm::vec3, 6>> & cutouts,
 	            const std::array<glm::mat4, 2> & cutout_mvp,
 	            mask_stage_cpu * cpu_stats,
-	            vk::Extent2D out_extent);
+	            vk::Extent2D out_extent,
+	            const volume_input * volume = nullptr);
 
 	bool has_mesh() const
 	{
@@ -269,8 +309,9 @@ private:
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0 = blur-H, 2 = blur-V upscale; 4,6,8 = downsample
-	// levels 1..3; 10 = erode-H, 12 = erode-V. One set per pass (not
+	// Index: 0 = blur-H, 1 = volume upscale+MAX merge, 2 = blur-V
+	// upscale; 4,6,8 = downsample levels 1..3; 10 = erode-H, 12 = erode-V.
+	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so eye-1
 	// slots stay unused. Erosion needs two sets because its H and V
 	// passes sample different images in the same command buffer (one
@@ -326,6 +367,73 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
+
+	// Depth-volume chain (3d-depth-passthrough, fixed 320px working
+	// size regardless of mask extent). Raster outputs R16 sensor-D,
+	// compare flattens to 4-level coverage R8, presmooth H blurs at 320
+	// with V folded into the merge upscale, merge upscales+MAXes into
+	// the tier seed. Created once in the constructor (format-fixed);
+	// targets are extent-fixed, so no rebuilds ever (unlike the mask
+	// intermediates).
+	static constexpr uint32_t volume_size = 320;
+	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
+	// Presmooth radius (blur-spread units = texels at 320): stairs
+	// smaller than ~2x this vanish into a stable gradient. 4 -> ~8px.
+	static constexpr float volume_smooth_spread = 1.4f;
+	struct volume_push
+	{
+		glm::mat4 mvp;
+		float near_z = 0.1f;
+		float far_z = 10.f;
+	};
+	vk::raii::RenderPass volume_raster_renderpass{nullptr};
+	vk::raii::PipelineLayout volume_raster_layout{nullptr};
+	vk::raii::Pipeline volume_raster_pipeline{nullptr};
+	// Compare (fullscreen _mv, 2 samplers: sensor D16 + volume R16).
+	// Dedicated CLEAR renderpass over volume_bin.blur_fb_mv (same R8 MV
+	// shape as the blur intermediates; loadOp is not part of render-pass
+	// compatibility, so the framebuffer is shared). CLEAR, not DONT_CARE:
+	// the merge LINEAR-upscales the whole 320 canvas, and any texel the
+	// compare draw did not write must read back deterministic 0, never
+	// undefined tile garbage.
+	vk::raii::RenderPass compare_renderpass_mv{nullptr};
+	vk::raii::DescriptorSetLayout compare_set_layout{nullptr};
+	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
+	vk::raii::DescriptorPool compare_pool{nullptr};
+	vk::raii::DescriptorSet compare_set{nullptr};
+	// Compare homography + B2 lateral correction: per-eye 3x3 columns as
+	// 6 vec4s plus per-eye corr (T.xy, a, b), 8 vec4s / 128B total,
+	// filled per volume record from volume_input and pushed (named
+	// members, never an array: push-constant arrays have driver-defined
+	// packing). Layout matches mat4 columns exactly.
+	struct volume_homography
+	{
+		glm::vec4 col[6]{};
+		glm::vec4 corr[2]{};
+	};
+	vk::raii::Pipeline compare_pipeline_mv{nullptr};
+	// Linear sampler for the compare taps (sensor + volume depth):
+	// deliberate coverage-AA. Bilinear ramps the depth across edge texels
+	// so the d<v crossing slides sub-texel instead of stepping on the
+	// 320-grid; the upscale+blur feather then smooths an already-smooth
+	// outline. Transition verdicts stay within ~1 texel + feather.
+	vk::raii::Sampler volume_sampler_linear{nullptr};
+	// Upscale+MAX merge into the tier seed (LOAD, preserves the
+	// silhouette + reversed-cut result, sets 1 where the sensor is
+	// inside). Reuses the blur shaders with spread 0 (the linear
+	// sampler is the upscale) under MAX blending; framebuffers are the
+	// seed's own MV target (loadOp is not part of compatibility).
+	vk::raii::RenderPass volume_max_r8_renderpass{nullptr};
+	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
+	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
+	vk::raii::Pipeline volume_max_rgb8_pipeline{nullptr};
+	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
+	blur_target volume_bin; // R8 coverage canvas (320, 2 layers):
+	// compare output, presmoothed in place before the merge upscale
+	blur_target volume_smooth; // R8 presmooth workspace (320, 2 layers):
+	// H destination, read directly by the merge upscale (V folded in)
+	bool volume_targets_ready = false;
+	void ensure_volume_targets();
 	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
 	                     vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 

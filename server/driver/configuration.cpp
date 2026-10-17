@@ -499,7 +499,8 @@ configuration::configuration()
 				if (item.contains("type"))
 					o.type = item["type"];
 				bool is_boundary = o.type == "3d-boundary" or o.type == "3d-boundary-reversed";
-				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary)
+				bool is_depth = o.type == "3d-depth-passthrough";
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary and not is_depth)
 				{
 					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
 					        item.value("id", o.type).c_str(), o.type.c_str());
@@ -564,7 +565,7 @@ configuration::configuration()
 				}
 				if (item.contains("surface-projected"))
 				{
-					if (o.type == "3d-passthrough-reversed" or is_boundary)
+					if (o.type == "3d-passthrough-reversed" or is_boundary or is_depth)
 						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
 						o.surface_projected = item["surface-projected"];
