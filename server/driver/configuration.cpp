@@ -643,6 +643,53 @@ configuration::configuration()
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;
 
+		if (auto it = json.find("reprojection"); it != json.end())
+		{
+			if (not it->is_object())
+				U_LOG_W("reprojection must be an object, ignoring");
+			else
+			{
+				if (it->contains("enabled"))
+					reprojection.enabled = it->at("enabled");
+				if (it->contains("mesh-width"))
+				{
+					reprojection.mesh_width = it->at("mesh-width");
+					if (reprojection.mesh_width < 16 or reprojection.mesh_width > 2048)
+					{
+						U_LOG_W("reprojection mesh-width out of range [16, 2048], clamping");
+						reprojection.mesh_width = std::clamp(reprojection.mesh_width, 16u, 2048u);
+					}
+				}
+				if (it->contains("mesh-height"))
+				{
+					reprojection.mesh_height = it->at("mesh-height");
+					if (reprojection.mesh_height < 16 or reprojection.mesh_height > 2048)
+					{
+						U_LOG_W("reprojection mesh-height out of range [16, 2048], clamping");
+						reprojection.mesh_height = std::clamp(reprojection.mesh_height, 16u, 2048u);
+					}
+				}
+				if (it->contains("bleed-radius"))
+				{
+					reprojection.bleed_radius = it->at("bleed-radius");
+					if (reprojection.bleed_radius < 0)
+					{
+						U_LOG_W("reprojection bleed-radius negative, clamping to 0");
+						reprojection.bleed_radius = 0;
+					}
+				}
+				if (it->contains("bleed-tolerance"))
+				{
+					reprojection.bleed_tolerance = it->at("bleed-tolerance");
+					if (reprojection.bleed_tolerance < 0)
+					{
+						U_LOG_W("reprojection bleed-tolerance negative, clamping to 0");
+						reprojection.bleed_tolerance = 0;
+					}
+				}
+			}
+		}
+
 		if (auto it = json.find("port"); it != json.end())
 			port = *it;
 

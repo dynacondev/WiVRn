@@ -102,6 +102,64 @@ An application to start when connection with the headset is established, can be 
 ```
 Launch No Man's Sky in VR mode on Steam when connection with headset is established.
 
+## `reprojection`
+Default value: enabled whenever a depth layer is submitted
+
+Server-side 6DoF reprojection for missed frame deadlines: when the
+application renders slower than the headset refresh rate (e.g. 45 fps
+app at 90 Hz), the last projection frame is re-warped to the missed
+display pose using the submitted depth buffer, so the encoder still
+emits at headset cadence. Only single fullscreen projection layers
+with depth (`XR_KHR_composition_layer_depth`) are reprojected; all
+other layers fall back to the previous frame. Corrects head motion
+(including translation of nearby objects); in-scene object animation
+stays at application rate.
+
+The warp math is a Vulkan port of the mesh algorithm from
+[OpenWarp](https://github.com/Zee2/openwarp) by Finn Sinclair
+(University of Illinois at Urbana-Champaign, NCSA license, see the
+shader sources for the full notice).
+
+### Example
+```json
+{
+	"reprojection": {
+		"mesh-width": 1024,
+		"mesh-height": 1024,
+		"bleed-radius": 0.005,
+		"bleed-tolerance": 0.0001
+	}
+}
+```
+
+### `enabled`
+Default value: `true`
+
+Master switch. Reprojection only engages when a depth layer is
+actually submitted, so common applications are unaffected.
+
+### `mesh-width`, `mesh-height`
+Default value: `1024`
+
+Reprojection mesh resolution (vertices = size + 1 per axis, shared
+index buffer for both eyes). Higher values resolve finer geometry at
+higher server GPU cost; lower values (e.g. 256) if the warp pass
+shows up in timings.
+
+### `bleed-radius`
+Default value: `0.005` (source UV units)
+
+Depth edge-bleed handling: depth samples within this radius vote for
+the foreground depth, hiding stretched triangles at depth
+discontinuities.
+
+### `bleed-tolerance`
+Default value: `0.0001`
+
+Vertices whose depth differs from the neighbourhood minimum by more
+than this are clamped to it (same semantics as the OpenWarp
+reference tunables).
+
 ## `tcp-only`
 Default value: `false`
 

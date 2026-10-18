@@ -155,6 +155,31 @@ struct configuration
 	// Applies to the until-lock transition only, nothing else.
 	float passthrough_fade_time_s = 2.0f;
 
+	// Server-side 6DoF reprojection (async spacewarp): when the
+	// application misses its frame deadline, the last projection frame
+	// is re-warped to the missed display pose using the submitted depth
+	// buffer (mesh-based forward warp, OpenWarp algorithm family).
+	// Active only for single fullscreen projection layers with depth;
+	// all other layers fall back to the default repeat behaviour.
+	struct reprojection
+	{
+		// Master switch, default on. Depth reprojection only engages
+		// when a depth layer is actually submitted.
+		bool enabled = true;
+		// Reprojection mesh resolution (vertices = size + 1 per axis).
+		// Higher values resolve finer geometry at higher GPU cost.
+		uint32_t mesh_width = 1024;
+		uint32_t mesh_height = 1024;
+		// Edge-bleed handling (in source UV units): depth samples in
+		// this radius vote for the foreground; vertices whose depth
+		// differs from the neighbourhood minimum by more than
+		// bleed_tolerance are clamped to it. Same semantics as the
+		// OpenWarp reference tunables.
+		float bleed_radius = 0.005f;
+		float bleed_tolerance = 0.0001f;
+	};
+	reprojection reprojection;
+
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;
