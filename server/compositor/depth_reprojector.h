@@ -40,7 +40,11 @@ struct reproject_ubo_data
 	float depth_rect[4];
 	float bleed_radius;
 	float bleed_tolerance;
-	float pad[2];
+	// 0 = GL-ordered source (row 0 = frustum bottom, e.g. xrizer),
+	// 1 = Vulkan-ordered source. Sampling V and output Y flip together
+	// so the warped target is always GL-ordered (foveated with flip).
+	float src_flip_y;
+	float pad;
 };
 static_assert(sizeof(reproject_ubo_data) == 240);
 
@@ -72,6 +76,8 @@ public:
 		xrt_fov fov;
 		float near_z;
 		float far_z;
+		// 0 = GL-ordered source rows, 1 = Vulkan-ordered.
+		float src_flip_y = 0;
 	};
 
 	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size);

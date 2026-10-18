@@ -459,7 +459,8 @@ bool depth_reprojector::reproject(
 	std::ranges::copy(src.depth_rect, ubo_data.depth_rect);
 	ubo_data.bleed_radius = bleed_radius;
 	ubo_data.bleed_tolerance = bleed_tolerance;
-	ubo_data.pad[0] = ubo_data.pad[1] = 0;
+	ubo_data.src_flip_y = src.src_flip_y;
+	ubo_data.pad = 0;
 
 	const auto extent = target[view].info().extent;
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);

@@ -495,6 +495,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				        .fov = src_fov[view],
 				        .near_z = src_near_z[view],
 				        .far_z = src_far_z[view],
+				        // GL-ordered sources (flip_y) need no flip;
+				        // Vulkan-ordered rows sample and render mirrored.
+				        .src_flip_y = flip_y ? 0.f : 1.f,
 				};
 				if (not reprojector.reproject(vk.device, cmd, view, fsrc, synth_poses[view], src_fov[view]))
 				{
@@ -525,8 +528,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        src_fov,
 	        view_info.alpha);
 
-	// Synthetic frames sample the warped targets (full-eye, GL-ordered
-	// like the real sources) through the same foveation.
+	// Synthetic frames sample the warped targets (full-eye, always
+	// GL-ordered by construction, hence flip_y = true) through the same
+	// foveation.
 	std::array<to_headset::foveation_parameter, 2> synth_foveation{};
 	if (synth >= 0)
 	{
@@ -546,7 +550,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        cmd,
 		        images[synth].view_y,
 		        images[synth].view_cbcr,
-		        flip_y,
+		        true, // warped targets are always GL-ordered
 		        reprojector.get_views(),
 		        synth_rect,
 		        src_fov,

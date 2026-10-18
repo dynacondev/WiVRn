@@ -63,6 +63,7 @@ layout(set = 0, binding = 2) uniform ReprojectUBO
 	vec4 depth_rect; // source depth sub-image: normalized offset.xy, extent.xy
 	float bleed_radius; // edge-bleed radius in depth-UV units
 	float bleed_tolerance; // foreground clamp tolerance (depth 0..1 units)
+	float src_flip_y; // 0 = GL-ordered source rows, 1 = Vulkan-ordered
 } ubo;
 
 layout(push_constant) uniform Push
@@ -79,8 +80,15 @@ void main()
 	uint iy = gl_VertexIndex / cols;
 	vec2 guv = vec2(ix, iy) / vec2(pc.grid);
 
-	vec2 color_uv = ubo.color_rect.xy + guv * ubo.color_rect.zw;
-	vec2 depth_uv = ubo.depth_rect.xy + guv * ubo.depth_rect.zw;
+	// Branchless orientation handling (scalar arithmetic only): the mesh
+	// math assumes frustum UV (v = 0 at the bottom). Vulkan-ordered
+	// sources sample mirrored and render mirrored, so the warped target
+	// is always GL-ordered.
+	float flip_f = ubo.src_flip_y;
+	vec2 guv_f = vec2(guv.x, guv.y + flip_f * (1.0 - 2.0 * guv.y));
+
+	vec2 color_uv = ubo.color_rect.xy + guv_f * ubo.color_rect.zw;
+	vec2 depth_uv = ubo.depth_rect.xy + guv_f * ubo.depth_rect.zw;
 
 	// Source depth is standard 0..1 nonlinear (GL convention).
 	float z = textureLod(depth_tex, depth_uv, 0.0).x;
@@ -109,6 +117,7 @@ void main()
 	vec4 frag_worldspace = ubo.render_inv_v * frag_viewspace;
 	vec4 result = ubo.warp_vp * frag_worldspace;
 
+	result.y *= (1.0 - 2.0 * flip_f);
 	result /= abs(result.w);
 	gl_Position = result;
 	out_color_uv = color_uv;
