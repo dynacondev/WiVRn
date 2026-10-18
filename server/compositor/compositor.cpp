@@ -334,7 +334,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	cmd_pool.reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	cmd.resetQueryPool(*query_pool, 0, 5);
+	cmd.resetQueryPool(*query_pool, 0, 4);
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 0);
 
 	bool flip_y = false;
@@ -461,11 +461,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// Depth reprojection: when the application missed its deadline
 	// (synth_count, computed above from the predicted-time gap), warp
-	// this frame to the missed display tick so the encoder still emits
-	// at headset cadence. True frames keep the existing rotation
-	// timewarp in the squasher/fast-path; the synthetic frame replaces
-	// it with a full 6DoF mesh warp of the same sources.
-	if (synth_count and has_depth_src and reprojector.supported() and configuration().reprojection.enabled)
+	// this frame to the next display tick the application will miss, so
+	// the encoder still emits at headset cadence. True frames keep the
+	// existing rotation timewarp in the squasher/fast-path; the synthetic
+	// frame replaces it with a full 6DoF mesh warp of the same sources.
+	if (synth_count and has_depth_src and reprojector.supported() and depth_reprojection_enabled)
 	{
 		int64_t synth_wake_ns, synth_slop_ns;
 		pacer.predict(synth_frame_id, synth_wake_ns, synth_desired_present_ns, synth_slop_ns, synth_predicted_ns);
@@ -687,8 +687,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		auto [res, ts] = query_pool.getResults<uint64_t>(
 		        0,
-		        5,
-		        5 * sizeof(uint64_t),
+		        4,
+		        4 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 
@@ -866,7 +866,7 @@ compositor::compositor(wivrn_session & session) :
                             }),
         query_pool(vk.device, vk::QueryPoolCreateInfo{
                                       .queryType = vk::QueryType::eTimestamp,
-                                      .queryCount = 5,
+                                      .queryCount = 4,
                               }),
         settings(get_encoder_settings(vk, session)),
         images{make_images(vk, cmd_pool, settings)},
@@ -876,7 +876,8 @@ compositor::compositor(wivrn_session & session) :
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
         foveation(vk, images[0].image.info().extent),
-        reprojector(vk, vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height})
+        reprojector(vk, vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height}),
+        depth_reprojection_enabled(configuration().reprojection.enabled)
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers

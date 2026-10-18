@@ -91,7 +91,7 @@ vk::raii::Sampler make_sampler(
 	                .addressModeW = address,
 	                .borderColor = border,
 	        }};
-	vk.name(res, "depth reprojector sampler");
+	vk.name(*res, "depth reprojector sampler");
 	return res;
 }
 
@@ -198,8 +198,8 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		                vk::ImageViewUsageCreateInfo{.usage = vk::ImageUsageFlagBits::eSampled},
 		        }
 		                .get()};
-		vk.name(target_view_unorm[i], std::format("depth reprojector target unorm {}", i).c_str());
-		vk.name(target_view_srgb[i], std::format("depth reprojector target srgb {}", i).c_str());
+		vk.name(*target_view_unorm[i], std::format("depth reprojector target unorm {}", i).c_str());
+		vk.name(*target_view_srgb[i], std::format("depth reprojector target srgb {}", i).c_str());
 	}
 
 	// Renderpass: clear holes to transparent black, store, end sampled.
@@ -228,7 +228,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .subpassCount = 1,
 	                .pSubpasses = &subpass,
 	        }};
-	vk.name(renderpass, "depth reprojector renderpass");
+	vk.name(*renderpass, "depth reprojector renderpass");
 
 	for (int i = 0; i < 2; ++i)
 	{
@@ -242,7 +242,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		                .height = target_size.height,
 		                .layers = 1,
 		        }};
-		vk.name(framebuffers[i], std::format("depth reprojector framebuffer {}", i).c_str());
+		vk.name(*framebuffers[i], std::format("depth reprojector framebuffer {}", i).c_str());
 	}
 
 	// Descriptor layout: color (fragment), depth (vertex), UBO (vertex).
@@ -272,7 +272,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .bindingCount = bindings.size(),
 	                .pBindings = bindings.data(),
 	        }};
-	vk.name(ds_layout, "depth reprojector descriptor set layout");
+	vk.name(*ds_layout, "depth reprojector descriptor set layout");
 
 	vk::PushConstantRange push_range{
 	        .stageFlags = vk::ShaderStageFlagBits::eVertex,
@@ -287,7 +287,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .pushConstantRangeCount = 1,
 	                .pPushConstantRanges = &push_range,
 	        }};
-	vk.name(layout, "depth reprojector pipeline layout");
+	vk.name(*layout, "depth reprojector pipeline layout");
 
 	auto vert = vk.load_shader("reproject_mesh.vert");
 	auto frag = vk.load_shader("reproject_mesh.frag");
@@ -353,7 +353,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .layout = *layout,
 	                .renderPass = *renderpass,
 	        }};
-	vk.name(pipeline, "depth reprojector pipeline");
+	vk.name(*pipeline, "depth reprojector pipeline");
 
 	// Shared grid index buffer for both eyes: W*H quads as triangles.
 	const uint64_t quad_count = uint64_t(mesh_w) * uint64_t(mesh_h);
@@ -403,7 +403,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .poolSizeCount = pool_sizes.size(),
 	                .pPoolSizes = pool_sizes.data(),
 	        }};
-	vk.name(descriptor_pool, "depth reprojector descriptor pool");
+	vk.name(*descriptor_pool, "depth reprojector descriptor pool");
 	{
 		std::array layouts = {*ds_layout, *ds_layout};
 		auto sets = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{

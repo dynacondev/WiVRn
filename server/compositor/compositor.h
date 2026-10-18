@@ -104,6 +104,9 @@ private:
 	wivrn::foveation foveation;
 	depth_reprojector reprojector;
 
+	// Cached at construction: server config is startup-read.
+	const bool depth_reprojection_enabled;
+
 	// Last real frame's predicted display time, for missed-tick
 	// detection (depth reprojection). Empty until the first commit.
 	std::optional<int64_t> last_real_predicted_ns;

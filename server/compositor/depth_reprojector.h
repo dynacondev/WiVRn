@@ -42,7 +42,7 @@ struct reproject_ubo_data
 	float bleed_tolerance;
 	float pad[2];
 };
-static_assert(sizeof(reproject_ubo_data) == 256);
+static_assert(sizeof(reproject_ubo_data) == 240);
 
 namespace wivrn
 {

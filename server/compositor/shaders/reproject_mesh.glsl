@@ -59,9 +59,8 @@ layout(set = 0, binding = 2) uniform ReprojectUBO
 	mat4 render_inv_p; // inverse of the source (render-pose) projection
 	mat4 render_inv_v; // inverse of the source view (camera-to-world)
 	mat4 warp_vp; // target projection * target view
-	vec4 color_rect; // source color rect in pixels: offset.xy, extent.xy
-	vec4 depth_rect; // source depth rect in pixels: offset.xy, extent.xy
-	vec4 img_extent; // color image extent.xy, depth image extent.zw (px)
+	vec4 color_rect; // source color sub-image: normalized offset.xy, extent.xy
+	vec4 depth_rect; // source depth sub-image: normalized offset.xy, extent.xy
 	float bleed_radius; // edge-bleed radius in depth-UV units
 	float bleed_tolerance; // foreground clamp tolerance (depth 0..1 units)
 } ubo;
@@ -80,8 +79,8 @@ void main()
 	uint iy = gl_VertexIndex / cols;
 	vec2 guv = vec2(ix, iy) / vec2(pc.grid);
 
-	vec2 color_uv = (ubo.color_rect.xy + guv * ubo.color_rect.zw) / ubo.img_extent.xy;
-	vec2 depth_uv = (ubo.depth_rect.xy + guv * ubo.depth_rect.zw) / ubo.img_extent.zw;
+	vec2 color_uv = ubo.color_rect.xy + guv * ubo.color_rect.zw;
+	vec2 depth_uv = ubo.depth_rect.xy + guv * ubo.depth_rect.zw;
 
 	// Source depth is standard 0..1 nonlinear (GL convention).
 	float z = textureLod(depth_tex, depth_uv, 0.0).x;
