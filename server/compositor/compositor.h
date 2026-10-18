@@ -24,6 +24,7 @@
 #include "util/comp_base.h"
 #include "util/u_logging.h"
 
+#include "depth_reprojector.h"
 #include "encoder/encoder_settings.h"
 #include "foveation.h"
 #include "layer_squasher.h"
@@ -34,7 +35,11 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
 
 namespace wivrn
@@ -77,6 +82,7 @@ private:
 
 	const u_logging_level log_level;
 	timings squasher_times;
+	timings warp_times;
 	timings foveation_times;
 	wivrn_session & session;
 	vk_bundle vk;
@@ -96,15 +102,17 @@ private:
 
 	layer_squasher squasher;
 	wivrn::foveation foveation;
+	depth_reprojector reprojector;
+
+	// Last real frame's predicted display time, for missed-tick
+	// detection (depth reprojection). Empty until the first commit.
+	std::optional<int64_t> last_real_predicted_ns;
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 
-#ifdef __cpp_lib_atomic_lock_free_type_aliases
-	using status_type = std::atomic_signed_lock_free;
-#else
-	using status_type = std::atomic_int8_t;
-#endif
-	status_type encode_request{-1}; // id of the image to encode
+	std::mutex encode_mutex;
+	std::condition_variable encode_cv;
+	std::deque<int> encode_queue;
 	std::jthread encoder_thread;
 
 	struct
@@ -159,6 +167,8 @@ private:
 	}
 
 	int acquire_image();
+
+	void queue_encode(int image);
 
 	void encoder_work(std::stop_token);
 
