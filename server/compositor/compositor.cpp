@@ -97,6 +97,10 @@ get_layer_depth_image(const comp_layer & layer, uint32_t swapchain_index, uint32
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_depth_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
+// Synthetic frames generated per real commit, covering sources down to
+// ~10 fps at 90 Hz. Beyond this the oldest ticks repeat.
+constexpr int max_synth_per_commit = 8;
+
 std::array<vk::Format, 3> image_formats(int bit_depth)
 {
 	switch (bit_depth)
@@ -364,7 +368,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		int64_t predicted_ns = 0;
 		std::array<xrt_pose, 2> poses{};
 	};
-	static constexpr int max_synth_per_commit = 8; // covers sources down to ~10 fps at 90 Hz
 	std::array<synth_frame, max_synth_per_commit> synths{};
 	int synth_done = 0;
 
@@ -552,11 +555,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		const auto synth_extent = images[0].image.info().extent;
 		std::array<xrt_rect, 2> synth_rect{
 		        xrt_rect{
-		                .offset = {.x = 0, .y = 0},
+		                .offset = {.w = 0, .h = 0},
 		                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
 		        },
 		        xrt_rect{
-		                .offset = {.x = 0, .y = 0},
+		                .offset = {.w = 0, .h = 0},
 		                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
 		        },
 		};

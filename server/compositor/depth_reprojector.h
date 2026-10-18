@@ -131,8 +131,8 @@ private:
 	const float bleed_radius;
 	const float bleed_tolerance;
 
-	vk::raii::Sampler clamp_to_border_black;
-	vk::raii::Sampler clamp_to_edge;
+	vk::raii::Sampler clamp_to_border_black = nullptr;
+	vk::raii::Sampler clamp_to_edge = nullptr;
 
 	// Retained last-real-frame sources, GL-ordered by construction:
 	// full-eye color (UNORM) and raw depth (R32F), 2 layers (eyes).
@@ -140,28 +140,28 @@ private:
 	bool retained_initialized = false;
 	image_allocation retained_color;
 	image_allocation retained_depth;
-	vk::raii::ImageView retained_color_view;
-	vk::raii::ImageView retained_depth_view;
-	std::array<vk::raii::ImageView, 2> retained_color_eye;
-	std::array<vk::raii::ImageView, 2> retained_depth_eye;
+	vk::raii::ImageView retained_color_view = nullptr;
+	vk::raii::ImageView retained_depth_view = nullptr;
+	std::array<vk::raii::ImageView, 2> retained_color_eye = {nullptr, nullptr};
+	std::array<vk::raii::ImageView, 2> retained_depth_eye = {nullptr, nullptr};
 
-	vk::raii::DescriptorSetLayout resolve_ds_layout;
-	vk::raii::PipelineLayout resolve_layout;
-	vk::raii::Pipeline resolve_pipeline;
-	vk::raii::DescriptorPool resolve_pool;
+	vk::raii::DescriptorSetLayout resolve_ds_layout = nullptr;
+	vk::raii::PipelineLayout resolve_layout = nullptr;
+	vk::raii::Pipeline resolve_pipeline = nullptr;
+	vk::raii::DescriptorPool resolve_pool = nullptr;
 	vk::DescriptorSet resolve_set;
 
 	// Per-eye warped color targets (plain UNORM, sampled raw).
 	std::array<image_allocation, 2> target;
-	std::array<vk::raii::ImageView, 2> target_view;
+	std::array<vk::raii::ImageView, 2> target_view = {nullptr, nullptr};
 
-	vk::raii::RenderPass renderpass;
-	std::array<vk::raii::Framebuffer, 2> framebuffers;
+	vk::raii::RenderPass renderpass = nullptr;
+	std::array<vk::raii::Framebuffer, 2> framebuffers = {nullptr, nullptr};
 
-	vk::raii::DescriptorSetLayout ds_layout;
-	vk::raii::PipelineLayout layout;
-	vk::raii::Pipeline pipeline;
-	vk::raii::DescriptorPool descriptor_pool;
+	vk::raii::DescriptorSetLayout ds_layout = nullptr;
+	vk::raii::PipelineLayout layout = nullptr;
+	vk::raii::Pipeline pipeline = nullptr;
+	vk::raii::DescriptorPool descriptor_pool = nullptr;
 	std::array<vk::DescriptorSet, 2> descriptor_sets;
 
 	std::array<buffer_allocation, 2> ubo;

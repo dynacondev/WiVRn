@@ -117,7 +117,7 @@ private:
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 
 	std::mutex encode_mutex;
-	std::condition_variable encode_cv;
+	std::condition_variable_any encode_cv;
 	std::deque<int> encode_queue;
 	std::jthread encoder_thread;
 
