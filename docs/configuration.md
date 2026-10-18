@@ -108,12 +108,18 @@ Default value: enabled whenever a depth layer is submitted
 Server-side 6DoF reprojection for missed frame deadlines: when the
 application renders slower than the headset refresh rate (e.g. 45 fps
 app at 90 Hz), the last projection frame is re-warped to the missed
-display pose using the submitted depth buffer, so the encoder still
-emits at headset cadence. Only single fullscreen projection layers
+display poses using the submitted depth buffer, so the encoder still
+emits at headset cadence — one synthetic frame per missed tick, up to
+8 per commit (sources down to ~10 fps). Only single fullscreen
+projection layers
 with depth (`XR_KHR_composition_layer_depth`) are reprojected; all
 other layers fall back to the previous frame. Corrects head motion
 (including translation of nearby objects); in-scene object animation
 stays at application rate.
+
+The current real frame is held in compositor-owned retained images
+and refreshed on every depth commit, so all synthetics warp from
+held sources even after the app recycles its swapchains.
 
 The warp math is a Vulkan port of the mesh algorithm from
 [OpenWarp](https://github.com/Zee2/openwarp) by Finn Sinclair

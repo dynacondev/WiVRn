@@ -91,7 +91,10 @@ private:
 
 	std::array<encoder_settings, 3> settings;
 
-	std::array<image, 2> images;
+	// Compositor output images awaiting encode: 1 real + up to 3
+	// in-flight synthetics (encoder slots bound the outstanding work,
+	// acquire_image fails gracefully past that).
+	std::array<image, 4> images;
 	vk::raii::CommandBuffer cmd;
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;

@@ -40,6 +40,8 @@
 #include "utils/wivrn_trace.h"
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
+
+#include <algorithm>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -115,7 +117,7 @@ std::array<vk::Format, 3> image_formats(int bit_depth)
 	throw std::runtime_error(std::format("Unsupported bit depth {}", bit_depth));
 }
 
-std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
+std::array<wivrn::compositor::image, 4> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
 {
 	auto formats = image_formats(encoders[0].bit_depth);
 
@@ -195,7 +197,7 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::C
 		        }};
 	};
 
-	return {make_image(0), make_image(1)};
+	return {make_image(0), make_image(1), make_image(2), make_image(3)};
 }
 
 vk::raii::Semaphore make_semaphore(wivrn::vk_bundle & vk)
@@ -296,17 +298,17 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
-	// Missed-tick detection for depth reprojection: a gap of ~two display
-	// periods since the last real commit means the application missed its
-	// deadline (e.g. 45 fps app at 90 Hz) and one synthetic frame can fill
-	// the missed tick. Refined below (depth layer + resources required).
-	int synth_count = 0;
+	// Missed-tick detection for depth reprojection: each display
+	// period without a real commit past the first means the application
+	// missed a deadline (e.g. 45 fps app at 90 Hz needs 1 synthetic per
+	// commit, 30 fps needs 2). Refined below (depth + resources).
+	int synth_wanted = 0;
 	const int64_t frame_period_ns = pacer.get_frame_duration();
 	if (last_real_predicted_ns)
 	{
 		int64_t gap = frame.rendering.predicted_display_time_ns - *last_real_predicted_ns;
-		if (gap >= frame_period_ns + frame_period_ns / 2)
-			synth_count = 1;
+		synth_wanted = int((gap + frame_period_ns / 2) / frame_period_ns) - 1;
+		synth_wanted = std::clamp(synth_wanted, 0, max_synth_per_commit);
 	}
 	last_real_predicted_ns = frame.rendering.predicted_display_time_ns;
 
@@ -352,12 +354,19 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<xrt_pose, 2> src_pose{};
 	bool has_depth_src = false;
 
-	// Synthetic frame bookkeeping, filled by the warp section below.
-	int synth = -1;
-	int64_t synth_frame_id = -1;
-	int64_t synth_desired_present_ns = 0;
-	int64_t synth_predicted_ns = 0;
-	std::array<xrt_pose, 2> synth_poses{};
+	// Synthetic frames for missed display ticks, filled by the warp
+	// section below (at most max_synth_per_commit per commit).
+	struct synth_frame
+	{
+		int image = -1;
+		int64_t frame_id = -1;
+		int64_t desired_present_ns = 0;
+		int64_t predicted_ns = 0;
+		std::array<xrt_pose, 2> poses{};
+	};
+	static constexpr int max_synth_per_commit = 8; // covers sources down to ~10 fps at 90 Hz
+	std::array<synth_frame, max_synth_per_commit> synths{};
+	int synth_done = 0;
 
 	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
 
@@ -459,56 +468,63 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
-	// Depth reprojection: when the application missed its deadline
-	// (synth_count, computed above from the predicted-time gap), warp
-	// this frame to the next display tick the application will miss, so
-	// the encoder still emits at headset cadence. True frames keep the
-	// existing rotation timewarp in the squasher/fast-path; the synthetic
-	// frame replaces it with a full 6DoF mesh warp of the same sources.
-	if (synth_count and has_depth_src and reprojector.supported() and depth_reprojection_enabled)
-	{
-		int64_t synth_wake_ns, synth_slop_ns;
-		pacer.predict(synth_frame_id, synth_wake_ns, synth_desired_present_ns, synth_slop_ns, synth_predicted_ns);
+	// Hold the current frame: copy color + depth into the
+	// compositor-owned retained sources so every synthetic below warps
+	// from held data, valid until the next real frame refreshes it.
+	if (has_depth_src)
+		reprojector.refresh_retained(vk.device, cmd, src, src_depth, src_color_nrect, src_depth_nrect, flip_y);
 
-		synth = acquire_image();
-		if (synth >= 0)
+	// Depth reprojection: one synthetic frame per missed display tick
+	// (synth_wanted, from the predicted-time gap), each warped from the
+	// retained sources to its own upcoming tick so the encoder still
+	// emits at headset cadence. True frames keep the existing rotation
+	// timewarp in the squasher/fast-path; synthetics replace it with a
+	// full 6DoF mesh warp.
+	if (synth_wanted and has_depth_src and reprojector.supported() and depth_reprojection_enabled)
+	{
+		for (int k = 0; k < synth_wanted; ++k)
 		{
-			xrt_space_relation synth_head{};
-			std::array<xrt_fov, 2> synth_fovs{};
+			synth_frame & s = synths[k];
+			int64_t wake_ns, slop_ns;
+			pacer.predict(s.frame_id, wake_ns, s.desired_present_ns, slop_ns, s.predicted_ns);
+
+			s.image = acquire_image();
+			if (s.image < 0)
+				break;
+
+			xrt_space_relation head{};
+			std::array<xrt_fov, 2> fovs{};
 			session.get_hmd().get_view_poses(
 			        nullptr,
-			        synth_predicted_ns,
+			        s.predicted_ns,
 			        XRT_VIEW_TYPE_STEREO,
 			        2,
-			        &synth_head,
-			        synth_fovs.data(),
-			        synth_poses.data());
+			        &head,
+			        fovs.data(),
+			        s.poses.data());
 
+			bool ok = true;
 			for (int view = 0; view < 2; ++view)
 			{
-				depth_reprojector::frame_source fsrc{
-				        .color = src[view],
-				        .depth = src_depth[view],
-				        .color_rect = src_color_nrect[view],
-				        .depth_rect = src_depth_nrect[view],
-				        .pose = src_pose[view],
-				        .fov = src_fov[view],
-				        .near_z = src_near_z[view],
-				        .far_z = src_far_z[view],
-				        // GL-ordered sources (flip_y) need no flip;
-				        // Vulkan-ordered rows sample and render mirrored.
-				        .src_flip_y = flip_y ? 0.f : 1.f,
-				};
-				if (not reprojector.reproject(vk.device, cmd, view, fsrc, synth_poses[view], src_fov[view]))
-				{
-					images[synth].busy = false;
-					synth = -1;
-					break;
-				}
+				ok &= reprojector.reproject(
+				        vk.device,
+				        cmd,
+				        view,
+				        src_pose[view],
+				        src_fov[view],
+				        src_near_z[view],
+				        src_far_z[view],
+				        s.poses[view],
+				        src_fov[view]);
 			}
+			if (not ok)
+			{
+				images[s.image].busy = false;
+				s.image = -1;
+				break;
+			}
+			++synth_done;
 		}
-		if (synth < 0)
-			synth_count = 0;
 	}
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
 
@@ -530,9 +546,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// Synthetic frames sample the warped targets (full-eye, always
 	// GL-ordered by construction, hence flip_y = true) through the same
-	// foveation.
-	std::array<to_headset::foveation_parameter, 2> synth_foveation{};
-	if (synth >= 0)
+	// foveation. All synthetics share rect and fov; only outputs differ.
+	if (synth_done)
 	{
 		const auto synth_extent = images[0].image.info().extent;
 		std::array<xrt_rect, 2> synth_rect{
@@ -545,27 +560,31 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
 		        },
 		};
-		synth_foveation = foveation.foveate(
-		        vk.device,
-		        cmd,
-		        images[synth].view_y,
-		        images[synth].view_cbcr,
-		        true, // warped targets are always GL-ordered
-		        reprojector.get_views(),
-		        synth_rect,
-		        src_fov,
-		        view_info.alpha);
-
-		images[synth].frame_index = uint64_t(synth_frame_id);
-		images[synth].view_info = {
-		        .display_time = session.get_offset().to_headset(synth_predicted_ns),
-		        .alpha = view_info.alpha,
-		};
-		for (int view = 0; view < 2; ++view)
+		for (int k = 0; k < synth_done; ++k)
 		{
-			images[synth].view_info.pose[view] = xrt_cast(synth_poses[view]);
-			images[synth].view_info.fov[view] = xrt_cast(src_fov[view]);
-			images[synth].view_info.foveation[view] = synth_foveation[view];
+			synth_frame & s = synths[k];
+			auto synth_foveation = foveation.foveate(
+			        vk.device,
+			        cmd,
+			        images[s.image].view_y,
+			        images[s.image].view_cbcr,
+			        true, // warped targets are always GL-ordered
+			        reprojector.get_views(),
+			        synth_rect,
+			        src_fov,
+			        view_info.alpha);
+
+			images[s.image].frame_index = uint64_t(s.frame_id);
+			images[s.image].view_info = {
+			        .display_time = session.get_offset().to_headset(s.predicted_ns),
+			        .alpha = view_info.alpha,
+			};
+			for (int view = 0; view < 2; ++view)
+			{
+				images[s.image].view_info.pose[view] = xrt_cast(s.poses[view]);
+				images[s.image].view_info.fov[view] = xrt_cast(src_fov[view]);
+				images[s.image].view_info.foveation[view] = synth_foveation[view];
+			}
 		}
 	}
 
@@ -606,8 +625,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	};
 
 	append_encoder_barriers(i, view_info);
-	if (synth >= 0)
-		append_encoder_barriers(synth, images[synth].view_info);
+	for (int k = 0; k < synth_done; ++k)
+		append_encoder_barriers(synths[k].image, images[synths[k].image].view_info);
 
 	cmd.pipelineBarrier2({
 	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
@@ -650,26 +669,28 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	}
 
 	// Synthetic frames are encoded right behind the real frame, in
-	// display order (real tick first, missed tick second). Backpressure
-	// is natural: if the encoder cannot sustain 90 Hz the present slots
-	// stay busy and the synthetic is skipped, degrading to repeat.
-	if (synth >= 0)
+	// display order (real tick first, then missed ticks). Backpressure
+	// is natural: if the encoder cannot sustain headset cadence the
+	// present slots stay busy, acquire_image fails and later synthetics
+	// are skipped, degrading to repeat.
+	for (int k = 0; k < synth_done; ++k)
 	{
-		auto synth_info = pacer.present_to_info(synth_desired_present_ns);
+		const synth_frame & s = synths[k];
+		auto synth_info = pacer.present_to_info(s.desired_present_ns);
 		for (auto & encoder: encoders)
 		{
-			if (encoder->stream_idx == 2 and not images[synth].view_info.alpha)
+			if (encoder->stream_idx == 2 and not images[s.image].view_info.alpha)
 				continue;
 			encoder->present_image(
-			        images[synth].image,
+			        images[s.image].image,
 			        sem_info,
 			        synth_info.frame_id);
 		}
 	}
 
 	queue_encode(i);
-	if (synth >= 0)
-		queue_encode(synth);
+	for (int k = 0; k < synth_done; ++k)
+		queue_encode(synths[k].image);
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
