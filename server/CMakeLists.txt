@@ -272,6 +272,7 @@ if (WIVRN_BUILD_SERVER)
 		SHADERS
 			"${_monado_src}/src/xrt/auxiliary/render/shaders/layer.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/foveation.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_mesh.glsl"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)
