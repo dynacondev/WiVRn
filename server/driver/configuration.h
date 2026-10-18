@@ -167,9 +167,13 @@ struct configuration
 		// when a depth layer is actually submitted.
 		bool enabled = true;
 		// Reprojection mesh resolution (vertices = size + 1 per axis).
-		// Higher values resolve finer geometry at higher GPU cost.
-		uint32_t mesh_width = 1024;
-		uint32_t mesh_height = 1024;
+		// 0 (default) means automatic: the depth image resolution, which
+		// matches the render resolution in the supported pipeline.
+		// Higher values resolve finer geometry at higher server GPU
+		// cost; turn down (e.g. 256) if the warp pass shows up in
+		// timings.
+		uint32_t mesh_width = 0;
+		uint32_t mesh_height = 0;
 		// Edge-bleed handling (in source UV units): depth samples in
 		// this radius vote for the foreground; vertices whose depth
 		// differs from the neighbourhood minimum by more than

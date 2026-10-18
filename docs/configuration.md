@@ -139,12 +139,13 @@ Master switch. Reprojection only engages when a depth layer is
 actually submitted, so common applications are unaffected.
 
 ### `mesh-width`, `mesh-height`
-Default value: `1024`
+Default value: `0` (automatic: depth image resolution)
 
-Reprojection mesh resolution (vertices = size + 1 per axis, shared
-index buffer for both eyes). Higher values resolve finer geometry at
-higher server GPU cost; lower values (e.g. 256) if the warp pass
-shows up in timings.
+Reprojection mesh resolution (vertices = size + 1 per axis). The
+default tracks the depth image resolution, which matches the render
+resolution in the supported pipeline. Set explicitly (e.g. 256) to
+trade geometry detail for server GPU cost if the warp pass shows up
+in timings. Range when set: 16–4096.
 
 ### `bleed-radius`
 Default value: `0.005` (source UV units)

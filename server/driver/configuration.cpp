@@ -654,19 +654,23 @@ configuration::configuration()
 				if (it->contains("mesh-width"))
 				{
 					reprojection.mesh_width = it->at("mesh-width");
-					if (reprojection.mesh_width < 16 or reprojection.mesh_width > 2048)
+					// 0 means automatic (depth image resolution).
+					if (reprojection.mesh_width != 0 and
+					    (reprojection.mesh_width < 16 or reprojection.mesh_width > 4096))
 					{
-						U_LOG_W("reprojection mesh-width out of range [16, 2048], clamping");
-						reprojection.mesh_width = std::clamp(reprojection.mesh_width, 16u, 2048u);
+						U_LOG_W("reprojection mesh-width out of range [16, 4096], clamping");
+						reprojection.mesh_width = std::clamp(reprojection.mesh_width, 16u, 4096u);
 					}
 				}
 				if (it->contains("mesh-height"))
 				{
 					reprojection.mesh_height = it->at("mesh-height");
-					if (reprojection.mesh_height < 16 or reprojection.mesh_height > 2048)
+					// 0 means automatic (depth image resolution).
+					if (reprojection.mesh_height != 0 and
+					    (reprojection.mesh_height < 16 or reprojection.mesh_height > 4096))
 					{
-						U_LOG_W("reprojection mesh-height out of range [16, 2048], clamping");
-						reprojection.mesh_height = std::clamp(reprojection.mesh_height, 16u, 2048u);
+						U_LOG_W("reprojection mesh-height out of range [16, 4096], clamping");
+						reprojection.mesh_height = std::clamp(reprojection.mesh_height, 16u, 4096u);
 					}
 				}
 				if (it->contains("bleed-radius"))
