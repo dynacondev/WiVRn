@@ -110,10 +110,12 @@ buffer_allocation make_ubo(vk::raii::Device & device, int i)
 	        std::format("depth reprojector UBO {}", i)};
 }
 
-const std::array formats{
-        vk::Format::eR8G8B8A8Srgb,
-        vk::Format::eR8G8B8A8Unorm,
-};
+uint32_t mesh_dim(uint32_t configured, uint32_t automatic)
+{
+	if (configured == 0)
+		return automatic;
+	return std::clamp(configured, 16u, 4096u);
+}
 
 } // namespace
 
@@ -124,12 +126,13 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         graphics_supported{
                 bool(vk.physical_device.getQueueFamilyProperties()[vk.queue.family_index].queueFlags &
                      vk::QueueFlagBits::eGraphics)},
-        mesh_w{std::clamp(configuration().reprojection.mesh_width, 16u, 2048u)},
-        mesh_h{std::clamp(configuration().reprojection.mesh_height, 16u, 2048u)},
+        mesh_w{mesh_dim(configuration().reprojection.mesh_width, target_size.width)},
+        mesh_h{mesh_dim(configuration().reprojection.mesh_height, target_size.height)},
         bleed_radius{std::max(configuration().reprojection.bleed_radius, 0.f)},
         bleed_tolerance{std::max(configuration().reprojection.bleed_tolerance, 0.f)},
         clamp_to_border_black{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToBorder, vk::BorderColor::eFloatOpaqueBlack)},
         clamp_to_edge{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToEdge, vk::BorderColor::eFloatOpaqueBlack)},
+        resolve_pool{vk.device, vk::DescriptorPoolCreateInfo{}},
         ubo{make_ubo(vk.device, 0), make_ubo(vk.device, 1)}
 {
 	if (not graphics_supported)
@@ -138,73 +141,207 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		return;
 	}
 
-	// Per-eye warped color targets, same dual-format convention as the
-	// layer squasher: render into UNORM (no sRGB store conversion),
-	// sample through SRGB.
+	// Retained last-real-frame sources, sized to the render (== depth)
+	// eye size. Full-eye, GL-ordered by the resolve pass.
+	retained_color = image_allocation{
+	        vk.device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = vk::Format::eR8G8B8A8Unorm,
+	                .extent = {target_size.width, target_size.height, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+	        },
+	        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+	        "depth reprojector retained color"};
+	retained_depth = image_allocation{
+	        vk.device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = vk::Format::eR32Sfloat,
+	                .extent = {target_size.width, target_size.height, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+	        },
+	        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+	        "depth reprojector retained depth"};
+
+	auto make_layered_view = [&](vk::Image image, vk::Format format, vk::ImageAspectFlags aspect,
+	                             vk::ImageViewType type, uint32_t base_layer, uint32_t layers,
+	                             vk::ImageUsageFlags usage, const char * name) {
+		vk::raii::ImageView view{
+		        vk.device,
+		        vk::StructureChain{
+		                vk::ImageViewCreateInfo{
+		                        .image = image,
+		                        .viewType = type,
+		                        .format = format,
+		                        .subresourceRange = {
+		                                .aspectMask = aspect,
+		                                .levelCount = 1,
+		                                .baseArrayLayer = base_layer,
+		                                .layerCount = layers,
+		                        },
+		                },
+		                vk::ImageViewUsageCreateInfo{.usage = usage},
+		        }
+		                .get()};
+		vk.name(*view, name);
+		return view;
+	};
+
+	retained_color_view = make_layered_view(
+	        retained_color, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor,
+	        vk::ImageViewType::e2DArray, 0, 2,
+	        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled, "depth reprojector retained color array");
+	retained_depth_view = make_layered_view(
+	        retained_depth, vk::Format::eR32Sfloat, vk::ImageAspectFlagBits::eColor,
+	        vk::ImageViewType::e2DArray, 0, 2,
+	        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled, "depth reprojector retained depth array");
+	for (int i = 0; i < 2; ++i)
+	{
+		retained_color_eye[i] = make_layered_view(
+		        retained_color, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor,
+		        vk::ImageViewType::e2D, i, 1, vk::ImageUsageFlagBits::eSampled,
+		        std::format("depth reprojector retained color {}", i).c_str());
+		retained_depth_eye[i] = make_layered_view(
+		        retained_depth, vk::Format::eR32Sfloat, vk::ImageAspectFlagBits::eColor,
+		        vk::ImageViewType::e2D, i, 1, vk::ImageUsageFlagBits::eSampled,
+		        std::format("depth reprojector retained depth {}", i).c_str());
+	}
+
+	// Resolve pass: compute copy of the current sources into retained.
+	std::array resolve_bindings{
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 0,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 2,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 3,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 4,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 5,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	};
+	resolve_ds_layout = vk::raii::DescriptorSetLayout{
+	        vk.device,
+	        vk::DescriptorSetLayoutCreateInfo{
+	                .bindingCount = resolve_bindings.size(),
+	                .pBindings = resolve_bindings.data(),
+	        }};
+	vk.name(*resolve_ds_layout, "depth reprojector resolve descriptor set layout");
+
+	vk::PushConstantRange resolve_push{
+	        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        .offset = 0,
+	        .size = sizeof(reproject_resolve_push),
+	};
+	resolve_layout = vk::raii::PipelineLayout{
+	        vk.device,
+	        vk::PipelineLayoutCreateInfo{
+	                .setLayoutCount = 1,
+	                .pSetLayouts = &*resolve_ds_layout,
+	                .pushConstantRangeCount = 1,
+	                .pPushConstantRanges = &resolve_push,
+	        }};
+	vk.name(*resolve_layout, "depth reprojector resolve pipeline layout");
+
+	auto resolve_shader = vk.load_shader("reproject_resolve");
+	resolve_pipeline = vk::raii::Pipeline{
+	        vk.device,
+	        nullptr,
+	        vk::ComputePipelineCreateInfo{
+	                .stage = {
+	                        .stage = vk::ShaderStageFlagBits::eCompute,
+	                        .module = *resolve_shader,
+	                        .pName = "main",
+	                },
+	                .layout = *resolve_layout,
+	        }};
+	vk.name(*resolve_pipeline, "depth reprojector resolve pipeline");
+
+	std::array resolve_pool_sizes{
+	        vk::DescriptorPoolSize{
+	                .type = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 4,
+	        },
+	        vk::DescriptorPoolSize{
+	                .type = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 2,
+	        },
+	};
+	resolve_pool = vk::raii::DescriptorPool{
+	        vk.device,
+	        vk::DescriptorPoolCreateInfo{
+	                .maxSets = 1,
+	                .poolSizeCount = resolve_pool_sizes.size(),
+	                .pPoolSizes = resolve_pool_sizes.data(),
+	        }};
+	vk.name(*resolve_pool, "depth reprojector resolve descriptor pool");
+	resolve_set = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+		.descriptorPool = *resolve_pool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = &*resolve_ds_layout,
+	})[0]
+	                        .release();
+
+	// Per-eye warped color targets (plain UNORM, sampled raw).
 	for (int i = 0; i < 2; ++i)
 	{
 		target[i] = image_allocation{
 		        vk.device,
-		        vk::StructureChain{
-		                vk::ImageCreateInfo{
-		                        .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat,
-		                        .imageType = vk::ImageType::e2D,
-		                        .format = formats[0],
-		                        .extent = {target_size.width, target_size.height, 1},
-		                        .mipLevels = 1,
-		                        .arrayLayers = 1,
-		                        .samples = vk::SampleCountFlagBits::e1,
-		                        .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
-		                },
-		                vk::ImageFormatListCreateInfo{
-		                        .viewFormatCount = formats.size(),
-		                        .pViewFormats = formats.data(),
-		                },
-		        }
-		                .get(),
+		        vk::ImageCreateInfo{
+		                .imageType = vk::ImageType::e2D,
+		                .format = vk::Format::eR8G8B8A8Unorm,
+		                .extent = {target_size.width, target_size.height, 1},
+		                .mipLevels = 1,
+		                .arrayLayers = 1,
+		                .samples = vk::SampleCountFlagBits::e1,
+		                .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+		        },
 		        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
 		        std::format("depth reprojector target {}", i)};
 
-		vk::Image image = target[i];
-		target_view_unorm[i] = vk::raii::ImageView{
-		        vk.device,
-		        vk::StructureChain{
-		                vk::ImageViewCreateInfo{
-		                        .image = image,
-		                        .viewType = vk::ImageViewType::e2D,
-		                        .format = formats[1],
-		                        .subresourceRange = {
-		                                .aspectMask = vk::ImageAspectFlagBits::eColor,
-		                                .levelCount = 1,
-		                                .layerCount = 1,
-		                        },
-		                },
-		                vk::ImageViewUsageCreateInfo{.usage = vk::ImageUsageFlagBits::eColorAttachment},
-		        }
-		                .get()};
-		target_view_srgb[i] = vk::raii::ImageView{
-		        vk.device,
-		        vk::StructureChain{
-		                vk::ImageViewCreateInfo{
-		                        .image = image,
-		                        .viewType = vk::ImageViewType::e2D,
-		                        .format = formats[0],
-		                        .subresourceRange = {
-		                                .aspectMask = vk::ImageAspectFlagBits::eColor,
-		                                .levelCount = 1,
-		                                .layerCount = 1,
-		                        },
-		                },
-		                vk::ImageViewUsageCreateInfo{.usage = vk::ImageUsageFlagBits::eSampled},
-		        }
-		                .get()};
-		vk.name(*target_view_unorm[i], std::format("depth reprojector target unorm {}", i).c_str());
-		vk.name(*target_view_srgb[i], std::format("depth reprojector target srgb {}", i).c_str());
+		target_view[i] = make_layered_view(
+		        target[i], vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor,
+		        vk::ImageViewType::e2D, 0, 1,
+		        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+		        std::format("depth reprojector target view {}", i).c_str());
 	}
 
 	// Renderpass: clear holes to transparent black, store, end sampled.
 	vk::AttachmentDescription attachment{
-	        .format = formats[1],
+	        .format = vk::Format::eR8G8B8A8Unorm,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
@@ -237,7 +374,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		        vk::FramebufferCreateInfo{
 		                .renderPass = *renderpass,
 		                .attachmentCount = 1,
-		                .pAttachments = &*target_view_unorm[i],
+		                .pAttachments = &*target_view[i],
 		                .width = target_size.width,
 		                .height = target_size.height,
 		                .layers = 1,
@@ -403,7 +540,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .poolSizeCount = pool_sizes.size(),
 	                .pPoolSizes = pool_sizes.data(),
 	        }};
-	vk.name(*descriptor_pool, "depth reprojector descriptor pool");
+	vk.name(*descriptor_pool, "depth reprojector pipeline descriptor pool");
 	{
 		std::array layouts = {*ds_layout, *ds_layout};
 		auto sets = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
@@ -416,35 +553,204 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	}
 }
 
+void depth_reprojector::refresh_retained(
+        vk::raii::Device & device,
+        vk::raii::CommandBuffer & cmd,
+        std::array<vk::ImageView, 2> color,
+        std::array<vk::ImageView, 2> depth,
+        std::array<std::array<float, 4>, 2> color_rect,
+        std::array<std::array<float, 4>, 2> depth_rect,
+        bool flip_y)
+{
+	// Retained images start UNDEFINED, then stay SHADER_READ_ONLY
+	// between refreshes.
+	vk::ImageLayout old_layout = retained_initialized ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
+	vk::AccessFlags src_access = retained_initialized ? vk::AccessFlagBits::eShaderRead : vk::AccessFlags{};
+	vk::PipelineStageFlags src_stage = retained_initialized
+	        ? vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader
+	        : vk::PipelineStageFlagBits::eTopOfPipe;
+	retained_initialized = true;
+
+	std::array barriers{
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = src_access,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderWrite,
+	                .oldLayout = old_layout,
+	                .newLayout = vk::ImageLayout::eGeneral,
+	                .image = retained_color,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 2,
+	                },
+	        },
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = src_access,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderWrite,
+	                .oldLayout = old_layout,
+	                .newLayout = vk::ImageLayout::eGeneral,
+	                .image = retained_depth,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 2,
+	                },
+	        },
+	};
+	cmd.pipelineBarrier(src_stage, vk::PipelineStageFlagBits::eComputeShader, {}, {}, {}, barriers);
+
+	std::array color_infos{
+	        vk::DescriptorImageInfo{
+	                .sampler = *clamp_to_border_black,
+	                .imageView = color[0],
+	                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        },
+	        vk::DescriptorImageInfo{
+	                .sampler = *clamp_to_border_black,
+	                .imageView = color[1],
+	                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        },
+	};
+	std::array depth_infos{
+	        vk::DescriptorImageInfo{
+	                .sampler = *clamp_to_edge,
+	                .imageView = depth[0],
+	                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        },
+	        vk::DescriptorImageInfo{
+	                .sampler = *clamp_to_edge,
+	                .imageView = depth[1],
+	                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        },
+	};
+	vk::DescriptorImageInfo dst_color_info{
+	        .imageView = *retained_color_view,
+	        .imageLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::DescriptorImageInfo dst_depth_info{
+	        .imageView = *retained_depth_view,
+	        .imageLayout = vk::ImageLayout::eGeneral,
+	};
+	std::array writes = {
+	        vk::WriteDescriptorSet{
+	                .dstSet = resolve_set,
+	                .dstBinding = 0,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &color_infos[0],
+	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = resolve_set,
+	                .dstBinding = 1,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &color_infos[1],
+	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = resolve_set,
+	                .dstBinding = 2,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &depth_infos[0],
+	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = resolve_set,
+	                .dstBinding = 3,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &depth_infos[1],
+	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = resolve_set,
+	                .dstBinding = 4,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .pImageInfo = &dst_color_info,
+	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = resolve_set,
+	                .dstBinding = 5,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .pImageInfo = &dst_depth_info,
+	        },
+	};
+	device.updateDescriptorSets(writes, {});
+
+	// GL-ordered sources (flip_y) need no mirroring; Vulkan-ordered
+	// rows sample mirrored so retained stays GL-ordered.
+	reproject_resolve_push push{};
+	std::ranges::copy(color_rect[0], push.color_rect[0]);
+	std::ranges::copy(color_rect[1], push.color_rect[1]);
+	std::ranges::copy(depth_rect[0], push.depth_rect[0]);
+	std::ranges::copy(depth_rect[1], push.depth_rect[1]);
+	push.src_flip = flip_y ? 0.f : 1.f;
+
+	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *resolve_pipeline);
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *resolve_layout, 0, resolve_set, {});
+	cmd.pushConstants<reproject_resolve_push>(*resolve_layout, vk::ShaderStageFlagBits::eCompute, 0, push);
+	const auto extent = retained_color.info().extent;
+	cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 2);
+
+	std::array out_barriers{
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                .oldLayout = vk::ImageLayout::eGeneral,
+	                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                .image = retained_color,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 2,
+	                },
+	        },
+	        vk::ImageMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                .oldLayout = vk::ImageLayout::eGeneral,
+	                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                .image = retained_depth,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 2,
+	                },
+	        },
+	};
+	cmd.pipelineBarrier(
+	        vk::PipelineStageFlagBits::eComputeShader,
+	        vk::PipelineStageFlagBits::eVertexShader | vk::PipelineStageFlagBits::eFragmentShader,
+	        {},
+	        {},
+	        {},
+	        out_barriers);
+}
+
 bool depth_reprojector::reproject(
         vk::raii::Device & device,
         vk::raii::CommandBuffer & cmd,
         int view,
-        const frame_source & src,
+        const xrt_pose & src_pose,
+        const xrt_fov & src_fov,
+        float near_z,
+        float far_z,
         const xrt_pose & dst_pose,
         const xrt_fov & dst_fov)
 {
-	// Positive sub-image extents only: the mesh grid maps guv straight
-	// onto frustum UV, which requires an unmirrored full-eye mapping.
-	for (float e: {src.color_rect[2], src.color_rect[3], src.depth_rect[2], src.depth_rect[3]})
-	{
-		if (not(std::isfinite(e) and e > 0))
-			return false;
-	}
-
 	// Source clip math in GL convention (matches the 0..1 depth buffer).
 	xrt_matrix_4x4 src_proj{};
-	if (not frustum_gl(src.fov, src.near_z, src.far_z, src_proj))
+	if (not frustum_gl(src_fov, near_z, far_z, src_proj))
 		return false;
 	xrt_matrix_4x4 src_view{};
-	math_matrix_4x4_view_from_pose(&src.pose, &src_view);
+	math_matrix_4x4_view_from_pose(&src_pose, &src_view);
 	xrt_matrix_4x4 render_inv_p{};
 	math_matrix_4x4_inverse(&src_proj, &render_inv_p);
 	xrt_matrix_4x4 render_inv_v{};
 	math_matrix_4x4_inverse(&src_view, &render_inv_v);
 
 	xrt_matrix_4x4 dst_proj{};
-	if (not frustum_gl(dst_fov, src.near_z, src.far_z, dst_proj))
+	if (not frustum_gl(dst_fov, near_z, far_z, dst_proj))
 		return false;
 	xrt_matrix_4x4 dst_view{};
 	math_matrix_4x4_view_from_pose(&dst_pose, &dst_view);
@@ -455,24 +761,26 @@ bool depth_reprojector::reproject(
 	ubo_data.render_inv_p = render_inv_p;
 	ubo_data.render_inv_v = render_inv_v;
 	ubo_data.warp_vp = warp_vp;
-	std::ranges::copy(src.color_rect, ubo_data.color_rect);
-	std::ranges::copy(src.depth_rect, ubo_data.depth_rect);
+	// Retained sources are full-eye by construction.
+	ubo_data.color_rect[0] = ubo_data.depth_rect[0] = 0;
+	ubo_data.color_rect[1] = ubo_data.depth_rect[1] = 0;
+	ubo_data.color_rect[2] = ubo_data.depth_rect[2] = 1;
+	ubo_data.color_rect[3] = ubo_data.depth_rect[3] = 1;
 	ubo_data.bleed_radius = bleed_radius;
 	ubo_data.bleed_tolerance = bleed_tolerance;
-	ubo_data.src_flip_y = src.src_flip_y;
-	ubo_data.pad = 0;
+	ubo_data.pad[0] = ubo_data.pad[1] = 0;
 
 	const auto extent = target[view].info().extent;
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 
 	vk::DescriptorImageInfo color_info{
 	        .sampler = *clamp_to_border_black,
-	        .imageView = src.color,
+	        .imageView = *retained_color_eye[view],
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorImageInfo depth_info{
 	        .sampler = *clamp_to_edge,
-	        .imageView = src.depth,
+	        .imageView = *retained_depth_eye[view],
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorBufferInfo ubo_info{
@@ -505,7 +813,7 @@ bool depth_reprojector::reproject(
 	device.updateDescriptorSets(writes, {});
 
 	// Target rows are GL-ordered (row 0 = frustum bottom), matching the
-	// source convention the mesh math assumes.
+	// retained source convention the mesh math assumes.
 	vk::Viewport viewport{
 	        .x = 0,
 	        .y = 0,
@@ -553,7 +861,7 @@ bool depth_reprojector::reproject(
 
 std::array<vk::ImageView, 2> depth_reprojector::get_views()
 {
-	return {*target_view_srgb[0], *target_view_srgb[1]};
+	return {*target_view[0], *target_view[1]};
 }
 
 } // namespace wivrn

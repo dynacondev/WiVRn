@@ -35,18 +35,24 @@ struct reproject_ubo_data
 	xrt_matrix_4x4 render_inv_p;
 	xrt_matrix_4x4 render_inv_v;
 	xrt_matrix_4x4 warp_vp;
-	// Normalized sub-image rects: offset.xy, extent.xy.
+	// Normalized sub-image rects of the retained sources: offset.xy,
+	// extent.xy. Always full-eye (identity) by construction.
 	float color_rect[4];
 	float depth_rect[4];
 	float bleed_radius;
 	float bleed_tolerance;
-	// 0 = GL-ordered source (row 0 = frustum bottom, e.g. xrizer),
-	// 1 = Vulkan-ordered source. Sampling V and output Y flip together
-	// so the warped target is always GL-ordered (foveated with flip).
-	float src_flip_y;
-	float pad;
+	float pad[2];
 };
 static_assert(sizeof(reproject_ubo_data) == 240);
+
+// Push block mirror of reproject_resolve.comp.
+struct reproject_resolve_push
+{
+	float color_rect[2][4];
+	float depth_rect[2][4];
+	float src_flip; // 0 = GL-ordered source rows, 1 = Vulkan-ordered
+};
+static_assert(sizeof(reproject_resolve_push) == 68);
 
 namespace wivrn
 {
@@ -58,28 +64,18 @@ struct vk_bundle;
 // world and reprojects to the target pose; the fragment is a plain
 // color tap. Uncovered pixels keep the renderpass clear color.
 //
-// One instance owns both eyes' targets, pipelines and mesh. Use is
-// single-threaded (compositor layer_commit thread).
+// The last real frame is held in compositor-owned retained images
+// (refreshed by refresh_retained on every depth commit), so any number
+// of synthetic frames can warp from held sources even after the app
+// recycles its swapchains. Warp targets are plain UNORM and sampled
+// raw: the chain introduces no color conversion of its own, values
+// match the direct sampling path exactly.
+//
+// One instance owns both eyes' targets, retained sources, pipelines
+// and mesh. Use is single-threaded (compositor layer_commit thread).
 class depth_reprojector
 {
 public:
-	struct frame_source
-	{
-		vk::ImageView color;
-		vk::ImageView depth;
-		// Normalized sub-image rects: offset.xy, extent.xy. Must have
-		// positive extent (full-eye from xrizer); anything else makes
-		// reproject() decline.
-		std::array<float, 4> color_rect;
-		std::array<float, 4> depth_rect;
-		xrt_pose pose;
-		xrt_fov fov;
-		float near_z;
-		float far_z;
-		// 0 = GL-ordered source rows, 1 = Vulkan-ordered.
-		float src_flip_y = 0;
-	};
-
 	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size);
 
 	// False when the compositor queue family cannot do graphics: the
@@ -98,15 +94,31 @@ public:
 		return mesh_h;
 	}
 
-	// Warps one eye's source (render pose) to dst_pose/dst_fov, recording
-	// into cmd. Output ends in SHADER_READ_ONLY_OPTIMAL, ready to feed
-	// foveation (see get_views). Returns false on degenerate input
-	// (caller falls back: no synthetic frame).
+	// Copies the current real frame into the retained sources.
+	// Norm-rects map each eye's sub-image; flip_y selects the source
+	// row order (true = GL-ordered, as submitted by GL runtimes).
+	void refresh_retained(
+	        vk::raii::Device & device,
+	        vk::raii::CommandBuffer & cmd,
+	        std::array<vk::ImageView, 2> color,
+	        std::array<vk::ImageView, 2> depth,
+	        std::array<std::array<float, 4>, 2> color_rect,
+	        std::array<std::array<float, 4>, 2> depth_rect,
+	        bool flip_y);
+
+	// Warps one eye's retained source (render pose/param) to
+	// dst_pose/dst_fov, recording into cmd. Output ends in
+	// SHADER_READ_ONLY_OPTIMAL, ready to feed foveation (see
+	// get_views). Returns false on degenerate input (caller falls
+	// back: no synthetic frame).
 	bool reproject(
 	        vk::raii::Device & device,
 	        vk::raii::CommandBuffer & cmd,
 	        int view,
-	        const frame_source & src,
+	        const xrt_pose & src_pose,
+	        const xrt_fov & src_fov,
+	        float near_z,
+	        float far_z,
 	        const xrt_pose & dst_pose,
 	        const xrt_fov & dst_fov);
 
@@ -122,12 +134,26 @@ private:
 	vk::raii::Sampler clamp_to_border_black;
 	vk::raii::Sampler clamp_to_edge;
 
-	// Per-eye warped color targets: mutable-format images with an UNORM
-	// attachment view (render into, no sRGB conversion on store) and an
-	// SRGB sampled view (same convention as layer_squasher targets).
+	// Retained last-real-frame sources, GL-ordered by construction:
+	// full-eye color (UNORM) and raw depth (R32F), 2 layers (eyes).
+	// SHADER_READ_ONLY except across refresh_retained.
+	bool retained_initialized = false;
+	image_allocation retained_color;
+	image_allocation retained_depth;
+	vk::raii::ImageView retained_color_view;
+	vk::raii::ImageView retained_depth_view;
+	std::array<vk::raii::ImageView, 2> retained_color_eye;
+	std::array<vk::raii::ImageView, 2> retained_depth_eye;
+
+	vk::raii::DescriptorSetLayout resolve_ds_layout;
+	vk::raii::PipelineLayout resolve_layout;
+	vk::raii::Pipeline resolve_pipeline;
+	vk::raii::DescriptorPool resolve_pool;
+	vk::DescriptorSet resolve_set;
+
+	// Per-eye warped color targets (plain UNORM, sampled raw).
 	std::array<image_allocation, 2> target;
-	std::array<vk::raii::ImageView, 2> target_view_unorm;
-	std::array<vk::raii::ImageView, 2> target_view_srgb;
+	std::array<vk::raii::ImageView, 2> target_view;
 
 	vk::raii::RenderPass renderpass;
 	std::array<vk::raii::Framebuffer, 2> framebuffers;
