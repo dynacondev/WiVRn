@@ -16,8 +16,8 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 #include "pose_list.h"
+
 #include "driver/clock_offset.h"
 #include "driver/polynomial_interpolator.h"
 #include "math/m_api.h"
@@ -25,9 +25,11 @@
 #include "math/m_space.h"
 #include "math/m_vec3.h"
 #include "os/os_time.h"
+#include "util/u_logging.h"
 #include "xrt/xrt_defines.h"
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <atomic>
 #include <iostream>
 #include <magic_enum.hpp>
 
@@ -160,6 +162,29 @@ void pose_list::reset()
 
 void pose_list::add_sample(XrTime production_timestamp, XrTime timestamp, const from_headset::tracking::pose & pose, const clock_offset & offset)
 {
+	// Catch the headset reporting a valid-flagged identity pose (tracking
+	// lost but flags lie): it poisons the history and every prediction
+	// made from it, which the warp then trips over. Throttled; HEAD only
+	// (hands legitimately pass through origin).
+	if (device == wivrn::device_id::HEAD and
+	    (pose.flags & (from_headset::pose_flags::position_valid | from_headset::pose_flags::orientation_valid)) ==
+	            (from_headset::pose_flags::position_valid | from_headset::pose_flags::orientation_valid))
+	{
+		float px = pose.pose.position.x, py = pose.pose.position.y, pz = pose.pose.position.z;
+		float qx = pose.pose.orientation.x, qy = pose.pose.orientation.y, qz = pose.pose.orientation.z;
+		float qw = pose.pose.orientation.w;
+		if (px * px + py * py + pz * pz < 1e-6f and qx * qx + qy * qy + qz * qz < 1e-4f and qw * qw > 0.9999f)
+		{
+			static std::atomic<uint64_t> last_warn_ns{0};
+			uint64_t now_ns = os_monotonic_get_ns();
+			if (now_ns - last_warn_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_warn_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("tracking: HEAD pose is identity with valid flags (tracking lost on headset?)");
+			}
+		}
+	}
+
 	production_timestamp = offset.from_headset(production_timestamp);
 	timestamp = offset.from_headset(timestamp);
 
