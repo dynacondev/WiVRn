@@ -303,6 +303,28 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
+	// Commit-rate + depth-presence heartbeat (logging only: answers "is
+	// the app submitting?" and "is depth arriving?" in one line so a
+	// quiet warp section is distinguishable from a starved pipeline).
+	// Only the log line is throttled; the commit path is untouched.
+	static uint64_t last_rate_log_ns = 0;
+	static uint64_t commits_since_log = 0;
+	static uint64_t depth_commits_since_log = 0;
+	{
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (last_rate_log_ns != 0 and now_ns - last_rate_log_ns > 5'000'000'000ull)
+		{
+			double dt = (now_ns - last_rate_log_ns) / 1e9;
+			U_LOG_I("compositor: %.1f commits/s (%llu with depth)", commits_since_log / dt, (unsigned long long)depth_commits_since_log);
+			commits_since_log = 0;
+			depth_commits_since_log = 0;
+			last_rate_log_ns = now_ns;
+		}
+		if (last_rate_log_ns == 0)
+			last_rate_log_ns = now_ns;
+		++commits_since_log;
+	}
+
 	// Missed-tick detection for depth reprojection: each display
 	// period without a real commit past the first means the application
 	// missed a deadline (e.g. 45 fps app at 90 Hz needs 1 synthetic per
@@ -421,7 +443,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 		}
 		if (layer.data.type == XRT_LAYER_PROJECTION_DEPTH)
+		{
 			has_depth_src = true;
+			++depth_commits_since_log;
+		}
 	}
 	else
 	{
