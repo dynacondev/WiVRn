@@ -572,6 +572,28 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				        fovs.data(),
 				        s.poses.data());
 
+				// The tracker may be unable to serve a synthetic tick
+				// (too far ahead, momentary tracking loss): it reports
+				// that via the head relation flags while the eye poses
+				// fall back to identity+offsets. Warping to those
+				// produces a fully degenerate splat (trips the breaker
+				// and blinds the warp for 5 s), so skip synthetics on
+				// invalid head poses instead, degrading to repeat.
+				constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+				if ((head.relation_flags & need_pose) != need_pose)
+				{
+					static uint64_t last_invalid_pose_log_ns = 0;
+					if (warp_now_ns - last_invalid_pose_log_ns > 5'000'000'000ull)
+					{
+						last_invalid_pose_log_ns = warp_now_ns;
+						U_LOG_I("Depth warp: skipping %d synthetics (head pose invalid for tick, repeat instead)",
+						        synth_wanted - synth_done);
+					}
+					images[s.image].busy = false;
+					s.image = -1;
+					break;
+				}
+
 				bool ok = true;
 				for (int view = 0; view < 2; ++view)
 				{
