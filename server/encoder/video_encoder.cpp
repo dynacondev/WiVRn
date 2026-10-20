@@ -48,11 +48,48 @@
 namespace wivrn
 {
 
+std::atomic<int> & video_encoder::stage_for(uint8_t stream)
+{
+	static std::atomic<int> stages[8]{};
+	return stages[stream & 7];
+}
+
+std::atomic<uint64_t> & video_encoder::sender_heartbeat()
+{
+	static std::atomic<uint64_t> heartbeat{0};
+	return heartbeat;
+}
+
+std::string video_encoder::stages_snapshot()
+{
+	static const char * names[] = {"IDLE", "ENTER", "IDR", "FENCE", "QUERY", "OVERFLOW", "MAP", "PUSH"};
+	static const size_t count = sizeof(names) / sizeof(names[0]);
+	std::string out = "encode-stages=[";
+	for (int i = 0; i < 8; ++i)
+	{
+		int s = stage_for(uint8_t(i)).load(std::memory_order_relaxed);
+		if (s != VES_IDLE)
+		{
+			out += std::to_string(i) + ":";
+			out += (s >= 0 && size_t(s) < count) ? names[s] : "?";
+			out += " ";
+		}
+	}
+	out += "]";
+	uint64_t hb = sender_heartbeat().load(std::memory_order_relaxed);
+	if (hb)
+		out += " sender-heartbeat=" + std::to_string((os_monotonic_get_ns() - hb) / 1'000'000) + "ms-ago";
+	else
+		out += " sender-heartbeat=never";
+	return out;
+}
+
 video_encoder::sender::sender() :
-        thread([this](std::stop_token t) {
-	        while (not t.stop_requested())
-	        {
-		data * d = nullptr;
+	thread([this](std::stop_token t) {
+		while (not t.stop_requested())
+		{
+			sender_heartbeat().store(os_monotonic_get_ns(), std::memory_order_relaxed);
+			data * d = nullptr;
 		{
 			std::unique_lock lock(mutex);
 			if (pending.empty())
@@ -307,9 +344,11 @@ void video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info
 			{
 				last_present_log_ns.store(now_ns, std::memory_order_relaxed);
 				std::string probe = stall_info();
-				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?)%s",
+				probe += " ";
+				probe += video_encoder::stages_snapshot();
+				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?) %s",
 				        stream_idx, (unsigned long)frame_index, (now_ns - stall_start_ns) / 1e9,
-				        probe.empty() ? "" : (" " + probe).c_str());
+				        probe.c_str());
 			}
 		}
 	}

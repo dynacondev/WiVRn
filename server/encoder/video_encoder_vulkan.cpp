@@ -1075,7 +1075,7 @@ std::string wivrn::video_encoder_vulkan::stall_info()
 {
 	static const char * stage_names[] = {"IDLE", "ENTER", "IDR", "FENCE", "QUERY", "OVERFLOW", "MAP", "PUSH"};
 	static const size_t stage_count = sizeof(stage_names) / sizeof(stage_names[0]);
-	int s = stage.load(std::memory_order_relaxed);
+	int s = stage_for(stream_idx).load(std::memory_order_relaxed);
 	std::string out = "encode-stage=";
 	out += (s >= 0 && size_t(s) < stage_count) ? stage_names[s] : "?";
 	try
@@ -1106,14 +1106,14 @@ std::string wivrn::video_encoder_vulkan::stall_info()
 std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(uint8_t encode_slot, uint64_t frame_index)
 {
 	auto & slot_item = slot_data[encode_slot];
-	stage.store(STAGE_ENTER, std::memory_order_relaxed);
+	stage_for(stream_idx).store(VES_ENTER, std::memory_order_relaxed);
 	if (slot_item.idr)
 	{
-		stage.store(STAGE_IDR, std::memory_order_relaxed);
+		stage_for(stream_idx).store(VES_IDR, std::memory_order_relaxed);
 		send_idr_data();
 	}
 
-	stage.store(STAGE_FENCE, std::memory_order_relaxed);
+	stage_for(stream_idx).store(VES_FENCE, std::memory_order_relaxed);
 	if (vk.device.waitForFences(*slot_item.fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
@@ -1131,7 +1131,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 	// resets this slot's query, and streaming resumes by itself.
 	vk::Result res = vk::Result::eNotReady;
 	uint32_t size = 0;
-	stage.store(STAGE_QUERY, std::memory_order_relaxed);
+	stage_for(stream_idx).store(VES_QUERY, std::memory_order_relaxed);
 	const uint64_t query_start_ns = os_monotonic_get_ns();
 	while (res == vk::Result::eNotReady)
 	{
@@ -1188,7 +1188,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 	// If that wasn't enough, we have to issue a second copy command for the rest
 	if (slot_item.host_buffer and size > slot_item.copy_size)
 	{
-		stage.store(STAGE_OVERFLOW, std::memory_order_relaxed);
+		stage_for(stream_idx).store(VES_OVERFLOW, std::memory_order_relaxed);
 		U_LOG_D("additional copy needed: %ld", size - slot_item.copy_size);
 		const bool transfer_queue = *slot_item.transfer_cmd_buf;
 		// The encoded image is larger than expected, we need to copy some more data
@@ -1242,10 +1242,10 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		}
 	}
 
-	stage.store(STAGE_MAP, std::memory_order_relaxed);
+	stage_for(stream_idx).store(VES_MAP, std::memory_order_relaxed);
 	void * mapped = slot_item.host_buffer ? slot_item.host_buffer.map() : slot_item.output_buffer.map();
 
-	stage.store(STAGE_PUSH, std::memory_order_relaxed);
+	stage_for(stream_idx).store(VES_PUSH, std::memory_order_relaxed);
 	slot_item.busy = true;
 	return data{
 	        .encoder = this,

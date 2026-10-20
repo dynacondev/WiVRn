@@ -75,6 +75,29 @@ private:
 	};
 
 public:
+	// Encode sub-stages for stall diagnostics (written by encoder_work,
+	// sampled from other threads while a slot is stuck busy).
+	// Diagnostic only, never used for control.
+	enum video_encode_stage : int
+	{
+		VES_IDLE = 0,
+		VES_ENTER,
+		VES_IDR,
+		VES_FENCE,
+		VES_QUERY,
+		VES_OVERFLOW,
+		VES_MAP,
+		VES_PUSH,
+	};
+
+	// Per-stream encode stage, indexed by stream_idx (mod 8).
+	static std::atomic<int> & stage_for(uint8_t stream);
+	// Last sender-loop iteration (monotonic ns, 0 = never). A stale
+	// heartbeat means the sender thread is blocked or dead.
+	static std::atomic<uint64_t> & sender_heartbeat();
+	// One-line snapshot of all non-idle stages + sender heartbeat age.
+	static std::string stages_snapshot();
+
 	const uint8_t stream_idx;
 	const uint32_t target_queue;
 	const bool need_transfer;
