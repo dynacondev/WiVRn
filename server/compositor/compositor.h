@@ -36,6 +36,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -118,7 +119,15 @@ private:
 
 	std::mutex encode_mutex;
 	std::condition_variable_any encode_cv;
-	std::deque<int> encode_queue;
+	struct queued_frame
+	{
+		int image;
+		// Per-encoder slot recorded at present time (-1 = not presented:
+		// stream skipped). Encode consumes exactly the recorded slot, so
+		// present/encode cannot diverge across exceptions, drops or skips.
+		std::array<int8_t, 3> slots{-1, -1, -1};
+	};
+	std::deque<queued_frame> encode_queue;
 	std::jthread encoder_thread;
 
 	struct
@@ -174,7 +183,7 @@ private:
 
 	int acquire_image();
 
-	void queue_encode(int image);
+	void queue_encode(int image, const std::array<int8_t, 3> & slots);
 
 	void encoder_work(std::stop_token);
 

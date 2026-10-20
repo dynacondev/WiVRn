@@ -378,6 +378,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		int64_t desired_present_ns = 0;
 		int64_t predicted_ns = 0;
 		std::array<xrt_pose, 2> poses{};
+		std::array<int8_t, 3> enc_slots{-1, -1, -1};
 	};
 	std::array<synth_frame, max_synth_per_commit> synths{};
 	int synth_done = 0;
@@ -744,39 +745,73 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
 
-	for (auto & encoder: encoders)
+	// Record each encoder's slot on the queued frame; encode() consumes
+	// exactly the recorded slot, so present/encode stay paired across
+	// exceptions, drops and skips (no shared counters to diverge).
+	std::array<int8_t, 3> real_slots{-1, -1, -1};
+	try
 	{
-		if (encoder->stream_idx == 2 and not view_info.alpha)
-			continue;
-		encoder->present_image(
-		        images[i].image,
-		        sem_info,
-		        info.frame_id);
-	}
-
-	// Synthetic frames are encoded right behind the real frame, in
-	// display order (real tick first, then missed ticks). Backpressure
-	// is natural: if the encoder cannot sustain headset cadence the
-	// present slots stay busy, acquire_image fails and later synthetics
-	// are skipped, degrading to repeat.
-	for (int k = 0; k < synth_done; ++k)
-	{
-		const synth_frame & s = synths[k];
-		auto synth_info = pacer.present_to_info(s.desired_present_ns);
-		for (auto & encoder: encoders)
+		for (size_t ei = 0; ei < encoders.size(); ++ei)
 		{
-			if (encoder->stream_idx == 2 and not images[s.image].view_info.alpha)
+			auto & encoder = encoders[ei];
+			if (encoder->stream_idx == 2 and not view_info.alpha)
 				continue;
-			encoder->present_image(
-			        images[s.image].image,
+			real_slots[ei] = int8_t(encoder->present_image(
+			        images[i].image,
 			        sem_info,
-			        synth_info.frame_id);
+			        info.frame_id));
+		}
+
+		// Synthetic frames are encoded right behind the real frame, in
+		// display order (real tick first, then missed ticks). Backpressure
+		// is natural: if the encoder cannot sustain headset cadence the
+		// present slots stay busy, acquire_image fails and later synthetics
+		// are skipped, degrading to repeat.
+		for (int k = 0; k < synth_done; ++k)
+		{
+			synth_frame & s = synths[k];
+			auto synth_info = pacer.present_to_info(s.desired_present_ns);
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
+			{
+				auto & encoder = encoders[ei];
+				if (encoder->stream_idx == 2 and not images[s.image].view_info.alpha)
+					continue;
+				s.enc_slots[ei] = int8_t(encoder->present_image(
+				        images[s.image].image,
+				        sem_info,
+				        synth_info.frame_id));
+			}
 		}
 	}
+	catch (...)
+	{
+		// A present threw after earlier presents succeeded: those slots
+		// and images would never be encoded (the frame is dropped), so
+		// release them instead of leaking them busy, which wedges the
+		// compositor forever with zero logs.
+		U_LOG_E("compositor: present threw for frame %ld, releasing slots", (long)frame.rendering.id);
+		for (size_t ei = 0; ei < encoders.size(); ++ei)
+		{
+			if (real_slots[ei] >= 0)
+				encoders[ei]->release_slot(uint8_t(real_slots[ei]));
+			for (int k = 0; k < synth_done; ++k)
+			{
+				if (synths[k].enc_slots[ei] >= 0)
+					encoders[ei]->release_slot(uint8_t(synths[k].enc_slots[ei]));
+			}
+		}
+		images[i].busy = false;
+		for (int k = 0; k < synth_done; ++k)
+		{
+			if (synths[k].image >= 0)
+				images[synths[k].image].busy = false;
+		}
+		throw;
+	}
 
-	queue_encode(i);
+	queue_encode(i, real_slots);
 	for (int k = 0; k < synth_done; ++k)
-		queue_encode(synths[k].image);
+		queue_encode(synths[k].image, synths[k].enc_slots);
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -893,11 +928,11 @@ int compositor::acquire_image()
 	return -1;
 }
 
-void compositor::queue_encode(int image)
+void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
 {
 	{
 		std::lock_guard lock(encode_mutex);
-		encode_queue.push_back(image);
+		encode_queue.push_back({image, slots});
 	}
 	encode_cv.notify_one();
 }
@@ -906,27 +941,30 @@ void compositor::encoder_work(std::stop_token tok)
 {
 	while (true)
 	{
-		int req = -1;
+		queued_frame req{-1};
 		{
 			std::unique_lock lock(encode_mutex);
 			// Stop-aware wait: returns false when stop is requested.
 			if (not encode_cv.wait(lock, tok, [&] { return not encode_queue.empty(); }))
 				return;
-			req = encode_queue.front();
+			req = std::move(encode_queue.front());
 			encode_queue.pop_front();
 		}
 
-		assert(req >= 0 and req < images.size());
-		auto & image = images[req];
+		assert(req.image >= 0 and req.image < images.size());
+		auto & image = images[req.image];
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
 
 		try
 		{
-			for (auto & encoder: encoders)
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
 			{
+				auto & encoder = encoders[ei];
+				if (req.slots[ei] < 0)
+					continue;
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
-					encoder->encode(session, image.view_info, image.frame_index);
+					encoder->encode(session, image.view_info, image.frame_index, uint8_t(req.slots[ei]));
 			}
 		}
 		catch (std::exception & e)
