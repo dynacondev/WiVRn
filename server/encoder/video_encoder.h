@@ -116,7 +116,7 @@ public:
 	// or init() and read by the compositor on every layer_commit — must not
 	// change after the first frame.
 	vk::ImageLayout target_layout = vk::ImageLayout::eGeneral;
-	static const uint8_t num_slots = 2;
+	static const uint8_t num_slots = 4;
 	const double bitrate_multiplier;
 
 private:
@@ -124,7 +124,7 @@ private:
 	static const state_t idle = 0;
 	static const state_t busy = 1;
 	static const state_t skip = 2;
-	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle};
+	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle, idle, idle};
 	// Slot allocator for presents. Sole writer of slot assignments: each
 	// present records its slot on the queued frame and encode consumes
 	// exactly that slot, so the pairing cannot diverge (no counters to
@@ -164,10 +164,14 @@ public:
 	// Presents the image on the next free slot and returns that slot.
 	// The caller records it on the queued frame; encode() consumes
 	// exactly the recorded slot, so present/encode stay paired across
-	// exceptions, drops and skips.
+	// exceptions, drops and skips. With wait=false the wait is bounded
+	// (100 ms) and -1 is returned on timeout instead of parking: used
+	// for optional synthetic frames, which must never deadlock the
+	// commit (real frames always wait: their clearing encode is queued).
 	int present_image(vk::Image y_cbcr,
 	                  vk::SemaphoreSubmitInfo sem_info,
-	                  uint64_t frame_index);
+	                  uint64_t frame_index,
+	                  bool wait = true);
 
 	void on_feedback(const from_headset::feedback &);
 	void reset();

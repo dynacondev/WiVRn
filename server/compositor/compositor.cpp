@@ -767,20 +767,57 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// display order (real tick first, then missed ticks). Backpressure
 		// is natural: if the encoder cannot sustain headset cadence the
 		// present slots stay busy, acquire_image fails and later synthetics
-		// are skipped, degrading to repeat.
+		// are skipped, degrading to repeat. Synth presents are bounded
+		// (wait=false): a pressured pool skips synthetics instead of ever
+		// deadlocking the commit when the burst exceeds the slot count.
 		for (int k = 0; k < synth_done; ++k)
 		{
 			synth_frame & s = synths[k];
 			auto synth_info = pacer.present_to_info(s.desired_present_ns);
+			bool skipped = false;
 			for (size_t ei = 0; ei < encoders.size(); ++ei)
 			{
 				auto & encoder = encoders[ei];
 				if (encoder->stream_idx == 2 and not images[s.image].view_info.alpha)
 					continue;
-				s.enc_slots[ei] = int8_t(encoder->present_image(
+				int synth_slot = encoder->present_image(
 				        images[s.image].image,
 				        sem_info,
-				        synth_info.frame_id));
+				        synth_info.frame_id,
+				        false);
+				if (synth_slot < 0)
+				{
+					skipped = true;
+					break;
+				}
+				s.enc_slots[ei] = int8_t(synth_slot);
+			}
+			if (skipped)
+			{
+				static uint64_t last_synth_skip_log_ns = 0;
+				if (warp_now_ns - last_synth_skip_log_ns > 5'000'000'000ull)
+				{
+					last_synth_skip_log_ns = warp_now_ns;
+					U_LOG_W("Depth warp: skipping %d synthetics at present (slots pressured, repeat instead)", synth_done - k);
+				}
+				for (size_t ei = 0; ei < encoders.size(); ++ei)
+				{
+					if (s.enc_slots[ei] >= 0)
+					{
+						encoders[ei]->release_slot(uint8_t(s.enc_slots[ei]));
+						s.enc_slots[ei] = -1;
+					}
+				}
+				images[s.image].busy = false;
+				s.image = -1;
+				for (int j = k + 1; j < synth_done; ++j)
+				{
+					if (synths[j].image >= 0)
+						images[synths[j].image].busy = false;
+					synths[j].image = -1;
+				}
+				synth_done = k;
+				break;
 			}
 		}
 	}

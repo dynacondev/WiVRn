@@ -351,7 +351,7 @@ void video_encoder::set_framerate(float framerate)
 	pending_framerate = framerate;
 }
 
-int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
+int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index, bool wait)
 {
 	wivrn::trace::scope trace_present(wivrn::trace::cpu_track::encoder, stream_idx, frame_index, "present_image");
 	// Wait for encoder to be done
@@ -361,14 +361,18 @@ int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info,
 		// Poll instead of an unbounded atomic wait so a stall is VISIBLE
 		// (throttled log) rather than a silent permanent wedge. The slot
 		// is still not reused until idle, so the healthy path is unchanged
-		// (the wait is normally zero).
+		// (the wait is normally zero). Synthetic frames pass wait=false:
+		// bounded wait, then give up (caller degrades to repeat) instead
+		// of risking a deadlock when the pool is smaller than the burst.
 		uint64_t stall_start_ns = 0;
 		static std::atomic<uint64_t> last_present_log_ns{0};
 		while (state[slot].load() == busy)
 		{
 			if (not stall_start_ns)
 				stall_start_ns = os_monotonic_get_ns();
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			if (not wait and os_monotonic_get_ns() - stall_start_ns > 100'000'000ull)
+				return -1;
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			uint64_t now_ns = os_monotonic_get_ns();
 			if (now_ns - stall_start_ns > 5'000'000'000ull and
 			    now_ns - last_present_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
