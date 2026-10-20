@@ -573,6 +573,11 @@ void depth_reprojector::refresh_retained(
         std::array<std::array<float, 4>, 2> depth_rect,
         bool flip_y)
 {
+	// Disabled instance owns no images/pipelines (constructor early-out):
+	// recording with null handles would crash the server. Callers also
+	// guard, this is defense in depth.
+	if (not graphics_supported)
+		return;
 	// Retained images start UNDEFINED, then stay SHADER_READ_ONLY
 	// between refreshes.
 	vk::ImageLayout old_layout = retained_initialized ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
@@ -752,6 +757,9 @@ bool depth_reprojector::reproject(
         const xrt_pose & dst_pose,
         const xrt_fov & dst_fov)
 {
+	// See refresh_retained: disabled instance has no pipeline/targets.
+	if (not graphics_supported)
+		return false;
 	// Source clip math in GL convention (matches the 0..1 depth buffer).
 	xrt_matrix_4x4 src_proj{};
 	if (not frustum_gl(src_fov, near_z, far_z, src_proj))

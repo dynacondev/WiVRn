@@ -474,7 +474,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// Hold the current frame: copy color + depth into the
 	// compositor-owned retained sources so every synthetic below warps
 	// from held data, valid until the next real frame refreshes it.
-	if (has_depth_src)
+	// Guarded like the synth block: on queues without graphics support
+	// the reprojector owns no images/pipelines and refresh would record
+	// null handles (server crash -> client SESSION_LOST).
+	if (has_depth_src and reprojector.supported() and depth_reprojection_enabled)
 		reprojector.refresh_retained(vk.device, cmd, src, src_depth, src_color_nrect, src_depth_nrect, flip_y);
 
 	// Depth reprojection: one synthetic frame per missed display tick
