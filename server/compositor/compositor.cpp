@@ -477,56 +477,88 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (has_depth_src and depth_reprojection_enabled)
 		reprojector.refresh_retained(vk.device, cmd, src, src_depth, src_color_nrect, src_depth_nrect, flip_y);
 
+	// Warp circuit breaker: a degenerate splat (e.g. half the frame
+	// unmapped after a huge inter-frame jump at low app fps) turns
+	// every hole pixel into a full-radius expanding-ring search —
+	// hundreds of millions of taps per synthetic that wedge the GPU
+	// until the client gives up. If the last commit's hole fraction was
+	// catastrophic, skip the warp for a cooldown and emit repeats
+	// instead. Time-based, so recovery is automatic.
+	uint64_t warp_now_ns = os_monotonic_get_ns();
+	static uint64_t warp_cooldown_until_ns = 0;
+	const uint64_t warp_cooldown_ns = 5'000'000'000ull;
+	bool warp_cooldown = warp_now_ns < warp_cooldown_until_ns;
+
 	// Depth reprojection: one synthetic frame per missed display tick
 	// (synth_wanted, from the predicted-time gap), each warped from the
 	// retained sources to its own upcoming tick so the encoder still
 	// emits at headset cadence. True frames keep the existing rotation
 	// timewarp in the squasher/fast-path; synthetics replace it with a
 	// full 6DoF compute warp.
-	if (synth_wanted and has_depth_src and depth_reprojection_enabled)
+	if (synth_wanted and has_depth_src and depth_reprojection_enabled and not warp_cooldown)
 	{
-		for (int k = 0; k < synth_wanted; ++k)
+		try
 		{
-			synth_frame & s = synths[k];
-			int64_t wake_ns, slop_ns;
-			pacer.predict(s.frame_id, wake_ns, s.desired_present_ns, slop_ns, s.predicted_ns);
-
-			s.image = acquire_image();
-			if (s.image < 0)
-				break;
-
-			xrt_space_relation head{};
-			std::array<xrt_fov, 2> fovs{};
-			session.get_hmd().get_view_poses(
-			        nullptr,
-			        s.predicted_ns,
-			        XRT_VIEW_TYPE_STEREO,
-			        2,
-			        &head,
-			        fovs.data(),
-			        s.poses.data());
-
-			bool ok = true;
-			for (int view = 0; view < 2; ++view)
+			for (int k = 0; k < synth_wanted; ++k)
 			{
-				ok &= reprojector.reproject(
-				        vk.device,
-				        cmd,
-				        view,
-				        src_pose[view],
-				        src_fov[view],
-				        src_near_z[view],
-				        src_far_z[view],
-				        s.poses[view],
-				        src_fov[view]);
+				synth_frame & s = synths[k];
+				int64_t wake_ns, slop_ns;
+				pacer.predict(s.frame_id, wake_ns, s.desired_present_ns, slop_ns, s.predicted_ns);
+
+				s.image = acquire_image();
+				if (s.image < 0)
+					break;
+
+				xrt_space_relation head{};
+				std::array<xrt_fov, 2> fovs{};
+				session.get_hmd().get_view_poses(
+				        nullptr,
+				        s.predicted_ns,
+				        XRT_VIEW_TYPE_STEREO,
+				        2,
+				        &head,
+				        fovs.data(),
+				        s.poses.data());
+
+				bool ok = true;
+				for (int view = 0; view < 2; ++view)
+				{
+					ok &= reprojector.reproject(
+					        vk.device,
+					        cmd,
+					        view,
+					        src_pose[view],
+					        src_fov[view],
+					        src_near_z[view],
+					        src_far_z[view],
+					        s.poses[view],
+					        src_fov[view]);
+				}
+				if (not ok)
+				{
+					images[s.image].busy = false;
+					s.image = -1;
+					break;
+				}
+				++synth_done;
 			}
-			if (not ok)
+		}
+		catch (std::exception & e)
+		{
+			// A Vulkan/alloc throw mid-warp must never wedge the
+			// compositor thread (that wedges streaming until a server
+			// restart). Release the in-flight image, keep any completed
+			// synthetics, cool down, and repeat this commit.
+			U_LOG_E("Depth warp threw (%s); repeating frames for 5 s", e.what());
+			for (int k = synth_done; k < synth_wanted; ++k)
 			{
-				images[s.image].busy = false;
-				s.image = -1;
-				break;
+				if (synths[k].image >= 0)
+				{
+					images[synths[k].image].busy = false;
+					synths[k].image = -1;
+				}
 			}
-			++synth_done;
+			warp_cooldown_until_ns = warp_now_ns + warp_cooldown_ns;
 		}
 		if (synth_done)
 		{
@@ -535,12 +567,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			// at most one line per 5 s so a struggling scene can't spam.
 			uint32_t holes = reprojector.drain_hole_count();
 			static uint64_t last_warp_log_ns = 0;
-			uint64_t now_ns = os_monotonic_get_ns();
-			if (now_ns - last_warp_log_ns > 5'000'000'000ull)
+			if (warp_now_ns - last_warp_log_ns > 5'000'000'000ull)
 			{
-				last_warp_log_ns = now_ns;
+				last_warp_log_ns = warp_now_ns;
 				U_LOG_I("Depth warp: %d synthetics from retained depth (%u unfilled hole pixels)",
 				        synth_done, holes);
+			}
+			// Catastrophic hole fraction (> half of all target pixels):
+			// the splat is degenerate, not disoccluded. Trip the breaker
+			// rather than melting the GPU on full-radius searches.
+			const auto warp_extent = images[0].image.info().extent;
+			uint64_t warp_pixels =
+			        2ull * uint64_t(warp_extent.width) * uint64_t(warp_extent.height);
+			if (warp_pixels > 0 and uint64_t(holes) > warp_pixels / 2)
+			{
+				warp_cooldown_until_ns = warp_now_ns + warp_cooldown_ns;
+				U_LOG_W("Depth warp: %u/%llu pixels unfilled, pausing warp for 5 s (repeat instead)",
+				        holes, (unsigned long long)warp_pixels);
 			}
 		}
 	}
