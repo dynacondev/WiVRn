@@ -1085,11 +1085,13 @@ std::string wivrn::video_encoder_vulkan::stall_info()
 		// parked inside encode().
 		for (size_t i = 0; i < slot_data.size(); ++i)
 		{
-			vk::Result fr = vk.device.getFenceStatus(*slot_data[i].fence);
+			// No getFenceStatus on raii Device here; a zero-timeout
+			// wait is the same non-blocking poll.
+			vk::Result fr = vk.device.waitForFences(*slot_data[i].fence, true, 0);
 			auto [qr, sz] = query_pool.getResult<uint32_t>(uint32_t(i), 1, 0, vk::QueryResultFlags{});
 			(void)sz;
 			out += " slot" + std::to_string(i) + ":fence=";
-			out += (fr == vk::Result::eSuccess ? "signaled" : fr == vk::Result::eNotReady ? "unsignaled" : "error");
+			out += (fr == vk::Result::eSuccess ? "signaled" : fr == vk::Result::eTimeout ? "unsignaled" : "error");
 			out += ",query=";
 			out += (qr == vk::Result::eSuccess ? "ready" : qr == vk::Result::eNotReady ? "not-ready" : "error");
 		}
