@@ -122,6 +122,10 @@ public:
 
 private:
 	const uint32_t hole_radius;
+	// Depth encoding at construction: reverse-Z sources are converted
+	// once in the resolve pass. Read once here (not per commit) so the
+	// hot path never touches the config file.
+	const bool reverse_z;
 
 	vk::raii::Sampler clamp_to_border_black = nullptr;
 	vk::raii::Sampler clamp_to_edge = nullptr;

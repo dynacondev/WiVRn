@@ -118,6 +118,7 @@ namespace wivrn
 
 depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         hole_radius{configuration().reprojection.hole_radius},
+        reverse_z{configuration().reprojection.source_reverse_z},
         clamp_to_border_black{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToBorder, vk::BorderColor::eFloatOpaqueBlack)},
         clamp_to_edge{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToEdge, vk::BorderColor::eFloatOpaqueBlack)},
         resolve_pool{nullptr},
@@ -644,7 +645,7 @@ void depth_reprojector::refresh_retained(
 	push.src_flip = flip_y ? 0.f : 1.f;
 	// Reverse-Z sources (X-Plane Vulkan) convert once here so the warp
 	// math stays standard-convention downstream.
-	push.src_reverse_z = configuration().reprojection.source_reverse_z ? 1.f : 0.f;
+	push.src_reverse_z = reverse_z ? 1.f : 0.f;
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *resolve_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *resolve_layout, 0, resolve_set, {});
