@@ -98,6 +98,17 @@ public:
 	// One-line snapshot of all non-idle stages + sender heartbeat age.
 	static std::string stages_snapshot();
 
+	// Worker-loop liveness for stall diagnostics (written by
+	// encoder_work, sampled from other threads). Relaxed, diagnostic
+	// only. The heartbeat advances every loop iteration, including idle
+	// waits, so a stale heartbeat means the worker is parked or gone.
+	static std::atomic<uint64_t> & worker_heartbeat_ns();
+	// Last dequeued present-image index (-1 = none yet).
+	static std::atomic<int> & worker_last_image();
+	// Queue depth after the last push/pop (approximate).
+	static std::atomic<uint64_t> & worker_queue_depth();
+	static std::string worker_snapshot();
+
 	const uint8_t stream_idx;
 	const uint32_t target_queue;
 	const bool need_transfer;

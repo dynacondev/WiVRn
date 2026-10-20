@@ -42,6 +42,7 @@
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 
 #include <algorithm>
+#include <chrono>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -933,6 +934,7 @@ void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
 	{
 		std::lock_guard lock(encode_mutex);
 		encode_queue.push_back({image, slots});
+		video_encoder::worker_queue_depth().store(encode_queue.size(), std::memory_order_relaxed);
 	}
 	encode_cv.notify_one();
 }
@@ -941,15 +943,25 @@ void compositor::encoder_work(std::stop_token tok)
 {
 	while (true)
 	{
+		// Heartbeat every iteration, including idle waits: a stale
+		// heartbeat in a stall log means this thread is parked or gone
+		// (it never blocks unboundedly anywhere below).
+		video_encoder::worker_heartbeat_ns().store(os_monotonic_get_ns(), std::memory_order_relaxed);
 		queued_frame req{-1};
 		{
 			std::unique_lock lock(encode_mutex);
-			// Stop-aware wait: returns false when stop is requested.
-			if (not encode_cv.wait(lock, tok, [&] { return not encode_queue.empty(); }))
+			// Bounded stop-aware wait: an idle worker still heartbeats
+			// instead of sleeping forever; stop still exits promptly.
+			encode_cv.wait_for(lock, tok, std::chrono::milliseconds(100), [&] { return not encode_queue.empty(); });
+			if (tok.stop_requested())
 				return;
+			if (encode_queue.empty())
+				continue;
 			req = std::move(encode_queue.front());
 			encode_queue.pop_front();
+			video_encoder::worker_queue_depth().store(encode_queue.size(), std::memory_order_relaxed);
 		}
+		video_encoder::worker_last_image().store(req.image, std::memory_order_relaxed);
 
 		assert(req.image >= 0 and req.image < images.size());
 		auto & image = images[req.image];

@@ -60,6 +60,36 @@ std::atomic<uint64_t> & video_encoder::sender_heartbeat()
 	return heartbeat;
 }
 
+std::atomic<uint64_t> & video_encoder::worker_heartbeat_ns()
+{
+	static std::atomic<uint64_t> heartbeat{0};
+	return heartbeat;
+}
+
+std::atomic<int> & video_encoder::worker_last_image()
+{
+	static std::atomic<int> image{-1};
+	return image;
+}
+
+std::atomic<uint64_t> & video_encoder::worker_queue_depth()
+{
+	static std::atomic<uint64_t> depth{0};
+	return depth;
+}
+
+std::string video_encoder::worker_snapshot()
+{
+	uint64_t hb = worker_heartbeat_ns().load(std::memory_order_relaxed);
+	int img = worker_last_image().load(std::memory_order_relaxed);
+	uint64_t depth = worker_queue_depth().load(std::memory_order_relaxed);
+	std::string out = "worker-heartbeat=";
+	out += hb ? std::to_string((os_monotonic_get_ns() - hb) / 1'000'000) + "ms-ago" : "never";
+	out += " last-image=" + std::to_string(img);
+	out += " queue-depth=" + std::to_string(depth);
+	return out;
+}
+
 std::string video_encoder::stages_snapshot()
 {
 	static const char * names[] = {"IDLE", "ENTER", "IDR", "FENCE", "QUERY", "OVERFLOW", "MAP", "PUSH"};
@@ -347,6 +377,8 @@ int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info,
 				std::string probe = stall_info();
 				probe += " ";
 				probe += video_encoder::stages_snapshot();
+				probe += " ";
+				probe += video_encoder::worker_snapshot();
 				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?) %s",
 				        stream_idx, (unsigned long)frame_index, (now_ns - stall_start_ns) / 1e9,
 				        probe.c_str());
