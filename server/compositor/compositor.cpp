@@ -43,6 +43,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -592,6 +593,51 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					images[s.image].busy = false;
 					s.image = -1;
 					break;
+				}
+
+				// Valid flags are not sufficient: a stale identity packet
+				// (or interpolator miss) can arrive flagged valid. Reject
+				// target poses that imply impossible head motion versus
+				// the source pose — warping to those is what produces
+				// the catastrophic hole fractions, never real motion
+				// (thresholds are ~5x beyond violent human head motion).
+				{
+					bool plausible = true;
+					float worst_ms = 0, worst_rs = 0;
+					double dt_s = double(s.predicted_ns - frame.rendering.predicted_display_time_ns) / 1e9;
+					if (dt_s <= 0)
+						plausible = false;
+					for (int view = 0; plausible and view < 2; ++view)
+					{
+						const auto & a = src_pose[view];
+						const auto & b = s.poses[view];
+						float dx = b.position.x - a.position.x;
+						float dy = b.position.y - a.position.y;
+						float dz = b.position.z - a.position.z;
+						float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+						float dot = fabsf(a.orientation.x * b.orientation.x + a.orientation.y * b.orientation.y + a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w);
+						dot = fminf(fmaxf(dot, 0.f), 1.f);
+						float angle = 2.f * acosf(dot);
+						float ms = dist / float(dt_s);
+						float rs = angle / float(dt_s);
+						worst_ms = fmaxf(worst_ms, ms);
+						worst_rs = fmaxf(worst_rs, rs);
+						if (ms > 10.f or rs > 15.f)
+							plausible = false;
+					}
+					if (not plausible)
+					{
+						static uint64_t last_implausible_log_ns = 0;
+						if (warp_now_ns - last_implausible_log_ns > 5'000'000'000ull)
+						{
+							last_implausible_log_ns = warp_now_ns;
+							U_LOG_I("Depth warp: skipping %d synthetics (implausible head motion %.1f m/s %.1f rad/s, repeat instead)",
+							        synth_wanted - synth_done, worst_ms, worst_rs);
+						}
+						images[s.image].busy = false;
+						s.image = -1;
+						break;
+					}
 				}
 
 				bool ok = true;
