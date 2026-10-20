@@ -1097,9 +1097,9 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 	const uint64_t query_start_ns = os_monotonic_get_ns();
 	while (res == vk::Result::eNotReady)
 	{
-		auto qr = query_pool.getResult<uint32_t>(encode_slot, 1, 0, vk::QueryResultFlags{});
-		res = qr.result;
-		size = qr.value;
+		auto [r, s] = query_pool.getResult<uint32_t>(encode_slot, 1, 0, vk::QueryResultFlags{});
+		res = r;
+		size = s;
 		if (res != vk::Result::eNotReady and res != vk::Result::eSuccess)
 		{
 			U_LOG_W("video encoder %u: encode query failed (%s), dropping frame %lu",
