@@ -25,9 +25,11 @@
 #include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
+#include <chrono>
 #include <iostream>
 #include <ranges>
 #include <stdexcept>
+#include <thread>
 
 namespace
 {
@@ -650,7 +652,29 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		U_LOG_E("Timeout on stream %d", stream_idx);
 		return;
 	}
-	slot_item.busy.wait(true);
+	// Bounded wait for the previous packet to be consumed (its deleter
+	// clears this flag). The old unbounded wait parked the encoder
+	// thread forever when a client dropped with packets in flight: the
+	// flag never cleared, the encode queue never drained, every present
+	// image stayed busy, and streaming never recovered — while tracking
+	// (separate threads) kept working, so it looked half-alive and only
+	// a process kill fixed it. Wait up to 1 s like the fence waits,
+	// then reclaim the slot: its packet belongs to a dead flow and will
+	// never be consumed. A late deleter just re-clears harmlessly.
+	{
+		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+		while (slot_item.busy.load(std::memory_order_acquire))
+		{
+			if (std::chrono::steady_clock::now() >= deadline)
+			{
+				U_LOG_W("Encoder stream %d: packet unconsumed for 1 s, reclaiming slot", stream_idx);
+				slot_item.busy.store(false, std::memory_order_release);
+				slot_item.busy.notify_all();
+				break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+	}
 
 	auto & video_cmd_buf = slot_item.video_cmd_buf;
 	video_cmd_buf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
