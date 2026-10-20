@@ -779,8 +779,14 @@ bool depth_reprojector::reproject(
 	        {},
 	        pre_barriers);
 
-	// Sentinel = "no splat here" (above any encodable depth).
-	vk::ClearColorValue splat_clear{std::array<uint32_t, 4>{0xffffffffu, 0, 0, 0}};
+	// Sentinel = "no splat here" (above any encodable depth). Member-wise
+	// assignment: VULKAN_HPP_NO_CONSTRUCTORS leaves ClearColorValue a
+	// bare union (no array constructor).
+	vk::ClearColorValue splat_clear;
+	splat_clear.uint32[0] = 0xffffffffu;
+	splat_clear.uint32[1] = 0u;
+	splat_clear.uint32[2] = 0u;
+	splat_clear.uint32[3] = 0u;
 	cmd.clearColorImage(
 	        splat_depth[view],
 	        vk::ImageLayout::eTransferDstOptimal,

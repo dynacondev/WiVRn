@@ -132,8 +132,7 @@ color and is counted in the server log for tuning.
 ```json
 {
 	"reprojection": {
-		"hole-radius": 8,
-		"source-reverse-z": true
+		"hole-radius": 8
 	}
 }
 ```
@@ -161,16 +160,17 @@ cost on hole pixels only. Unfilled pixels are counted: watch for
 they persist during normal head motion, raise the radius.
 
 ### `source-reverse-z`
-Default value: `false`
+Default value: `true`
 
-Set `true` when the application submits reverse-Z depth (1.0 at the
-near plane, 0.0 at far — X-Plane 12 Vulkan, `near 0.01 / far 200.0`).
-The resolve pass converts to standard once (`1-z`), so the warp math
-stays standard-convention. X-Plane pipeline needs:
+Set `false` when the application submits standard-Z depth (0.0 at the
+near plane). The default `true` expects reverse-Z depth (1.0 at near,
+0.0 at far — X-Plane 12 Vulkan, `near 0.01 / far 200.0`); the resolve
+pass converts to standard once (`1-z`), so the warp math stays
+standard-convention. Normal-Z pipelines need:
 ```json
 {
 	"reprojection": {
-		"source-reverse-z": true
+		"source-reverse-z": false
 	}
 }
 ```

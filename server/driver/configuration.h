@@ -177,12 +177,13 @@ struct configuration
 		// nearest valid splat; anything still invalid is counted (see
 		// server logs) and left clear.
 		uint32_t hole_radius = 8;
-		// Source depth encoding: false = standard 0..1 (0 at near),
-		// true = reverse-Z 0..1 (1 at near, X-Plane 12 Vulkan:
-		// native_reverse_z, near 0.01 / far 200.0). When true the
-		// resolve pass converts to standard (1-z) once, so the warp
-		// math stays standard-convention.
-		bool source_reverse_z = false;
+		// Source depth encoding: true = reverse-Z 0..1 (1 at near,
+		// e.g. X-Plane 12 Vulkan: native_reverse_z, near 0.01 /
+		// far 200.0). When true the resolve pass converts to standard
+		// (1-z) once, so the warp math stays standard-convention.
+		// Default true (X-Plane pipeline); normal-Z apps set
+		// "source-reverse-z": false explicitly.
+		bool source_reverse_z = true;
 	};
 	reprojection reprojection;
 
