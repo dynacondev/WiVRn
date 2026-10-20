@@ -530,20 +530,17 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 		if (synth_done)
 		{
-			// Tuning signal for hole_radius: unfilled pixels across this
-			// commit's synthetics. Throttled: at most one line per 5 s.
+			// Proof-of-life for the warp + tuning signal for hole_radius:
+			// unfilled pixels across this commit's synthetics. Throttled:
+			// at most one line per 5 s so a struggling scene can't spam.
 			uint32_t holes = reprojector.drain_hole_count();
-			if (holes > 0)
+			static uint64_t last_warp_log_ns = 0;
+			uint64_t now_ns = os_monotonic_get_ns();
+			if (now_ns - last_warp_log_ns > 5'000'000'000ull)
 			{
-				static uint64_t last_hole_log_ns = 0;
-				uint64_t now_ns = os_monotonic_get_ns();
-				if (now_ns - last_hole_log_ns > 5'000'000'000ull)
-				{
-					last_hole_log_ns = now_ns;
-					U_LOG_W("Depth warp: %u unfilled hole pixels in %d synthetics "
-					        "(tune reprojection.hole-radius)",
-					        holes, synth_done);
-				}
+				last_warp_log_ns = now_ns;
+				U_LOG_I("Depth warp: %d synthetics from retained depth (%u unfilled hole pixels)",
+				        synth_done, holes);
 			}
 		}
 	}
