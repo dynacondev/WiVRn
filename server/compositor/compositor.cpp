@@ -319,6 +319,17 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	int i = acquire_image();
 	if (i < 0)
 	{
+		// No free present slot: the encoder/GPU is backed up (or the pool
+		// is undersized for the current load). The frame is dropped
+		// silently by design; log throttled so a sustained stall is
+		// visible instead of a silent freeze.
+		static uint64_t last_acquire_fail_ns = 0;
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_acquire_fail_ns > 5'000'000'000ull)
+		{
+			last_acquire_fail_ns = now_ns;
+			U_LOG_W("compositor: no free present image, dropping real frame (encoder/GPU backed up?)");
+		}
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
@@ -505,9 +516,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				int64_t wake_ns, slop_ns;
 				pacer.predict(s.frame_id, wake_ns, s.desired_present_ns, slop_ns, s.predicted_ns);
 
-				s.image = acquire_image();
-				if (s.image < 0)
-					break;
+			s.image = acquire_image();
+			if (s.image < 0)
+			{
+				// Same story as the real-frame path above: slots are full
+				// because the encoder/GPU can't drain at this load. Skip
+				// the remaining synthetics (degrade to repeat) and say so,
+				// throttled — this is the signal that distinguishes "no
+				// missed ticks" from "too backed up to synthesize".
+				static uint64_t last_synth_acquire_fail_ns = 0;
+				if (warp_now_ns - last_synth_acquire_fail_ns > 5'000'000'000ull)
+				{
+					last_synth_acquire_fail_ns = warp_now_ns;
+					U_LOG_W("Depth warp: no free present image, skipping %d synthetics (repeat instead)",
+					        synth_wanted - synth_done);
+				}
+				break;
+			}
 
 				xrt_space_relation head{};
 				std::array<xrt_fov, 2> fovs{};
