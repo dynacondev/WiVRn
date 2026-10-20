@@ -306,8 +306,10 @@ void video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info
 			    now_ns - last_present_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
 			{
 				last_present_log_ns.store(now_ns, std::memory_order_relaxed);
-				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?)",
-				        stream_idx, (unsigned long)frame_index, (now_ns - stall_start_ns) / 1e9);
+				std::string probe = stall_info();
+				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?)%s",
+				        stream_idx, (unsigned long)frame_index, (now_ns - stall_start_ns) / 1e9,
+				        probe.empty() ? "" : (" " + probe).c_str());
 			}
 		}
 	}

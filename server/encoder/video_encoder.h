@@ -140,6 +140,13 @@ public:
 	            const to_headset::video_stream_data_shard::view_info_t & view_info,
 	            uint64_t frame_index);
 
+	// Read-only stall diagnostics, called from another thread while an
+	// encode may be in flight. Must be non-blocking and thread-safe.
+	virtual std::string stall_info()
+	{
+		return {};
+	}
+
 protected:
 	// called on present to submit command buffers for the image.
 	virtual void present_image(vk::Image y_cbcr,

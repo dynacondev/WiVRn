@@ -81,11 +81,32 @@ class video_encoder_vulkan : public video_encoder
 
 	bool session_initialized = false;
 
+	// Encode-stage probe for stall diagnostics (written by encoder_work,
+	// read from the compositor thread while a slot is stuck busy).
+	// Values are STAGE_* below; diagnostic only, never used for control.
+	enum encode_stage : int
+	{
+		STAGE_IDLE = 0,
+		STAGE_ENTER,
+		STAGE_IDR,
+		STAGE_FENCE,
+		STAGE_QUERY,
+		STAGE_OVERFLOW,
+		STAGE_MAP,
+		STAGE_PUSH,
+	};
+	std::atomic<int> stage{STAGE_IDLE};
+
 protected:
 	const uint8_t num_dpb_slots;
 	vk::Extent3D aligned_extent;
 	vk::VideoEncodeRateControlLayerInfoKHR rate_control_layer;
 	std::optional<vk::VideoEncodeRateControlInfoKHR> rate_control;
+
+	// VPS/SPS/PPS depend only on the immutable session parameters: fetched
+	// once, then reused for every IDR frame (avoids a synchronous driver
+	// call on the encode hot path).
+	std::optional<std::vector<uint8_t>> idr_data_cache;
 
 	video_encoder_vulkan(wivrn::vk_bundle & vk,
 	                     const vk::VideoCapabilitiesKHR & video_caps,
@@ -114,5 +135,6 @@ protected:
 public:
 	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index) override;
 	std::optional<data> encode(uint8_t slot, uint64_t frame_index) override;
+	std::string stall_info() override;
 };
 } // namespace wivrn

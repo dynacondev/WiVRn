@@ -19,6 +19,7 @@
 #include "video_encoder_vulkan_h265.h"
 
 #include "encoder/encoder_settings.h"
+#include "util/u_logging.h"
 #include "utils/wivrn_vk_bundle.h"
 #include <cstdint>
 #include <vulkan/vulkan_core.h>
@@ -367,8 +368,15 @@ std::vector<uint8_t> wivrn::video_encoder_vulkan_h265::get_vps_sps_pps()
 
 void wivrn::video_encoder_vulkan_h265::send_idr_data()
 {
-	auto data = get_vps_sps_pps();
-	SendData(data, false, true);
+	// VPS/SPS/PPS depend only on the immutable session parameters: fetch
+	// once, then reuse for every IDR frame (avoids a synchronous driver
+	// call on the encode hot path).
+	if (not idr_data_cache)
+	{
+		idr_data_cache = get_vps_sps_pps();
+		U_LOG_I("video encoder %u: caching IDR params (%zu bytes)", stream_idx, idr_data_cache->size());
+	}
+	SendData(*idr_data_cache, false, true);
 }
 
 void * wivrn::video_encoder_vulkan_h265::encode_info_next(uint32_t frame_num, size_t slot, std::optional<int32_t> ref_slot)
