@@ -112,9 +112,16 @@ buffer_allocation make_ubo(vk::raii::Device & device, int i)
 
 uint32_t mesh_dim(uint32_t configured, uint32_t automatic)
 {
-	if (configured == 0)
-		return automatic;
-	return std::clamp(configured, 16u, 4096u);
+	if (configured != 0)
+		return std::clamp(configured, 16u, 4096u);
+	// Automatic: quarter of the target resolution, clamped. Full-res mesh
+	// (e.g. 2476x2594 = 6.4M quads = 154MB index buffer) burns VRAM and
+	// vertex throughput for no visual gain — depth varies smoothly, and
+	// OpenWarp itself defaults to ~1k meshes for 2k targets.
+	if (automatic == 0)
+		return 256;
+	uint32_t q = (automatic + 3) / 4;
+	return std::clamp(q, 16u, 512u);
 }
 
 } // namespace
@@ -132,7 +139,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         bleed_tolerance{std::max(configuration().reprojection.bleed_tolerance, 0.f)},
         clamp_to_border_black{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToBorder, vk::BorderColor::eFloatOpaqueBlack)},
         clamp_to_edge{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToEdge, vk::BorderColor::eFloatOpaqueBlack)},
-        resolve_pool{vk.device, vk::DescriptorPoolCreateInfo{}},
+        resolve_pool{nullptr},
         ubo{make_ubo(vk.device, 0), make_ubo(vk.device, 1)}
 {
 	if (not graphics_supported)
@@ -172,7 +179,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 
 	auto make_layered_view = [&](vk::Image image, vk::Format format, vk::ImageAspectFlags aspect,
 	                             vk::ImageViewType type, uint32_t base_layer, uint32_t layers,
-	                             vk::ImageUsageFlags usage, const char * name) {
+	                             vk::ImageUsageFlags usage, const std::string & name) {
 		vk::raii::ImageView view{
 		        vk.device,
 		        vk::StructureChain{
@@ -190,7 +197,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		                vk::ImageViewUsageCreateInfo{.usage = usage},
 		        }
 		                .get()};
-		vk.name(*view, name);
+		vk.name(*view, name.c_str());
 		return view;
 	};
 
@@ -207,11 +214,11 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		retained_color_eye[i] = make_layered_view(
 		        retained_color, vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor,
 		        vk::ImageViewType::e2D, i, 1, vk::ImageUsageFlagBits::eSampled,
-		        std::format("depth reprojector retained color {}", i).c_str());
+		        std::format("depth reprojector retained color {}", i));
 		retained_depth_eye[i] = make_layered_view(
 		        retained_depth, vk::Format::eR32Sfloat, vk::ImageAspectFlagBits::eColor,
 		        vk::ImageViewType::e2D, i, 1, vk::ImageUsageFlagBits::eSampled,
-		        std::format("depth reprojector retained depth {}", i).c_str());
+		        std::format("depth reprojector retained depth {}", i));
 	}
 
 	// Resolve pass: compute copy of the current sources into retained.
@@ -336,7 +343,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		        target[i], vk::Format::eR8G8B8A8Unorm, vk::ImageAspectFlagBits::eColor,
 		        vk::ImageViewType::e2D, 0, 1,
 		        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
-		        std::format("depth reprojector target view {}", i).c_str());
+		        std::format("depth reprojector target view {}", i));
 	}
 
 	// Renderpass: clear holes to transparent black, store, end sampled.
@@ -493,6 +500,9 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	vk.name(*pipeline, "depth reprojector pipeline");
 
 	// Shared grid index buffer for both eyes: W*H quads as triangles.
+	// Host-visible + coherent only: requiring DEVICE_LOCAL here fails on
+	// discrete GPUs (BAR host-visible is rarely device-local, and the
+	// combined flag set often has no heap at all -> allocation failure).
 	const uint64_t quad_count = uint64_t(mesh_w) * uint64_t(mesh_h);
 	index_buffer = buffer_allocation{
 	        vk.device,
@@ -501,8 +511,8 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	                .usage = vk::BufferUsageFlagBits::eIndexBuffer,
 	        },
 	        VmaAllocationCreateInfo{
-	                .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-	                                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO,
 	        },
 	        "depth reprojector index buffer"};
 	{

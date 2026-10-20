@@ -166,12 +166,14 @@ struct configuration
 		// Master switch, default on. Depth reprojection only engages
 		// when a depth layer is actually submitted.
 		bool enabled = true;
-		// Reprojection mesh resolution (vertices = size + 1 per axis).
-		// 0 (default) means automatic: the depth image resolution, which
-		// matches the render resolution in the supported pipeline.
-		// Higher values resolve finer geometry at higher server GPU
-		// cost; turn down (e.g. 256) if the warp pass shows up in
-		// timings.
+	// Reprojection mesh resolution (vertices = size + 1 per axis).
+	// 0 (default) means automatic: a quarter of the render target per
+	// axis, clamped 16-512. Full-res meshes waste VRAM/vertices (a
+	// 2476x2594 eye would be 6.4M quads / 154MB of indices) for no
+	// visual gain.
+	// Higher values resolve finer geometry at higher server GPU
+	// cost; turn down (e.g. 256) if the warp pass shows up in
+	// timings.
 		uint32_t mesh_width = 0;
 		uint32_t mesh_height = 0;
 		// Edge-bleed handling (in source UV units): depth samples in
