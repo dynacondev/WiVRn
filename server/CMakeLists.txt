@@ -273,7 +273,8 @@ if (WIVRN_BUILD_SERVER)
 		SHADERS
 			"${_monado_src}/src/xrt/auxiliary/render/shaders/layer.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/foveation.comp"
-			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_mesh.glsl"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_splat.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_pull.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_resolve.comp"
 		)
 

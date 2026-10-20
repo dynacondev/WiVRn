@@ -121,19 +121,19 @@ The current real frame is held in compositor-owned retained images
 and refreshed on every depth commit, so all synthetics warp from
 held sources even after the app recycles its swapchains.
 
-The warp math is a Vulkan port of the mesh algorithm from
-[OpenWarp](https://github.com/Zee2/openwarp) by Finn Sinclair
-(University of Illinois at Urbana-Champaign, NCSA license, see the
-shader sources for the full notice).
+The warp is all-compute (no graphics queue required): pass 1 splats
+each retained depth pixel forward to the target pose (atomic min wins
+= foreground), pass 2 pulls color backward through the splatted depth.
+Disoccluded pixels with no valid splat are filled by an expanding-ring
+search (see `hole-radius`); anything still invalid keeps the clear
+color and is counted in the server log for tuning.
 
 ### Example
 ```json
 {
 	"reprojection": {
-		"mesh-width": 1024,
-		"mesh-height": 1024,
-		"bleed-radius": 0.005,
-		"bleed-tolerance": 0.0001
+		"hole-radius": 8,
+		"source-reverse-z": true
 	}
 }
 ```
@@ -145,29 +145,20 @@ Master switch. Reprojection only engages when a depth layer is
 actually submitted, so common applications are unaffected.
 
 ### `mesh-width`, `mesh-height`
-Default value: `0` (automatic: quarter of the target resolution, clamped 16–512)
+Default value: `0`. RESERVED (parsed, ignored).
 
-Reprojection mesh resolution (vertices = size + 1 per axis). The
-default is a quarter of the render target per axis (e.g. ~619x649 for
-a 2476x2594 eye) — full-res meshes (6M+ quads, 150MB+ index buffer)
-burn VRAM and vertex throughput for no visual gain since depth varies
-smoothly. Set explicitly (e.g. 256, or up to 1024) to trade geometry
-detail for server GPU cost if the warp pass shows up in timings.
-Range when set: 16–4096.
+Kept so existing config files keep loading. The compute warp runs at
+full eye resolution; these will be removed once compute time is
+validated on-target.
 
-### `bleed-radius`
-Default value: `0.005` (source UV units)
+### `hole-radius`
+Default value: `8` (pixels, range 0–32)
 
-Depth edge-bleed handling: depth samples within this radius vote for
-the foreground depth, hiding stretched triangles at depth
-discontinuities.
-
-### `bleed-tolerance`
-Default value: `0.0001`
-
-Vertices whose depth differs from the neighbourhood minimum by more
-than this are clamped to it (same semantics as the OpenWarp
-reference tunables).
+Expanding-ring search radius for hole filling. `0` leaves holes clear
+(fastest). Larger values fill bigger disocclusions at higher per-pixel
+cost on hole pixels only. Unfilled pixels are counted: watch for
+`Depth warp: N unfilled hole pixels` warnings in the server log — if
+they persist during normal head motion, raise the radius.
 
 ### `source-reverse-z`
 Default value: `false`

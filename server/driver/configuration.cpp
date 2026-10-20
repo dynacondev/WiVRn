@@ -654,41 +654,22 @@ configuration::configuration()
 				if (it->contains("mesh-width"))
 				{
 					reprojection.mesh_width = it->at("mesh-width");
-					// 0 means automatic (depth image resolution).
-					if (reprojection.mesh_width != 0 and
-					    (reprojection.mesh_width < 16 or reprojection.mesh_width > 4096))
-					{
-						U_LOG_W("reprojection mesh-width out of range [16, 4096], clamping");
-						reprojection.mesh_width = std::clamp(reprojection.mesh_width, 16u, 4096u);
-					}
+					// RESERVED by the compute warp (runs at full eye
+					// resolution). Parsed only so old configs load.
 				}
 				if (it->contains("mesh-height"))
 				{
 					reprojection.mesh_height = it->at("mesh-height");
-					// 0 means automatic (depth image resolution).
-					if (reprojection.mesh_height != 0 and
-					    (reprojection.mesh_height < 16 or reprojection.mesh_height > 4096))
-					{
-						U_LOG_W("reprojection mesh-height out of range [16, 4096], clamping");
-						reprojection.mesh_height = std::clamp(reprojection.mesh_height, 16u, 4096u);
-					}
+					// RESERVED by the compute warp (runs at full eye
+					// resolution). Parsed only so old configs load.
 				}
-				if (it->contains("bleed-radius"))
+				if (it->contains("hole-radius"))
 				{
-					reprojection.bleed_radius = it->at("bleed-radius");
-					if (reprojection.bleed_radius < 0)
+					reprojection.hole_radius = it->at("hole-radius");
+					if (reprojection.hole_radius > 32)
 					{
-						U_LOG_W("reprojection bleed-radius negative, clamping to 0");
-						reprojection.bleed_radius = 0;
-					}
-				}
-				if (it->contains("bleed-tolerance"))
-				{
-					reprojection.bleed_tolerance = it->at("bleed-tolerance");
-					if (reprojection.bleed_tolerance < 0)
-					{
-						U_LOG_W("reprojection bleed-tolerance negative, clamping to 0");
-						reprojection.bleed_tolerance = 0;
+						U_LOG_W("reprojection hole-radius out of range [0, 32], clamping");
+						reprojection.hole_radius = 32;
 					}
 				}
 				if (it->contains("source-reverse-z"))

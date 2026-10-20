@@ -158,7 +158,7 @@ struct configuration
 	// Server-side 6DoF reprojection (async spacewarp): when the
 	// application misses its frame deadline, the last projection frame
 	// is re-warped to the missed display pose using the submitted depth
-	// buffer (mesh-based forward warp, OpenWarp algorithm family).
+	// buffer (all-compute backward warp: depth splat + color pull).
 	// Active only for single fullscreen projection layers with depth;
 	// all other layers fall back to the default repeat behaviour.
 	struct reprojection
@@ -166,23 +166,17 @@ struct configuration
 		// Master switch, default on. Depth reprojection only engages
 		// when a depth layer is actually submitted.
 		bool enabled = true;
-	// Reprojection mesh resolution (vertices = size + 1 per axis).
-	// 0 (default) means automatic: a quarter of the render target per
-	// axis, clamped 16-512. Full-res meshes waste VRAM/vertices (a
-	// 2476x2594 eye would be 6.4M quads / 154MB of indices) for no
-	// visual gain.
-	// Higher values resolve finer geometry at higher server GPU
-	// cost; turn down (e.g. 256) if the warp pass shows up in
-	// timings.
+		// Reprojection mesh resolution (vertices = size + 1 per axis).
+		// RESERVED by the compute warp (all-compute splat/pull runs at
+		// full eye resolution). Kept parsed so existing config files
+		// keep loading; removed once compute time is validated.
 		uint32_t mesh_width = 0;
 		uint32_t mesh_height = 0;
-		// Edge-bleed handling (in source UV units): depth samples in
-		// this radius vote for the foreground; vertices whose depth
-		// differs from the neighbourhood minimum by more than
-		// bleed_tolerance are clamped to it. Same semantics as the
-		// OpenWarp reference tunables.
-		float bleed_radius = 0.005f;
-		float bleed_tolerance = 0.0001f;
+		// Expanding-ring hole fill radius in pixels (0 = holes keep the
+		// clear color). Disoccluded target pixels search outward for the
+		// nearest valid splat; anything still invalid is counted (see
+		// server logs) and left clear.
+		uint32_t hole_radius = 8;
 		// Source depth encoding: false = standard 0..1 (0 at near),
 		// true = reverse-Z 0..1 (1 at near, X-Plane 12 Vulkan:
 		// native_reverse_z, near 0.01 / far 200.0). When true the

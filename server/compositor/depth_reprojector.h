@@ -25,25 +25,29 @@
 #include <array>
 #include <vulkan/vulkan_raii.hpp>
 
-// UBO mirror of server/compositor/shaders/reproject_mesh.glsl.
-// mat4 arrays are column-major on both sides: xrt_matrix_4x4::v copies
-// straight across. All matrix math is mat4 * vec4 with scalar depth
-// handling: no mat3 constructors or matrix ternaries anywhere (see
-// AGENTS.md Adreno notes; keeps the shader portable anyway).
-struct reproject_ubo_data
+// UBO mirror of server/compositor/shaders/reproject_splat.comp:
+// source clip -> world -> target clip. mat4 arrays are column-major on
+// both sides: xrt_matrix_4x4::v copies straight across.
+struct reproject_splat_ubo
 {
 	xrt_matrix_4x4 render_inv_p;
 	xrt_matrix_4x4 render_inv_v;
 	xrt_matrix_4x4 warp_vp;
-	// Normalized sub-image rects of the retained sources: offset.xy,
-	// extent.xy. Always full-eye (identity) by construction.
-	float color_rect[4];
-	float depth_rect[4];
-	float bleed_radius;
-	float bleed_tolerance;
-	float pad[2];
 };
-static_assert(sizeof(reproject_ubo_data) == 240);
+static_assert(sizeof(reproject_splat_ubo) == 192);
+
+// UBO mirror of server/compositor/shaders/reproject_pull.comp:
+// target clip -> world -> source clip, plus the hole-fill radius.
+struct reproject_pull_ubo
+{
+	xrt_matrix_4x4 dst_inv_p;
+	xrt_matrix_4x4 dst_inv_v;
+	xrt_matrix_4x4 src_p;
+	xrt_matrix_4x4 src_v;
+	float hole_radius;
+	float pad[3];
+};
+static_assert(sizeof(reproject_pull_ubo) == 272);
 
 // Push block mirror of reproject_resolve.comp.
 struct reproject_resolve_push
@@ -60,10 +64,12 @@ namespace wivrn
 struct vk_bundle;
 
 // Server-side 6DoF reprojection (async spacewarp for missed frame
-// deadlines). Forward-warp mesh pass, Vulkan port of the OpenWarp mesh
-// algorithm: each mesh vertex unprojects its source depth sample to the
-// world and reprojects to the target pose; the fragment is a plain
-// color tap. Uncovered pixels keep the renderpass clear color.
+// deadlines). All-compute backward warp in the OpenWarp algorithm
+// family: pass 1 splats each retained source pixel's depth forward to
+// the target pose (atomic min wins = foreground), pass 2 pulls color
+// backward per target pixel through the splatted depth. Holes
+// (disoccluded pixels) are filled by an expanding-ring search for the
+// nearest valid splat, else keep the clear color.
 //
 // The last real frame is held in compositor-owned retained images
 // (refreshed by refresh_retained on every depth commit), so any number
@@ -72,28 +78,17 @@ struct vk_bundle;
 // raw: the chain introduces no color conversion of its own, values
 // match the direct sampling path exactly.
 //
-// One instance owns both eyes' targets, retained sources, pipelines
-// and mesh. Use is single-threaded (compositor layer_commit thread).
+// One instance owns both eyes' targets, retained sources and compute
+// pipelines. Runs on the compositor queue with no graphics capability
+// required. Use is single-threaded (compositor layer_commit thread).
 class depth_reprojector
 {
 public:
 	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size);
 
-	// False when the compositor queue family cannot do graphics: the
-	// caller must fall back to repeating the previous frame.
-	bool supported() const
-	{
-		return graphics_supported;
-	}
-
-	uint32_t mesh_width() const
-	{
-		return mesh_w;
-	}
-	uint32_t mesh_height() const
-	{
-		return mesh_h;
-	}
+	// Number of target pixels that found no valid source (monotonic).
+	// drain_hole_count() returns the delta since the last call.
+	uint32_t drain_hole_count();
 
 	// Copies the current real frame into the retained sources.
 	// Norm-rects map each eye's sub-image; flip_y selects the source
@@ -126,12 +121,7 @@ public:
 	std::array<vk::ImageView, 2> get_views();
 
 private:
-	const bool graphics_supported;
-	const uint32_t mesh_w;
-	const uint32_t mesh_h;
-	const float bleed_radius;
-	const float bleed_tolerance;
-	const bool reverse_z;
+	const uint32_t hole_radius;
 
 	vk::raii::Sampler clamp_to_border_black = nullptr;
 	vk::raii::Sampler clamp_to_edge = nullptr;
@@ -153,20 +143,33 @@ private:
 	vk::raii::DescriptorPool resolve_pool = nullptr;
 	vk::DescriptorSet resolve_set;
 
-	// Per-eye warped color targets (plain UNORM, sampled raw).
+	// Per-eye warped color targets (plain UNORM, sampled raw) plus
+	// per-eye splatted foreground-depth scratch (R32_UINT, cleared
+	// each warp). GENERAL except when sampled downstream.
+	bool warp_targets_ready = false;
 	std::array<image_allocation, 2> target;
 	std::array<vk::raii::ImageView, 2> target_view = {nullptr, nullptr};
+	std::array<image_allocation, 2> splat_depth;
+	std::array<vk::raii::ImageView, 2> splat_view = {nullptr, nullptr};
 
-	vk::raii::RenderPass renderpass = nullptr;
-	std::array<vk::raii::Framebuffer, 2> framebuffers = {nullptr, nullptr};
+	// Splat: depth sampler + splat UBO + splat storage image.
+	// Pull: color sampler + pull UBO + splat storage image +
+	// hole counter + color storage target.
+	vk::raii::DescriptorSetLayout splat_ds_layout = nullptr;
+	vk::raii::PipelineLayout splat_layout = nullptr;
+	vk::raii::Pipeline splat_pipeline = nullptr;
+	vk::raii::DescriptorSetLayout pull_ds_layout = nullptr;
+	vk::raii::PipelineLayout pull_layout = nullptr;
+	vk::raii::Pipeline pull_pipeline = nullptr;
+	vk::raii::DescriptorPool warp_pool = nullptr;
+	std::array<vk::DescriptorSet, 2> splat_sets;
+	std::array<vk::DescriptorSet, 2> pull_sets;
 
-	vk::raii::DescriptorSetLayout ds_layout = nullptr;
-	vk::raii::PipelineLayout layout = nullptr;
-	vk::raii::Pipeline pipeline = nullptr;
-	vk::raii::DescriptorPool descriptor_pool = nullptr;
-	std::array<vk::DescriptorSet, 2> descriptor_sets;
+	std::array<buffer_allocation, 2> splat_ubo;
+	std::array<buffer_allocation, 2> pull_ubo;
 
-	std::array<buffer_allocation, 2> ubo;
-	buffer_allocation index_buffer;
+	// Monotonic unfilled-pixel count (host-visible, drained for logs).
+	buffer_allocation hole_count;
+	uint32_t last_hole_total = 0;
 };
 } // namespace wivrn

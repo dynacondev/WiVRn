@@ -474,10 +474,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// Hold the current frame: copy color + depth into the
 	// compositor-owned retained sources so every synthetic below warps
 	// from held data, valid until the next real frame refreshes it.
-	// Guarded like the synth block: on queues without graphics support
-	// the reprojector owns no images/pipelines and refresh would record
-	// null handles (server crash -> client SESSION_LOST).
-	if (has_depth_src and reprojector.supported() and depth_reprojection_enabled)
+	if (has_depth_src and depth_reprojection_enabled)
 		reprojector.refresh_retained(vk.device, cmd, src, src_depth, src_color_nrect, src_depth_nrect, flip_y);
 
 	// Depth reprojection: one synthetic frame per missed display tick
@@ -485,8 +482,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// retained sources to its own upcoming tick so the encoder still
 	// emits at headset cadence. True frames keep the existing rotation
 	// timewarp in the squasher/fast-path; synthetics replace it with a
-	// full 6DoF mesh warp.
-	if (synth_wanted and has_depth_src and reprojector.supported() and depth_reprojection_enabled)
+	// full 6DoF compute warp.
+	if (synth_wanted and has_depth_src and depth_reprojection_enabled)
 	{
 		for (int k = 0; k < synth_wanted; ++k)
 		{
@@ -530,6 +527,24 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				break;
 			}
 			++synth_done;
+		}
+		if (synth_done)
+		{
+			// Tuning signal for hole_radius: unfilled pixels across this
+			// commit's synthetics. Throttled: at most one line per 5 s.
+			uint32_t holes = reprojector.drain_hole_count();
+			if (holes > 0)
+			{
+				static uint64_t last_hole_log_ns = 0;
+				uint64_t now_ns = os_monotonic_get_ns();
+				if (now_ns - last_hole_log_ns > 5'000'000'000ull)
+				{
+					last_hole_log_ns = now_ns;
+					U_LOG_W("Depth warp: %u unfilled hole pixels in %d synthetics "
+					        "(tune reprojection.hole-radius)",
+					        holes, synth_done);
+				}
+			}
 		}
 	}
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
