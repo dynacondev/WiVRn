@@ -183,6 +183,12 @@ struct configuration
 		// OpenWarp reference tunables.
 		float bleed_radius = 0.005f;
 		float bleed_tolerance = 0.0001f;
+		// Source depth encoding: false = standard 0..1 (0 at near),
+		// true = reverse-Z 0..1 (1 at near, X-Plane 12 Vulkan:
+		// native_reverse_z, near 0.01 / far 200.0). When true the
+		// resolve pass converts to standard (1-z) once, so the warp
+		// math stays standard-convention.
+		bool source_reverse_z = false;
 	};
 	reprojection reprojection;
 

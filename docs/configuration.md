@@ -169,6 +169,21 @@ Vertices whose depth differs from the neighbourhood minimum by more
 than this are clamped to it (same semantics as the OpenWarp
 reference tunables).
 
+### `source-reverse-z`
+Default value: `false`
+
+Set `true` when the application submits reverse-Z depth (1.0 at the
+near plane, 0.0 at far — X-Plane 12 Vulkan, `near 0.01 / far 200.0`).
+The resolve pass converts to standard once (`1-z`), so the warp math
+stays standard-convention. X-Plane pipeline needs:
+```json
+{
+	"reprojection": {
+		"source-reverse-z": true
+	}
+}
+```
+
 ## `tcp-only`
 Default value: `false`
 

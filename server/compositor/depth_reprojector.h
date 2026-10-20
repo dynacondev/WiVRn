@@ -51,8 +51,9 @@ struct reproject_resolve_push
 	float color_rect[2][4];
 	float depth_rect[2][4];
 	float src_flip; // 0 = GL-ordered source rows, 1 = Vulkan-ordered
+	float src_reverse_z; // 0 = standard depth, 1 = reverse-Z source (flip 1-z)
 };
-static_assert(sizeof(reproject_resolve_push) == 68);
+static_assert(sizeof(reproject_resolve_push) == 72);
 
 namespace wivrn
 {
@@ -130,6 +131,7 @@ private:
 	const uint32_t mesh_h;
 	const float bleed_radius;
 	const float bleed_tolerance;
+	const bool reverse_z;
 
 	vk::raii::Sampler clamp_to_border_black = nullptr;
 	vk::raii::Sampler clamp_to_edge = nullptr;

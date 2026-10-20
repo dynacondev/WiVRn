@@ -137,6 +137,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         mesh_h{mesh_dim(configuration().reprojection.mesh_height, target_size.height)},
         bleed_radius{std::max(configuration().reprojection.bleed_radius, 0.f)},
         bleed_tolerance{std::max(configuration().reprojection.bleed_tolerance, 0.f)},
+        reverse_z{configuration().reprojection.source_reverse_z},
         clamp_to_border_black{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToBorder, vk::BorderColor::eFloatOpaqueBlack)},
         clamp_to_edge{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToEdge, vk::BorderColor::eFloatOpaqueBlack)},
         resolve_pool{nullptr},
@@ -695,6 +696,9 @@ void depth_reprojector::refresh_retained(
 	std::ranges::copy(depth_rect[0], push.depth_rect[0]);
 	std::ranges::copy(depth_rect[1], push.depth_rect[1]);
 	push.src_flip = flip_y ? 0.f : 1.f;
+	// Reverse-Z sources (X-Plane Vulkan) convert once here so the warp
+	// math stays standard-convention downstream.
+	push.src_reverse_z = reverse_z ? 1.f : 0.f;
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *resolve_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *resolve_layout, 0, resolve_set, {});

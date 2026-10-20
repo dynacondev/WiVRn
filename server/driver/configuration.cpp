@@ -691,6 +691,8 @@ configuration::configuration()
 						reprojection.bleed_tolerance = 0;
 					}
 				}
+				if (it->contains("source-reverse-z"))
+					reprojection.source_reverse_z = it->at("source-reverse-z");
 			}
 		}
 

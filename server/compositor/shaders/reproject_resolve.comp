@@ -30,6 +30,7 @@ layout(push_constant) uniform Push
 	vec4 color_rect[2]; // per-eye normalized sub-image rects
 	vec4 depth_rect[2];
 	float src_flip; // 0 = GL-ordered source rows, 1 = Vulkan-ordered
+	float src_reverse_z; // 0 = standard depth, 1 = reverse-Z (flip 1-z)
 } pc;
 
 void main()
@@ -65,5 +66,8 @@ void main()
 	}
 
 	imageStore(dst_color, ivec3(id.xy, eye), color);
+	// Reverse-Z (X-Plane Vulkan, 1 at near) -> standard (0 at near) once,
+	// here, so the warp shader stays standard-convention.
+	depth = mix(depth, 1.0 - depth, pc.src_reverse_z);
 	imageStore(dst_depth, ivec3(id.xy, eye), vec4(depth, 0.0, 0.0, 0.0));
 }
