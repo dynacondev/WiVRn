@@ -636,6 +636,36 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				warp_cooldown_until_ns = warp_now_ns + warp_cooldown_ns;
 				U_LOG_W("Depth warp: %u/%llu pixels unfilled, pausing warp for 5 s (repeat instead)",
 				        holes, (unsigned long long)warp_pixels);
+				// Input dump for the degenerate case: a clean commit
+				// followed by a catastrophic one within milliseconds
+				// points at transient inputs (pose jump, degenerate
+				// rect, wrong near/far), not scene motion. All CPU-side,
+				// no GPU readback.
+				for (int view = 0; view < 2; ++view)
+				{
+					const auto & sp = src_pose[view];
+					U_LOG_W("Depth warp input v%d: src pos=(%.3f,%.3f,%.3f) quat=(%.3f,%.3f,%.3f,%.3f) fov=(%.3f,%.3f,%.3f,%.3f) near=%.4f far=%.1f color_rect=(%.3f,%.3f,%.3f,%.3f) depth_rect=(%.3f,%.3f,%.3f,%.3f)",
+					        view,
+					        sp.position.x, sp.position.y, sp.position.z,
+					        sp.orientation.x, sp.orientation.y, sp.orientation.z, sp.orientation.w,
+					        src_fov[view].angle_left, src_fov[view].angle_right, src_fov[view].angle_up, src_fov[view].angle_down,
+					        src_near_z[view], src_far_z[view],
+					        src_color_nrect[view][0], src_color_nrect[view][1], src_color_nrect[view][2], src_color_nrect[view][3],
+					        src_depth_nrect[view][0], src_depth_nrect[view][1], src_depth_nrect[view][2], src_depth_nrect[view][3]);
+				}
+				for (int k = 0; k < synth_done; ++k)
+				{
+					const synth_frame & s = synths[k];
+					for (int view = 0; view < 2; ++view)
+					{
+						const auto & tp = s.poses[view];
+						U_LOG_W("Depth warp target k%d v%d: pos=(%.3f,%.3f,%.3f) quat=(%.3f,%.3f,%.3f,%.3f) predicted=%lldms desired=%lldms",
+						        k, view,
+						        tp.position.x, tp.position.y, tp.position.z,
+						        tp.orientation.x, tp.orientation.y, tp.orientation.z, tp.orientation.w,
+						        (long long)(s.predicted_ns / 1'000'000), (long long)(s.desired_present_ns / 1'000'000));
+					}
+				}
 			}
 		}
 	}
