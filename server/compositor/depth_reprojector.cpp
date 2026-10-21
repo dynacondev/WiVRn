@@ -42,7 +42,7 @@ bool frustum_gl(const xrt_fov & fov, float near_z, float far_z, xrt_matrix_4x4 &
 	float r = near_z * tanf(fov.angle_right);
 	float b = near_z * tanf(fov.angle_down);
 	float t = near_z * tanf(fov.angle_up);
-	if (not(r > l and t > b))
+	if (not(std::isfinite(l) and std::isfinite(r) and std::isfinite(b) and std::isfinite(t)) or not(r > l and t > b))
 		return false;
 	float rl = 2 * near_z / (r - l);
 	float tb = 2 * near_z / (t - b);
@@ -833,16 +833,13 @@ bool depth_reprojector::reproject(
 	math_matrix_4x4_inverse(&dst_view, &dst_inv_v);
 
 	reproject_splat_ubo splat_data{};
-	splat_data.render_inv_p = render_inv_p;
-	splat_data.render_inv_v = render_inv_v;
+	math_matrix_4x4_multiply(&render_inv_v, &render_inv_p, &splat_data.render_inv_vp);
 	splat_data.warp_vp = warp_vp;
 	upload_ubo(splat_ubo[view], splat_data);
 
 	reproject_pull_ubo pull_data{};
-	pull_data.dst_inv_p = dst_inv_p;
-	pull_data.dst_inv_v = dst_inv_v;
-	pull_data.src_p = src_proj;
-	pull_data.src_v = src_view;
+	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &pull_data.dst_inv);
+	math_matrix_4x4_multiply(&src_proj, &src_view, &pull_data.src_vp);
 	pull_data.hole_radius = float(kHoleRadius);
 	pull_data.pad[0] = pull_data.pad[1] = pull_data.pad[2] = 0;
 	upload_ubo(pull_ubo[view], pull_data);

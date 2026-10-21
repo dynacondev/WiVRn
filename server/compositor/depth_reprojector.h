@@ -27,27 +27,26 @@
 
 // UBO mirror of server/compositor/shaders/reproject_splat.comp:
 // source clip -> world -> target clip. mat4 arrays are column-major on
-// both sides: xrt_matrix_4x4::v copies straight across.
+// both sides: xrt_matrix_4x4::v copies straight across. The
+// inverse-view * inverse-projection product is folded on the CPU.
 struct reproject_splat_ubo
 {
-	xrt_matrix_4x4 render_inv_p;
-	xrt_matrix_4x4 render_inv_v;
+	xrt_matrix_4x4 render_inv_vp;
 	xrt_matrix_4x4 warp_vp;
 };
-static_assert(sizeof(reproject_splat_ubo) == 192);
+static_assert(sizeof(reproject_splat_ubo) == 128);
 
 // UBO mirror of server/compositor/shaders/reproject_pull.comp:
-// target clip -> world -> source clip, plus the hole-fill radius.
+// target clip -> world -> source clip, plus the hole-fill radius. The
+// products are folded on the CPU.
 struct reproject_pull_ubo
 {
-	xrt_matrix_4x4 dst_inv_p;
-	xrt_matrix_4x4 dst_inv_v;
-	xrt_matrix_4x4 src_p;
-	xrt_matrix_4x4 src_v;
+	xrt_matrix_4x4 dst_inv;
+	xrt_matrix_4x4 src_vp;
 	float hole_radius;
 	float pad[3];
 };
-static_assert(sizeof(reproject_pull_ubo) == 272);
+static_assert(sizeof(reproject_pull_ubo) == 144);
 
 // Push block mirror of reproject_resolve.comp.
 struct reproject_resolve_push

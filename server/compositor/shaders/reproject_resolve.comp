@@ -5,9 +5,6 @@
  * retained images so synthetic frames warp from held sources: the app
  * may recycle or recreate its swapchains at any time, while the
  * retained copy lives until the next real frame refreshes it.
- *
- * Warp math uses mat4 * vec4 only (no mat3 constructors or ternaries):
- * Adreno-740-safe by construction.
  */
 
 #version 450

@@ -9,9 +9,6 @@
  *
  * Warp math follows the OpenWarp family (https://github.com/Zee2/openwarp,
  * NCSA-licensed); the splat/pull structure is original.
- *
- * Warp math uses mat4 * vec4 only (no mat3 constructors or ternaries):
- * Adreno-740-safe by construction.
  */
 
 #version 450
@@ -22,8 +19,7 @@ layout(set = 0, binding = 0) uniform sampler2D src_depth;
 
 layout(set = 0, binding = 1) uniform SplatUBO
 {
-	mat4 render_inv_p; // inverse of the source (render-pose) projection
-	mat4 render_inv_v; // inverse of the source view (camera-to-world)
+	mat4 render_inv_vp; // source clip -> world (inverse view * inverse projection, folded on CPU)
 	mat4 warp_vp; // target projection * target view
 } ubo;
 
@@ -46,7 +42,7 @@ void main()
 	float z = texture(src_depth, guv).x;
 
 	vec4 clip_pos = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
-	vec4 frag_worldspace = ubo.render_inv_v * (ubo.render_inv_p * clip_pos);
+	vec4 frag_worldspace = ubo.render_inv_vp * clip_pos;
 	vec4 result = ubo.warp_vp * frag_worldspace;
 
 	// Behind the target camera: nothing to splat (sign must be tested
@@ -54,6 +50,10 @@ void main()
 	if (result.w <= 0.0)
 		return;
 	result /= result.w;
+	// Outside the target frustum in depth: the mesh rasterizer clips
+	// these; without the reject they splat clamped garbage.
+	if (result.z < -1.0 || result.z > 1.0)
+		return;
 
 	vec2 tuv = result.xy * 0.5 + 0.5;
 	if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0)
@@ -61,6 +61,10 @@ void main()
 
 	ivec2 dst_xy = ivec2(tuv * vec2(size));
 	dst_xy = clamp(dst_xy, ivec2(0), size - ivec2(1));
-	uint enc = uint(clamp(z, 0.0, 1.0) * DEPTH_SCALE);
+	// Encode TARGET-view depth: the pull side unprojects through the
+	// target inverses, and atomicMin must order contributors by target
+	// depth or occlusion resolves wrong under motion.
+	float zt = result.z * 0.5 + 0.5;
+	uint enc = uint(clamp(zt, 0.0, 1.0) * DEPTH_SCALE);
 	imageAtomicMin(dst_splat, dst_xy, enc);
 }
