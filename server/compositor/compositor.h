@@ -91,6 +91,14 @@ private:
 	vk::raii::CommandPool cmd_pool;
 	vk::raii::QueryPool query_pool;
 
+	// Synth path command resources: the ticker records independently of
+	// layer_commit (serialized by commit_mutex, never concurrent), so it
+	// needs its own pool — resetting the shared pool would invalidate
+	// the in-flight record. No query pool: synth warps skip timestamp
+	// reads (warp cost is estimated, corrected by the lateness signal).
+	vk::raii::CommandPool synth_pool;
+	vk::raii::CommandBuffer synth_cmd;
+
 	std::array<encoder_settings, 3> settings;
 
 	// Compositor output images awaiting encode: 1 real + 1 replacement
@@ -113,6 +121,15 @@ private:
 	// Cached at construction: server config is startup-read.
 	const bool depth_reprojection_enabled;
 
+	// Render-time source metadata for the retained frame (pose/FOV/clip
+	// per eye). Written alongside refresh_retained on fresh depth
+	// commits, read by the synth ticker under the same commit lock.
+	// Lets the ticker warp without a layer in hand.
+	std::array<xrt_pose, 2> retained_src_pose{};
+	std::array<xrt_fov, 2> retained_src_fov{};
+	std::array<float, 2> retained_src_near{1, 1};
+	std::array<float, 2> retained_src_far{1000, 1000};
+
 	// Last client app-frame timestamp seen on a fast-path commit, for
 	// refresh gating: a changed timestamp means the commit carries a new
 	// app frame whose color+depth must be retained. Empty until the
@@ -126,6 +143,17 @@ private:
 	// carry fresh ones). Zero until the first commit. Atomic: the synth
 	// ticker reads it while layer_commit writes it.
 	std::atomic<uint64_t> last_commit_ns{0};
+
+	// Last queued output (monotonic ns, commit or synth path). The ticker
+	// synthesizes a tick only when no output covers it.
+	std::atomic<uint64_t> last_output_ns{0};
+	// Whether the latest commit carried depth. The ticker synthesizes
+	// only from depth frames (warping from stale retained content while
+	// the app shows non-depth layers would show the wrong frame).
+	std::atomic<bool> last_had_depth{false};
+	// Arrival time of the commit that last refreshed retained sources.
+	// Bounds how stale a synth source may be (dead-app guard).
+	std::atomic<uint64_t> last_retained_ns{0};
 
 	// Alpha blend mode of the latest commit. The synth ticker cannot
 	// safely read layer_accum (owned by the commit path), so layer_commit
@@ -158,6 +186,20 @@ private:
 	// commit while the pool holds 4 (acquire_image drops past it).
 	std::deque<queued_frame> encode_queue;
 	std::jthread encoder_thread;
+
+	// Last timeline value submitted by the synth ticker. The ticker waits
+	// for it (bounded) before resetting its command pool, mirroring the
+	// commit path's end-of-tick wait: never reset a pool whose work is
+	// still on the GPU. Ticker-thread only.
+	uint64_t last_synth_submit_value = 0;
+
+	// Display-rate synth ticker: emits warped frames on ticks with no
+	// fresh EndFrame, so slow apps still feed the client at display
+	// cadence. Purely additive — the EndFrame path is untouched. Stopped
+	// + joined before the encoder thread (it produces; the worker drains).
+	std::jthread synth_thread;
+	std::mutex synth_mutex;
+	std::condition_variable_any synth_cv;
 
 	struct
 	{
@@ -212,6 +254,8 @@ private:
 
 	int acquire_image();
 
+	void synth_work(std::stop_token tok);
+
 	void append_encoder_barriers(
 	        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> & barriers,
 	        int image_idx,
@@ -219,7 +263,8 @@ private:
 
 	// Submits a fully recorded command buffer on the compositor queue,
 	// signaling the timeline semaphore. Returns the signaled value for
-	// the present call. Called with commit_mutex held.
+	// the present call. Self-synchronizing via the queue mutex (submit
+	// order is signal order); callable with or without commit_mutex.
 	uint64_t submit_cmd_buffer(vk::raii::CommandBuffer & cmd);
 
 	// Presents one fully-recorded image to all encoders and records

@@ -128,6 +128,13 @@ public:
 
 	std::array<vk::ImageView, 2> get_views();
 
+	// Whether refresh_retained has ever run (sources valid for warping).
+	// Read under the compositor's commit lock on both paths.
+	bool has_retained() const
+	{
+		return retained_initialized;
+	}
+
 private:
 	// Depth encoding at construction (config source-reverse-z):
 	// reverse-Z sources are converted once in the resolve pass. Read

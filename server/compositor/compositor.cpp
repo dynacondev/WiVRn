@@ -486,6 +486,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			                },
 			        });
 		}
+		last_had_depth.store(has_depth_src);
 
 		image_barriers.push_back(
 		        vk::ImageMemoryBarrier2{
@@ -513,10 +514,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// compositor-owned retained sources so a synthetic below warps from
 		// held data, valid until the next real frame refreshes it.
 		if (has_depth_src and depth_reprojection_enabled and app_fresh)
+		{
 			// Depth rows arrive Vulkan top-first by producer construction
 			// (dma-buf import chain, row 0 = top), independent of the color
 			// layer's flip_y: retained rows mirror so the images stay
 			// GL-ordered (row 0 = frustum bottom) whatever the color order.
+			// Retained refresh also stamps the synth source clock (the
+			// ticker's dead-app guard measures source age from here).
+			last_retained_ns.store(commit_ns);
+			retained_src_pose = src_pose;
+			retained_src_fov = src_fov;
+			retained_src_near = src_near_z;
+			retained_src_far = src_far_z;
 			reprojector.refresh_retained(
 			        vk.device,
 			        cmd,
@@ -526,6 +535,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        src_depth_nrect,
 			        /*flip_color=*/!flip_y,
 			        /*flip_depth=*/true);
+		}
 
 		// Depth reprojection for stale app frames: the app is running slower
 		// than the display (see the staleness gate above), so this frame will
@@ -748,6 +758,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		queue_encode(synth.image, synth_slots);
 	else
 		queue_encode(i, real_slots);
+	// This output serves the frame's predicted tick: the ticker treats
+	// ticks near a queued output as covered (nearest-pick duality with
+	// the client's frame selection).
+	last_output_ns.store(uint64_t(frame.rendering.predicted_display_time_ns));
 
 	// End of the serialized region: everything below touches only
 	// commit-private or self-synchronizing state (timeline wait, query
@@ -981,10 +995,259 @@ bool compositor::present_to_encoders(
 	return presented_any;
 }
 
+void compositor::synth_work(std::stop_token tok)
+{
+	// Lead and staleness bounds (monotonic ns). The lead starts work
+	// early enough to present in time for the tick: pacer-learned
+	// pipeline latency + a warp estimate + a small margin.
+	// Overestimating only adds constant latency (the client holds early
+	// frames); the retained-age bound stops synthesis from a long-dead
+	// app (static scene repeats instead, which is correct).
+	static constexpr uint64_t kSynthWarpEstNs = 3'000'000;
+	static constexpr uint64_t kSynthMarginNs = 1'000'000;
+	static constexpr uint64_t kSynthMaxRetainedAgeNs = 2'000'000'000ull;
+
+	while (!tok.stop_requested())
+	{
+		uint64_t period_ns = pacer.get_frame_duration();
+		if (period_ns == 0)
+		{
+			std::unique_lock lock{synth_mutex};
+			synth_cv.wait_for(lock, tok, std::chrono::milliseconds(100), [] { return false; });
+			continue;
+		}
+		uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+		uint64_t tick_ns = uint64_t(pacer.next_display_tick_ns(int64_t(now_ns)));
+		uint64_t lead_ns = uint64_t(pacer.present_lead_ns()) + kSynthWarpEstNs + kSynthMarginNs;
+		uint64_t wake_ns = tick_ns > now_ns + lead_ns ? tick_ns - lead_ns : now_ns;
+		{
+			std::unique_lock lock{synth_mutex};
+			synth_cv.wait_for(lock, tok, std::chrono::nanoseconds(wake_ns > now_ns ? wake_ns - now_ns : 0), [] { return false; });
+		}
+		if (tok.stop_requested())
+			return;
+		now_ns = uint64_t(os_monotonic_get_ns());
+
+		// No output within half a period of this tick means the tick is
+		// uncovered (nearest-pick duality with the client's frame
+		// selection: an output that close IS this tick's frame).
+		// Everything else below is a silent skip: the client repeats.
+		int64_t cover_dt = int64_t(tick_ns) - int64_t(last_output_ns.load());
+		int64_t half_period_ns = int64_t(period_ns / 2);
+		bool covered = cover_dt <= half_period_ns && cover_dt >= -half_period_ns;
+		uint64_t last_retained = last_retained_ns.load();
+		bool retained_fresh = last_retained != 0 && now_ns - last_retained <= kSynthMaxRetainedAgeNs;
+		if (covered || !retained_fresh || !depth_reprojection_enabled || !last_had_depth.load())
+			continue;
+		if (!session.connected() || !session.get_offset())
+			continue;
+
+		int synth_image = -1;
+		std::array<xrt_pose, 2> synth_poses{};
+		std::array<xrt_fov, 2> synth_fov{};
+		int64_t synth_id = -1;
+		bool have_synth = false;
+		std::array<int8_t, 3> synth_slots{-1, -1, -1};
+		try
+		{
+			std::lock_guard commit_lock{commit_mutex};
+			// Re-verify under lock: an EndFrame may have committed (and
+			// queued) while we slept.
+			int64_t cover_dt2 = int64_t(tick_ns) - int64_t(last_output_ns.load());
+			bool covered2 = cover_dt2 <= half_period_ns && cover_dt2 >= -half_period_ns;
+			bool ok = !covered2 && reprojector.has_retained();
+			xrt_space_relation head{};
+			if (ok)
+			{
+				if (session.get_hmd().get_view_poses(
+				            nullptr,
+				            int64_t(tick_ns),
+				            XRT_VIEW_TYPE_STEREO,
+				            2,
+				            &head,
+				            synth_fov.data(),
+				            synth_poses.data()) != XRT_SUCCESS)
+					ok = false;
+			}
+			constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+			if (ok && (head.relation_flags & need_pose) != need_pose)
+				ok = false;
+			if (ok)
+			{
+				for (int view = 0; view < 2; ++view)
+				{
+					xrt_relation_chain xrc{};
+					xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+					m_relation_chain_push_pose_if_not_identity(&xrc, &synth_poses[view]);
+					m_relation_chain_push_relation(&xrc, &head);
+					m_relation_chain_resolve(&xrc, &rel);
+					synth_poses[view] = rel.pose;
+				}
+			}
+			if (ok)
+			{
+				// The tick must postdate the retained frame: warping
+				// backward is never meaningful (guards clock confusion).
+				ok = tick_ns > last_retained_ns.load();
+			}
+			if (ok)
+			{
+				synth_image = acquire_image();
+				if (synth_image < 0)
+					ok = false; // Pool momentarily full (commit in flight): skip silently.
+
+			}
+
+			if (ok)
+			{
+				// The previous synth submit must be off the GPU before its
+				// command pool is reset (same discipline as the commit path's
+				// end-of-tick wait). Bounded by one period: a backed-up GPU
+				// skips the tick instead of piling on.
+				if (last_synth_submit_value != 0 &&
+				    vk.device.waitSemaphores(vk::SemaphoreWaitInfo{
+				                               .semaphoreCount = 1,
+				                               .pSemaphores = &*sem,
+				                               .pValues = &last_synth_submit_value,
+				                       },
+				                       period_ns) == vk::Result::eTimeout)
+				{
+					images[synth_image].busy = false;
+					synth_image = -1;
+					ok = false;
+				}
+				else
+				{
+					synth_pool.reset();
+					synth_cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+
+					// Fresh or recycled images start UNDEFINED (same as the commit
+					// path: UNDEFINED discards, valid for any actual layout).
+					std::array image_barrier{
+					        vk::ImageMemoryBarrier2{
+					                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+					                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+					                .oldLayout = vk::ImageLayout::eUndefined,
+					                .newLayout = vk::ImageLayout::eGeneral,
+					                .image = images[synth_image].image,
+					                .subresourceRange = {
+					                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+					                        .levelCount = 1,
+					                        .layerCount = images[synth_image].image.info().arrayLayers,
+					                },
+					        },
+					};
+					synth_cmd.pipelineBarrier2({
+					        .imageMemoryBarrierCount = uint32_t(image_barrier.size()),
+					        .pImageMemoryBarriers = image_barrier.data(),
+					});
+				}
+
+			}
+			if (ok)
+			{
+				for (int view = 0; view < 2; ++view)
+				{
+					ok &= reprojector.reproject(
+					        synth_cmd,
+					        view,
+					        retained_src_pose[view],
+					        retained_src_fov[view],
+					        retained_src_near[view],
+					        retained_src_far[view],
+					        synth_poses[view],
+					        synth_fov[view]);
+				}
+				if (!ok && synth_image >= 0)
+				{
+					images[synth_image].busy = false;
+					synth_image = -1;
+				}
+			}
+			if (ok)
+			{
+				synth_id = pacer.predict_synth(int64_t(tick_ns), int64_t(tick_ns));
+				images[synth_image].frame_index = uint64_t(synth_id);
+
+				const auto synth_extent = images[0].image.info().extent;
+				std::array<xrt_rect, 2> synth_rect{
+				        xrt_rect{
+				                .offset = {.w = 0, .h = 0},
+				                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
+				        },
+				        xrt_rect{
+				                .offset = {.w = 0, .h = 0},
+				                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
+				        },
+				};
+				auto synth_foveation = foveation.foveate(
+				        vk.device,
+				        synth_cmd,
+				        images[synth_image].view_y,
+				        images[synth_image].view_cbcr,
+				        true, // warped targets are always GL-ordered
+				        reprojector.get_views(),
+				        synth_rect,
+				        synth_fov,
+				        last_alpha_blend.load());
+
+				images[synth_image].view_info = {
+				        .display_time = session.get_offset().to_headset(int64_t(tick_ns)),
+				        .alpha = last_alpha_blend.load(),
+				};
+				for (int view = 0; view < 2; ++view)
+				{
+					images[synth_image].view_info.pose[view] = xrt_cast(synth_poses[view]);
+					images[synth_image].view_info.fov[view] = xrt_cast(synth_fov[view]);
+					images[synth_image].view_info.foveation[view] = synth_foveation[view];
+				}
+
+
+				beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
+				append_encoder_barriers(image_barriers, synth_image, images[synth_image].view_info);
+				synth_cmd.pipelineBarrier2({
+				        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
+				        .pImageMemoryBarriers = image_barriers.data(),
+				});
+
+				synth_cmd.end();
+				have_synth = true;
+			}
+		if (!have_synth)
+			continue;
+		uint64_t sem_value_now = submit_cmd_buffer(synth_cmd);
+		last_synth_submit_value = sem_value_now;
+		const vk::SemaphoreSubmitInfo sem_info{
+		        .semaphore = *sem,
+		        .value = sem_value_now,
+		        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
+		};
+		if (!present_to_encoders(synth_image, images[synth_image].view_info, synth_id, sem_info, synth_slots))
+		{
+			images[synth_image].busy = false;
+			continue;
+		}
+		queue_encode(synth_image, synth_slots);
+		last_output_ns.store(tick_ns);
+		}
+		catch (...)
+		{
+			// Same guarantee as the commit path: a record, submit or
+			// present throw must release what was acquired, never the
+			// thread (a dead ticker stops all synthesis silently). The
+			// encoder already released its own slot and logged.
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
+				if (synth_slots[ei] >= 0)
+					encoders[ei]->release_slot(uint8_t(synth_slots[ei]));
+			if (synth_image >= 0)
+				images[synth_image].busy = false;
+			continue;
+		}
+	}
+}
+
 void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
 {
-	// Bounded in practice by images (header): at most 2 frames queued
-	// per commit while the pool holds 4; acquire_image drops past it.
 	std::lock_guard lock(encode_mutex);
 	encode_queue.push_back({image, slots});
 	// Bounded in practice by images: at most 2 frames queued per commit
@@ -1078,6 +1341,11 @@ compositor::compositor(wivrn_session & session) :
                                       .queryType = vk::QueryType::eTimestamp,
                                       .queryCount = 4,
                               }),
+        synth_pool(vk.device, vk::CommandPoolCreateInfo{
+                                    .flags = vk::CommandPoolCreateFlagBits::eTransient,
+                                    .queueFamilyIndex = vk.queue.family_index,
+                            }),
+        synth_cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *synth_pool, .commandBufferCount = 1})[0])},
         settings(get_encoder_settings(vk, session)),
         images{make_images(vk, cmd_pool, settings)},
         cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1})[0])},
@@ -1153,13 +1421,19 @@ compositor::compositor(wivrn_session & session) :
 	        depth_reprojection_enabled ? "enabled" : "disabled",
 	        configuration().reprojection.source_reverse_z ? "true" : "false");
 
-	// Start the thread after everything is initialized
+	// Start the threads after everything is initialized. The synth
+	// ticker is declared after the encoder thread so it stops (and
+	// joins) first: it produces frames, the worker drains them.
 	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};
+	synth_thread = std::jthread{[&](std::stop_token t) { synth_work(t); }};
 }
 
 compositor::~compositor()
 {
 	u_var_remove_root(this);
+	synth_thread.request_stop();
+	synth_cv.notify_all();
+	synth_thread.join();
 	encoder_thread.request_stop();
 	encode_cv.notify_all();
 	comp_base * c_base = this;
