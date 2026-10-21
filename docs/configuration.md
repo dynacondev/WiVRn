@@ -124,7 +124,9 @@ with its depth.
 Default value: `true`
 
 Master switch for the warp. `false` disables synthesis entirely (repeat
-last frame).
+last frame). When enabled and the app runs slower than the display, the
+server synthesizes warped frames at display cadence so the client stops
+repeating stale ones; fresh app frames always go out straight.
 
 ### `source-reverse-z`
 Default value: `true`
