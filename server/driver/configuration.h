@@ -155,6 +155,20 @@ struct configuration
 	// Applies to the until-lock transition only, nothing else.
 	float passthrough_fade_time_s = 2.0f;
 
+	struct reprojection
+	{
+		// Master switch for the server-side depth warp: when the app
+		// frame rate drops below the display rate, synthesize replacement
+		// frames by reprojecting the last real frame with its depth.
+		bool enabled = true;
+		// Depth encoding of the submitting app: true = reverse-Z
+		// (1 at near, X-Plane 12 Vulkan). No in-band signal carries
+		// this, so the default encodes the pipeline assumption;
+		// normal-Z apps set it false explicitly.
+		bool source_reverse_z = true;
+	};
+	reprojection reprojection;
+
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;

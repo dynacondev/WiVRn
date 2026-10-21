@@ -643,6 +643,14 @@ configuration::configuration()
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;
 
+		if (auto it = json.find("reprojection"); it != json.end())
+		{
+			if (auto jt = it->find("enabled"); jt != it->end())
+				reprojection.enabled = *jt;
+			if (auto jt = it->find("source-reverse-z"); jt != it->end())
+				reprojection.source_reverse_z = *jt;
+		}
+
 		if (auto it = json.find("port"); it != json.end())
 			port = *it;
 

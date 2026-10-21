@@ -115,6 +115,33 @@ If `false` or unset, WiVRn will use both TCP and UDP.
 }
 ```
 
+## `reprojection`
+Server-side depth warp: when the app frame rate drops below the display
+rate, synthesize replacement frames by reprojecting the last real frame
+with its depth.
+
+### `enabled`
+Default value: `true`
+
+Master switch for the warp. `false` disables synthesis entirely (repeat
+last frame).
+
+### `source-reverse-z`
+Default value: `true`
+
+Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
+Vulkan). Normal-Z apps set `false` explicitly.
+
+### Example
+```json
+{
+	"reprojection": {
+		"enabled": true,
+		"source-reverse-z": true
+	}
+}
+```
+
 ## `publish-service`
 Default value: `avahi`
 
