@@ -113,12 +113,17 @@ private:
 	const bool depth_reprojection_enabled;
 
 	// Last client app-frame timestamp seen on a fast-path commit, for
-	// repeat detection. The display-driven commit loop re-submits the
-	// latest client frame every tick, so delivery spacing cannot signal
-	// demand; the client layer timestamp is replayed verbatim across
-	// repeats, so a changed timestamp means a fresh app frame. Empty
-	// until the first fast-path commit.
+	// refresh gating: a changed timestamp means the commit carries a new
+	// app frame whose color+depth must be retained. Empty until the
+	// first fast-path commit.
 	std::optional<int64_t> last_app_layer_ts;
+
+	// Arrival time of the previous layer_commit (monotonic ns). The warp
+	// gate compares inter-commit spacing against the display period:
+	// layer_commit runs once per app EndFrame, not per display tick, so
+	// staleness cannot come from timestamps (consecutive commits always
+	// carry fresh ones). Zero until the first commit.
+	uint64_t last_commit_ns = 0;
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 

@@ -156,8 +156,9 @@ private:
 	// Per-eye warped color targets (plain UNORM, sampled raw) plus
 	// per-eye splatted foreground-depth scratch (R32_UINT, cleared
 	// each warp). SHADER_READ_ONLY (targets) / GENERAL (scratch)
-	// between warps.
-	bool warp_targets_ready = false;
+	// between warps. Per-view: the two eyes warp independently, so a
+	// view-0 warp must not mark view 1's resources transitioned.
+	std::array<bool, 2> warp_targets_ready = {false, false};
 	std::array<image_allocation, 2> target;
 	std::array<vk::raii::ImageView, 2> target_view = {nullptr, nullptr};
 	std::array<image_allocation, 2> splat_depth;

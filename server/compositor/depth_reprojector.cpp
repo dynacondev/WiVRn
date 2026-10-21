@@ -36,6 +36,11 @@ namespace
 // back: no synthetic frame).
 bool frustum_gl(const xrt_fov & fov, float near_z, float far_z, xrt_matrix_4x4 & out)
 {
+	// GL internal convention (NDC z in [-1,1], remapped *0.5+0.5 for
+	// storage) reproduces exactly the depth values a Vulkan app stores:
+	// Vulkan's [0,1] NDC was defined to coincide with the remapped GL
+	// values (both are f/(f-n) - nf/((f-n)*d)). So this matrix matches
+	// Vulkan-rendered depth buffers; no convention conversion needed.
 	if (not(std::isfinite(near_z) and std::isfinite(far_z)) or near_z <= 0 or far_z <= near_z)
 		return false;
 	float l = near_z * tanf(fov.angle_left);
@@ -853,19 +858,20 @@ bool depth_reprojector::reproject(
 
 	// Splat scratch ends each warp in GENERAL (pull only reads); the
 	// target ends each warp in SHADER_READ_ONLY (foveation only
-	// samples), so the next warp reuses it from there. First warp from
-	// UNDEFINED.
+	// samples), so the next warp reuses it from there. First warp per
+	// view from UNDEFINED. Per-view: the two eyes warp independently
+	// (view 0 must not mark view 1's resources transitioned).
 	vk::ImageLayout splat_start =
-	        warp_targets_ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
+	        warp_targets_ready[view] ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
 	vk::AccessFlags splat_src_access =
-	        warp_targets_ready ? vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite : vk::AccessFlags{};
+	        warp_targets_ready[view] ? vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite : vk::AccessFlags{};
 	vk::ImageLayout target_start =
-	        warp_targets_ready ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
+	        warp_targets_ready[view] ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
 	vk::AccessFlags target_src_access =
-	        warp_targets_ready ? vk::AccessFlagBits::eShaderRead : vk::AccessFlags{};
+	        warp_targets_ready[view] ? vk::AccessFlagBits::eShaderRead : vk::AccessFlags{};
 	vk::PipelineStageFlags reuse_stage =
-	        warp_targets_ready ? vk::PipelineStageFlagBits::eComputeShader : vk::PipelineStageFlagBits::eTopOfPipe;
-	warp_targets_ready = true;
+	        warp_targets_ready[view] ? vk::PipelineStageFlagBits::eComputeShader : vk::PipelineStageFlagBits::eTopOfPipe;
+	warp_targets_ready[view] = true;
 
 	std::array pre_barriers{
 	        vk::ImageMemoryBarrier{
