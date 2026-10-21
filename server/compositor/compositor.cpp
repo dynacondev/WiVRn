@@ -24,6 +24,7 @@
 // Monado includes
 #include "driver/xrt_cast.h"
 #include "main/comp_frame.h"
+#include "math/m_space.h"
 #include "util/comp_layer_accum.h"
 #include "util/comp_render_helpers.h"
 #include "util/comp_vulkan.h"
@@ -619,6 +620,21 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					images[s.image].busy = false;
 					s.image = -1;
 					break;
+				}
+
+				// get_view_poses returns head-relative eye offsets in
+				// s.poses plus the head-in-world relation (Monado device
+				// contract, cf. u_device_get_view_poses). Compose
+				// world-space targets here so plausibility, reproject and
+				// view_info below all see world poses.
+				for (int view = 0; view < 2; ++view)
+				{
+					xrt_relation_chain xrc{};
+					xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+					m_relation_chain_push_pose_if_not_identity(&xrc, &s.poses[view]);
+					m_relation_chain_push_relation(&xrc, &head);
+					m_relation_chain_resolve(&xrc, &rel);
+					s.poses[view] = rel.pose;
 				}
 
 				// Valid flags are not sufficient: a stale identity packet
