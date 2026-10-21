@@ -45,6 +45,15 @@ void main()
 	// retained images are always GL-ordered (row 0 = frustum bottom).
 	vec2 guv = (vec2(id.xy) + vec2(0.5)) / vec2(size);
 	vec2 guv_f = vec2(guv.x, guv.y + pc.src_flip * (1.0 - 2.0 * guv.y));
+	// Depth rows are Vulkan top-first by producer construction
+	// (vkCmdCopyImage / SHM row 0 = top, preserved texel-identical
+	// through the dma-buf import and CopyImageSubData), independent of
+	// the color layer's flip_y: retained bottom rows must sample the
+	// LAST depth row, so depth always mirrors while color follows
+	// src_flip. Sharing guv_f for both (as before) stores depth
+	// upside-down relative to color: warps then read wrong depths
+	// everywhere, splatting holes on any head motion (~0 when still).
+	vec2 depth_guv = vec2(guv.x, 1.0 - guv.y);
 
 	vec2 color_uv;
 	vec2 depth_uv;
@@ -53,14 +62,14 @@ void main()
 	if (eye == 0)
 	{
 		color_uv = pc.color_rect[0].xy + guv_f * pc.color_rect[0].zw;
-		depth_uv = pc.depth_rect[0].xy + guv_f * pc.depth_rect[0].zw;
+		depth_uv = pc.depth_rect[0].xy + depth_guv * pc.depth_rect[0].zw;
 		color = texture(src_color0, color_uv);
 		depth = texture(src_depth0, depth_uv).x;
 	}
 	else
 	{
 		color_uv = pc.color_rect[1].xy + guv_f * pc.color_rect[1].zw;
-		depth_uv = pc.depth_rect[1].xy + guv_f * pc.depth_rect[1].zw;
+		depth_uv = pc.depth_rect[1].xy + depth_guv * pc.depth_rect[1].zw;
 		color = texture(src_color1, color_uv);
 		depth = texture(src_depth1, depth_uv).x;
 	}
