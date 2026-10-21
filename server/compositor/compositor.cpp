@@ -45,6 +45,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <thread>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
@@ -239,6 +240,55 @@ void compositor::timings::add(float us)
 	int index = this->index;
 	this->index = (this->index + 1) % values.size();
 	values[index] = us;
+}
+
+// Plausibility gate for depth warps (prototype parity): implied head
+// velocity between source capture and target display. A tick this
+// violent would splat mostly-holes (every hole pixel costs a
+// full-radius expanding-ring search); a single repeat degrades far more
+// gracefully. Pure CPU, no GPU readback.
+static constexpr float kMaxWarpSpeedMps = 10.f;
+static constexpr float kMaxWarpSpeedRps = 12.f;
+static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
+                                  const std::array<xrt_pose, 2> & dst,
+                                  double dt_s,
+                                  float & worst_ms,
+                                  float & worst_rs)
+{
+	worst_ms = 0.f;
+	worst_rs = 0.f;
+	if (!(dt_s > 0.))
+		return false;
+	for (int view = 0; view < 2; ++view)
+	{
+		const auto & a = src[view];
+		const auto & b = dst[view];
+		float dx = b.position.x - a.position.x;
+		float dy = b.position.y - a.position.y;
+		float dz = b.position.z - a.position.z;
+		float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+		float dot = fabsf(a.orientation.x * b.orientation.x + a.orientation.y * b.orientation.y +
+		                  a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w);
+		dot = fminf(fmaxf(dot, 0.f), 1.f);
+		float angle = 2.f * acosf(dot);
+		worst_ms = fmaxf(worst_ms, float(dist / dt_s));
+		worst_rs = fmaxf(worst_rs, float(angle / dt_s));
+	}
+	return worst_ms <= kMaxWarpSpeedMps && worst_rs <= kMaxWarpSpeedRps;
+}
+
+// Throttled skip note shared by both warp paths (same 5 s window:
+// a violent motion episode trips both).
+static void note_warp_skip_implausible(float worst_ms, float worst_rs, double dt_ms)
+{
+	static std::atomic<uint64_t> last_ns{0};
+	uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+	if (now_ns - last_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+	{
+		last_ns.store(now_ns, std::memory_order_relaxed);
+		U_LOG_W("compositor: skipping warp (implausible head motion %.1f m/s %.1f rad/s dt=%.1fms, repeat instead)",
+		        worst_ms, worst_rs, dt_ms);
+	}
 }
 
 xrt_result_t compositor::predict_frame(int64_t * out_frame_id,
@@ -488,7 +538,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 		else
 		{
-			// no fast-path, squash layers
+			// No fast-path, squash layers. Multi-layer frames carry no
+			// depth source (warping a squashed composite has no valid
+			// per-pixel depth), so has_depth_src stays false and the
+			// synth ticker stands down until the next depth commit.
+			// Fine for fullscreen X-Plane; a transient overlay pauses
+			// synthesis while it is up.
 			std::array<xrt_pose, 2> poses;
 			const auto extent = images[0].image.info().extent;
 			std::tie(poses, src_fov, src_rect) = squasher.do_layers(
@@ -619,6 +674,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 			if (synth_ok)
 			{
+				// Plausibility gate (see helper): violent ticks splat
+				// mostly-holes; repeat instead.
+				float worst_ms = 0.f, worst_rs = 0.f;
+				double dt_s = double(frame.rendering.predicted_display_time_ns - app_layer_ts_ns) / 1e9;
+				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs))
+				{
+					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3);
+					synth_ok = false;
+				}
+			}
+			if (synth_ok)
+			{
 				synth.image = acquire_image();
 				if (synth.image < 0)
 				{
@@ -645,6 +712,17 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				}
 				if (!synth_ok and synth.image >= 0)
 				{
+					// reproject() only fails on degenerate frustum input
+					// (non-finite or inverted near/far/FOV): throttled, since
+					// a bad upstream header would fail every tick.
+					static std::atomic<uint64_t> last_degenerate_ns{0};
+					uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
+					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+					{
+						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
+						U_LOG_W("compositor: warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, repeat instead)",
+						        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1]);
+					}
 					images[synth.image].busy = false;
 					synth.image = -1;
 				}
@@ -1193,6 +1271,18 @@ void compositor::synth_work(std::stop_token tok)
 			}
 			if (ok)
 			{
+				// Plausibility gate (see helper): violent ticks splat
+				// mostly-holes; skip the tick instead.
+				float worst_ms = 0.f, worst_rs = 0.f;
+				double dt_s = double(tick_ns - last_retained_ns.load()) / 1e9;
+				if (!warp_motion_plausible(retained_src_pose, synth_poses, dt_s, worst_ms, worst_rs))
+				{
+					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3);
+					ok = false;
+				}
+			}
+			if (ok)
+			{
 				synth_image = acquire_image();
 				if (synth_image < 0)
 					ok = false; // Pool momentarily full (commit in flight): skip silently.
@@ -1240,6 +1330,17 @@ void compositor::synth_work(std::stop_token tok)
 				}
 				if (!ok && synth_image >= 0)
 				{
+					// reproject() only fails on degenerate frustum input
+					// (non-finite or inverted near/far/FOV): throttled, since
+					// a bad upstream header would fail every tick.
+					static std::atomic<uint64_t> last_degenerate_ns{0};
+					uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
+					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+					{
+						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
+						U_LOG_W("compositor: synth warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, skipping tick)",
+						        retained_src_near[0], retained_src_near[1], retained_src_far[0], retained_src_far[1]);
+					}
 					images[synth_image].busy = false;
 					synth_image = -1;
 				}
@@ -1297,20 +1398,21 @@ void compositor::synth_work(std::stop_token tok)
 				synth_cmd.end();
 				have_synth = true;
 			}
-		// Release the record lock before the bounded slot waits: present
-		// touches only the exclusive synth image + per-encoder state,
-		// so holding commit_mutex across up to 3 s of encoder waits
-		// would park fresh commits behind synthesis. Submit order is
-		// already fixed via the queue mutex.
-		commit_lock.unlock();
 		if (!have_synth)
 			continue;
+		// Submit under the record lock (like the commit path): this
+		// publishes last_submit_value before any other path can pass
+		// its pre-record wait, so no record can start against
+		// in-flight upload state. Submit only takes the queue mutex
+		// (non-blocking). The slow bounded slot waits in
+		// present_to_encoders run unlocked below.
 		uint64_t sem_value_now = submit_cmd_buffer(synth_cmd);
 		const vk::SemaphoreSubmitInfo sem_info{
 		        .semaphore = *sem,
 		        .value = sem_value_now,
 		        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
 		};
+		commit_lock.unlock();
 		if (!present_to_encoders(synth_image, images[synth_image].view_info, synth_id, sem_info, synth_slots))
 		{
 			images[synth_image].busy = false;

@@ -97,8 +97,10 @@ private:
 	// Slot allocator for presents: each present records its slot on the
 	// queued frame and encode consumes exactly that slot, so the pairing
 	// cannot diverge (no counters to drift apart across exceptions, drops
-	// or skips). Atomic as belt-and-braces (both present paths call
-	// present_image; today they are serialized by commit_mutex).
+	// or skips). Atomic: both present paths call present_image outside
+	// commit_mutex (record-only is serialized; presents run unlocked so
+	// a wedged encoder never parks the other path). Per-slot busy polls
+	// make overlapping presents safe.
 	std::atomic<uint8_t> present_cursor{0};
 
 	std::mutex mutex;

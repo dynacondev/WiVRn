@@ -27,6 +27,7 @@
 
 #include "os/os_time.h"
 #include "util/u_debug.h"
+#include "util/u_logging.h"
 
 DEBUG_GET_ONCE_FLOAT_OPTION(client_margin_ms, "WIVRN_CLIENT_MARGIN_MS", 1.f)
 
@@ -207,7 +208,17 @@ pacer::frame_info pacer::present_to_info(int64_t present)
 		if (info.present_ns == present)
 			return info;
 	}
-	assert(false);
+	// Unreachable in practice (64-deep ring ≈ 0.3 s at worst-case id
+	// rate vs ~50–100 ms feedback delay): degrade to id 0, which the
+	// feedback matcher drops by frame_id inequality. Throttled: an
+	// eviction storm must not spam (and must never abort a session).
+	static int64_t last_ns = 0;
+	int64_t now_ns = os_monotonic_get_ns();
+	if (now_ns - last_ns > 5'000'000'000ll)
+	{
+		last_ns = now_ns;
+		U_LOG_W("pacer: present_to_info evicted (present=%lld), dropping match", (long long)present);
+	}
 	return {};
 }
 

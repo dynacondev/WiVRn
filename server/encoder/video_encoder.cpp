@@ -88,8 +88,16 @@ video_encoder::sender::sender() :
 				        // must still be popped: leaving it at the head of the
 				        // queue wedges this thread (and with it encoder_work
 				        // in wait_idle and the compositor in present_image)
-				        // forever, with no log anywhere.
-				        U_LOG_W("video sender: dropping empty packet for stream %u", d->encoder->stream_idx);
+				        // forever, with no log anywhere. Unreachable today
+				        // (push() drops empties at the door, the sole enqueue
+				        // path) — throttled, kept as a safety net.
+				        uint64_t empty_now_ns = os_monotonic_get_ns();
+				        static std::atomic<uint64_t> last_empty_drop_ns{0};
+				        if (empty_now_ns - last_empty_drop_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+				        {
+					        last_empty_drop_ns.store(empty_now_ns, std::memory_order_relaxed);
+					        U_LOG_W("video sender: dropping empty packet for stream %u", d->encoder->stream_idx);
+				        }
 			        }
 			        {
 				        std::unique_lock lock(mutex);
