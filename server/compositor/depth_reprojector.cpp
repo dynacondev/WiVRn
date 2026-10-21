@@ -904,7 +904,7 @@ bool depth_reprojector::reproject(
 	cmd.clearColorImage(
 	        splat_depth[view],
 	        vk::ImageLayout::eTransferDstOptimal,
-	        *reinterpret_cast<const vk::ClearColorValue *>(splat_empty_bytes()),
+	        *reinterpret_cast<const vk::ClearColorValue *>(splat_empty_bytes().bytes),
 	        vk::ImageSubresourceRange{
 	                .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                .levelCount = 1,
