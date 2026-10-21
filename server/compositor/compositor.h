@@ -24,6 +24,7 @@
 #include "util/comp_base.h"
 #include "util/u_logging.h"
 
+#include "depth_reprojector.h"
 #include "encoder/encoder_settings.h"
 #include "foveation.h"
 #include "layer_squasher.h"
@@ -34,7 +35,12 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
 
 namespace wivrn
@@ -77,6 +83,7 @@ private:
 
 	const u_logging_level log_level;
 	timings squasher_times;
+	timings warp_times;
 	timings foveation_times;
 	wivrn_session & session;
 	vk_bundle vk;
@@ -85,7 +92,11 @@ private:
 
 	std::array<encoder_settings, 3> settings;
 
-	std::array<image, 2> images;
+	// Compositor output images awaiting encode: 1 real + 1 replacement
+	// synth per commit, times 2 commits in flight. Encoder slots
+	// (num_slots per stream) are the outer bound; acquire_image fails
+	// gracefully past it.
+	std::array<image, 4> images;
 	vk::raii::CommandBuffer cmd;
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
@@ -96,15 +107,35 @@ private:
 
 	layer_squasher squasher;
 	wivrn::foveation foveation;
+	depth_reprojector reprojector;
+
+	// Cached at construction: server config is startup-read.
+	const bool depth_reprojection_enabled;
+
+	// Last client app-frame timestamp seen on a fast-path commit, for
+	// repeat detection. The display-driven commit loop re-submits the
+	// latest client frame every tick, so delivery spacing cannot signal
+	// demand; the client layer timestamp is replayed verbatim across
+	// repeats, so a changed timestamp means a fresh app frame. Empty
+	// until the first fast-path commit.
+	std::optional<int64_t> last_app_layer_ts;
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 
-#ifdef __cpp_lib_atomic_lock_free_type_aliases
-	using status_type = std::atomic_signed_lock_free;
-#else
-	using status_type = std::atomic_int8_t;
-#endif
-	status_type encode_request{-1}; // id of the image to encode
+	std::mutex encode_mutex;
+	std::condition_variable_any encode_cv;
+	struct queued_frame
+	{
+		int image = -1;
+		// Per-encoder slot recorded at present time (-1 = stream
+		// skipped). Encode consumes exactly the recorded slot, so
+		// present/encode cannot diverge across exceptions, drops or
+		// skips.
+		std::array<int8_t, 3> slots{-1, -1, -1};
+	};
+	// Bounded in practice by images: at most 2 frames queued per
+	// commit while the pool holds 4 (acquire_image drops past it).
+	std::deque<queued_frame> encode_queue;
 	std::jthread encoder_thread;
 
 	struct
@@ -159,6 +190,8 @@ private:
 	}
 
 	int acquire_image();
+
+	void queue_encode(int image, const std::array<int8_t, 3> & slots);
 
 	void encoder_work(std::stop_token);
 

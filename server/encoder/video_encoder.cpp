@@ -24,10 +24,12 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
+#include "util/u_logging.h"
 #include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
 #include <string>
+#include <thread>
 
 #if WIVRN_USE_NVENC
 #include "video_encoder_nvenc.h"
@@ -233,27 +235,63 @@ void video_encoder::set_framerate(float framerate)
 	pending_framerate = framerate;
 }
 
-void video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
+int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
 {
 	wivrn::trace::scope trace_present(wivrn::trace::cpu_track::encoder, stream_idx, frame_index, "present_image");
 	// Wait for encoder to be done
-	present_slot = (present_slot + 1) % num_slots;
-	state[present_slot].wait(busy);
+	present_cursor = (present_cursor + 1) % num_slots;
+	uint8_t slot = present_cursor;
+	{
+		// Poll instead of an unbounded atomic wait so a stall is VISIBLE
+		// (throttled log) rather than a silent permanent wedge. The slot
+		// is still not reused until idle, so the healthy path is unchanged
+		// (the wait is normally zero).
+		uint64_t stall_start_ns = 0;
+		static std::atomic<uint64_t> last_present_log_ns{0};
+		while (state[slot].load() == busy)
+		{
+			if (not stall_start_ns)
+				stall_start_ns = os_monotonic_get_ns();
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			uint64_t now_ns = os_monotonic_get_ns();
+			if (now_ns - stall_start_ns > 5'000'000'000ull and
+			    now_ns - last_present_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_present_log_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?)",
+				        stream_idx, (unsigned long)frame_index, (now_ns - stall_start_ns) / 1e9);
+			}
+		}
+	}
 	if (idr->should_skip(frame_index, stream_idx))
 	{
-		state[present_slot] = skip;
-		return;
+		state[slot] = skip;
+		return slot;
 	}
-	state[present_slot] = busy;
-	return present_image(y_cbcr, info, present_slot, frame_index);
+	state[slot] = busy;
+	try
+	{
+		present_image(y_cbcr, info, slot, frame_index);
+	}
+	catch (...)
+	{
+		// The present never reached the GPU, so no encode will ever
+		// consume this slot: release it instead of leaking it busy
+		// (a leaked slot wedges the compositor with zero logs), then
+		// rethrow so the frame still fails loudly.
+		state[slot] = idle;
+		state[slot].notify_all();
+		U_LOG_E("video encoder %u: present threw for frame %lu, slot %u released", stream_idx, (unsigned long)frame_index, slot);
+		throw;
+	}
+	return slot;
 }
 
 void video_encoder::encode(wivrn_session & cnx,
                            const to_headset::video_stream_data_shard::view_info_t & view_info,
-                           uint64_t frame_index)
+                           uint64_t frame_index,
+                           uint8_t slot)
 {
-	encode_slot = (encode_slot + 1) % num_slots;
-
 	struct idle_setter
 	{
 		std::atomic_unsigned_lock_free & state;
@@ -263,9 +301,9 @@ void video_encoder::encode(wivrn_session & cnx,
 			state.notify_all();
 		}
 	};
-	idle_setter i{state[encode_slot]};
+	idle_setter i{state[slot]};
 
-	if (state[encode_slot] == skip)
+	if (state[slot] == skip)
 		return;
 
 	if (shared_sender)
@@ -286,7 +324,7 @@ void video_encoder::encode(wivrn_session & cnx,
 	shard.view_info = view_info;
 	shard.timing_info.reset();
 
-	auto data = encode(encode_slot, frame_index);
+	auto data = encode(slot, frame_index);
 	if (data)
 	{
 		timing_info.encode_end = clock.to_headset(os_monotonic_get_ns());

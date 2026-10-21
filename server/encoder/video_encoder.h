@@ -82,7 +82,10 @@ public:
 	// or init() and read by the compositor on every layer_commit — must not
 	// change after the first frame.
 	vk::ImageLayout target_layout = vk::ImageLayout::eGeneral;
-	static const uint8_t num_slots = 2;
+	// Outstanding present slots per stream: 1 real + 1 replacement synth
+	// per commit, times 2 commits in flight. The compositor pool is sized
+	// to match; acquire_image fails gracefully past it.
+	static const uint8_t num_slots = 4;
 	const double bitrate_multiplier;
 
 private:
@@ -90,9 +93,12 @@ private:
 	static const state_t idle = 0;
 	static const state_t busy = 1;
 	static const state_t skip = 2;
-	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle};
-	uint8_t present_slot = 0;
-	uint8_t encode_slot = 0;
+	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle, idle, idle};
+	// Slot allocator for presents. Sole writer of slot assignments: each
+	// present records its slot on the queued frame and encode consumes
+	// exactly that slot, so the pairing cannot diverge (no counters to
+	// drift apart across exceptions, drops or skips).
+	uint8_t present_cursor = 0;
 
 	std::mutex mutex;
 
@@ -124,12 +130,27 @@ public:
 	video_encoder(vk_bundle &, uint8_t stream_idx, uint32_t target_queue, const encoder_settings & settings, std::unique_ptr<idr_handler>, bool async_send);
 	virtual ~video_encoder();
 
-	void present_image(vk::Image y_cbcr,
-	                   vk::SemaphoreSubmitInfo sem_info,
-	                   uint64_t frame_index);
+	// Presents the image on the next free slot and returns that slot.
+	// The caller records it on the queued frame; encode() consumes
+	// exactly the recorded slot, so present/encode stay paired across
+	// exceptions, drops and skips.
+	int present_image(vk::Image y_cbcr,
+	                  vk::SemaphoreSubmitInfo sem_info,
+	                  uint64_t frame_index);
 
 	void on_feedback(const from_headset::feedback &);
 	void reset();
+
+	// Release a slot whose present completed but whose frame will never
+	// be queued (e.g. a later encoder's present threw and aborted the
+	// commit). Prevents a leaked busy slot from wedging the compositor.
+	// Safe: no encode can be in flight for a slot whose frame was never
+	// queued.
+	void release_slot(uint8_t slot)
+	{
+		state[slot] = idle;
+		state[slot].notify_all();
+	}
 
 	// bitrate_bps is the bitrate for the whole stream
 	// the encoder bitrate will be scaled accordingly
@@ -138,7 +159,8 @@ public:
 
 	void encode(wivrn_session & cnx,
 	            const to_headset::video_stream_data_shard::view_info_t & view_info,
-	            uint64_t frame_index);
+	            uint64_t frame_index,
+	            uint8_t slot);
 
 protected:
 	// called on present to submit command buffers for the image.

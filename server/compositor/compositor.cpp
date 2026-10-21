@@ -24,6 +24,8 @@
 // Monado includes
 #include "driver/xrt_cast.h"
 #include "main/comp_frame.h"
+#include "math/m_space.h"
+#include "util/comp_layer_accum.h"
 #include "util/comp_render_helpers.h"
 #include "util/comp_vulkan.h"
 #include "util/u_debug.h"
@@ -31,6 +33,7 @@
 #include "util/u_time.h"
 #include "vk/vk_helpers.h"
 
+#include "driver/configuration.h"
 #include "driver/wivrn_session.h"
 #include "encoder/video_encoder.h"
 #include "inplace_vector.hpp"
@@ -38,6 +41,9 @@
 #include "utils/wivrn_trace.h"
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
+
+#include <algorithm>
+#include <chrono>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -87,6 +93,12 @@ const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t 
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
+const struct comp_swapchain_image &
+get_layer_depth_image(const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index)
+{
+	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_depth_swapchain(&layer, swapchain_index))->images[image_index];
+}
+
 std::array<vk::Format, 3> image_formats(int bit_depth)
 {
 	switch (bit_depth)
@@ -107,7 +119,7 @@ std::array<vk::Format, 3> image_formats(int bit_depth)
 	throw std::runtime_error(std::format("Unsupported bit depth {}", bit_depth));
 }
 
-std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
+std::array<wivrn::compositor::image, 4> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
 {
 	auto formats = image_formats(encoders[0].bit_depth);
 
@@ -282,16 +294,29 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	U_LOG_IFL_D(log_level, "frame %ld commit %d layers", frame.rendering.id, layer_accum.layer_count);
 
-	if (encode_request >= 0 // encoders have not picked up the previous frame
-	    or not session.connected() or not session.get_offset())
+	if (not session.connected() or not session.get_offset())
 	{
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
 
 	int i = acquire_image();
+
+	// Pool exhaustion (real or synth): the encoder/GPU is backed up.
+	// The tick degrades to drop/repeat by design; one throttled line so
+	// a sustained stall is visible instead of a silent freeze.
+	auto note_acquire_fail = [] {
+		static uint64_t last_ns = 0;
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_ns > 5'000'000'000ull)
+		{
+			last_ns = now_ns;
+			U_LOG_W("compositor: no free present image (encoder/GPU backed up?)");
+		}
+	};
 	if (i < 0)
 	{
+		note_acquire_fail();
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
@@ -313,13 +338,43 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	cmd_pool.reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	cmd.resetQueryPool(*query_pool, 0, 3);
+	cmd.resetQueryPool(*query_pool, 0, 4);
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 0);
 
 	bool flip_y = false;
 	std::array<vk::ImageView, 2> src;
 	std::array<xrt_rect, 2> src_rect;
 	std::array<xrt_fov, 2> src_fov;
+
+	// Depth reprojection inputs, valid only when has_depth_src is set
+	// below (single fullscreen projection layer with depth).
+	std::array<vk::ImageView, 2> src_depth;
+	std::array<std::array<float, 4>, 2> src_color_nrect{};
+	std::array<std::array<float, 4>, 2> src_depth_nrect{};
+	std::array<float, 2> src_near_z{1, 1};
+	std::array<float, 2> src_far_z{1000, 1000};
+	std::array<xrt_pose, 2> src_pose{};
+	bool has_depth_src = false;
+
+	// Replacement warp for this tick, if the app missed it. At most one
+	// synthetic per commit: a stale repeat is replaced 1:1 by its warp.
+	struct synth_frame
+	{
+		int image = -1;
+		std::array<xrt_pose, 2> poses{};
+		std::array<int8_t, 3> enc_slots{-1, -1, -1};
+	};
+	synth_frame synth{};
+	bool have_synth = false;
+	// Fresh tracker FOVs for the warp target (filled with the poses).
+	std::array<xrt_fov, 2> synth_fov{};
+
+	// App-frame freshness for repeat detection (depth reprojection): the
+	// display-driven commit loop re-submits the latest client frame every
+	// tick, so a changed client timestamp means a fresh app frame and an
+	// unchanged one means this tick is a stale repeat.
+	bool app_fresh = true;
+	int64_t app_layer_ts_ns = 0;
 
 	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
 
@@ -341,7 +396,29 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			flip_y = layer.data.flip_y;
 			view_info.pose[view] = xrt_cast(data.pose);
 			view_info.fov[view] = xrt_cast(data.fov);
+			src_pose[view] = data.pose;
+			const auto & cnr = data.sub.norm_rect;
+			src_color_nrect[view] = {cnr.x, cnr.y, cnr.w, cnr.h};
+			if (layer.data.type == XRT_LAYER_PROJECTION_DEPTH)
+			{
+				const auto & dvd = layer.data.depth.d[view];
+				src_depth[view] = get_image_view(
+				        &get_layer_depth_image(layer, view, dvd.sub.image_index),
+				        layer.data.flags,
+				        dvd.sub.array_index);
+				const auto & dnr = dvd.sub.norm_rect;
+				src_depth_nrect[view] = {dnr.x, dnr.y, dnr.w, dnr.h};
+				src_near_z[view] = dvd.near_z;
+				src_far_z[view] = dvd.far_z;
+			}
 		}
+		// Client xrEndFrame displayTime: identical across display-tick
+		// replays of the same app frame, fresh on every new app frame.
+		app_layer_ts_ns = layer.data.timestamp;
+		app_fresh = !last_app_layer_ts || *last_app_layer_ts != app_layer_ts_ns;
+		last_app_layer_ts = app_layer_ts_ns;
+		if (layer.data.type == XRT_LAYER_PROJECTION_DEPTH)
+			has_depth_src = true;
 	}
 	else
 	{
@@ -404,61 +481,212 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
+	// Hold the current frame: copy color + depth into the
+	// compositor-owned retained sources so a synthetic below warps from
+	// held data, valid until the next real frame refreshes it.
+	if (has_depth_src and depth_reprojection_enabled and app_fresh)
+		// Depth rows arrive Vulkan top-first by producer construction
+		// (dma-buf import chain, row 0 = top), independent of the color
+		// layer's flip_y: retained rows mirror so the images stay
+		// GL-ordered (row 0 = frustum bottom) whatever the color order.
+		reprojector.refresh_retained(
+		        vk.device,
+		        cmd,
+		        src,
+		        src_depth,
+		        src_color_nrect,
+		        src_depth_nrect,
+		        /*flip_color=*/!flip_y,
+		        /*flip_depth=*/true);
+
+	// Depth reprojection for repeated app frames: this loop runs at
+	// display cadence and re-submits the latest client frame every tick,
+	// so a repeat (stale app timestamp) means the app missed this tick.
+	// Warp the retained sources to this tick and serve that INSTEAD of
+	// the stale repeat (at most one warp per commit). Fresh app frames
+	// are served straight (client-side rotation timewarp covers them).
+	if (!app_fresh and has_depth_src and depth_reprojection_enabled)
+	{
+		xrt_space_relation head{};
+		session.get_hmd().get_view_poses(
+		        nullptr,
+		        frame.rendering.predicted_display_time_ns,
+		        XRT_VIEW_TYPE_STEREO,
+		        2,
+		        &head,
+		        synth_fov.data(),
+		        synth.poses.data());
+
+		// The tracker reports an unservable tick via the head relation
+		// flags while eye poses fall back to identity+offsets: warping
+		// to those produces garbage, so require a valid head pose and
+		// otherwise skip silently (repeat instead).
+		constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+		bool synth_ok = (head.relation_flags & need_pose) == need_pose;
+		if (synth_ok)
+		{
+			// get_view_poses returns head-relative eye offsets in
+			// poses plus the head-in-world relation (Monado device
+			// contract): compose world-space targets here.
+			for (int view = 0; view < 2; ++view)
+			{
+				xrt_relation_chain xrc{};
+				xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+				m_relation_chain_push_pose_if_not_identity(&xrc, &synth.poses[view]);
+				m_relation_chain_push_relation(&xrc, &head);
+				m_relation_chain_resolve(&xrc, &rel);
+				synth.poses[view] = rel.pose;
+			}
+			// The synthetic tick must postdate the app frame it
+			// replaces; otherwise the warp below is meaningless.
+			synth_ok = frame.rendering.predicted_display_time_ns > app_layer_ts_ns;
+		}
+		if (synth_ok)
+		{
+			synth.image = acquire_image();
+			if (synth.image < 0)
+			{
+				// Pool exhausted: degrade to repeat (throttled above).
+				synth_ok = false;
+			}
+		}
+		if (synth_ok)
+		{
+			for (int view = 0; view < 2; ++view)
+			{
+				// Target uses the fresh tracker FOV (not the
+				// render-time one): identical unless the headset
+				// mutates FOV mid-session.
+				synth_ok &= reprojector.reproject(
+				        cmd,
+				        view,
+				        src_pose[view],
+				        src_fov[view],
+				        src_near_z[view],
+				        src_far_z[view],
+				        synth.poses[view],
+				        synth_fov[view]);
+			}
+			if (!synth_ok and synth.image >= 0)
+			{
+				images[synth.image].busy = false;
+				synth.image = -1;
+			}
+		}
+		have_synth = synth_ok;
+	}
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
+
 	if (session.get_info().eye_gaze)
 	{
 		auto now = os_monotonic_get_ns();
 		session.add_tracking_request(device_id::EYE_GAZE, frame.rendering.desired_present_time_ns, now, now);
 	}
-	view_info.foveation = foveation.foveate(
-	        vk.device,
-	        cmd,
-	        images[i].view_y,
-	        images[i].view_cbcr,
-	        flip_y,
-	        src,
-	        src_rect,
-	        src_fov,
-	        view_info.alpha);
-
-	for (auto & encoder: encoders)
+	// On a successful replacement warp the real (stale repeat) image is
+	// dropped below: skip foveating into it (the warp target is foveated
+	// instead).
+	bool warp_replaces_real = have_synth;
+	if (!warp_replaces_real)
 	{
-		if (encoder->stream_idx == 2 and not view_info.alpha)
-			continue;
-		else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
+		view_info.foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        images[i].view_y,
+		        images[i].view_cbcr,
+		        flip_y,
+		        src,
+		        src_rect,
+		        src_fov,
+		        view_info.alpha);
+	}
+
+	if (have_synth)
+	{
+		// Synthetic frames sample the warped targets (full-eye, always
+		// GL-ordered by construction, hence flip_y = true). The
+		// replacement reuses this tick's identity: never consume an
+		// extra pacer tick (that would desync the display cadence).
+		const auto synth_extent = images[0].image.info().extent;
+		std::array<xrt_rect, 2> synth_rect{
+		        xrt_rect{
+		                .offset = {.w = 0, .h = 0},
+		                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
+		        },
+		        xrt_rect{
+		                .offset = {.w = 0, .h = 0},
+		                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
+		        },
+		};
+		auto synth_foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        images[synth.image].view_y,
+		        images[synth.image].view_cbcr,
+		        true,
+		        reprojector.get_views(),
+		        synth_rect,
+		        src_fov,
+		        view_info.alpha);
+
+		images[synth.image].frame_index = uint64_t(frame.rendering.id);
+		images[synth.image].view_info = {
+		        .display_time = session.get_offset().to_headset(frame.rendering.predicted_display_time_ns),
+		        .alpha = view_info.alpha,
+		};
+		for (int view = 0; view < 2; ++view)
 		{
-			image_barriers.push_back(
-			        vk::ImageMemoryBarrier2{
-			                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-			                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-			                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-			                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-			                // For a queue-family ownership transfer in EXCLUSIVE
-			                // sharing mode, the release barrier's old/new layout
-			                // must match the encoder-side acquire. newLayout is
-			                // the encoder's target_layout; per the VkImageMemoryBarrier2
-			                // spec the layout transition is executed exactly once
-			                // between the queues, so this single QFOT barrier covers
-			                // both the queue-family transfer and the layout
-			                // transition the encoder needs.
-			                .oldLayout = vk::ImageLayout::eGeneral,
-			                .newLayout = encoder->target_layout,
-			                .srcQueueFamilyIndex = vk.queue.family_index,
-			                .dstQueueFamilyIndex = encoder->target_queue,
-			                .image = images[i].image,
-			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-			                                     .baseMipLevel = 0,
-			                                     .levelCount = 1,
-			                                     .baseArrayLayer = encoder->stream_idx,
-			                                     .layerCount = 1},
-			        });
+			images[synth.image].view_info.pose[view] = xrt_cast(synth.poses[view]);
+			images[synth.image].view_info.fov[view] = xrt_cast(synth_fov[view]);
+			images[synth.image].view_info.foveation[view] = synth_foveation[view];
 		}
 	}
+
+	auto append_encoder_barriers = [&](int image_idx, const to_headset::video_stream_data_shard::view_info_t & info) {
+		for (auto & encoder: encoders)
+		{
+			if (encoder->stream_idx == 2 and not info.alpha)
+				continue;
+			else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
+			{
+				image_barriers.push_back(
+				        vk::ImageMemoryBarrier2{
+				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+				                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+				                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+				                // For a queue-family ownership transfer in EXCLUSIVE
+				                // sharing mode, the release barrier's old/new layout
+				                // must match the encoder-side acquire. newLayout is
+				                // the encoder's target_layout; per the VkImageMemoryBarrier2
+				                // spec the layout transition is executed exactly once
+				                // between the queues, so this single QFOT barrier covers
+				                // both the queue-family transfer and the layout
+				                // transition the encoder needs.
+				                .oldLayout = vk::ImageLayout::eGeneral,
+				                .newLayout = encoder->target_layout,
+				                .srcQueueFamilyIndex = vk.queue.family_index,
+				                .dstQueueFamilyIndex = encoder->target_queue,
+				                .image = images[image_idx].image,
+				                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+				                                     .baseMipLevel = 0,
+				                                     .levelCount = 1,
+				                                     .baseArrayLayer = encoder->stream_idx,
+				                                     .layerCount = 1},
+				        });
+			}
+		}
+	};
+
+	if (!warp_replaces_real)
+		append_encoder_barriers(i, view_info);
+	if (have_synth)
+		append_encoder_barriers(synth.image, images[synth.image].view_info);
 
 	cmd.pipelineBarrier2({
 	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
 	        .pImageMemoryBarriers = image_barriers.data(),
 	});
-	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 3);
 
 	cmd.end();
 
@@ -484,19 +712,69 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
 
-	for (auto & encoder: encoders)
+	// Record each encoder's slot on the queued frame; encode() consumes
+	// exactly the recorded slot, so present/encode stay paired across
+	// exceptions, drops and skips.
+	std::array<int8_t, 3> real_slots{-1, -1, -1};
+	std::array<int8_t, 3> synth_slots{-1, -1, -1};
+	try
 	{
-		if (encoder->stream_idx == 2 and not view_info.alpha)
-			continue;
-		encoder->present_image(
-		        images[i].image,
-		        sem_info,
-		        info.frame_id);
+		if (warp_replaces_real)
+		{
+			// The warped frame IS this tick's output: drop the stale
+			// repeat and present the warp with this tick's frame id
+			// (same blocking semantics as a real present).
+			images[i].busy = false;
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
+			{
+				auto & encoder = encoders[ei];
+				if (encoder->stream_idx == 2 and not images[synth.image].view_info.alpha)
+					continue;
+				synth_slots[ei] = int8_t(encoder->present_image(
+				        images[synth.image].image,
+				        sem_info,
+				        info.frame_id));
+			}
+		}
+		else
+		{
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
+			{
+				auto & encoder = encoders[ei];
+				if (encoder->stream_idx == 2 and not view_info.alpha)
+					continue;
+				real_slots[ei] = int8_t(encoder->present_image(
+				        images[i].image,
+				        sem_info,
+				        info.frame_id));
+			}
+		}
+	}
+	catch (...)
+	{
+		// A present threw after earlier presents succeeded: those slots
+		// and images would never be encoded, so release them instead of
+		// leaking them busy. The encoder already released its own slot
+		// and logged; convert to an error return here (exceptions must
+		// not cross the C ABI out of layer_commit).
+		for (size_t ei = 0; ei < encoders.size(); ++ei)
+		{
+			if (real_slots[ei] >= 0)
+				encoders[ei]->release_slot(uint8_t(real_slots[ei]));
+			if (synth_slots[ei] >= 0)
+				encoders[ei]->release_slot(uint8_t(synth_slots[ei]));
+		}
+		images[i].busy = false;
+		if (synth.image >= 0)
+			images[synth.image].busy = false;
+		comp_frame_clear_locked(&frame.rendering);
+		return XRT_ERROR_VULKAN;
 	}
 
-	auto j = encode_request.exchange(i);
-	encode_request.notify_all();
-	assert(j == -1);
+	if (warp_replaces_real)
+		queue_encode(synth.image, synth_slots);
+	else
+		queue_encode(i, real_slots);
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -518,8 +796,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		auto [res, ts] = query_pool.getResults<uint64_t>(
 		        0,
-		        3,
-		        3 * sizeof(uint64_t),
+		        4,
+		        4 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 
@@ -527,7 +805,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
 			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
-			foveation_times.add((ts[2] - ts[1]) * period / 1e3);
+			warp_times.add((ts[2] - ts[1]) * period / 1e3);
+			foveation_times.add((ts[3] - ts[2]) * period / 1e3);
 		}
 	}
 
@@ -612,29 +891,51 @@ int compositor::acquire_image()
 	return -1;
 }
 
+void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
+{
+	// Bounded in practice by images (header): at most 2 frames queued
+	// per commit while the pool holds 4; acquire_image drops past it.
+	assert(encode_queue.size() <= images.size());
+	{
+		std::lock_guard lock(encode_mutex);
+		encode_queue.push_back({image, slots});
+	}
+	encode_cv.notify_one();
+}
+
 void compositor::encoder_work(std::stop_token tok)
 {
-	while (not tok.stop_requested())
+	while (true)
 	{
-		auto req = encode_request.exchange(-1);
-		if (req < 0)
+		queued_frame req;
 		{
-			encode_request.wait(req);
-			wivrn::trace::cpu_instant(wivrn::trace::cpu_track::compositor, "encoder_work wake", 0, 0);
-			continue;
+			std::unique_lock lock(encode_mutex);
+			// Bounded stop-aware wait: an idle worker still wakes
+			// regularly instead of sleeping forever; stop still exits
+			// promptly.
+			encode_cv.wait_for(lock, tok, std::chrono::milliseconds(100), [&] { return not encode_queue.empty(); });
+			if (tok.stop_requested())
+				return;
+			if (encode_queue.empty())
+				continue;
+			req = std::move(encode_queue.front());
+			encode_queue.pop_front();
 		}
 
-		assert(req < images.size());
-		auto & image = images[req];
+		assert(req.image >= 0 and req.image < images.size());
+		auto & image = images[req.image];
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
 
 		try
 		{
-			for (auto & encoder: encoders)
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
 			{
+				auto & encoder = encoders[ei];
+				if (req.slots[ei] < 0)
+					continue;
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
-					encoder->encode(session, image.view_info, image.frame_index);
+					encoder->encode(session, image.view_info, image.frame_index, uint8_t(req.slots[ei]));
 			}
 		}
 		catch (std::exception & e)
@@ -685,7 +986,7 @@ compositor::compositor(wivrn_session & session) :
                             }),
         query_pool(vk.device, vk::QueryPoolCreateInfo{
                                       .queryType = vk::QueryType::eTimestamp,
-                                      .queryCount = 3,
+                                      .queryCount = 4,
                               }),
         settings(get_encoder_settings(vk, session)),
         images{make_images(vk, cmd_pool, settings)},
@@ -694,7 +995,9 @@ compositor::compositor(wivrn_session & session) :
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
-        foveation(vk, images[0].image.info().extent)
+        foveation(vk, images[0].image.info().extent),
+        reprojector(vk, vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height}),
+        depth_reprojection_enabled(configuration().reprojection.enabled)
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
@@ -754,6 +1057,7 @@ compositor::compositor(wivrn_session & session) :
 
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
+	u_var_add_f32_timing(this, &warp_times.var, "depth warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
 
 	// Start the thread after everything is initialized
@@ -764,8 +1068,7 @@ compositor::~compositor()
 {
 	u_var_remove_root(this);
 	encoder_thread.request_stop();
-	encode_request = -2;
-	encode_request.notify_all();
+	encode_cv.notify_all();
 	comp_base * c_base = this;
 	comp_swapchain_shared_garbage_collect(&cscs);
 	comp_swapchain_shared_destroy(&cscs, &c_base->vk);
@@ -809,6 +1112,9 @@ void compositor::set_framerate(float hz)
 		return;
 	U_LOG_IFL_D(log_level, "Framerate change from %.0f to %.0f", frame_rate.load(), hz);
 	pacer.set_frame_duration(U_TIME_1S_IN_NS / hz);
+	// Display ticks moved: forget the last app timestamp so the next
+	// commit counts as fresh (no spurious replacement warp).
+	last_app_layer_ts.reset();
 	for (auto & encoder: encoders)
 		encoder->set_framerate(hz);
 }
@@ -827,6 +1133,7 @@ void compositor::resume()
 {
 	for (auto & encoder: encoders)
 		encoder->reset();
+	last_app_layer_ts.reset();
 	send_video_stream_description();
 }
 
