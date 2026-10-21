@@ -43,6 +43,9 @@ struct reproject_pull_ubo
 {
 	xrt_matrix_4x4 dst_inv;
 	xrt_matrix_4x4 src_vp;
+	// Packs as one vec4 in std140 (float arrays stride to 16): hole
+	// radius at +128, 12 pad bytes after. Must stay byte-exact with
+	// the PullUBO block.
 	float hole_radius;
 	float pad[3];
 };

@@ -5,7 +5,7 @@
  * unprojects with the target inverses and reprojects with the source
  * projection, then taps the retained color. Disoccluded pixels (no
  * valid splat) are filled by an expanding-ring search for the nearest
- * valid splat, up to HOLE_RADIUS; anything still invalid keeps black.
+ * valid splat, up to the hole radius; anything still invalid keeps black.
  *
  * Warp math follows the OpenWarp family (https://github.com/Zee2/openwarp,
  * NCSA-licensed); the splat/pull structure is original.
@@ -21,8 +21,9 @@ layout(set = 0, binding = 1) uniform PullUBO
 {
 	mat4 dst_inv; // target clip -> world (inverse view * inverse projection, folded on CPU)
 	mat4 src_vp; // source projection * source view, folded on CPU
-	float hole_radius; // max expanding-ring radius for hole fill (0 = black)
-	float pad[3];
+	// vec4 (not float[3]: std140 arrays stride to 16): .x is the max
+	// expanding-ring radius for hole fill (0 = black).
+	vec4 hole_and_pad;
 } ubo;
 
 layout(set = 0, binding = 2, r32ui) uniform uimage2D splat_depth;
@@ -75,7 +76,7 @@ void main()
 		// non-empty ring (background stretch): the nearest valid splat
 		// to a disocclusion is usually the occluding foreground edge,
 		// and smearing it reads as fringing.
-		int rmax = int(ubo.hole_radius + 0.5);
+		int rmax = int(ubo.hole_and_pad.x + 0.5);
 		vec2 best_suv = vec2(0.0);
 		float best_depth = -1.0;
 		for (int r = 1; r <= rmax && best_depth < 0.0; r++) {
