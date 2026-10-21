@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
 
@@ -790,23 +791,48 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	                             },
 	                             U_TIME_1S_IN_NS) == vk::Result::eTimeout)
 	{
-		U_LOG_IFL_W(log_level, "compositor timeout");
+		// Bounded (1 s) by construction: a wedged GPU slows the commit
+		// thread to ~1 Hz instead of parking it; the in-flight frame
+		// still completes (or not) through the normal encode path, so
+		// busy/slot accounting is untouched here. Throttled: a wedge
+		// would otherwise log every tick.
+		static uint64_t last_sem_timeout_ns = 0;
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_sem_timeout_ns > 5'000'000'000ull)
+		{
+			last_sem_timeout_ns = now_ns;
+			U_LOG_IFL_W(log_level, "compositor timeout");
+		}
 	}
 	else
 	{
-		auto [res, ts] = query_pool.getResults<uint64_t>(
-		        0,
-		        4,
-		        4 * sizeof(uint64_t),
-		        sizeof(uint64_t),
-		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-
-		if (res == vk::Result::eSuccess)
+		// Never park the commit thread on the GPU: poll with
+		// availability and give up after a bounded wait (20 x 50 us).
+		// A wedged GPU then costs timing data for the tick, not a
+		// wedged server.
+		constexpr int query_polls = 20;
+		constexpr auto query_poll_step = std::chrono::microseconds(50);
+		for (int q = 0; q < query_polls; ++q)
 		{
+			auto [res, ts] = query_pool.getResults<uint64_t>(
+			        0,
+			        4,
+			        8 * sizeof(uint64_t),
+			        2 * sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+			if (res != vk::Result::eSuccess || ts.size() < 8)
+				break;
+			// Values at even indices, availability flags at odd.
+			if ((ts[1] & ts[3] & ts[5] & ts[7]) == 0)
+			{
+				std::this_thread::sleep_for(query_poll_step);
+				continue;
+			}
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
-			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
-			warp_times.add((ts[2] - ts[1]) * period / 1e3);
-			foveation_times.add((ts[3] - ts[2]) * period / 1e3);
+			squasher_times.add((ts[2] - ts[0]) * period / 1e3);
+			warp_times.add((ts[4] - ts[2]) * period / 1e3);
+			foveation_times.add((ts[6] - ts[4]) * period / 1e3);
+			break;
 		}
 	}
 
