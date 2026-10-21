@@ -579,7 +579,8 @@ void foveation::update_ubo(
 		         foveated_size.height);
 	}
 	vmaCopyMemoryToAllocation(vk_allocator::instance(), &ubo, gpu_buffer, 0, sizeof(ubo));
-	std::memcpy(gpu_buffer.data<ubo_data>(), &ubo, sizeof(ubo));
+	// Note: no memcpy — vmaCopy already flushed the upload; a second copy
+	// would bypass the flush on non-coherent heaps.
 }
 
 std::array<to_headset::foveation_parameter, 2> foveation::foveate(

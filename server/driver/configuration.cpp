@@ -650,9 +650,19 @@ configuration::configuration()
 			else
 			{
 				if (auto jt = it->find("enabled"); jt != it->end())
-					reprojection.enabled = *jt;
+				{
+					if (jt->is_boolean())
+						reprojection.enabled = jt->get<bool>();
+					else
+						U_LOG_W("reprojection.enabled must be a boolean, ignoring");
+				}
 				if (auto jt = it->find("source-reverse-z"); jt != it->end())
-					reprojection.source_reverse_z = *jt;
+				{
+					if (jt->is_boolean())
+						reprojection.source_reverse_z = jt->get<bool>();
+					else
+						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
+				}
 			}
 		}
 

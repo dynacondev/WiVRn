@@ -360,17 +360,36 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
-	// Serialized with the synth ticker (commit_mutex): everything below
-	// up to queue_encode shares the reprojector, foveation UBO /
-	// descriptor writes, cmd buffer, sem_value and last_submit_value.
-	// Explicitly released before the trailing GPU waits (see below) so a
-	// wedged tick never parks the other path — and the synth ticker does
-	// the same around its record. Present calls stay inside: their 1 s
-	// slot bound is the backpressure signal, not a wedge.
+	// Serialized with the synth ticker (commit_mutex): record + submit
+	// share the reprojector, foveation UBO / descriptor writes, cmd
+	// buffer, sem_value and last_submit_value. Released before the
+	// present calls (each encoder bounds its slot wait at 1 s) and
+	// before the trailing GPU waits, so a wedged tick never parks the
+	// other path — and the synth ticker does the same around its
+	// record.
 	std::unique_lock commit_lock{commit_mutex};
 
-	// Everything recorded or submitted below (resolve, warp, foveate,
-	// present) runs inside one guard: a Vulkan throw (device loss, OOM)
+	// Hoisted for the catch + post-try tail: everything recorded or
+	// submitted below runs inside the try guard (a Vulkan throw must
+	// release acquired images/slots, never cross the C ABI), but the
+	// catch and the queue tail live outside the try scope.
+	struct commit_synth_frame
+	{
+		int image = -1;
+		std::array<xrt_pose, 2> poses{};
+		std::array<int8_t, 3> enc_slots{-1, -1, -1};
+	};
+	commit_synth_frame synth{};
+	bool have_synth = false;
+	std::array<xrt_fov, 2> synth_fov{};
+	std::array<int8_t, 3> real_slots{-1, -1, -1};
+	std::array<int8_t, 3> synth_slots{-1, -1, -1};
+	uint64_t sem_value_now = 0;
+	pacer::frame_info present_info{};
+	bool warp_replaces_real = false;
+
+	// Everything recorded or submitted below (resolve, warp, foveate)
+	// runs inside one guard: a Vulkan throw (device loss, OOM)
 	// must release the acquired images and recorded slots and return an
 	// error — exceptions must not cross the C ABI out of layer_commit.
 	try
@@ -389,6 +408,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				last_pre_record_timeout_ns.store(now_ns, std::memory_order_relaxed);
 				U_LOG_W("compositor: previous GPU work never completed, dropping frame");
 			}
+			images[i].busy = false;
 			comp_frame_clear_locked(&frame.rendering);
 			return XRT_SUCCESS;
 		}
@@ -413,26 +433,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		std::array<xrt_pose, 2> src_pose{};
 		bool has_depth_src = false;
 
-		// Replacement warp for this tick, if the app missed it. At most one
-		// synthetic per commit: a stale repeat is replaced 1:1 by its warp.
-		struct synth_frame
-		{
-			int image = -1;
-			std::array<xrt_pose, 2> poses{};
-			std::array<int8_t, 3> enc_slots{-1, -1, -1};
-		};
-		synth_frame synth{};
-		bool have_synth = false;
-		// Fresh tracker FOVs for the warp target (filled with the poses).
-		std::array<xrt_fov, 2> synth_fov{};
-
+		// (synth/have_synth/synth_fov are hoisted above the try for the
+		// catch + queue tail; reused here.)
 		// App-frame freshness for refresh gating: a changed client timestamp
 		// means this commit carries a new app frame. (Freshness can never
 		// signal a repeat — see the staleness gate above.)
 		bool app_fresh = true;
 		int64_t app_layer_ts_ns = 0;
 
-		beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
+		beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> image_barriers;
 
 		// Check if we can pass a layer directly to foveation
 		if (layer_accum.layer_count == 1 and
@@ -652,7 +661,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// On a successful replacement warp the real (stale repeat) image is
 		// dropped below: skip foveating into it (the warp target is foveated
 		// instead).
-		bool warp_replaces_real = have_synth;
+		warp_replaces_real = have_synth;
 		if (!warp_replaces_real)
 		{
 			view_info.foveation = foveation.foveate(
@@ -721,28 +730,33 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 		cmd.end();
 
-		const uint64_t sem_value_now = submit_cmd_buffer(cmd);
-		const vk::SemaphoreSubmitInfo sem_info{
+		sem_value_now = submit_cmd_buffer(cmd);
+		vk::SemaphoreSubmitInfo sem_info{
 		        .semaphore = *sem,
 		        .value = sem_value_now,
 		        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
 		};
 
 		pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
-		auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
+		present_info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
 
 		// Record each encoder's slot on the queued frame; encode() consumes
 		// exactly the recorded slot, so present/encode stay paired across
-		// exceptions, drops and skips.
-		std::array<int8_t, 3> real_slots{-1, -1, -1};
-		std::array<int8_t, 3> synth_slots{-1, -1, -1};
+		// exceptions, drops and skips. (Slots hoisted above the try.)
+		// Release the record lock before the bounded slot waits: present
+		// touches only per-image state (already exclusive via busy) and
+		// per-encoder state (own locks), so holding commit_mutex across
+		// up to 3 s of slot waits would park the synth ticker behind a
+		// wedged encoder. Submit order is already fixed via the queue
+		// mutex inside submit_cmd_buffer.
+		commit_lock.unlock();
 		if (warp_replaces_real)
 		{
 			// The warped frame IS this tick's output: drop the stale
 			// repeat and present the warp with this tick's frame id
 			// (same blocking semantics as a real present).
 			images[i].busy = false;
-			if (!present_to_encoders(synth.image, images[synth.image].view_info, info.frame_id, sem_info, synth_slots))
+			if (!present_to_encoders(synth.image, images[synth.image].view_info, present_info.frame_id, sem_info, synth_slots))
 			{
 				// Every present hit the 1 s slot bound (throttled
 				// above): drop the tick rather than queue a frame no
@@ -754,7 +768,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 		else
 		{
-			if (!present_to_encoders(i, view_info, info.frame_id, sem_info, real_slots))
+			if (!present_to_encoders(i, view_info, present_info.frame_id, sem_info, real_slots))
 			{
 				images[i].busy = false;
 				comp_frame_clear_locked(&frame.rendering);
@@ -780,6 +794,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		if (synth.image >= 0)
 			images[synth.image].busy = false;
 		comp_frame_clear_locked(&frame.rendering);
+		if (commit_lock.owns_lock())
+			commit_lock.unlock();
 		return XRT_ERROR_VULKAN;
 	}
 
@@ -794,9 +810,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// End of the serialized region: everything below touches only
 	// commit-private or self-synchronizing state (timeline wait, query
-	// read, garbage collect). Releasing here keeps a wedged tick from
-	// parking the synth ticker behind it.
-	commit_lock.unlock();
+	// read, garbage collect). The record lock was already released
+	// before present; release here too if a throw path still holds it.
+	if (commit_lock.owns_lock())
+		commit_lock.unlock();
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -808,7 +825,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (vk.device.waitSemaphores(vk::SemaphoreWaitInfo{
 	                                     .semaphoreCount = 1,
 	                                     .pSemaphores = &*sem,
-	                                     .pValues = &sem_info.value,
+	                                     .pValues = &sem_value_now,
 	                             },
 	                             U_TIME_1S_IN_NS) == vk::Result::eTimeout)
 	{
@@ -939,7 +956,7 @@ int compositor::acquire_image()
 }
 
 void compositor::append_encoder_barriers(
-        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> & barriers,
+        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> & barriers,
         int image_idx,
         const to_headset::video_stream_data_shard::view_info_t & info)
 {
@@ -1270,7 +1287,7 @@ void compositor::synth_work(std::stop_token tok)
 				}
 
 
-				beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
+				beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> image_barriers;
 				append_encoder_barriers(image_barriers, synth_image, images[synth_image].view_info);
 				synth_cmd.pipelineBarrier2({
 				        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
@@ -1280,6 +1297,12 @@ void compositor::synth_work(std::stop_token tok)
 				synth_cmd.end();
 				have_synth = true;
 			}
+		// Release the record lock before the bounded slot waits: present
+		// touches only the exclusive synth image + per-encoder state,
+		// so holding commit_mutex across up to 3 s of encoder waits
+		// would park fresh commits behind synthesis. Submit order is
+		// already fixed via the queue mutex.
+		commit_lock.unlock();
 		if (!have_synth)
 			continue;
 		uint64_t sem_value_now = submit_cmd_buffer(synth_cmd);
@@ -1317,8 +1340,25 @@ void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
 	std::lock_guard lock(encode_mutex);
 	encode_queue.push_back({image, slots});
 	// Bounded in practice by images: at most 2 frames queued per commit
-	// while the pool holds 4; acquire_image drops past it.
-	assert(encode_queue.size() <= images.size());
+	// while the pool holds 4; acquire_image drops past it. Never abort
+	// on overflow in any build — drop the oldest instead (its image was
+	// already exclusive-busy, so release it back to the pool).
+	if (encode_queue.size() > images.size())
+	{
+		static uint64_t last_overflow_ns = 0;
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_overflow_ns > 5'000'000'000ull)
+		{
+			last_overflow_ns = now_ns;
+			U_LOG_W("compositor: encode queue overflow, dropping oldest");
+		}
+		auto old = std::move(encode_queue.front());
+		encode_queue.pop_front();
+		for (size_t ei = 0; ei < encoders.size(); ++ei)
+			if (old.slots[ei] >= 0)
+				encoders[ei]->release_slot(uint8_t(old.slots[ei]));
+		images[old.image].busy = false;
+	}
 	encode_cv.notify_one();
 }
 
@@ -1342,6 +1382,17 @@ void compositor::encoder_work(std::stop_token tok)
 		}
 
 		assert(req.image >= 0 and req.image < images.size());
+		if (req.image < 0 or req.image >= int(images.size()))
+		{
+			static uint64_t last_bad_ns = 0;
+			uint64_t now_ns = os_monotonic_get_ns();
+			if (now_ns - last_bad_ns > 5'000'000'000ull)
+			{
+				last_bad_ns = now_ns;
+				U_LOG_W("compositor: bad encode image %d, dropping", req.image);
+			}
+			continue;
+		}
 		auto & image = images[req.image];
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
@@ -1360,6 +1411,10 @@ void compositor::encoder_work(std::stop_token tok)
 		catch (std::exception & e)
 		{
 			U_LOG_W("encode error: %s", e.what());
+		}
+		catch (...)
+		{
+			U_LOG_W("encode error: unknown exception");
 		}
 		image.busy = false;
 	}

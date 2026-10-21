@@ -186,7 +186,13 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_raw::encode(uint8
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_W("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_encode_timeout_ns{0};
+		uint64_t timeout_now_ns = os_monotonic_get_ns();
+		if (timeout_now_ns - last_encode_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_encode_timeout_ns.store(timeout_now_ns, std::memory_order_relaxed);
+			U_LOG_W("Timeout on stream %d", stream_idx);
+		}
 		return {};
 	}
 

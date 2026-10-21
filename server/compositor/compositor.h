@@ -267,7 +267,7 @@ private:
 	void synth_work(std::stop_token tok);
 
 	void append_encoder_barriers(
-	        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> & barriers,
+	        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> & barriers,
 	        int image_idx,
 	        const to_headset::video_stream_data_shard::view_info_t & info);
 

@@ -350,13 +350,18 @@ std::optional<video_encoder::data> video_encoder_x264::encode(uint8_t slot, uint
 		return {};
 	}
 	int size = x264_encoder_encode(enc, &nal, &num_nal, &pic, &pic_out);
-	if (next_mb != num_mb)
+	if (next_mb != num_mb || size < 0)
 	{
-		U_LOG_W("unexpected macroblock count: %d", next_mb);
-	}
-	if (size < 0)
-	{
-		U_LOG_W("x264_encoder_encode failed: %d", size);
+		static std::atomic<uint64_t> last_x264_warn_ns{0};
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_x264_warn_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_x264_warn_ns.store(now_ns, std::memory_order_relaxed);
+			if (next_mb != num_mb)
+				U_LOG_W("unexpected macroblock count: %d", next_mb);
+			if (size < 0)
+				U_LOG_W("x264_encoder_encode failed: %d", size);
+		}
 	}
 	return {};
 }

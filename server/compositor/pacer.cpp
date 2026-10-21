@@ -104,10 +104,16 @@ void pacer::predict(
 	frame_id = this->frame_id++;
 	auto now = os_monotonic_get_ns();
 
-	int64_t predicted_client_render = last_ns + frame_duration_ns;
+	// Guarded: set_framerate rejects hz <= 0 but a huge hz still yields
+	// frame_duration_ns == 0 (integer division). Without this the divide
+	// below faults; with it the tick simply tracks now.
+	int64_t period = int64_t(frame_duration_ns);
+	if (period <= 0)
+		period = 1;
+	int64_t predicted_client_render = last_ns + period;
 
 	if (now + mean_wake_up_to_present_ns + safe_present_to_decoded_ns > predicted_client_render)
-		predicted_client_render += frame_duration_ns * ((now + mean_wake_up_to_present_ns + safe_present_to_decoded_ns - predicted_client_render) / frame_duration_ns);
+		predicted_client_render += period * ((now + mean_wake_up_to_present_ns + safe_present_to_decoded_ns - predicted_client_render) / period);
 
 	out_predicted_display_time_ns = predicted_client_render + mean_render_to_display_ns;
 	out_desired_present_time_ns = predicted_client_render - safe_present_to_decoded_ns;
@@ -225,7 +231,9 @@ int64_t pacer::next_display_tick_ns(int64_t after_ns)
 		return after_ns + 1;
 	int64_t phase = last_ns % period;
 	int64_t base = after_ns - (after_ns % period) + phase;
-	if (base <= after_ns)
+	// Loop (not a single add): phase can be negative at startup (feedback
+	// drives last_ns), leaving base more than one period behind.
+	while (base <= after_ns)
 		base += period;
 	return base;
 }
