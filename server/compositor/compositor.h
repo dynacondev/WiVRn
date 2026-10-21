@@ -111,9 +111,13 @@ private:
 	// Cached at construction: server config is startup-read.
 	const bool depth_reprojection_enabled;
 
-	// Last real frame's predicted display time, for missed-tick
-	// detection (depth reprojection). Empty until the first commit.
-	std::optional<int64_t> last_real_predicted_ns;
+	// Last client app-frame timestamp seen on a fast-path commit, for
+	// repeat detection (depth reprojection). The display-driven commit
+	// loop re-submits the latest client frame every tick with tick-level
+	// envelope metadata, but the client layer timestamp is replayed
+	// verbatim: unchanged means this tick is a stale repeat. Empty until
+	// the first fast-path commit.
+	std::optional<int64_t> last_app_layer_ts;
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 

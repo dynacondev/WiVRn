@@ -100,8 +100,8 @@ get_layer_depth_image(const comp_layer & layer, uint32_t swapchain_index, uint32
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_depth_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
-// Synthetic frames generated per real commit, covering sources down to
-// ~10 fps at 90 Hz. Beyond this the oldest ticks repeat.
+// Warp scratch slots: at most one replacement warp per commit (a stale
+// repeat is replaced 1:1 by its warp, never burst).
 constexpr int max_synth_per_commit = 8;
 
 std::array<vk::Format, 3> image_formats(int bit_depth)
@@ -350,19 +350,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		++commits_since_log;
 	}
 
-	// Missed-tick detection for depth reprojection: each display
-	// period without a real commit past the first means the application
-	// missed a deadline (e.g. 45 fps app at 90 Hz needs 1 synthetic per
-	// commit, 30 fps needs 2). Refined below (depth + resources).
+	// App-frame freshness for depth reprojection (see warp section): the
+	// display-driven commit loop re-submits the latest client frame every
+	// tick, so delivery spacing is always one period and cannot signal
+	// demand. The client layer timestamp (app xrEndFrame displayTime) is
+	// replayed verbatim across repeats, so a changed timestamp means a
+	// fresh app frame. Assigned in the fast-path section below.
 	int synth_wanted = 0;
-	const int64_t frame_period_ns = pacer.get_frame_duration();
-	if (last_real_predicted_ns)
-	{
-		int64_t gap = frame.rendering.predicted_display_time_ns - *last_real_predicted_ns;
-		synth_wanted = int((gap + frame_period_ns / 2) / frame_period_ns) - 1;
-		synth_wanted = std::clamp(synth_wanted, 0, max_synth_per_commit);
-	}
-	last_real_predicted_ns = frame.rendering.predicted_display_time_ns;
+	bool app_fresh = true;
+	int64_t app_layer_ts_ns = 0;
 
 	int i = acquire_image();
 	if (i < 0)
@@ -467,6 +463,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				src_far_z[view] = dvd.far_z;
 			}
 		}
+		// Client xrEndFrame displayTime: identical across display-tick
+		// replays of the same app frame (transfer_layers_locked replays
+		// the latched layers verbatim), fresh on every new app frame.
+		app_layer_ts_ns = layer.data.timestamp;
+		app_fresh = !last_app_layer_ts || *last_app_layer_ts != app_layer_ts_ns;
+		last_app_layer_ts = app_layer_ts_ns;
 		if (layer.data.type == XRT_LAYER_PROJECTION_DEPTH)
 		{
 			has_depth_src = true;
@@ -537,7 +539,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// Hold the current frame: copy color + depth into the
 	// compositor-owned retained sources so every synthetic below warps
 	// from held data, valid until the next real frame refreshes it.
-	if (has_depth_src and depth_reprojection_enabled)
+	if (has_depth_src and depth_reprojection_enabled and app_fresh)
 		reprojector.refresh_retained(vk.device, cmd, src, src_depth, src_color_nrect, src_depth_nrect, flip_y);
 
 	// Warp circuit breaker: a degenerate splat (e.g. half the frame
@@ -552,22 +554,30 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	const uint64_t warp_cooldown_ns = 5'000'000'000ull;
 	bool warp_cooldown = warp_now_ns < warp_cooldown_until_ns;
 
-	// Depth reprojection: one synthetic frame per missed display tick
-	// (synth_wanted, from the predicted-time gap), each warped from the
-	// retained sources to its own upcoming tick so the encoder still
-	// emits at headset cadence. True frames keep the existing rotation
-	// timewarp in the squasher/fast-path; synthetics replace it with a
-	// full 6DoF compute warp.
-	warp_wanted_since_log += uint64_t(synth_wanted > 0 ? synth_wanted : 0);
-	if (synth_wanted and has_depth_src and depth_reprojection_enabled and not warp_cooldown)
+	// Depth reprojection for repeated app frames: this commit loop runs
+	// at display cadence and re-submits the latest client frame every
+	// tick, so a repeat (stale app timestamp) means the app missed this
+	// tick. Warp the retained sources to this tick and serve that INSTEAD
+	// of the stale repeat (at most one warp per commit). Fresh app frames
+	// are served straight (client-side rotation timewarp covers them).
+	// Full 6DoF compute warp replaces the rotation-only repeat.
+	synth_wanted = (!app_fresh and has_depth_src and depth_reprojection_enabled and not warp_cooldown) ? 1 : 0;
+	warp_wanted_since_log += uint64_t(synth_wanted);
+	if (synth_wanted)
 	{
 		try
 		{
 			for (int k = 0; k < synth_wanted; ++k)
 			{
 				synth_frame & s = synths[k];
-				int64_t wake_ns, slop_ns;
-				pacer.predict(s.frame_id, wake_ns, s.desired_present_ns, slop_ns, s.predicted_ns);
+				// Replacement warp for this display tick: reuse the
+				// rendering frame's own tick identity so the warped
+				// frame takes the repeat's place 1:1. Never consume an
+				// extra pacer tick here (that would desync the display
+				// cadence the pacer is tracking).
+				s.frame_id = frame.rendering.id;
+				s.desired_present_ns = frame.rendering.desired_present_time_ns;
+				s.predicted_ns = frame.rendering.predicted_display_time_ns;
 
 			s.image = acquire_image();
 			if (s.image < 0)
@@ -646,7 +656,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				{
 					bool plausible = true;
 					float worst_ms = 0, worst_rs = 0;
-					double dt_s = double(s.predicted_ns - frame.rendering.predicted_display_time_ns) / 1e9;
+					double dt_s = double(s.predicted_ns - app_layer_ts_ns) / 1e9;
 					if (dt_s <= 0)
 						plausible = false;
 					for (int view = 0; plausible and view < 2; ++view)
@@ -815,19 +825,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 		}
 	}
-	else if (synth_wanted > 0)
+	else if (!app_fresh)
 	{
-		// Demand existed but the warp never ran: log which gate failed
+		// Stale repeat but the warp never ran: log which gate failed
 		// (throttled) and count it so the heartbeat shows gate skips vs
-		// zero-demand commits. synth_wanted==0 (app at display rate) is
-		// normal and stays silent.
+		// fresh commits. Fresh app frames are normal and stay silent.
 		++warp_gate_skip_since_log;
 		static uint64_t last_warp_gate_log_ns = 0;
 		if (warp_now_ns - last_warp_gate_log_ns > 5'000'000'000ull)
 		{
 			last_warp_gate_log_ns = warp_now_ns;
-			U_LOG_I("Depth warp: demand %d tick(s) but warp gated (has_depth=%d enabled=%d cooldown=%d, repeat instead)",
-			        synth_wanted, (int)has_depth_src, (int)depth_reprojection_enabled, (int)warp_cooldown);
+			U_LOG_I("Depth warp: stale repeat but warp gated (has_depth=%d enabled=%d cooldown=%d, repeat instead)",
+			        (int)has_depth_src, (int)depth_reprojection_enabled, (int)warp_cooldown);
 		}
 	}
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
@@ -837,16 +846,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		auto now = os_monotonic_get_ns();
 		session.add_tracking_request(device_id::EYE_GAZE, frame.rendering.desired_present_time_ns, now, now);
 	}
-	view_info.foveation = foveation.foveate(
-	        vk.device,
-	        cmd,
-	        images[i].view_y,
-	        images[i].view_cbcr,
-	        flip_y,
-	        src,
-	        src_rect,
-	        src_fov,
-	        view_info.alpha);
+	// On a successful replacement warp the real (stale repeat) image is
+	// dropped below: skip foveating into it (the warped image is
+	// foveated in the synth block instead).
+	bool warp_replaces_real = (synth_done == 1);
+	if (!warp_replaces_real)
+	{
+		view_info.foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        images[i].view_y,
+		        images[i].view_cbcr,
+		        flip_y,
+		        src,
+		        src_rect,
+		        src_fov,
+		        view_info.alpha);
+	}
 
 	// Synthetic frames sample the warped targets (full-eye, always
 	// GL-ordered by construction, hence flip_y = true) through the same
@@ -928,7 +944,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 	};
 
-	append_encoder_barriers(i, view_info);
+	if (!warp_replaces_real)
+		append_encoder_barriers(i, view_info);
 	for (int k = 0; k < synth_done; ++k)
 		append_encoder_barriers(synths[k].image, images[synths[k].image].view_info);
 
@@ -968,74 +985,35 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<int8_t, 3> real_slots{-1, -1, -1};
 	try
 	{
-		for (size_t ei = 0; ei < encoders.size(); ++ei)
+		if (warp_replaces_real)
 		{
-			auto & encoder = encoders[ei];
-			if (encoder->stream_idx == 2 and not view_info.alpha)
-				continue;
-			real_slots[ei] = int8_t(encoder->present_image(
-			        images[i].image,
-			        sem_info,
-			        info.frame_id));
-		}
-
-		// Synthetic frames are encoded right behind the real frame, in
-		// display order (real tick first, then missed ticks). Backpressure
-		// is natural: if the encoder cannot sustain headset cadence the
-		// present slots stay busy, acquire_image fails and later synthetics
-		// are skipped, degrading to repeat. Synth presents are bounded
-		// (wait=false): a pressured pool skips synthetics instead of ever
-		// deadlocking the commit when the burst exceeds the slot count.
-		for (int k = 0; k < synth_done; ++k)
-		{
-			synth_frame & s = synths[k];
-			auto synth_info = pacer.present_to_info(s.desired_present_ns);
-			bool skipped = false;
+			// The warped frame IS this tick's output: drop the stale
+			// repeat and present the warp with this tick's frame id
+			// (same blocking semantics as a real present).
+			images[i].busy = false;
+			synth_frame & s = synths[0];
 			for (size_t ei = 0; ei < encoders.size(); ++ei)
 			{
 				auto & encoder = encoders[ei];
 				if (encoder->stream_idx == 2 and not images[s.image].view_info.alpha)
 					continue;
-				int synth_slot = encoder->present_image(
+				s.enc_slots[ei] = int8_t(encoder->present_image(
 				        images[s.image].image,
 				        sem_info,
-				        synth_info.frame_id,
-				        false);
-				if (synth_slot < 0)
-				{
-					skipped = true;
-					break;
-				}
-				s.enc_slots[ei] = int8_t(synth_slot);
+				        info.frame_id));
 			}
-			if (skipped)
+		}
+		else
+		{
+			for (size_t ei = 0; ei < encoders.size(); ++ei)
 			{
-				warp_skip_present_since_log += uint64_t(synth_done - k);
-				warp_done_since_log -= uint64_t(synth_done - k);
-				static uint64_t last_synth_skip_log_ns = 0;
-				if (warp_now_ns - last_synth_skip_log_ns > 5'000'000'000ull)
-				{
-					last_synth_skip_log_ns = warp_now_ns;
-					U_LOG_W("Depth warp: skipping %d synthetics at present (slots pressured, repeat instead)", synth_done - k);
-				}
-				for (size_t ei = 0; ei < encoders.size(); ++ei)
-				{
-					if (s.enc_slots[ei] >= 0)
-					{
-						encoders[ei]->release_slot(uint8_t(s.enc_slots[ei]));
-						s.enc_slots[ei] = -1;
-					}
-				}
-				images[s.image].busy = false;
-				s.image = -1;
-				for (int j = k + 1; j < synth_done; ++j)
-				{
-					if (synths[j].image >= 0)
-						images[synths[j].image].busy = false;
-					synths[j].image = -1;
-				}
-				synth_done = k;
-				break;
+				auto & encoder = encoders[ei];
+				if (encoder->stream_idx == 2 and not view_info.alpha)
+					continue;
+				real_slots[ei] = int8_t(encoder->present_image(
+				        images[i].image,
+				        sem_info,
+				        info.frame_id));
 			}
 		}
 	}
@@ -1065,9 +1043,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		throw;
 	}
 
-	queue_encode(i, real_slots);
-	for (int k = 0; k < synth_done; ++k)
-		queue_encode(synths[k].image, synths[k].enc_slots);
+	if (warp_replaces_real)
+		queue_encode(synths[0].image, synths[0].enc_slots);
+	else
+	{
+		queue_encode(i, real_slots);
+		for (int k = 0; k < synth_done; ++k)
+			queue_encode(synths[k].image, synths[k].enc_slots);
+	}
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -1408,9 +1391,9 @@ void compositor::set_framerate(float hz)
 		return;
 	U_LOG_IFL_D(log_level, "Framerate change from %.0f to %.0f", frame_rate.load(), hz);
 	pacer.set_frame_duration(U_TIME_1S_IN_NS / hz);
-	// Display ticks moved: forget the last real tick so the next gap
-	// computation cannot fire a spurious synthetic.
-	last_real_predicted_ns.reset();
+	// Display ticks moved: forget the last app timestamp so the next
+	// commit counts as fresh (no spurious replacement warp).
+	last_app_layer_ts.reset();
 	for (auto & encoder: encoders)
 		encoder->set_framerate(hz);
 }
@@ -1429,7 +1412,7 @@ void compositor::resume()
 {
 	for (auto & encoder: encoders)
 		encoder->reset();
-	last_real_predicted_ns.reset();
+	last_app_layer_ts.reset();
 	send_video_stream_description();
 }
 
