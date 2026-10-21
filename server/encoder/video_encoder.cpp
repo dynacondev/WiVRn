@@ -127,16 +127,22 @@ void video_encoder::sender::wait_idle(video_encoder * encoder)
 		cv.wait_for(lock, std::chrono::milliseconds(100));
 		uint64_t now_ns = os_monotonic_get_ns();
 		static std::atomic<uint64_t> last_idle_log_ns{0};
-		if (now_ns - stall_start_ns > 5'000'000'000ull and
-		    now_ns - last_idle_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		if (now_ns - stall_start_ns > 5'000'000'000ull)
 		{
 			// The sender stopped draining our packets: the headset is
 			// not consuming video (or the sender wedged). encoder_work
 			// is parked here and the compositor will stall behind it —
-			// say so, throttled, instead of dying silently.
-			last_idle_log_ns.store(now_ns, std::memory_order_relaxed);
-			U_LOG_W("video sender: %zu packets pending for stream %u, encoder stalled %.1f s (headset not consuming video?)",
-			        pending.size(), encoder->stream_idx, (now_ns - stall_start_ns) / 1e9);
+			// say so, throttled, instead of dying silently. Past
+			// another 5 s, proceed anyway: the queue is bounded by the
+			// image pool, and parking forever helps nothing.
+			if (now_ns - last_idle_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_idle_log_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("video sender: %zu packets pending for stream %u, encoder stalled %.1f s (headset not consuming video?)",
+				        pending.size(), encoder->stream_idx, (now_ns - stall_start_ns) / 1e9);
+			}
+			if (now_ns - stall_start_ns > 10'000'000'000ull)
+				break;
 		}
 	}
 }
@@ -293,25 +299,29 @@ int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info,
 	present_cursor = (present_cursor + 1) % num_slots;
 	uint8_t slot = present_cursor;
 	{
-		// Poll instead of an unbounded atomic wait so a stall is VISIBLE
-		// (throttled log) rather than a silent permanent wedge. The slot
-		// is still not reused until idle, so the healthy path is unchanged
-		// (the wait is normally zero).
+		// Poll instead of an unbounded atomic wait, bounded at 1 s: a
+		// wedged encoder must drop the tick, never park the commit
+		// thread. The slot is still not reused until idle, so the
+		// healthy path is unchanged (the wait is normally zero).
 		uint64_t stall_start_ns = 0;
-		static std::atomic<uint64_t> last_present_log_ns{0};
+		static std::atomic<uint64_t> last_present_drop_ns{0};
 		while (state[slot].load() == busy)
 		{
 			if (not stall_start_ns)
 				stall_start_ns = os_monotonic_get_ns();
-			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			uint64_t now_ns = os_monotonic_get_ns();
-			if (now_ns - stall_start_ns > 5'000'000'000ull and
-			    now_ns - last_present_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			if (now_ns - stall_start_ns > 1'000'000'000ull)
 			{
-				last_present_log_ns.store(now_ns, std::memory_order_relaxed);
-				U_LOG_W("video encoder %u: frame %lu stalled %.1f s waiting for encoder slot (encoder/sender wedged?)",
-				        stream_idx, (unsigned long)frame_index, (now_ns - stall_start_ns) / 1e9);
+				uint64_t last_ns = last_present_drop_ns.load(std::memory_order_relaxed);
+				if (now_ns - last_ns > 5'000'000'000ull)
+				{
+					last_present_drop_ns.store(now_ns, std::memory_order_relaxed);
+					U_LOG_W("video encoder %u: no free slot for 1 s, dropping frame %lu (encoder wedged?)",
+					        stream_idx, (unsigned long)frame_index);
+				}
+				return -1;
 			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 	}
 	if (idr->should_skip(frame_index, stream_idx))

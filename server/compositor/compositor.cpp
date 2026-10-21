@@ -737,6 +737,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// exceptions, drops and skips.
 		std::array<int8_t, 3> real_slots{-1, -1, -1};
 		std::array<int8_t, 3> synth_slots{-1, -1, -1};
+		bool presented_any = false;
 		if (warp_replaces_real)
 		{
 			// The warped frame IS this tick's output: drop the stale
@@ -752,6 +753,16 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				        images[synth.image].image,
 				        sem_info,
 				        info.frame_id));
+				presented_any |= synth_slots[ei] >= 0;
+			}
+			if (!presented_any)
+			{
+				// Every present hit the 1 s slot bound (throttled
+				// above): drop the tick rather than queue a frame no
+				// stream can encode.
+				images[synth.image].busy = false;
+				comp_frame_clear_locked(&frame.rendering);
+				return XRT_SUCCESS;
 			}
 		}
 		else
@@ -765,6 +776,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				        images[i].image,
 				        sem_info,
 				        info.frame_id));
+				presented_any |= real_slots[ei] >= 0;
+			}
+			if (!presented_any)
+			{
+				images[i].busy = false;
+				comp_frame_clear_locked(&frame.rendering);
+				return XRT_SUCCESS;
 			}
 		}
 	}
@@ -938,11 +956,11 @@ void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
 {
 	// Bounded in practice by images (header): at most 2 frames queued
 	// per commit while the pool holds 4; acquire_image drops past it.
+	std::lock_guard lock(encode_mutex);
+	encode_queue.push_back({image, slots});
+	// Bounded in practice by images: at most 2 frames queued per commit
+	// while the pool holds 4; acquire_image drops past it.
 	assert(encode_queue.size() <= images.size());
-	{
-		std::lock_guard lock(encode_mutex);
-		encode_queue.push_back({image, slots});
-	}
 	encode_cv.notify_one();
 }
 
@@ -1102,6 +1120,9 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &warp_times.var, "depth warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
+	U_LOG_I("depth warp %s (source-reverse-z %s)",
+	        depth_reprojection_enabled ? "enabled" : "disabled",
+	        configuration().reprojection.source_reverse_z ? "true" : "false");
 
 	// Start the thread after everything is initialized
 	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};

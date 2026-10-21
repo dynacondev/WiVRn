@@ -25,6 +25,7 @@
 #include "utils/wivrn_trace.h"
 #include "utils/wivrn_vk_bundle.h"
 
+#include <atomic>
 #include <chrono>
 #include <iostream>
 #include <ranges>
@@ -649,7 +650,13 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 
 	if (vk.device.waitForFences(*slot_item.fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_fence_timeout_ns{0};
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_fence_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_fence_timeout_ns.store(now_ns, std::memory_order_relaxed);
+			U_LOG_E("Timeout on stream %d", stream_idx);
+		}
 		return;
 	}
 	// Bounded wait for the previous packet to be consumed (its deleter
@@ -666,7 +673,13 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		{
 			if (std::chrono::steady_clock::now() >= deadline)
 			{
-				U_LOG_W("Encoder stream %d: packet unconsumed for 1 s, reclaiming slot", stream_idx);
+				static std::atomic<uint64_t> last_reclaim_ns{0};
+				uint64_t now_ns = os_monotonic_get_ns();
+				if (now_ns - last_reclaim_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+				{
+					last_reclaim_ns.store(now_ns, std::memory_order_relaxed);
+					U_LOG_W("Encoder stream %d: packet unconsumed for 1 s, reclaiming slot", stream_idx);
+				}
 				slot_item.busy.store(false, std::memory_order_release);
 				slot_item.busy.notify_all();
 				break;
@@ -1078,7 +1091,13 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 
 	if (vk.device.waitForFences(*slot_item.fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_enc_fence_timeout_ns{0};
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (now_ns - last_enc_fence_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_enc_fence_timeout_ns.store(now_ns, std::memory_order_relaxed);
+			U_LOG_E("Timeout on stream %d", stream_idx);
+		}
 		return {};
 	}
 
@@ -1099,16 +1118,28 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		size = s;
 		if (res != vk::Result::eNotReady and res != vk::Result::eSuccess)
 		{
-			U_LOG_W("video encoder %u: encode query failed (%s), dropping frame %lu",
-			        stream_idx, vk::to_string(res).c_str(), (unsigned long)frame_index);
+			static std::atomic<uint64_t> last_query_fail_ns{0};
+			uint64_t now_ns = os_monotonic_get_ns();
+			if (now_ns - last_query_fail_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_query_fail_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("video encoder %u: encode query failed (%s), dropping frame %lu",
+				        stream_idx, vk::to_string(res).c_str(), (unsigned long)frame_index);
+			}
 			return {};
 		}
 		if (res == vk::Result::eNotReady)
 		{
 			if (os_monotonic_get_ns() - query_start_ns > 1'000'000'000ull)
 			{
-				U_LOG_W("video encoder %u: encode query never completed for frame %lu, dropping it (wedged video engine?)",
-				        stream_idx, (unsigned long)frame_index);
+				static std::atomic<uint64_t> last_query_stall_ns{0};
+				uint64_t now_ns = os_monotonic_get_ns();
+				if (now_ns - last_query_stall_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+				{
+					last_query_stall_ns.store(now_ns, std::memory_order_relaxed);
+					U_LOG_W("video encoder %u: encode query never completed for frame %lu, dropping it (wedged video engine?)",
+					        stream_idx, (unsigned long)frame_index);
+				}
 				return {};
 			}
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));

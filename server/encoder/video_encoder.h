@@ -130,10 +130,11 @@ public:
 	video_encoder(vk_bundle &, uint8_t stream_idx, uint32_t target_queue, const encoder_settings & settings, std::unique_ptr<idr_handler>, bool async_send);
 	virtual ~video_encoder();
 
-	// Presents the image on the next free slot and returns that slot.
-	// The caller records it on the queued frame; encode() consumes
-	// exactly the recorded slot, so present/encode stay paired across
-	// exceptions, drops and skips.
+	// Presents the image on the next free slot and returns that slot,
+	// or -1 after a bounded (1 s) wait if no slot frees (the caller
+	// drops the tick). The caller records the slot on the queued frame;
+	// encode() consumes exactly the recorded slot, so present/encode
+	// stay paired across exceptions, drops and skips.
 	int present_image(vk::Image y_cbcr,
 	                  vk::SemaphoreSubmitInfo sem_info,
 	                  uint64_t frame_index);
