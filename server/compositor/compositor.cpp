@@ -322,17 +322,25 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	static uint64_t warp_skip_present_since_log = 0;
 	static uint64_t warp_skip_degenerate_since_log = 0;
 	static uint64_t warp_gate_skip_since_log = 0;
+	// Warp-section GPU time (splat+pull+foveation queries live below):
+	// sum/count/max over the window so the heartbeat reports avg/max.
+	// Lags by one window like the other counters (accumulated after).
+	static double warp_gpu_us_sum = 0;
+	static uint64_t warp_gpu_us_count = 0;
+	static double warp_gpu_us_max = 0;
 	{
 		uint64_t now_ns = os_monotonic_get_ns();
 		if (last_rate_log_ns != 0 and now_ns - last_rate_log_ns > 5'000'000'000ull)
 		{
 			double dt = (now_ns - last_rate_log_ns) / 1e9;
-			U_LOG_I("compositor: %.1f commits/s (%llu with depth) warp wanted=%llu done=%llu skip{invalid=%llu implausible=%llu noimage=%llu present=%llu degenerate=%llu gate=%llu}",
+			U_LOG_I("compositor: %.1f commits/s (%llu with depth) warp wanted=%llu done=%llu skip{invalid=%llu implausible=%llu noimage=%llu present=%llu degenerate=%llu gate=%llu} warp_gpu_us avg=%.1f max=%.1f over %llu",
 			        commits_since_log / dt, (unsigned long long)depth_commits_since_log,
 			        (unsigned long long)warp_wanted_since_log, (unsigned long long)warp_done_since_log,
 			        (unsigned long long)warp_skip_invalid_since_log, (unsigned long long)warp_skip_implausible_since_log,
 			        (unsigned long long)warp_skip_noimage_since_log, (unsigned long long)warp_skip_present_since_log,
-			        (unsigned long long)warp_skip_degenerate_since_log, (unsigned long long)warp_gate_skip_since_log);
+			        (unsigned long long)warp_skip_degenerate_since_log, (unsigned long long)warp_gate_skip_since_log,
+			        warp_gpu_us_count ? warp_gpu_us_sum / double(warp_gpu_us_count) : 0.0, warp_gpu_us_max,
+			        (unsigned long long)warp_gpu_us_count);
 			commits_since_log = 0;
 			depth_commits_since_log = 0;
 			warp_wanted_since_log = 0;
@@ -343,6 +351,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			warp_skip_present_since_log = 0;
 			warp_skip_degenerate_since_log = 0;
 			warp_gate_skip_since_log = 0;
+			warp_gpu_us_sum = 0;
+			warp_gpu_us_count = 0;
+			warp_gpu_us_max = 0;
 			last_rate_log_ns = now_ns;
 		}
 		if (last_rate_log_ns == 0)
@@ -1081,7 +1092,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
 			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
-			warp_times.add((ts[2] - ts[1]) * period / 1e3);
+			double warp_us = (ts[2] - ts[1]) * period / 1e3;
+			warp_times.add(warp_us);
+			warp_gpu_us_sum += warp_us;
+			++warp_gpu_us_count;
+			if (warp_us > warp_gpu_us_max)
+				warp_gpu_us_max = warp_us;
 			foveation_times.add((ts[3] - ts[2]) * period / 1e3);
 		}
 	}
