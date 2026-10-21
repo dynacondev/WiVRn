@@ -628,12 +628,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 			if (synth_ok)
 			{
-				for (int view = 0; view < 2; ++view)
+				for (int view = 0; view < 2 && synth_ok; ++view)
 				{
 					// Target uses the fresh tracker FOV (not the
 					// render-time one): identical unless the headset
 					// mutates FOV mid-session.
-					synth_ok &= reprojector.reproject(
+					synth_ok = reprojector.reproject(
 					        cmd,
 					        view,
 					        src_pose[view],
@@ -1226,9 +1226,9 @@ void compositor::synth_work(std::stop_token tok)
 			}
 			if (ok)
 			{
-				for (int view = 0; view < 2; ++view)
+				for (int view = 0; view < 2 && ok; ++view)
 				{
-					ok &= reprojector.reproject(
+					ok = reprojector.reproject(
 					        synth_cmd,
 					        view,
 					        retained_src_pose[view],
