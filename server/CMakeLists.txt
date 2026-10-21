@@ -107,6 +107,7 @@ if (WIVRN_BUILD_SERVER)
 			audio/audio_setup.cpp
 
 			compositor/compositor.cpp
+			compositor/depth_reprojector.cpp
 			compositor/layer_squasher.cpp
 			compositor/foveation.cpp
 			compositor/pacer.cpp
@@ -272,6 +273,9 @@ if (WIVRN_BUILD_SERVER)
 		SHADERS
 			"${_monado_src}/src/xrt/auxiliary/render/shaders/layer.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/foveation.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_resolve.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_splat.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_pull.comp"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)

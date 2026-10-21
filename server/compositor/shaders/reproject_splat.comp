@@ -1,0 +1,66 @@
+/*
+ * Depth splat (pass 1 of the compute backward warp).
+ *
+ * One thread per retained source pixel: unprojects with the render
+ * (source) inverses and reprojects to the target pose, then records the
+ * winning depth at the target pixel with an atomic min. Depth is
+ * uint-encoded so min-wins selects the foreground surface with no
+ * blending and no tuning knobs.
+ *
+ * Warp math follows the OpenWarp family (https://github.com/Zee2/openwarp,
+ * NCSA-licensed); the splat/pull structure is original.
+ *
+ * Warp math uses mat4 * vec4 only (no mat3 constructors or ternaries):
+ * Adreno-740-safe by construction.
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src_depth;
+
+layout(set = 0, binding = 1) uniform SplatUBO
+{
+	mat4 render_inv_p; // inverse of the source (render-pose) projection
+	mat4 render_inv_v; // inverse of the source view (camera-to-world)
+	mat4 warp_vp; // target projection * target view
+} ubo;
+
+layout(set = 0, binding = 2, r32ui) uniform coherent uimage2D dst_splat;
+
+#define DEPTH_SCALE 16777215.0
+#define SPLAT_EMPTY 0xffffffffu
+
+void main()
+{
+	ivec2 src_xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(dst_splat);
+	if (src_xy.x >= size.x || src_xy.y >= size.y)
+		return;
+
+	vec2 guv = (vec2(src_xy) + vec2(0.5)) / vec2(size);
+
+	// Source depth is standard 0..1 nonlinear (the resolve pass already
+	// converts reverse-Z sources).
+	float z = texture(src_depth, guv).x;
+
+	vec4 clip_pos = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
+	vec4 frag_worldspace = ubo.render_inv_v * (ubo.render_inv_p * clip_pos);
+	vec4 result = ubo.warp_vp * frag_worldspace;
+
+	// Behind the target camera: nothing to splat (sign must be tested
+	// before the perspective divide destroys it).
+	if (result.w <= 0.0)
+		return;
+	result /= result.w;
+
+	vec2 tuv = result.xy * 0.5 + 0.5;
+	if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0)
+		return;
+
+	ivec2 dst_xy = ivec2(tuv * vec2(size));
+	dst_xy = clamp(dst_xy, ivec2(0), size - ivec2(1));
+	uint enc = uint(clamp(z, 0.0, 1.0) * DEPTH_SCALE);
+	imageAtomicMin(dst_splat, dst_xy, enc);
+}
