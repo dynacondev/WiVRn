@@ -22,9 +22,11 @@
 #include "encoder/video_encoder.h"
 #include "encoder_settings.h"
 #include "util/u_logging.h"
+#include "os/os_time.h"
 #include "utils/wivrn_vk_bundle.h"
 
 #include <stdexcept>
+#include <atomic>
 
 namespace wivrn
 {
@@ -212,7 +214,13 @@ void video_encoder_x264::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_present_timeout_ns{0};
+		uint64_t timeout_now_ns = os_monotonic_get_ns();
+		if (timeout_now_ns - last_present_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_present_timeout_ns.store(timeout_now_ns, std::memory_order_relaxed);
+			U_LOG_E("Timeout on stream %d", stream_idx);
+		}
 		return;
 	}
 
@@ -332,7 +340,13 @@ std::optional<video_encoder::data> video_encoder_x264::encode(uint8_t slot, uint
 	assert(pending_nals.empty());
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_encode_timeout_ns{0};
+		uint64_t timeout_now_ns = os_monotonic_get_ns();
+		if (timeout_now_ns - last_encode_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_encode_timeout_ns.store(timeout_now_ns, std::memory_order_relaxed);
+			U_LOG_E("Timeout on stream %d", stream_idx);
+		}
 		return {};
 	}
 	int size = x264_encoder_encode(enc, &nal, &num_nal, &pic, &pic_out);

@@ -72,7 +72,7 @@ private:
 	std::vector<frame_time> frame_times_compute;
 	std::jthread worker;
 
-	std::array<frame_info, 8> in_flight_frames;
+	std::array<frame_info, 64> in_flight_frames;
 
 public:
 	pacer(uint64_t frame_duration);
@@ -104,6 +104,13 @@ public:
 	// + render→display (learned mean). Learned from client feedback like
 	// everything else the pacer predicts.
 	int64_t present_lead_ns() const;
+
+	// Learned render→display latency (monotonic ns). The synth ticker
+	// compares its grid ticks against queued outputs' display times;
+	// both derive from the pacer's last_ns grid, offset by exactly this
+	// mean — subtracting it re-centers the comparison so a learned
+	// latency can't systematically cover or uncover ticks.
+	int64_t learned_render_latency_ns() const;
 
 	void on_feedback(const wivrn::from_headset::feedback &, const clock_offset &);
 

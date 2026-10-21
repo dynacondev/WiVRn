@@ -221,6 +221,8 @@ int64_t pacer::next_display_tick_ns(int64_t after_ns)
 {
 	std::lock_guard lock(mutex);
 	int64_t period = int64_t(frame_duration_ns);
+	if (period <= 0)
+		return after_ns + 1;
 	int64_t phase = last_ns % period;
 	int64_t base = after_ns - (after_ns % period) + phase;
 	if (base <= after_ns)
@@ -232,6 +234,12 @@ int64_t pacer::present_lead_ns() const
 {
 	std::lock_guard lock(mutex);
 	return safe_present_to_decoded_ns + mean_render_to_display_ns;
+}
+
+int64_t pacer::learned_render_latency_ns() const
+{
+	std::lock_guard lock(mutex);
+	return mean_render_to_display_ns;
 }
 
 void pacer::reset()

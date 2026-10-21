@@ -94,11 +94,11 @@ private:
 	static const state_t busy = 1;
 	static const state_t skip = 2;
 	std::array<std::atomic_unsigned_lock_free, num_slots> state = {idle, idle, idle, idle};
-	// Slot allocator for presents. Sole writer of slot assignments: each
-	// present records its slot on the queued frame and encode consumes
-	// exactly that slot, so the pairing cannot diverge (no counters to
-	// drift apart across exceptions, drops or skips). Atomic: the EndFrame
-	// path and the synth ticker present concurrently.
+	// Slot allocator for presents: each present records its slot on the
+	// queued frame and encode consumes exactly that slot, so the pairing
+	// cannot diverge (no counters to drift apart across exceptions, drops
+	// or skips). Atomic as belt-and-braces (both present paths call
+	// present_image; today they are serialized by commit_mutex).
 	std::atomic<uint8_t> present_cursor{0};
 
 	std::mutex mutex;

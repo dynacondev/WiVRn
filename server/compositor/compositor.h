@@ -108,7 +108,11 @@ private:
 	std::array<image, 4> images;
 	vk::raii::CommandBuffer cmd;
 	vk::raii::Semaphore sem;
-	uint64_t sem_value = 0;
+	// Monotonic timeline value, incremented per submit on either path.
+	// Atomic: both paths submit without holding commit_mutex across the
+	// queue lock (submit_cmd_buffer is self-synchronizing); the commit
+	// path additionally holds commit_mutex when it submits.
+	std::atomic<uint64_t> sem_value{0};
 
 	std::atomic<float> requested_refresh_rate;
 	std::atomic<float> frame_rate;
@@ -132,9 +136,14 @@ private:
 
 	// Last client app-frame timestamp seen on a fast-path commit, for
 	// refresh gating: a changed timestamp means the commit carries a new
-	// app frame whose color+depth must be retained. Empty until the
-	// first fast-path commit.
-	std::optional<int64_t> last_app_layer_ts;
+	// app frame whose color+depth must be retained. -1 until the first
+	// fast-path commit. Atomic: set_framerate/resume on the session
+	// thread reset it while layer_commit reads it.
+	std::atomic<int64_t> last_app_layer_ts{-1};
+
+	// Hysteresis latch for the stale-frame warp (see layer_commit):
+	// plain bool would race set_framerate/resume on the session thread.
+	std::atomic<bool> warp_armed_stale{false};
 
 	// Arrival time of the previous layer_commit (monotonic ns). The warp
 	// gate compares inter-commit spacing against the display period:
@@ -161,6 +170,13 @@ private:
 	// on app layer changes).
 	std::atomic<bool> last_alpha_blend{false};
 
+	// Last submitted timeline value (any path). Host-visible UBO and
+	// descriptor writes must not land while the GPU still reads them
+	// (recording is serialized by commit_mutex, but execution is async),
+	// so both paths wait — bounded — for this value's work before
+	// touching shared upload state. Set in submit_cmd_buffer.
+	std::atomic<uint64_t> last_submit_value{0};
+
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 
 	// Serializes the record→submit→present→queue region across the
@@ -186,12 +202,6 @@ private:
 	// commit while the pool holds 4 (acquire_image drops past it).
 	std::deque<queued_frame> encode_queue;
 	std::jthread encoder_thread;
-
-	// Last timeline value submitted by the synth ticker. The ticker waits
-	// for it (bounded) before resetting its command pool, mirroring the
-	// commit path's end-of-tick wait: never reset a pool whose work is
-	// still on the GPU. Ticker-thread only.
-	uint64_t last_synth_submit_value = 0;
 
 	// Display-rate synth ticker: emits warped frames on ticks with no
 	// fresh EndFrame, so slow apps still feed the client at display
@@ -262,10 +272,19 @@ private:
 	        const to_headset::video_stream_data_shard::view_info_t & info);
 
 	// Submits a fully recorded command buffer on the compositor queue,
-	// signaling the timeline semaphore. Returns the signaled value for
-	// the present call. Self-synchronizing via the queue mutex (submit
-	// order is signal order); callable with or without commit_mutex.
+	// signaling the timeline semaphore and recording the value in
+	// sem_value (both paths). Self-synchronizing via the queue mutex
+	// (submit order is signal order); callable with or without
+	// commit_mutex.
 	uint64_t submit_cmd_buffer(vk::raii::CommandBuffer & cmd);
+
+	// Host-visible UBO / descriptor writes must not land while the GPU
+	// still reads them from the other path's submit (recording is
+	// serialized by commit_mutex, execution is not). Bounded wait for the
+	// last submitted work; false on timeout or error, in which case the
+	// caller skips its warp (plain repeat / dropped tick) instead of
+	// recording against in-flight state.
+	bool wait_for_last_submit(uint64_t timeout_ns);
 
 	// Presents one fully-recorded image to all encoders and records
 	// their slots. Returns false when no stream could present within the

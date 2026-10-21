@@ -34,6 +34,7 @@ bool operator==(const GUID & l, const GUID & r)
 }
 
 #include <algorithm>
+#include <atomic>
 #include <stdexcept>
 
 #define NVENC_CHECK_NOENCODER(x)                                          \
@@ -426,7 +427,13 @@ void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInf
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_present_timeout_ns{0};
+		uint64_t timeout_now_ns = os_monotonic_get_ns();
+		if (timeout_now_ns - last_present_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_present_timeout_ns.store(timeout_now_ns, std::memory_order_relaxed);
+			U_LOG_E("Timeout on stream %d", stream_idx);
+		}
 		return;
 	}
 	auto & cmd = in[slot].cmd;
@@ -485,7 +492,13 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
+		static std::atomic<uint64_t> last_encode_timeout_ns{0};
+		uint64_t timeout_now_ns = os_monotonic_get_ns();
+		if (timeout_now_ns - last_encode_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_encode_timeout_ns.store(timeout_now_ns, std::memory_order_relaxed);
+			U_LOG_E("Timeout on stream %d", stream_idx);
+		}
 		return {};
 	}
 
