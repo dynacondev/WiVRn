@@ -28,6 +28,7 @@
 #include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
+#include <atomic>
 #include <string>
 #include <thread>
 
@@ -59,14 +60,42 @@ video_encoder::sender::sender() :
 			        if (pending.empty())
 				        cv.wait_for(lock, std::chrono::milliseconds(100));
 			        else
+			        {
+				        if (pending.size() > 16)
+				        {
+					        // Video backing up: normally the queue drains in
+					        // milliseconds. A deep queue means the headset
+					        // stopped consuming (or the link stalled) — say so,
+					        // throttled, while it is still recoverable.
+					        uint64_t now_ns = os_monotonic_get_ns();
+					        static std::atomic<uint64_t> last_depth_log_ns{0};
+					        if (now_ns - last_depth_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+					        {
+						        last_depth_log_ns.store(now_ns, std::memory_order_relaxed);
+						        U_LOG_W("video sender: %zu packets queued (video backing up?)", pending.size());
+					        }
+				        }
 				        d = &pending.front();
+			        }
 		        }
-		        if (d and not d->span.empty())
+		        if (d)
 		        {
-			        d->encoder->SendData(d->span, true, d->prefer_control);
-			        std::unique_lock lock(mutex);
-			        pending.pop_front();
-			        cv.notify_all();
+			        if (not d->span.empty())
+				        d->encoder->SendData(d->span, true, d->prefer_control);
+			        else
+			        {
+				        // A zero-byte encode output carries no frame, but it
+				        // must still be popped: leaving it at the head of the
+				        // queue wedges this thread (and with it encoder_work
+				        // in wait_idle and the compositor in present_image)
+				        // forever, with no log anywhere.
+				        U_LOG_W("video sender: dropping empty packet for stream %u", d->encoder->stream_idx);
+			        }
+			        {
+				        std::unique_lock lock(mutex);
+				        pending.pop_front();
+				        cv.notify_all();
+			        }
 		        }
 	        }
 	        std::unique_lock lock(mutex);
@@ -79,6 +108,10 @@ video_encoder::sender::sender() :
 void video_encoder::sender::push(data && d)
 {
 	std::unique_lock lock(mutex);
+	// Drop empty packets at the door: a zero-byte encode output carries
+	// no frame, and must never reach the queue (see run()).
+	if (d.span.empty())
+		return;
 	pending.push_back(std::move(d));
 	cv.notify_all();
 }
@@ -86,8 +119,26 @@ void video_encoder::sender::push(data && d)
 void video_encoder::sender::wait_idle(video_encoder * encoder)
 {
 	std::unique_lock lock(mutex);
+	uint64_t stall_start_ns = 0;
 	while (std::ranges::any_of(pending, [=](auto & data) { return data.encoder == encoder; }))
+	{
+		if (not stall_start_ns)
+			stall_start_ns = os_monotonic_get_ns();
 		cv.wait_for(lock, std::chrono::milliseconds(100));
+		uint64_t now_ns = os_monotonic_get_ns();
+		static std::atomic<uint64_t> last_idle_log_ns{0};
+		if (now_ns - stall_start_ns > 5'000'000'000ull and
+		    now_ns - last_idle_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			// The sender stopped draining our packets: the headset is
+			// not consuming video (or the sender wedged). encoder_work
+			// is parked here and the compositor will stall behind it —
+			// say so, throttled, instead of dying silently.
+			last_idle_log_ns.store(now_ns, std::memory_order_relaxed);
+			U_LOG_W("video sender: %zu packets pending for stream %u, encoder stalled %.1f s (headset not consuming video?)",
+			        pending.size(), encoder->stream_idx, (now_ns - stall_start_ns) / 1e9);
+		}
+	}
 }
 
 std::shared_ptr<video_encoder::sender> video_encoder::sender::get()
