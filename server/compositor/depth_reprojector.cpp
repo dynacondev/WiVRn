@@ -94,20 +94,25 @@ vk::raii::Sampler make_sampler(
 	return res;
 }
 
-// Sentinel = "no splat here" (above any encodable depth).
+// Sentinel bytes = "no splat here" (above any encodable depth).
 // VULKAN_HPP_NO_CONSTRUCTORS leaves vk::ClearColorValue without any
 // usable constructor, and reinterpreting the C struct trips
-// -Werror=strict-aliasing: stage the bits through unsigned char
-// (char aliasing is allowed) inside this one helper.
-vk::ClearColorValue splat_empty_value()
+// -Werror=strict-aliasing: stage the bits through unsigned char (char
+// aliasing is allowed) and reinterpret at the call site, which takes
+// the value by const reference (never materialized as the union type).
+// (VkClearColorValue <-> vk::ClearColorValue layout identity is
+// static_asserted inside vulkan.hpp itself.)
+struct splat_empty_storage
 {
-	alignas(vk::ClearColorValue) unsigned char bits[sizeof(vk::ClearColorValue)] = {};
+	alignas(VkClearColorValue) unsigned char bytes[sizeof(VkClearColorValue)];
+};
+splat_empty_storage splat_empty_bytes()
+{
+	splat_empty_storage out{};
 	VkClearColorValue raw{};
 	raw.uint32[0] = 0xffffffffu;
-	static_assert(sizeof(raw) == sizeof(bits), "clear layout");
-	std::memcpy(bits, &raw, sizeof(bits));
-	vk::ClearColorValue out;
-	std::memcpy(&out, bits, sizeof(out));
+	static_assert(sizeof(raw) == sizeof(out.bytes), "clear layout");
+	std::memcpy(out.bytes, &raw, sizeof(out.bytes));
 	return out;
 }
 
@@ -899,7 +904,7 @@ bool depth_reprojector::reproject(
 	cmd.clearColorImage(
 	        splat_depth[view],
 	        vk::ImageLayout::eTransferDstOptimal,
-	        splat_empty_value(),
+	        *reinterpret_cast<const vk::ClearColorValue *>(splat_empty_bytes()),
 	        vk::ImageSubresourceRange{
 	                .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                .levelCount = 1,

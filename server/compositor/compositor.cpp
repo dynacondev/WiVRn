@@ -200,7 +200,7 @@ std::array<wivrn::compositor::image, 4> make_images(wivrn::vk_bundle & vk, vk::C
 		        }};
 	};
 
-	return {make_image(0), make_image(1)};
+	return {make_image(0), make_image(1), make_image(2), make_image(3)};
 }
 
 vk::raii::Semaphore make_semaphore(wivrn::vk_bundle & vk)
