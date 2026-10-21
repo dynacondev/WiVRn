@@ -304,21 +304,44 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
-	// Commit-rate + depth-presence heartbeat (logging only: answers "is
-	// the app submitting?" and "is depth arriving?" in one line so a
-	// quiet warp section is distinguishable from a starved pipeline).
+	// Commit-rate + depth-presence + warp-outcome heartbeat (logging
+	// only: answers "is the app submitting?", "is depth arriving?" and
+	// "what happened to warp demand?" in one line so a quiet warp
+	// section is distinguishable from a starved pipeline).
 	// Only the log line is throttled; the commit path is untouched.
+	// Warp counters lag by one window (incremented after this block).
 	static uint64_t last_rate_log_ns = 0;
 	static uint64_t commits_since_log = 0;
 	static uint64_t depth_commits_since_log = 0;
+	static uint64_t warp_wanted_since_log = 0;
+	static uint64_t warp_done_since_log = 0;
+	static uint64_t warp_skip_invalid_since_log = 0;
+	static uint64_t warp_skip_implausible_since_log = 0;
+	static uint64_t warp_skip_noimage_since_log = 0;
+	static uint64_t warp_skip_present_since_log = 0;
+	static uint64_t warp_skip_degenerate_since_log = 0;
+	static uint64_t warp_gate_skip_since_log = 0;
 	{
 		uint64_t now_ns = os_monotonic_get_ns();
 		if (last_rate_log_ns != 0 and now_ns - last_rate_log_ns > 5'000'000'000ull)
 		{
 			double dt = (now_ns - last_rate_log_ns) / 1e9;
-			U_LOG_I("compositor: %.1f commits/s (%llu with depth)", commits_since_log / dt, (unsigned long long)depth_commits_since_log);
+			U_LOG_I("compositor: %.1f commits/s (%llu with depth) warp wanted=%llu done=%llu skip{invalid=%llu implausible=%llu noimage=%llu present=%llu degenerate=%llu gate=%llu}",
+			        commits_since_log / dt, (unsigned long long)depth_commits_since_log,
+			        (unsigned long long)warp_wanted_since_log, (unsigned long long)warp_done_since_log,
+			        (unsigned long long)warp_skip_invalid_since_log, (unsigned long long)warp_skip_implausible_since_log,
+			        (unsigned long long)warp_skip_noimage_since_log, (unsigned long long)warp_skip_present_since_log,
+			        (unsigned long long)warp_skip_degenerate_since_log, (unsigned long long)warp_gate_skip_since_log);
 			commits_since_log = 0;
 			depth_commits_since_log = 0;
+			warp_wanted_since_log = 0;
+			warp_done_since_log = 0;
+			warp_skip_invalid_since_log = 0;
+			warp_skip_implausible_since_log = 0;
+			warp_skip_noimage_since_log = 0;
+			warp_skip_present_since_log = 0;
+			warp_skip_degenerate_since_log = 0;
+			warp_gate_skip_since_log = 0;
 			last_rate_log_ns = now_ns;
 		}
 		if (last_rate_log_ns == 0)
@@ -534,6 +557,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// emits at headset cadence. True frames keep the existing rotation
 	// timewarp in the squasher/fast-path; synthetics replace it with a
 	// full 6DoF compute warp.
+	warp_wanted_since_log += uint64_t(synth_wanted > 0 ? synth_wanted : 0);
 	if (synth_wanted and has_depth_src and depth_reprojection_enabled and not warp_cooldown)
 	{
 		try
@@ -559,6 +583,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					U_LOG_W("Depth warp: no free present image, skipping %d synthetics (repeat instead)",
 					        synth_wanted - synth_done);
 				}
+				warp_skip_noimage_since_log += uint64_t(synth_wanted - synth_done);
 				break;
 			}
 
@@ -583,12 +608,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
 				if ((head.relation_flags & need_pose) != need_pose)
 				{
+					warp_skip_invalid_since_log += uint64_t(synth_wanted - synth_done);
 					static uint64_t last_invalid_pose_log_ns = 0;
 					if (warp_now_ns - last_invalid_pose_log_ns > 5'000'000'000ull)
 					{
 						last_invalid_pose_log_ns = warp_now_ns;
-						U_LOG_I("Depth warp: skipping %d synthetics (head pose invalid for tick, repeat instead)",
-						        synth_wanted - synth_done);
+						U_LOG_I("Depth warp: skipping %d synthetics (head pose invalid for tick flags=0x%x, repeat instead)",
+						        synth_wanted - synth_done, (unsigned)head.relation_flags);
 					}
 					images[s.image].busy = false;
 					s.image = -1;
@@ -627,12 +653,41 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					}
 					if (not plausible)
 					{
+						warp_skip_implausible_since_log += uint64_t(synth_wanted - synth_done);
 						static uint64_t last_implausible_log_ns = 0;
 						if (warp_now_ns - last_implausible_log_ns > 5'000'000'000ull)
 						{
 							last_implausible_log_ns = warp_now_ns;
-							U_LOG_I("Depth warp: skipping %d synthetics (implausible head motion %.1f m/s %.1f rad/s, repeat instead)",
-							        synth_wanted - synth_done, worst_ms, worst_rs);
+							// Forensics for the src-vs-target jump: src is the
+							// app-submitted (xrizer) pose, target is the fresh
+							// headset pose for this synthetic tick. An
+							// identity src (0,0,0 + 0,0,0,1) means xrizer fell
+							// back at end_frame (ViewStateFlags missing VALID).
+							bool src_identity = true;
+							for (int view = 0; view < 2; ++view)
+							{
+								const auto & a = src_pose[view];
+								float pn = sqrtf(a.position.x * a.position.x + a.position.y * a.position.y + a.position.z * a.position.z);
+								bool qid = fabsf(a.orientation.x) < 1e-3f and fabsf(a.orientation.y) < 1e-3f and
+								        fabsf(a.orientation.z) < 1e-3f and fabsf(a.orientation.w - 1.f) < 1e-3f;
+								if (pn > 1e-3f or not qid)
+									src_identity = false;
+							}
+							U_LOG_I("Depth warp: skipping %d synthetics (implausible head motion %.1f m/s %.1f rad/s dt=%.1fms headflags=0x%x src_identity=%d, repeat instead)",
+							        synth_wanted - synth_done, worst_ms, worst_rs, dt_s * 1e3,
+							        (unsigned)head.relation_flags, (int)src_identity);
+							for (int view = 0; view < 2; ++view)
+							{
+								const auto & sp = src_pose[view];
+								const auto & tp = s.poses[view];
+								U_LOG_I("Depth warp src/vs/tgt v%d: src pos=(%.3f,%.3f,%.3f) quat=(%.3f,%.3f,%.3f,%.3f) tgt pos=(%.3f,%.3f,%.3f) quat=(%.3f,%.3f,%.3f,%.3f) near=%.4f far=%.1f",
+								        view,
+								        sp.position.x, sp.position.y, sp.position.z,
+								        sp.orientation.x, sp.orientation.y, sp.orientation.z, sp.orientation.w,
+								        tp.position.x, tp.position.y, tp.position.z,
+								        tp.orientation.x, tp.orientation.y, tp.orientation.z, tp.orientation.w,
+								        src_near_z[view], src_far_z[view]);
+							}
 						}
 						images[s.image].busy = false;
 						s.image = -1;
@@ -656,6 +711,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				}
 				if (not ok)
 				{
+					// Degenerate inputs (bad frustum from near/far or fov):
+					// silent single-frame skip previously; now counted in
+					// the heartbeat so it can't hide.
+					warp_skip_degenerate_since_log += uint64_t(synth_wanted - synth_done);
+					U_LOG_IFL_D(log_level, "Depth warp: reproject() rejected tick %d (near=%.4f/%.4f far=%.1f/%.1f)",
+					        synth_done, src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1]);
 					images[s.image].busy = false;
 					s.image = -1;
 					break;
@@ -680,6 +741,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 			warp_cooldown_until_ns = warp_now_ns + warp_cooldown_ns;
 		}
+		warp_done_since_log += uint64_t(synth_done);
 		if (synth_done)
 		{
 			// Proof-of-life for the warp + tuning signal for hole_radius:
@@ -735,6 +797,21 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					}
 				}
 			}
+		}
+	}
+	else if (synth_wanted > 0)
+	{
+		// Demand existed but the warp never ran: log which gate failed
+		// (throttled) and count it so the heartbeat shows gate skips vs
+		// zero-demand commits. synth_wanted==0 (app at display rate) is
+		// normal and stays silent.
+		++warp_gate_skip_since_log;
+		static uint64_t last_warp_gate_log_ns = 0;
+		if (warp_now_ns - last_warp_gate_log_ns > 5'000'000'000ull)
+		{
+			last_warp_gate_log_ns = warp_now_ns;
+			U_LOG_I("Depth warp: demand %d tick(s) but warp gated (has_depth=%d enabled=%d cooldown=%d, repeat instead)",
+			        synth_wanted, (int)has_depth_src, (int)depth_reprojection_enabled, (int)warp_cooldown);
 		}
 	}
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
@@ -917,6 +994,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 			if (skipped)
 			{
+				warp_skip_present_since_log += uint64_t(synth_done - k);
+				warp_done_since_log -= uint64_t(synth_done - k);
 				static uint64_t last_synth_skip_log_ns = 0;
 				if (warp_now_ns - last_synth_skip_log_ns > 5'000'000'000ull)
 				{
