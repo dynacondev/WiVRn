@@ -311,9 +311,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// fires (zero cost, zero risk).
 	const uint64_t commit_ns = os_monotonic_get_ns();
 	const uint64_t display_period_ns = uint64_t(pacer.get_frame_duration());
-	const bool stale_commit = last_commit_ns != 0 &&
-	        commit_ns - last_commit_ns > display_period_ns + display_period_ns / 2;
-	last_commit_ns = commit_ns;
+	const uint64_t last_commit = last_commit_ns.load();
+	const bool stale_commit = last_commit != 0 &&
+	        commit_ns - last_commit > display_period_ns + display_period_ns / 2;
+	last_commit_ns.store(commit_ns);
 
 	int i = acquire_image();
 
@@ -347,8 +348,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        .display_time = session.get_offset().to_headset(frame.rendering.predicted_display_time_ns),
 	        .alpha = layer_accum.data.env_blend_mode == XRT_BLEND_MODE_ALPHA_BLEND,
 	};
+	last_alpha_blend.store(view_info.alpha);
 
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
+
+	// Serialized with the synth ticker (commit_mutex): everything below
+	// up to queue_encode shares the reprojector, foveation UBO /
+	// descriptor writes, cmd buffer and sem_value. Released before the
+	// trailing GPU waits so a wedged tick never parks the other path.
+	std::lock_guard commit_lock{commit_mutex};
 
 	// Everything recorded or submitted below (resolve, warp, foveate,
 	// present) runs inside one guard: a Vulkan throw (device loss, OOM)
@@ -661,46 +669,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 		}
 
-		auto append_encoder_barriers = [&](int image_idx, const to_headset::video_stream_data_shard::view_info_t & info) {
-			for (auto & encoder: encoders)
-			{
-				if (encoder->stream_idx == 2 and not info.alpha)
-					continue;
-				else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
-				{
-					image_barriers.push_back(
-					        vk::ImageMemoryBarrier2{
-					                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-					                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-					                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-					                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-					                // For a queue-family ownership transfer in EXCLUSIVE
-					                // sharing mode, the release barrier's old/new layout
-					                // must match the encoder-side acquire. newLayout is
-					                // the encoder's target_layout; per the VkImageMemoryBarrier2
-					                // spec the layout transition is executed exactly once
-					                // between the queues, so this single QFOT barrier covers
-					                // both the queue-family transfer and the layout
-					                // transition the encoder needs.
-					                .oldLayout = vk::ImageLayout::eGeneral,
-					                .newLayout = encoder->target_layout,
-					                .srcQueueFamilyIndex = vk.queue.family_index,
-					                .dstQueueFamilyIndex = encoder->target_queue,
-					                .image = images[image_idx].image,
-					                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
-					                                     .baseMipLevel = 0,
-					                                     .levelCount = 1,
-					                                     .baseArrayLayer = encoder->stream_idx,
-					                                     .layerCount = 1},
-					        });
-				}
-			}
-		};
-
 		if (!warp_replaces_real)
-			append_encoder_barriers(i, view_info);
+			append_encoder_barriers(image_barriers, i, view_info);
 		if (have_synth)
-			append_encoder_barriers(synth.image, images[synth.image].view_info);
+			append_encoder_barriers(image_barriers, synth.image, images[synth.image].view_info);
 
 		cmd.pipelineBarrier2({
 		        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
@@ -710,24 +682,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 		cmd.end();
 
+		const uint64_t sem_value_now = submit_cmd_buffer(cmd);
 		const vk::SemaphoreSubmitInfo sem_info{
 		        .semaphore = *sem,
-		        .value = ++sem_value,
+		        .value = sem_value_now,
 		        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
 		};
-
-		{
-			vk::CommandBufferSubmitInfo cmd_info{
-			        .commandBuffer = cmd,
-			};
-			std::unique_lock lock{vk.queue.mutex};
-			vk.queue.queue.submit2(vk::SubmitInfo2{
-			        .commandBufferInfoCount = 1,
-			        .pCommandBufferInfos = &cmd_info,
-			        .signalSemaphoreInfoCount = 1,
-			        .pSignalSemaphoreInfos = &sem_info,
-			});
-		}
 
 		pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 		auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
@@ -737,25 +697,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// exceptions, drops and skips.
 		std::array<int8_t, 3> real_slots{-1, -1, -1};
 		std::array<int8_t, 3> synth_slots{-1, -1, -1};
-		bool presented_any = false;
 		if (warp_replaces_real)
 		{
 			// The warped frame IS this tick's output: drop the stale
 			// repeat and present the warp with this tick's frame id
 			// (same blocking semantics as a real present).
 			images[i].busy = false;
-			for (size_t ei = 0; ei < encoders.size(); ++ei)
-			{
-				auto & encoder = encoders[ei];
-				if (encoder->stream_idx == 2 and not images[synth.image].view_info.alpha)
-					continue;
-				synth_slots[ei] = int8_t(encoder->present_image(
-				        images[synth.image].image,
-				        sem_info,
-				        info.frame_id));
-				presented_any |= synth_slots[ei] >= 0;
-			}
-			if (!presented_any)
+			if (!present_to_encoders(synth.image, images[synth.image].view_info, info.frame_id, sem_info, synth_slots))
 			{
 				// Every present hit the 1 s slot bound (throttled
 				// above): drop the tick rather than queue a frame no
@@ -767,18 +715,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 		else
 		{
-			for (size_t ei = 0; ei < encoders.size(); ++ei)
-			{
-				auto & encoder = encoders[ei];
-				if (encoder->stream_idx == 2 and not view_info.alpha)
-					continue;
-				real_slots[ei] = int8_t(encoder->present_image(
-				        images[i].image,
-				        sem_info,
-				        info.frame_id));
-				presented_any |= real_slots[ei] >= 0;
-			}
-			if (!presented_any)
+			if (!present_to_encoders(i, view_info, info.frame_id, sem_info, real_slots))
 			{
 				images[i].busy = false;
 				comp_frame_clear_locked(&frame.rendering);
@@ -811,6 +748,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		queue_encode(synth.image, synth_slots);
 	else
 		queue_encode(i, real_slots);
+
+	// End of the serialized region: everything below touches only
+	// commit-private or self-synchronizing state (timeline wait, query
+	// read, garbage collect). Releasing here keeps a wedged tick from
+	// parking the synth ticker behind it.
+	commit_lock.unlock();
 
 #ifdef XRT_FEATURE_RENDERDOC
 	if (auto r = renderdoc())
@@ -950,6 +893,92 @@ int compositor::acquire_image()
 			return i;
 	}
 	return -1;
+}
+
+void compositor::append_encoder_barriers(
+        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> & barriers,
+        int image_idx,
+        const to_headset::video_stream_data_shard::view_info_t & info)
+{
+	for (auto & encoder: encoders)
+	{
+		if (encoder->stream_idx == 2 and not info.alpha)
+			continue;
+		else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
+		{
+			barriers.push_back(
+			        vk::ImageMemoryBarrier2{
+			                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+			                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+			                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+			                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+			                // For a queue-family ownership transfer in EXCLUSIVE
+			                // sharing mode, the release barrier's old/new layout
+			                // must match the encoder-side acquire. newLayout is
+			                // the encoder's target_layout; per the VkImageMemoryBarrier2
+			                // spec the layout transition is executed exactly once
+			                // between the queues, so this single QFOT barrier covers
+			                // both the queue-family transfer and the layout
+			                // transition the encoder needs.
+			                .oldLayout = vk::ImageLayout::eGeneral,
+			                .newLayout = encoder->target_layout,
+			                .srcQueueFamilyIndex = vk.queue.family_index,
+			                .dstQueueFamilyIndex = encoder->target_queue,
+			                .image = images[image_idx].image,
+			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+			                                     .baseMipLevel = 0,
+			                                     .levelCount = 1,
+			                                     .baseArrayLayer = encoder->stream_idx,
+			                                     .layerCount = 1},
+			        });
+		}
+	}
+}
+
+uint64_t compositor::submit_cmd_buffer(vk::raii::CommandBuffer & cmd)
+{
+	vk::CommandBufferSubmitInfo cmd_info{
+	        .commandBuffer = cmd,
+	};
+	std::unique_lock lock{vk.queue.mutex};
+	uint64_t value = ++sem_value;
+	vk::SemaphoreSubmitInfo sem_info{
+	        .semaphore = *sem,
+	        .value = value,
+	        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	};
+	vk.queue.queue.submit2(vk::SubmitInfo2{
+	        .commandBufferInfoCount = 1,
+	        .pCommandBufferInfos = &cmd_info,
+	        .signalSemaphoreInfoCount = 1,
+	        .pSignalSemaphoreInfos = &sem_info,
+	});
+	return value;
+}
+
+bool compositor::present_to_encoders(
+        int image_idx,
+        const to_headset::video_stream_data_shard::view_info_t & info,
+        int64_t frame_id,
+        const vk::SemaphoreSubmitInfo & sem_info,
+        std::array<int8_t, 3> & slots)
+{
+	// Record each encoder's slot on the queued frame; encode() consumes
+	// exactly the recorded slot, so present/encode stay paired across
+	// exceptions, drops and skips.
+	bool presented_any = false;
+	for (size_t ei = 0; ei < encoders.size(); ++ei)
+	{
+		auto & encoder = encoders[ei];
+		if (encoder->stream_idx == 2 and not info.alpha)
+			continue;
+		slots[ei] = int8_t(encoder->present_image(
+		        images[image_idx].image,
+		        sem_info,
+		        frame_id));
+		presented_any |= slots[ei] >= 0;
+	}
+	return presented_any;
 }
 
 void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
@@ -1180,7 +1209,7 @@ void compositor::set_framerate(float hz)
 	// commit counts as fresh, and the arrival spacing so it never counts
 	// as stale (no spurious replacement warp).
 	last_app_layer_ts.reset();
-	last_commit_ns = 0;
+	last_commit_ns.store(0);
 	for (auto & encoder: encoders)
 		encoder->set_framerate(hz);
 }
@@ -1200,7 +1229,7 @@ void compositor::resume()
 	for (auto & encoder: encoders)
 		encoder->reset();
 	last_app_layer_ts.reset();
-	last_commit_ns = 0;
+	last_commit_ns.store(0);
 	send_video_stream_description();
 }
 

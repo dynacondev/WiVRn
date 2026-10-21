@@ -97,8 +97,9 @@ private:
 	// Slot allocator for presents. Sole writer of slot assignments: each
 	// present records its slot on the queued frame and encode consumes
 	// exactly that slot, so the pairing cannot diverge (no counters to
-	// drift apart across exceptions, drops or skips).
-	uint8_t present_cursor = 0;
+	// drift apart across exceptions, drops or skips). Atomic: the EndFrame
+	// path and the synth ticker present concurrently.
+	std::atomic<uint8_t> present_cursor{0};
 
 	std::mutex mutex;
 

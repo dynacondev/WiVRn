@@ -27,6 +27,7 @@
 #include "depth_reprojector.h"
 #include "encoder/encoder_settings.h"
 #include "foveation.h"
+#include "inplace_vector.hpp"
 #include "layer_squasher.h"
 #include "pacer.h"
 #include "utils/wivrn_vk_bundle.h"
@@ -122,10 +123,25 @@ private:
 	// gate compares inter-commit spacing against the display period:
 	// layer_commit runs once per app EndFrame, not per display tick, so
 	// staleness cannot come from timestamps (consecutive commits always
-	// carry fresh ones). Zero until the first commit.
-	uint64_t last_commit_ns = 0;
+	// carry fresh ones). Zero until the first commit. Atomic: the synth
+	// ticker reads it while layer_commit writes it.
+	std::atomic<uint64_t> last_commit_ns{0};
+
+	// Alpha blend mode of the latest commit. The synth ticker cannot
+	// safely read layer_accum (owned by the commit path), so layer_commit
+	// publishes it here. Staleness is harmless (blend mode changes only
+	// on app layer changes).
+	std::atomic<bool> last_alpha_blend{false};
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
+
+	// Serializes the record→submit→present→queue region across the
+	// EndFrame path and the synth ticker (reprojector, foveation UBO /
+	// descriptor writes, cmd buffer, resolve set, sem_value). Leaf lock:
+	// only ever taken alone, never nested inside another lock
+	// (queue_encode takes encode_mutex under it: commit → encode order
+	// everywhere, no reverse path). Uncontended fast path.
+	std::mutex commit_mutex;
 
 	std::mutex encode_mutex;
 	std::condition_variable_any encode_cv;
@@ -195,6 +211,27 @@ private:
 	}
 
 	int acquire_image();
+
+	void append_encoder_barriers(
+	        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> & barriers,
+	        int image_idx,
+	        const to_headset::video_stream_data_shard::view_info_t & info);
+
+	// Submits a fully recorded command buffer on the compositor queue,
+	// signaling the timeline semaphore. Returns the signaled value for
+	// the present call. Called with commit_mutex held.
+	uint64_t submit_cmd_buffer(vk::raii::CommandBuffer & cmd);
+
+	// Presents one fully-recorded image to all encoders and records
+	// their slots. Returns false when no stream could present within the
+	// bounded slot wait (tick dropped; caller releases the image).
+	// Partial presents queue normally (the worker skips the -1 streams).
+	bool present_to_encoders(
+	        int image_idx,
+	        const to_headset::video_stream_data_shard::view_info_t & info,
+	        int64_t frame_id,
+	        const vk::SemaphoreSubmitInfo & sem_info,
+	        std::array<int8_t, 3> & slots);
 
 	void queue_encode(int image, const std::array<int8_t, 3> & slots);
 

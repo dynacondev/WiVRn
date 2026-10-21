@@ -296,8 +296,7 @@ int video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info,
 {
 	wivrn::trace::scope trace_present(wivrn::trace::cpu_track::encoder, stream_idx, frame_index, "present_image");
 	// Wait for encoder to be done
-	present_cursor = (present_cursor + 1) % num_slots;
-	uint8_t slot = present_cursor;
+	uint8_t slot = present_cursor.fetch_add(1) % num_slots;
 	{
 		// Poll instead of an unbounded atomic wait, bounded at 1 s: a
 		// wedged encoder must drop the tick, never park the commit
