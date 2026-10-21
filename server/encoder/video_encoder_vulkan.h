@@ -87,6 +87,11 @@ protected:
 	vk::VideoEncodeRateControlLayerInfoKHR rate_control_layer;
 	std::optional<vk::VideoEncodeRateControlInfoKHR> rate_control;
 
+	// VPS/SPS/PPS depend only on the immutable session parameters: fetched
+	// once, then reused for every IDR frame (avoids a synchronous driver
+	// call on the encode hot path).
+	std::optional<std::vector<uint8_t>> idr_data_cache;
+
 	video_encoder_vulkan(wivrn::vk_bundle & vk,
 	                     const vk::VideoCapabilitiesKHR & video_caps,
 	                     const vk::VideoEncodeCapabilitiesKHR & encode_caps,
