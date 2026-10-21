@@ -646,14 +646,14 @@ configuration::configuration()
 		if (auto it = json.find("reprojection"); it != json.end())
 		{
 			if (not it->is_object())
-			{
 				U_LOG_W("reprojection must be an object, ignoring");
-				return;
+			else
+			{
+				if (auto jt = it->find("enabled"); jt != it->end())
+					reprojection.enabled = *jt;
+				if (auto jt = it->find("source-reverse-z"); jt != it->end())
+					reprojection.source_reverse_z = *jt;
 			}
-			if (auto jt = it->find("enabled"); jt != it->end())
-				reprojection.enabled = *jt;
-			if (auto jt = it->find("source-reverse-z"); jt != it->end())
-				reprojection.source_reverse_z = *jt;
 		}
 
 		if (auto it = json.find("port"); it != json.end())

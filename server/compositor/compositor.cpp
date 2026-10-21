@@ -43,6 +43,7 @@
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <thread>
 #ifdef XRT_FEATURE_RENDERDOC
@@ -378,9 +379,16 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// be idle before recording: a synth submit may still be on the
 		// GPU (recording is serialized, execution is not). Bounded by one
 		// period; on timeout drop the tick rather than recording against
-		// in-flight work (the end-of-tick wait below reports a real wedge).
+		// in-flight work.
 		if (!wait_for_last_submit(display_period_ns))
 		{
+			static std::atomic<uint64_t> last_pre_record_timeout_ns{0};
+			uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+			if (now_ns - last_pre_record_timeout_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_pre_record_timeout_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("compositor: previous GPU work never completed, dropping frame");
+			}
 			comp_frame_clear_locked(&frame.rendering);
 			return XRT_SUCCESS;
 		}
@@ -1171,23 +1179,8 @@ void compositor::synth_work(std::stop_token tok)
 				synth_image = acquire_image();
 				if (synth_image < 0)
 					ok = false; // Pool momentarily full (commit in flight): skip silently.
-
 			}
 
-			if (ok)
-			{
-				// Shared upload state (UBOs, descriptor sets, resolve set)
-				// must be idle before recording: the other path may still be
-				// on the GPU (recording is serialized, execution is not).
-				// Bounded by one period; on timeout skip the tick instead of
-				// corrupting in-flight work.
-				if (!wait_for_last_submit(period_ns))
-				{
-					images[synth_image].busy = false;
-					synth_image = -1;
-					ok = false;
-				}
-			}
 			if (ok)
 			{
 				synth_pool.reset();
