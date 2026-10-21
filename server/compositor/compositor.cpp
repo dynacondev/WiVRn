@@ -656,6 +656,20 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					m_relation_chain_push_relation(&xrc, &head);
 					m_relation_chain_resolve(&xrc, &rel);
 					s.poses[view] = rel.pose;
+					// Hemisphere-normalize against the source: q and
+					// -q are the same rotation, but a flipped target
+					// trips readers (and any future blending) for no
+					// reason. The interpolator emits either hemisphere.
+					const auto & sq = src_pose[view].orientation;
+					auto & tq = s.poses[view].orientation;
+					float qdot = sq.x * tq.x + sq.y * tq.y + sq.z * tq.z + sq.w * tq.w;
+					if (qdot < 0)
+					{
+						tq.x = -tq.x;
+						tq.y = -tq.y;
+						tq.z = -tq.z;
+						tq.w = -tq.w;
+					}
 				}
 
 				// Valid flags are not sufficient: a stale identity packet
