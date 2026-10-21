@@ -562,7 +562,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// instead. Time-based, so recovery is automatic.
 	uint64_t warp_now_ns = os_monotonic_get_ns();
 	static uint64_t warp_cooldown_until_ns = 0;
-	const uint64_t warp_cooldown_ns = 5'000'000'000ull;
+	const uint64_t warp_cooldown_ns = 2'000'000'000ull;
 	bool warp_cooldown = warp_now_ns < warp_cooldown_until_ns;
 
 	// Depth reprojection for repeated app frames: this commit loop runs
@@ -662,8 +662,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				// (or interpolator miss) can arrive flagged valid. Reject
 				// target poses that imply impossible head motion versus
 				// the source pose — warping to those is what produces
-				// the catastrophic hole fractions, never real motion
-				// (thresholds are ~5x beyond violent human head motion).
+				// the catastrophic hole fractions, never real motion.
 				{
 					bool plausible = true;
 					float worst_ms = 0, worst_rs = 0;
@@ -685,7 +684,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 						float rs = angle / float(dt_s);
 						worst_ms = fmaxf(worst_ms, ms);
 						worst_rs = fmaxf(worst_rs, rs);
-						if (ms > 10.f or rs > 15.f)
+						// Deliberately tight: a tick this violent would
+						// splat mostly-holes and trip the hole breaker
+						// (seconds of blindness). A single repeat
+						// instead degrades far more gracefully.
+						if (ms > 10.f or rs > 12.f)
 							plausible = false;
 					}
 					if (not plausible)
@@ -767,7 +770,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			// compositor thread (that wedges streaming until a server
 			// restart). Release the in-flight image, keep any completed
 			// synthetics, cool down, and repeat this commit.
-			U_LOG_E("Depth warp threw (%s); repeating frames for 5 s", e.what());
+			U_LOG_E("Depth warp threw (%s); repeating frames for 2 s", e.what());
 			for (int k = synth_done; k < synth_wanted; ++k)
 			{
 				if (synths[k].image >= 0)
@@ -801,7 +804,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			if (warp_pixels > 0 and uint64_t(holes) > warp_pixels / 2)
 			{
 				warp_cooldown_until_ns = warp_now_ns + warp_cooldown_ns;
-				U_LOG_W("Depth warp: %u/%llu pixels unfilled, pausing warp for 5 s (repeat instead)",
+				U_LOG_W("Depth warp: %u/%llu pixels unfilled, pausing warp for 2 s (repeat instead)",
 				        holes, (unsigned long long)warp_pixels);
 				// Input dump for the degenerate case: a clean commit
 				// followed by a catastrophic one within milliseconds
