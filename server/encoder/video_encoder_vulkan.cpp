@@ -1082,10 +1082,37 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		return {};
 	}
 
-	auto [res, size] = query_pool.getResult<uint32_t>(encode_slot, 1, 0, vk::QueryResultFlagBits::eWait);
-	if (res != vk::Result::eSuccess)
+	// The matching fence already signaled, so the feedback query should
+	// be ready. Still, never wait unboundedly here: a query that never
+	// completes used to park encoder_work in eWait forever — which parks
+	// the compositor in present_image with zero logs. Poll up to 1 s like
+	// the fence waits, then drop the frame: the slot still clears, the
+	// compositor unparks, the next present resets this slot's query, and
+	// streaming resumes by itself.
+	vk::Result res = vk::Result::eNotReady;
+	uint32_t size = 0;
+	const uint64_t query_start_ns = os_monotonic_get_ns();
+	while (res == vk::Result::eNotReady)
 	{
-		std::cerr << "device.getQueryPoolResults: " << vk::to_string(res) << std::endl;
+		auto [r, s] = query_pool.getResult<uint32_t>(encode_slot, 1, 0, vk::QueryResultFlags{});
+		res = r;
+		size = s;
+		if (res != vk::Result::eNotReady and res != vk::Result::eSuccess)
+		{
+			U_LOG_W("video encoder %u: encode query failed (%s), dropping frame %lu",
+			        stream_idx, vk::to_string(res).c_str(), (unsigned long)frame_index);
+			return {};
+		}
+		if (res == vk::Result::eNotReady)
+		{
+			if (os_monotonic_get_ns() - query_start_ns > 1'000'000'000ull)
+			{
+				U_LOG_W("video encoder %u: encode query never completed for frame %lu, dropping it (wedged video engine?)",
+				        stream_idx, (unsigned long)frame_index);
+				return {};
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
 	}
 
 	if (auto s = ts_pool.collect(encode_slot))
