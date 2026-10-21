@@ -88,6 +88,23 @@ public:
 	        int64_t & out_present_slop_ns,
 	        int64_t & out_predicted_display_time_ns);
 
+	// Registers a server-synthesized tick (no app waitFrame behind it)
+	// and returns its frame id. Participates in in_flight_frames,
+	// feedback matching and phase tracking exactly like real
+	// predictions, so the existing learners keep working uniformly.
+	int64_t predict_synth(int64_t present_ns, int64_t predicted_display_time_ns);
+
+	// Next display tick strictly after `after_ns`, on the display grid.
+	// Grid phase comes from the feedback-locked last_ns, so no separate
+	// phase tracking is needed (residual constant offset = constant
+	// latency, not judder; the client's nearest-pick tolerates jitter).
+	int64_t next_display_tick_ns(int64_t after_ns);
+
+	// Pipeline lead for synth scheduling: present→decoded (learned p99)
+	// + render→display (learned mean). Learned from client feedback like
+	// everything else the pacer predicts.
+	int64_t present_lead_ns() const;
+
 	void on_feedback(const wivrn::from_headset::feedback &, const clock_offset &);
 
 	void mark_timing_point(
