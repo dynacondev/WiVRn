@@ -470,7 +470,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		int image = -1;
 		std::array<xrt_pose, 2> poses{};
-		std::array<int8_t, 3> enc_slots{-1, -1, -1};
 	};
 	commit_synth_frame synth{};
 	bool have_synth = false;
@@ -662,8 +661,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			// (dma-buf import chain, row 0 = top), independent of the color
 			// layer's flip_y: retained rows mirror so the images stay
 			// GL-ordered (row 0 = frustum bottom) whatever the color order.
-			// Retained refresh also stamps the synth source clock (the
-			// ticker's dead-app guard measures source age from here).
+			// Retained refresh also stamps the source clock (repeat-warp
+			// fabrication measures source age from here).
 			last_retained_ns.store(commit_ns);
 			retained_src_pose = src_pose;
 			retained_src_fov = src_fov;
@@ -752,6 +751,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				if (synth.image < 0)
 				{
 					// Pool exhausted: degrade to repeat (throttled above).
+					// Count it: the straight fallback still presents, so
+					// this is pool pressure, not a dropped tick.
+					wcounts.c_pool++;
 					synth_ok = false;
 				}
 			}

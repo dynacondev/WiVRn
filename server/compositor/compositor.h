@@ -132,10 +132,9 @@ private:
 	std::array<image, 4> images;
 	vk::raii::CommandBuffer cmd;
 	vk::raii::Semaphore sem;
-	// Monotonic timeline value, incremented per submit on either path.
-	// Atomic: both paths submit without holding commit_mutex across the
-	// queue lock (submit_cmd_buffer is self-synchronizing); the commit
-	// path additionally holds commit_mutex when it submits.
+	// Monotonic timeline value, incremented per submit. Atomic:
+	// submit_cmd_buffer is self-synchronizing via the queue mutex
+	// (submit order is signal order).
 	std::atomic<uint64_t> sem_value{0};
 
 	std::atomic<float> requested_refresh_rate;
@@ -181,10 +180,10 @@ private:
 	// harmless (blend mode changes only on app layer switches).
 	std::atomic<bool> last_alpha_blend{false};
 
-	// Last submitted timeline value (any path). Host-visible UBO and
-	// descriptor writes must not land while the GPU still reads them
-	// (recording is serialized by commit_mutex, but execution is async),
-	// so both paths wait — bounded — for this value's work before
+	// Last submitted timeline value. Host-visible UBO and descriptor
+	// writes must not land while the GPU still reads them (recording
+	// is serialized by commit_mutex, but execution is async), so the
+	// commit path waits — bounded — for this value's work before
 	// touching shared upload state. Set in submit_cmd_buffer.
 	std::atomic<uint64_t> last_submit_value{0};
 
@@ -273,13 +272,12 @@ private:
 
 	// Submits a fully recorded command buffer on the compositor queue,
 	// signaling the timeline semaphore and recording the value in
-	// sem_value (both paths). Self-synchronizing via the queue mutex
-	// (submit order is signal order); callable with or without
-	// commit_mutex.
+	// sem_value. Self-synchronizing via the queue mutex
+	// (submit order is signal order).
 	uint64_t submit_cmd_buffer(vk::raii::CommandBuffer & cmd);
 
 	// Host-visible UBO / descriptor writes must not land while the GPU
-	// still reads them from the other path's submit (recording is
+	// still reads them from an in-flight submit (recording is
 	// serialized by commit_mutex, execution is not). Bounded wait for the
 	// last submitted work; false on timeout or error, in which case the
 	// caller skips its warp (plain repeat / dropped tick) instead of
