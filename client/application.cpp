@@ -1039,6 +1039,14 @@ void application::initialize_vulkan()
 	        .shaderClipDistance = true,
 	};
 
+	// Anisotropic texture filtering (ground planes at grazing angles).
+	// Samplers are created in scene_renderer::get_sampler.
+	sampler_anisotropy_enabled = vk_physical_device.getFeatures().samplerAnisotropy;
+	if (sampler_anisotropy_enabled)
+		device_features.samplerAnisotropy = true;
+	else
+		spdlog::warn("Anisotropic filtering not supported by device, textures may shimmer at grazing angles");
+
 	vk::StructureChain device_create_info{
 	        vk::DeviceCreateInfo{
 	                .queueCreateInfoCount = 1,

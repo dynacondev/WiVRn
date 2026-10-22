@@ -134,6 +134,9 @@ private:
 
 	bool openxr_post_processing_supported = false;
 
+	// True when the Vulkan device was created with samplerAnisotropy enabled.
+	bool sampler_anisotropy_enabled = false;
+
 	bool session_running = false;
 	bool session_focused = false;
 	bool session_visible = false;
@@ -410,6 +413,11 @@ public:
 	static bool get_openxr_post_processing_supported()
 	{
 		return instance().openxr_post_processing_supported;
+	}
+
+	static bool get_sampler_anisotropy_enabled()
+	{
+		return instance().sampler_anisotropy_enabled;
 	}
 
 	static const hmd_traits & get_hmd_traits()
