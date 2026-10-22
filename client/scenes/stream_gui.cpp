@@ -984,7 +984,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	const float tab_width = wivrn::ui::metrics::sidebar_width;
 	const float top_bar_h = wivrn::ui::metrics::top_bar_height;
 	const float content_margin = wivrn::ui::metrics::content_margin;
-	const ImVec2 margin_around_window{50, 50};
+	// vertical margin is tighter than the sides: the sidebar nav list
+	// overflows by ~12px with 50px all around, 30px gives it room
+	// without touching the XR viewport/swapchain sizes
+	const ImVec2 margin_around_window{50, 30};
 
 	ImGuiStyle & style = ImGui::GetStyle();
 	imgui_ctx->new_frame(predicted_display_time);
