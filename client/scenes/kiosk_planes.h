@@ -23,6 +23,7 @@
 #include <entt/entity/fwd.hpp>
 #include <glm/vec3.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <array>
 #include <memory>
 #include <openxr/openxr.h>
 #include <random>
@@ -61,6 +62,10 @@ private:
 		XrTime t0 = 0;
 		XrDuration dur = 0;
 		float phase = 0;
+		// Arc-length table for constant-speed flight (33 samples over t in
+		// [0, 1]); rebuilt on every respawn.
+		std::array<float, 33> arclen{};
+		float total_len = 0.f;
 	};
 
 	::scene & scene_;
@@ -71,6 +76,7 @@ private:
 	void respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, double age_offset);
 	static glm::vec3 bezier(const flight & f, double t);
 	static glm::vec3 bezier_vel(const flight & f, double t);
+	static glm::vec3 bezier_acc(const flight & f, double t);
 };
 
 } // namespace wivrn
