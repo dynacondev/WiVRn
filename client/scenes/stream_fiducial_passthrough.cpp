@@ -1228,17 +1228,21 @@ void scenes::stream::gui_passthrough()
 			dirty = true;
 		}
 		ImGui::SameLine();
+		ImGui::BeginDisabled(!lut_supported);
 		if (ImGui::RadioButton("LUT", mode == (int)xr::passthrough_effect_mode::lut))
 		{
 			mode = (int)xr::passthrough_effect_mode::lut;
 			dirty = true;
 		}
+		ImGui::EndDisabled();
 		ImGui::SameLine();
+		ImGui::BeginDisabled(!lut_supported);
 		if (ImGui::RadioButton(_S("LUT mix"), mode == (int)xr::passthrough_effect_mode::interpolated_lut))
 		{
 			mode = (int)xr::passthrough_effect_mode::interpolated_lut;
 			dirty = true;
 		}
+		ImGui::EndDisabled();
 		fx.mode = (xr::passthrough_effect_mode)mode;
 
 		// BCS: brightness/contrast/saturation (CIELAB, Quest runtime).
@@ -1260,14 +1264,25 @@ void scenes::stream::gui_passthrough()
 		}
 		ImGui::EndDisabled();
 
-		// Mono false-color (luminance -> RGBA ramp).
+		// Mono false-color (luminance -> RGBA ramp). Stepper, not a combo:
+		// popups dangling past the panel split across GUI viewports.
 		ImGui::BeginDisabled(fx.mode != xr::passthrough_effect_mode::mono_rgba);
 		{
-			const char * monos[] = {"Gray", "Thermal", "Posterize"};
-			int cur = (int)fx.mono_preset;
-			if (ImGui::Combo(_S("Mono preset"), &cur, monos, 3))
+			static const char * mono_names[] = {"Gray", "Thermal", "Posterize"};
+			constexpr int mono_preset_count = (int)(sizeof(mono_names) / sizeof(mono_names[0]));
+			ImGui::Text("%s", _S("Mono preset"));
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##mono_prev", ImGuiDir_Left))
 			{
-				fx.mono_preset = (xr::passthrough_mono_preset)cur;
+				fx.mono_preset = (xr::passthrough_mono_preset)(((int)fx.mono_preset + mono_preset_count - 1) % mono_preset_count);
+				dirty = true;
+			}
+			ImGui::SameLine();
+			ImGui::TextUnformatted(mono_names[(int)fx.mono_preset]);
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##mono_next", ImGuiDir_Right))
+			{
+				fx.mono_preset = (xr::passthrough_mono_preset)(((int)fx.mono_preset + 1) % mono_preset_count);
 				dirty = true;
 			}
 		}
@@ -1279,7 +1294,7 @@ void scenes::stream::gui_passthrough()
 		// into the next GUI viewport and split across quads (chopped,
 		// detached look). ‹ › cycles with no popup.
 		static const char * lut_names[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
-		constexpr int lut_preset_count = 5;
+		constexpr int lut_preset_count = (int)(sizeof(lut_names) / sizeof(lut_names[0]));
 		auto lut_stepper = [&](const char * prev_id, const char * next_id, xr::passthrough_lut_preset & preset) {
 			if (ImGui::ArrowButton(prev_id, ImGuiDir_Left))
 			{

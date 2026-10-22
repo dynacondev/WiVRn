@@ -392,9 +392,14 @@ void xr::session::enable_passthrough(xr::system & system)
 		// bad_variant_access in add_passthrough_layer, skips end_frame,
 		// and all later acquire/release calls fail with
 		// CALL_ORDER_INVALID. Fall back to no passthrough instead.
+		// set_effects is inside the guard too: it only allocates on LUT
+		// preset changes, but a throw here would poison the frame loop
+		// the same way, so keep creation + first style atomic.
 		try
 		{
 			passthrough.emplace<xr::passthrough_fb>(*inst, *this);
+			if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+				fb->set_effects(effects_state);
 		}
 		catch (std::exception & e)
 		{
@@ -402,8 +407,6 @@ void xr::session::enable_passthrough(xr::system & system)
 			passthrough.emplace<std::monostate>();
 			return;
 		}
-		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-			fb->set_effects(effects_state);
 	}
 	else if (inst->has_extension(XR_HTC_PASSTHROUGH_EXTENSION_NAME))
 	{

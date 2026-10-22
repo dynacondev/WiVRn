@@ -287,6 +287,11 @@ void fill_mono_rgba(xr::passthrough_mono_preset preset, XrColor4f out[256])
 				out[i] = {cols[level][0], cols[level][1], cols[level][2], 1.0f};
 				break;
 			}
+			default:
+				// Unreachable via the GUI (combo/stepper only emit valid
+				// presets); fall back to gray rather than leaving garbage.
+				out[i] = {t, t, t, 1.0f};
+				break;
 		}
 	}
 }
@@ -332,8 +337,23 @@ XrPassthroughColorLutMETA xr::passthrough_fb::get_or_create_lut(passthrough_lut_
 
 void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 {
-	float opacity = clamp_opacity(fx.opacity);
-	XrColor4f edge{fx.edge_r, fx.edge_g, fx.edge_b, clamp_opacity(fx.edge_alpha)};
+	// Demo off: pristine passthrough regardless of the other fields, so
+	// unchecking the toggle (while passthrough stays live for another
+	// reason, e.g. a fiducial map) always restores the exact previous
+	// state instead of stranding the last demo values with no UI path back.
+	passthrough_effects v = fx;
+	if (not v.enabled)
+	{
+		v.opacity = 1.0f;
+		v.edge_alpha = 0.0f;
+		v.brightness = 0.0f;
+		v.contrast = 1.0f;
+		v.saturation = 1.0f;
+		v.mode = passthrough_effect_mode::off;
+	}
+
+	float opacity = clamp_opacity(v.opacity);
+	XrColor4f edge{v.edge_r, v.edge_g, v.edge_b, clamp_opacity(v.edge_alpha)};
 
 	XrPassthroughStyleFB style{
 	        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
@@ -345,9 +365,9 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 	XrPassthroughBrightnessContrastSaturationFB bcs{
 	        .type = XR_TYPE_PASSTHROUGH_BRIGHTNESS_CONTRAST_SATURATION_FB,
 	        .next = nullptr,
-	        .brightness = clamp_brightness(fx.brightness),
-	        .contrast = clamp_nonneg(fx.contrast),
-	        .saturation = clamp_nonneg(fx.saturation),
+	        .brightness = clamp_brightness(v.brightness),
+	        .contrast = clamp_nonneg(v.contrast),
+	        .saturation = clamp_nonneg(v.saturation),
 	};
 
 	XrPassthroughColorMapMonoToRgbaFB mono{
@@ -370,7 +390,7 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 	};
 
 	// Only one color struct may be chained; mode selects it.
-	switch (fx.mode)
+	switch (v.mode)
 	{
 		case passthrough_effect_mode::off:
 			break;
@@ -378,7 +398,7 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 			style.next = &bcs;
 			break;
 		case passthrough_effect_mode::mono_rgba:
-			fill_mono_rgba(fx.mono_preset, mono.textureColorMap);
+			fill_mono_rgba(v.mono_preset, mono.textureColorMap);
 			style.next = &mono;
 			break;
 		case passthrough_effect_mode::lut: {
@@ -392,11 +412,11 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 				}
 				break;
 			}
-			XrPassthroughColorLutMETA h = get_or_create_lut(fx.lut_preset, 32);
+			XrPassthroughColorLutMETA h = get_or_create_lut(v.lut_preset, 32);
 			if (h == XR_NULL_HANDLE)
 				break;
 			lut.colorLut = h;
-			lut.weight = clamp_opacity(fx.lut_weight);
+			lut.weight = clamp_opacity(v.lut_weight);
 			style.next = &lut;
 #else
 			break;
@@ -414,14 +434,15 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 				}
 				break;
 			}
-			XrPassthroughColorLutMETA ha = get_or_create_lut(fx.lut_preset, 32);
-			XrPassthroughColorLutMETA hb = get_or_create_lut(fx.lut_preset_b, 32);
+			XrPassthroughColorLutMETA ha = get_or_create_lut(v.lut_preset, 32);
+			XrPassthroughColorLutMETA hb = get_or_create_lut(v.lut_preset_b, 32);
 			if (ha == XR_NULL_HANDLE || hb == XR_NULL_HANDLE)
 				break;
 			interp.sourceColorLut = ha;
 			interp.targetColorLut = hb;
-			interp.weight = clamp_opacity(fx.lut_mix);
+			interp.weight = clamp_opacity(v.lut_mix);
 			style.next = &interp;
+			break;
 #else
 			break;
 #endif
@@ -431,9 +452,9 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 	auto apply_one = [&](XrPassthroughLayerFB layer, const char * name) {
 		XrResult res = xrPassthroughLayerSetStyleFB(layer, &style);
 		if (res != XR_SUCCESS)
-			spdlog::warn("xrPassthroughLayerSetStyleFB({}) failed mode={}: {}", name, (int)fx.mode, (int)res);
+			spdlog::warn("xrPassthroughLayerSetStyleFB({}) failed mode={}: {}", name, (int)v.mode, (int)res);
 		else
-			spdlog::debug("Passthrough style {}: opacity {:.2f} edge_a {:.2f} mode {}", name, opacity, (double)edge.a, (int)fx.mode);
+			spdlog::debug("Passthrough style {}: opacity {:.2f} edge_a {:.2f} mode {}", name, opacity, (double)edge.a, (int)v.mode);
 	};
 	apply_one(passthrough_layer, "flat");
 	if (projected_layer)

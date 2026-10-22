@@ -142,6 +142,9 @@ class passthrough_fb : public utils::handle<XrPassthroughFB>
 public:
 	passthrough_fb(instance &, session &);
 	~passthrough_fb();
+	// Move-only: moving assigns the LUT map without destroying the
+	// target's handles, so never move-assign a live instance (the
+	// variant only ever emplaces/destroys; no moves happen in practice).
 	passthrough_fb(passthrough_fb &&) noexcept = default;
 	passthrough_fb & operator=(passthrough_fb &&) noexcept = default;
 	passthrough_fb(const passthrough_fb &) = delete;
