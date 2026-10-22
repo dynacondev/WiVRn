@@ -402,6 +402,7 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 #else
 			break;
 #endif
+			break;
 		}
 		case passthrough_effect_mode::interpolated_lut: {
 #ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
