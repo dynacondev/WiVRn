@@ -1473,6 +1473,8 @@ void scenes::lobby::on_focused()
 	setup_passthrough();
 	discover.emplace();
 
+	kiosk_planes_.emplace(*this, layer_controllers);
+
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 }
@@ -1521,6 +1523,7 @@ void scenes::lobby::on_unfocused()
 
 	imgui_ctx.reset();
 	world = entt::registry{};
+	kiosk_planes_.reset();
 
 	input.reset();
 	left_hand.reset();

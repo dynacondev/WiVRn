@@ -24,6 +24,7 @@
 #include "audio/audio.h"
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
+#include "kiosk_planes.h"
 #include "render/debug_lines.h"
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
@@ -259,6 +260,7 @@ private:
 	XrTime last_kiosk_app_req = 0;
 	XrTime last_stream_kiosk_toggle = 0;
 	bool stream_chord_held = false;
+	std::optional<wivrn::kiosk_planes> kiosk_planes_;
 	std::atomic<bool> stream_apps_known = false;
 	bool has_active_simulation();
 	void update_stream_kiosk(XrTime predicted_display_time);

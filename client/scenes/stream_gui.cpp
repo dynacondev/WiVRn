@@ -1024,6 +1024,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	wivrn::ui::set_hover_haptic([this] { imgui_ctx->vibrate_on_hover(); });
 	wivrn::ui::set_tooltip_hook([this](const char * text) { imgui_ctx->tooltip(text); });
 
+	// model planes wheeling behind the waiting overlay (hidden otherwise)
+	if (kiosk_planes_)
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown);
+
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);
 	ImVec2 content_size{viewport_size - ImVec2{tab_width, 0} - margin_around_window * 2};
 	ImVec2 content_center = margin_around_window + content_size / 2 + ImVec2{tab_width, 0};

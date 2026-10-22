@@ -1082,6 +1082,10 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 	// kiosk overlay is display-only: no controller interaction
 	imgui_ctx->set_controllers_enabled(!kiosk_shown);
 
+	// model planes wheeling behind the overlay panel (hidden otherwise)
+	if (kiosk_planes_)
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, kiosk_shown);
+
 	ImGuiStyle & style = ImGui::GetStyle();
 	style.FontScaleMain = wivrn::ui::current().font_scale * wivrn::ui::metrics::font_base;
 

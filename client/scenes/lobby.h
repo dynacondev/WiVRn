@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "input_profile.h"
+#include "kiosk_planes.h"
 #include "utils/async.h"
 
 class wivrn_session;
@@ -125,6 +126,7 @@ class lobby : public scene_impl<lobby>
 	bool kiosk_shown = false;
 	XrTime last_kiosk_toggle = 0;
 	bool kiosk_chord_held = false;
+	std::optional<wivrn::kiosk_planes> kiosk_planes_;
 	glm::quat kiosk_orientation{1, 0, 0, 0};
 	bool kiosk_orientation_init = false;
 	// config half of the kiosk predicate (mode on, server configured);
