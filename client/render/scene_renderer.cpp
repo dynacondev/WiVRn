@@ -1402,6 +1402,7 @@ void scene_renderer::render(
 		        .front_face = primitive.front_face,
 		        .topology = primitive.topology,
 		        .blend_enable = material->blend_enable,
+		        .blend_additive = material->blend_additive,
 
 		        .nb_texcoords = 2, // TODO
 		        .skinning = !node.joints.empty(),

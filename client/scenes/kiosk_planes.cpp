@@ -26,7 +26,9 @@
 #include <functional>
 #include <glm/geometric.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <glm/ext/matrix_transform.hpp>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <numbers>
 #include <string>
@@ -36,8 +38,8 @@ namespace
 // tuning knobs, all device-tunable: model is ~13.4m wingspan in file units
 constexpr int plane_count = 4;
 constexpr float model_scale = 0.00675f; // ~0.13m wingspan
-constexpr double dur_min = 7.0;
-constexpr double dur_max = 11.0;
+constexpr double dur_min = 9.0;
+constexpr double dur_max = 14.0;
 constexpr double fade_in = 1.2;
 constexpr double fade_out = 2.0;
 
@@ -62,9 +64,29 @@ constexpr float exclusion_tan = 0.2679491924f; // tan(15 deg)
 // allowed more freedom than pitch, like a real aircraft.
 constexpr float min_leg_len = 0.45f;
 constexpr float max_yaw_turn = 1.3963f;    // 80 deg direction change per leg
-constexpr float min_turn_radius = 1.0f;    // legs must span this much arc per radian of turn: big turns go wide
+constexpr float min_turn_radius = 0.4f;    // legs must span this much arc per radian of turn: big turns go wide
+constexpr float max_flight_range = 5.0f;   // control points stay within this distance of the anchor
+constexpr float launch_yaw_dev = 3.14159265f; // full circle: spawn headings cover all directions, cone-trimmed into flybys
+constexpr float launch_pitch_dev = 0.5f;
+// Homing: with this probability per leg, steer back toward the anchor so
+// flights swing by the user instead of diffusing away forever. The
+// exclusion cone still trims anything inside 15 deg into a near miss.
+constexpr float homing_prob = 0.5f;
+constexpr float homing_blend = 0.55f;
+// Yaw sampling bias: legs always turn at least this fraction of the limit
+// so flights wiggle constantly instead of sneaking in near-straight legs.
+constexpr float min_turn_fraction = 0.25f;
 constexpr float max_pitch_change = 0.5236f; // 30 deg climb/dive change per leg
 constexpr float max_abs_pitch = 0.7854f;   // 45 deg absolute climb/dive
+
+// Engine trail ribbon: resampled while moving, fades out by age.
+constexpr size_t trail_points = 60;
+constexpr double trail_sample_dt = 1. / 30.;
+constexpr double trail_max_age = trail_points * trail_sample_dt;
+constexpr float trail_width_head = 0.02f;  // ribbon half-width at the engine (m)
+constexpr float trail_width_tail = 0.055f; // ... at the faded end
+constexpr float trail_alpha_max = 0.15f;
+constexpr glm::vec3 trail_tint{0.9f, 0.92f, 0.98f};
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -86,20 +108,27 @@ const paint paints[]{
         {{0.03f, 0.06f, 0.36f}, 0.10f},                // dark #0E1B8D navy
 };
 
-glm::vec3 random_unit(std::mt19937 & rng)
+} // namespace
+
+namespace
 {
-	std::uniform_real_distribution<float> dist(-1.f, 1.f);
-	glm::vec3 v(dist(rng), dist(rng), dist(rng));
-	if (glm::length(v) < 1e-3f)
-		return {0.f, 0.f, 1.f};
-	return glm::normalize(v);
-}
+struct trail_vertex
+{
+	glm::vec4 position;
+	glm::vec4 color;
+};
+
+constexpr size_t trail_verts_per_plane = trail_points * 5;
+constexpr size_t trail_indices_per_plane = (trail_points - 1) * 4 * 6;
+constexpr size_t trail_max_verts = size_t(plane_count) * trail_verts_per_plane;
+constexpr size_t trail_max_indices = size_t(plane_count) * trail_indices_per_plane;
+constexpr size_t trail_vert_bytes = trail_max_verts * sizeof(trail_vertex);
 } // namespace
 
 namespace wivrn
 {
 
-kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
+kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_layer_mask) :
         scene_(scene), rng_(std::random_device{}())
 {
 	for (int i = 0; i < plane_count; ++i)
@@ -178,6 +207,115 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 		visit(entity);
 		flights_.push_back(std::move(f));
 	}
+
+	// Measure the model OBB in plane-root space for the trail emitter: walk
+	// the first flight's subtree accumulating node transforms (the file's
+	// own rotations live on child nodes, so the raw primitive OBBs alone
+	// point the wrong way).
+	glm::vec3 obb_min{std::numeric_limits<float>::max()};
+	glm::vec3 obb_max{std::numeric_limits<float>::lowest()};
+	std::function<void(entt::entity, const glm::mat4 &)> measure = [&](entt::entity e, const glm::mat4 & parent) {
+		const auto & n = scene_.world.get<components::node>(e);
+		glm::mat4 m = parent * (glm::translate(glm::mat4(1), n.position) * glm::mat4(n.orientation) * glm::scale(glm::mat4(1), n.scale));
+		if (n.mesh)
+		{
+			for (auto & prim: n.mesh->primitives)
+			{
+				for (int i = 0; i < 8; ++i)
+				{
+					glm::vec3 corner{
+					        (i & 1) ? prim.obb_max.x : prim.obb_min.x,
+					        (i & 2) ? prim.obb_max.y : prim.obb_min.y,
+					        (i & 4) ? prim.obb_max.z : prim.obb_min.z,
+					};
+					glm::vec3 w = m * glm::vec4(corner, 1);
+					obb_min.x = std::min(obb_min.x, w.x);
+					obb_min.y = std::min(obb_min.y, w.y);
+					obb_min.z = std::min(obb_min.z, w.z);
+					obb_max.x = std::max(obb_max.x, w.x);
+					obb_max.y = std::max(obb_max.y, w.y);
+					obb_max.z = std::max(obb_max.z, w.z);
+				}
+			}
+		}
+		for (auto && [child, child_node]: scene_.world.view<components::node>().each())
+		{
+			if (child_node.parent == e)
+				measure(child, m);
+		}
+	};
+	measure(flights_.front().root, glm::mat4(1));
+	// Nose points along +Z: emit at the tail center.
+	tail_root = {(obb_min.x + obb_max.x) * 0.5f, (obb_min.y + obb_max.y) * 0.5f, obb_min.z};
+
+	// Shared trail ribbon: one node/primitive holding every flight's
+	// camera-facing strip (debug_draw shaders: unlit position+color).
+	trail_entity = scene_.world.create();
+	auto & trail_node = scene_.world.emplace<components::node>(trail_entity);
+	trail_node.name = "kiosk-trails";
+	trail_node.layer_mask = trail_layer_mask;
+	trail_node.visible = false;
+
+	trail_mesh = std::make_shared<renderer::mesh>();
+	auto & prim = trail_mesh->primitives.emplace_back();
+	prim.indexed = true;
+	prim.index_type = vk::IndexType::eUint16;
+	prim.index_offset = trail_vert_bytes;
+	prim.topology = vk::PrimitiveTopology::eTriangleList;
+	prim.cull_mode = vk::CullModeFlagBits::eNone;
+	prim.vertex_shader = "debug_draw.vert";
+	prim.layout.add_vertex_attribute("Position", vk::Format::eR32G32B32A32Sfloat, 0, 0);
+	prim.layout.add_vertex_attribute("Color", vk::Format::eR32G32B32A32Sfloat, 0, 1);
+	prim.obb_min = {-10.f, -10.f, -10.f};
+	prim.obb_max = {10.f, 10.f, 10.f};
+	prim.material_ = scene_.create_material([](renderer::material & m) {
+		m.name = "kiosk-trail";
+		m.fragment_shader = "debug_draw.frag";
+		m.blend_enable = true;
+		// Additive: overlapping trail segments sum order-independently
+		// instead of slicing each other out with sorted over-blends.
+		m.blend_additive = true;
+		m.depth_write_enable = false;
+	});
+
+	trail_buffer = std::make_shared<buffer_allocation>(
+	        scene_.device,
+	        vk::BufferCreateInfo{
+	                .size = trail_vert_bytes + trail_max_indices * sizeof(uint16_t),
+	                .usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer,
+	        },
+	        VmaAllocationCreateInfo{
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+	        },
+	        "kiosk_planes::trails");
+
+	// Fixed strip topology: one independent 5-wide quad strip per flight.
+	// The across-width alpha profile (0 at the edges) makes the ribbon
+	// soft on all sides; length fade is written per-vertex each frame.
+	auto * index = reinterpret_cast<uint16_t *>(trail_buffer->map()) + trail_vert_bytes / sizeof(uint16_t);
+	for (int p = 0; p < plane_count; ++p)
+	{
+		for (size_t j = 0; j < trail_points - 1; ++j)
+		{
+			for (size_t k = 0; k < 4; ++k)
+			{
+				uint16_t a = uint16_t(p * trail_verts_per_plane + 5 * j + k);
+				*index++ = a;
+				*index++ = a + 1;
+				*index++ = a + 5;
+				*index++ = a + 1;
+				*index++ = a + 6;
+				*index++ = a + 5;
+			}
+		}
+	}
+
+	prim.vertex_offset.push_back(0);
+	prim.vertex_count = uint32_t(trail_max_verts);
+	prim.index_count = uint32_t(trail_max_indices);
+	trail_mesh->buffer = trail_buffer;
+	trail_node.mesh = trail_mesh;
 }
 
 glm::vec3 kiosk_planes::bezier(const flight & f, double t)
@@ -203,11 +341,10 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	glm::mat3 R = glm::mat3_cast(anchor_orient);
 	std::uniform_real_distribution<float> lateral(-0.3f, 0.3f);
 	std::uniform_real_distribution<float> vertical(-0.2f, 0.2f);
-	std::uniform_real_distribution<float> near_dist(0.8f, 1.4f);
-	std::uniform_real_distribution<float> mid_dist(1.0f, 1.8f);
-	std::uniform_real_distribution<float> far_dist(2.5f, 4.0f);
+	std::uniform_real_distribution<float> near_dist(0.6f, 1.0f);
+	std::uniform_real_distribution<float> mid_dist(0.8f, 1.3f);
+	std::uniform_real_distribution<float> far_dist(1.5f, 2.2f);
 	std::uniform_real_distribution<double> dur_dist(dur_min, dur_max);
-	std::uniform_real_distribution<float> phase_dist(0.f, 2.f * std::numbers::pi_v<float>);
 
 	auto clamp_height = [&](glm::vec3 v) {
 		v.y = std::clamp(v.y, anchor_pos.y - 0.6f, anchor_pos.y + 0.9f);
@@ -251,41 +388,69 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 			return 999.f; // near-vertical leg: force a resample
 		return std::acos(std::clamp(glm::dot(a / la, b / lb), -1.f, 1.f));
 	};
-	auto leg_ok = [&](const glm::vec3 & prev2, const glm::vec3 & prev1, const glm::vec3 & cand, bool check_turn) {
-		glm::vec3 d1 = cand - prev1;
-		if (glm::length(d1) < min_leg_len or std::abs(leg_pitch(d1)) > max_abs_pitch)
-			return false;
-		if (check_turn)
-		{
-			glm::vec3 d0 = prev1 - prev2;
-			if (glm::length(d0) < min_leg_len)
-				return false;
-			float yaw = yaw_change(d0, d1);
-			if (yaw > max_yaw_turn)
-				return false;
-			// Wide banks only: a large direction change needs long legs,
-			// otherwise it is a lightning-fast pivot, not a turn.
-			if (std::min(glm::length(d0), glm::length(d1)) < min_turn_radius * yaw)
-				return false;
-			if (std::abs(leg_pitch(d1) - leg_pitch(d0)) > max_pitch_change)
-				return false;
-		}
-		return true;
-	};
 
-	// Sample each control point off its base (user-cone push + height
-	// clamp applied), retrying while the leg/turn limits fail. Retries
-	// almost always succeed since the limits are loose vs the spread; the
-	// last candidate is kept as a rare fallback.
-	auto sample_point = [&](const glm::vec3 & base, const glm::vec3 & prev2, const glm::vec3 & prev1, bool check_turn, auto & dist_rng) {
-		glm::vec3 p = clamp_height(push_outside_cone(base + random_unit(rng_) * dist_rng(rng_)));
-		for (int attempt = 0; attempt < 12 and not leg_ok(prev2, prev1, p, check_turn); ++attempt)
-			p = clamp_height(push_outside_cone(base + random_unit(rng_) * dist_rng(rng_)));
+	// Sample each control point chained tip-to-tail off the previous point,
+	// steering around the previous leg direction: the achieved turn then
+	// matches the sampled one by construction (the old code sampled around
+	// the anchor, so the turn check measured a different vector than the
+	// sampler produced and the fallback kept invalid legs). Cone push and
+	// height clamp are verified after the fact with a few retries; the
+	// fallback flies straight, which always satisfies the turn limits.
+	auto sample_point = [&](const glm::vec3 & base, const glm::vec3 & prev2, const glm::vec3 & prev1, bool check_turn, auto & dist_rng, float yaw_lim, float pitch_lim, const glm::vec3 * launch_dir = nullptr) {
+		auto gen = [&]() {
+			glm::vec3 pd = launch_dir ? *launch_dir : prev1 - prev2;
+			float pp = launch_dir ? 0.f : leg_pitch(pd);
+			float p = std::clamp(pp + std::uniform_real_distribution<float>(-pitch_lim, pitch_lim)(rng_), -max_abs_pitch, max_abs_pitch);
+			float u = std::uniform_real_distribution<float>(-1.f, 1.f)(rng_);
+			float y = std::atan2(pd.x, pd.z) + (u >= 0.f ? 1.f : -1.f) * (min_turn_fraction + (1.f - min_turn_fraction) * std::abs(u)) * yaw_lim;
+			glm::vec3 d{std::cos(p) * std::sin(y), std::sin(p), std::cos(p) * std::cos(y)};
+			if (not launch_dir and std::uniform_real_distribution<float>(0.f, 1.f)(rng_) < homing_prob)
+			{
+				glm::vec3 to_anchor = anchor_pos - base;
+				if (glm::length(to_anchor) > 1e-3f)
+					d = glm::normalize(glm::mix(d, to_anchor / glm::length(to_anchor), homing_blend));
+			}
+			return base + d * dist_rng(rng_);
+		};
+		auto leg_ok = [&](const glm::vec3 & cand) {
+			glm::vec3 d1 = cand - prev1;
+			if (glm::length(d1) < min_leg_len or std::abs(leg_pitch(d1)) > max_abs_pitch)
+				return false;
+			if (glm::length(cand - anchor_pos) > max_flight_range)
+				return false;
+			if (check_turn)
+			{
+				glm::vec3 d0 = prev1 - prev2;
+				if (glm::length(d0) < min_leg_len)
+					return false;
+				float yaw = yaw_change(d0, d1);
+				if (yaw > max_yaw_turn)
+					return false;
+				// Wide banks only: a large direction change needs long legs,
+				// otherwise it is a lightning-fast pivot, not a turn.
+				if (std::min(glm::length(d0), glm::length(d1)) < min_turn_radius * yaw)
+					return false;
+				if (std::abs(leg_pitch(d1) - leg_pitch(d0)) > max_pitch_change)
+					return false;
+			}
+			return true;
+		};
+		glm::vec3 p = clamp_height(push_outside_cone(gen()));
+		for (int attempt = 0; attempt < 12 and not leg_ok(p); ++attempt)
+			p = clamp_height(push_outside_cone(gen()));
+		if (not leg_ok(p))
+		{
+			glm::vec3 pd = launch_dir ? *launch_dir : prev1 - prev2;
+			float pl = glm::length(pd);
+			glm::vec3 dn = pl > 1e-6f ? pd / pl : glm::vec3{0.f, 0.f, -1.f};
+			p = clamp_height(push_outside_cone(base + dn * dist_rng.max()));
+		}
 		return p;
 	};
-	f.p1 = sample_point(f.p0, f.p0, f.p0, false, near_dist);
-	f.p2 = sample_point(anchor_pos, f.p0, f.p1, true, mid_dist);
-	f.p3 = sample_point(anchor_pos, f.p1, f.p2, true, far_dist);
+	const glm::vec3 launch_dir = R * glm::vec3{0.f, 0.f, -1.f};
+	f.p1 = sample_point(f.p0, f.p0, f.p0, false, near_dist, launch_yaw_dev, launch_pitch_dev, &launch_dir);
+	f.p2 = sample_point(f.p1, f.p0, f.p1, true, mid_dist, max_yaw_turn, max_pitch_change);
+	f.p3 = sample_point(f.p2, f.p1, f.p2, true, far_dist, max_yaw_turn, max_pitch_change);
 
 	// Arc-length table for constant-speed flight: with clustered control
 	// points gone the curve is well-behaved, and walking it by distance
@@ -302,12 +467,16 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	}
 
 	f.dur = XrDuration(dur_dist(rng_) * 1e9);
-	f.phase = phase_dist(rng_);
 	double off = std::clamp(age_offset, 0., double(f.dur) * 1e-9);
 	f.t0 = now - XrTime(off * 1e9);
+	f.trail.clear();
+	f.trail_t.clear();
+	f.last_sample_t = 0;
+	f.dist_flown = 0.f;
+	f.prev_now = 0;
 }
 
-void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
+void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera)
 {
 	if (active && !was_active_)
 	{
@@ -342,26 +511,34 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		double dur = double(f.dur) * 1e-9;
 		if (age < 0.)
 			age = 0.;
-		if (age >= dur)
+		if (age >= dur or f.dist_flown >= f.total_len)
 		{
 			respawn(f, now, anchor_pos, anchor_orient, 0.);
 			continue;
 		}
-		double t = age / dur;
-
-		// Constant speed: map flight time to arc length, then to the curve
-		// parameter, so the plane no longer hangs almost still in tight spots
-		// and rushes the straights. Degenerate paths fall back to raw t.
-		float tt = float(t);
-		if (f.total_len > 1e-6f)
-		{
-			float s = f.total_len * float(t);
+		// Arc-length walk with climb-coupled airspeed: the plane works
+		// uphill and swoops downhill instead of holding exact constant
+		// speed, which reads as natural velocity variation without any
+		// pivoting. Degenerate paths fall back to raw time.
+		auto arc_param = [&](float dist) {
+			float s = std::clamp(dist, 0.f, f.total_len);
 			size_t seg = 1;
 			while (seg < f.arclen.size() - 1 and f.arclen[seg] < s)
 				++seg;
 			float s0 = f.arclen[seg - 1], s1 = f.arclen[seg];
-			tt = (float(seg - 1) + (s1 > s0 ? (s - s0) / (s1 - s0) : 0.f)) / float(f.arclen.size() - 1);
-		}
+			return (float(seg - 1) + (s1 > s0 ? (s - s0) / (s1 - s0) : 0.f)) / float(f.arclen.size() - 1);
+		};
+		float tt = f.total_len > 1e-6f ? arc_param(f.dist_flown) : float(age / std::max(dur, 1e-3));
+
+		glm::vec3 vel_probe = bezier_vel(f, tt);
+		float probe_len = glm::length(vel_probe);
+		float slope = probe_len > 1e-6f ? vel_probe.y / probe_len : 0.f;
+		float v_cruise = f.total_len / float(std::max(dur, 1e-3));
+		double dt = f.prev_now == 0 ? 1. / 60. : std::clamp(double(now - f.prev_now) * 1e-9, 0.001, 0.1);
+		f.prev_now = now;
+		float v = v_cruise * std::clamp(1.f - 0.35f * slope, 0.7f, 1.35f);
+		f.dist_flown = std::min(f.dist_flown + v * float(dt), f.total_len);
+		tt = f.total_len > 1e-6f ? arc_param(f.dist_flown) : tt;
 
 		glm::vec3 vel = bezier_vel(f, tt);
 		if (glm::length(vel) > 1e-6f)
@@ -385,8 +562,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			glm::vec3 acc = bezier_acc(f, tt);
 			float v2 = glm::dot(vel, vel);
 			float kappa = glm::dot(glm::cross(vel, acc), up0) / std::max(v2 * std::sqrt(v2), 1e-6f);
-			float v_time = f.total_len / float(std::max(dur, 1e-3));
-			float bank = std::clamp(bank_sign * -kappa * v_time * v_time * bank_gain, -bank_max, bank_max);
+			float bank = std::clamp(bank_sign * -kappa * v * v * bank_gain, -bank_max, bank_max);
 			orient = glm::angleAxis(bank, fwd) * orient;
 
 			if (model_yaw_adjust != 0.f)
@@ -395,7 +571,6 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		}
 
 		glm::vec3 pos = bezier(f, tt);
-		pos.y += 0.015f * std::sin(2. * std::numbers::pi * age * 0.7 + f.phase);
 		node->position = pos;
 
 		float alpha = float(smoothstep(0., fade_in, age) * (1. - smoothstep(dur - fade_out, dur, age)));
@@ -409,6 +584,116 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			material->staging.base_emissive_factor = glm::vec4(f.base_emissives[i] * alpha, 0.f);
 			std::memcpy(material->buffer->map(), &material->staging, sizeof(material->staging));
 			material->buffer->unmap();
+		}
+
+		// Record the engine position for the trail ribbon: the measured
+		// tail offset is already in world units at the construction
+		// scale, so only the orientation applies (uniform scale).
+		// A long stall (hidden overlay, hitches) clears the trail instead
+		// of streaking across the scene on resume.
+		glm::vec3 tail = pos + node->orientation * tail_root;
+		if (f.last_sample_t != 0 and double(now - f.last_sample_t) * 1e-9 > 0.5)
+		{
+			f.trail.clear();
+			f.trail_t.clear();
+		}
+		if (f.last_sample_t == 0 or double(now - f.last_sample_t) * 1e-9 >= trail_sample_dt)
+		{
+			f.trail.push_back(tail);
+			f.trail_t.push_back(now);
+			if (f.trail.size() > trail_points)
+			{
+				f.trail.erase(f.trail.begin());
+				f.trail_t.erase(f.trail_t.begin());
+			}
+			f.last_sample_t = now;
+		}
+		if (auto * trail_node = scene_.world.try_get<components::node>(trail_entity))
+			trail_node->visible = active;
+		f.trail_alpha = alpha;
+	}
+
+	if (active)
+		build_trail(camera, now);
+}
+
+void kiosk_planes::build_trail(const std::optional<glm::vec3> & camera, XrTime now)
+{
+	auto * verts = reinterpret_cast<trail_vertex *>(trail_buffer->map());
+	const glm::vec3 up{0.f, 1.f, 0.f};
+	constexpr double trail_max_age = trail_points * trail_sample_dt;
+
+	for (int p = 0; p < plane_count; ++p)
+	{
+		const flight & f = flights_[size_t(p)];
+		trail_vertex * out = verts + size_t(p) * trail_verts_per_plane;
+
+		// Slot j=0 is the newest sample; pad short trails with the oldest
+		// point (written at zero alpha below) so the fixed index buffer
+		// always has valid data. Fade keys off real sample age, not slot
+		// index, so a young trail never shows a hard end.
+		glm::vec3 ring[trail_points];
+		float ring_age[trail_points]{};
+		const size_t n = f.trail.size();
+		const bool live = n >= 2;
+		for (size_t j = 0; j < trail_points; ++j)
+		{
+			const size_t src = live ? n - 1 - std::min(j, n - 1) : 0;
+			ring[j] = live ? f.trail[src] : glm::vec3(0.f);
+			ring_age[j] = live ? float(double(now - f.trail_t[src]) * 1e-9) : 0.f;
+		}
+
+		glm::vec3 last_side{1.f, 0.f, 0.f};
+		for (size_t j = 0; j < trail_points; ++j)
+		{
+			const float t = float(j) / float(trail_points - 1); // 0 = engine, 1 = faded end
+			const glm::vec3 & pt = ring[j];
+
+			glm::vec3 dir = ring[std::min(j + 1, trail_points - 1)] - ring[j > 0 ? j - 1 : j];
+			glm::vec3 side = last_side;
+			if (glm::length(dir) > 1e-6f)
+			{
+				glm::vec3 dir_n = dir / glm::length(dir);
+				glm::vec3 axis = camera ? (*camera - pt) : up;
+				if (glm::length(axis) > 1e-6f)
+				{
+					glm::vec3 s = glm::cross(dir_n, axis / glm::length(axis));
+					if (glm::length(s) > 1e-4f)
+						side = s / glm::length(s);
+					else
+					{
+						s = glm::cross(dir_n, up);
+						if (glm::length(s) > 1e-4f)
+							side = s / glm::length(s);
+					}
+				}
+				last_side = side;
+			}
+
+			const float width = trail_width_head + (trail_width_tail - trail_width_head) * t;
+			// Gradual age falloff (long tail, not a hard end) times a head
+			// ramp over the first segments, so a young trail can never show
+			// a bright leading edge no matter the sample age. The tail ramp
+			// keys off the live point count (not the slot index): padding
+			// duplicates the oldest sample, so without it a young trail
+			// would end in a bright streak cut off at the last live point.
+			const float age_frac = std::clamp(ring_age[j] / float(trail_max_age), 0.f, 1.f);
+			const float envelope = std::pow(1.f - age_frac, 1.5f);
+			const float head_ramp = float(smoothstep(0., 8., double(j)));
+			const float tail_ramp = j < n ? 1.f - float(smoothstep(double(n > 4 ? n - 4 : 0), double(n > 1 ? n - 1 : 0), double(j))) : 0.f;
+			const float a = live ? trail_alpha_max * f.trail_alpha * envelope * head_ramp * tail_ramp : 0.f;
+
+			// Soft across-width profile: transparent edges, bright core.
+			constexpr float across[5] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
+			constexpr float across_alpha[5] = {0.f, 0.6f, 1.f, 0.6f, 0.f};
+			for (size_t k = 0; k < 5; ++k)
+			{
+				const float ak = a * across_alpha[k];
+				out[5 * j + k] = {
+				        glm::vec4(pt + side * (across[k] * width * 0.5f), 1.f),
+				        glm::vec4(trail_tint * ak, ak), // premultiplied
+				};
+			}
 		}
 	}
 }

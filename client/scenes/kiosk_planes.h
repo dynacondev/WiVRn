@@ -26,6 +26,7 @@
 #include <array>
 #include <memory>
 #include <openxr/openxr.h>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -43,11 +44,13 @@ namespace wivrn
 class kiosk_planes
 {
 public:
-	kiosk_planes(::scene & scene, uint32_t layer_mask);
+	kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_layer_mask);
 
 	// anchor is the overlay panel pose sampled this frame; only used when
 	// (re)spawning. Inactive planes are hidden and frozen.
-	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active);
+	// camera is the viewer position for billboarding the trails; without
+	// it the ribbons fall back to facing up.
+	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera);
 
 private:
 	struct flight
@@ -61,11 +64,21 @@ private:
 		glm::vec3 p0, p1, p2, p3;
 		XrTime t0 = 0;
 		XrDuration dur = 0;
-		float phase = 0;
 		// Arc-length table for constant-speed flight (33 samples over t in
 		// [0, 1]); rebuilt on every respawn.
 		std::array<float, 33> arclen{};
 		float total_len = 0.f;
+		// Distance flown along the path (arc-length walk) and timestamp of
+		// the last speed update, for climb-coupled airspeed.
+		float dist_flown = 0.f;
+		XrTime prev_now = 0;
+		// Engine trail history (world space, newest last) for the ribbon,
+		// with sample timestamps so the fade keys off real age.
+		std::vector<glm::vec3> trail;
+		std::vector<XrTime> trail_t;
+		XrTime last_sample_t = 0;
+		// Current plane fade, applied to the trail so it fades with the body.
+		float trail_alpha = 0.f;
 	};
 
 	::scene & scene_;
@@ -73,10 +86,23 @@ private:
 	std::mt19937 rng_;
 	bool was_active_ = false;
 
+	// Shared engine-trail ribbon: one node/primitive holding every flight's
+	// camera-facing strip, rebuilt on the CPU each frame.
+	entt::entity trail_entity = entt::null;
+	std::shared_ptr<renderer::mesh> trail_mesh;
+	std::shared_ptr<renderer::material> trail_material;
+	std::shared_ptr<buffer_allocation> trail_buffer;
+	// Emitter in construction-time world units (tail center of the measured
+	// model OBB at origin); only the plane orientation applies per frame
+	// since the node scale never changes after construction.
+	glm::vec3 tail_root{0.f};
+
 	void respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, double age_offset);
 	static glm::vec3 bezier(const flight & f, double t);
 	static glm::vec3 bezier_vel(const flight & f, double t);
 	static glm::vec3 bezier_acc(const flight & f, double t);
+
+	void build_trail(const std::optional<glm::vec3> & camera, XrTime now);
 };
 
 } // namespace wivrn
