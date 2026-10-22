@@ -292,6 +292,9 @@ static constexpr float kGateMaxAngleRad = 0.6f;
 static constexpr float kGateMaxDistM = 0.6f;
 static constexpr float kMaxWarpSpeedMps = 10.f;
 static constexpr float kMaxWarpSpeedRps = 12.f;
+// Retained-source age bound for repeat-warp fabrication: warping from
+// older sources repeats garbage instead of motion.
+static constexpr uint64_t kMaxRetainedAgeNs = 2'000'000'000ull;
 static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
                                   const std::array<xrt_pose, 2> & dst,
                                   double dt_s,
@@ -410,35 +413,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
-	// Inter-commit spacing (arrival clock) feeds the synth ticker's
-	// expected-commit skip below: a pipelined app commits ~a period
-	// behind the working tick. layer_commit runs once per app EndFrame.
+	// Arrival clock for retained-freshness and heartbeat cadence.
 	const uint64_t commit_ns = os_monotonic_get_ns();
 	const uint64_t display_period_ns = uint64_t(pacer.get_frame_duration());
-	const uint64_t last_commit = last_commit_ns.load();
-	last_commit_ns.store(commit_ns);
-	if (last_commit != 0 && commit_ns > last_commit)
-	{
-		// Smoothed spacing for the ticker's expected-commit skip.
-		// Updated only forward in time (clock confusion must not poison
-		// the estimate); EMA α=1/4 tracks rate changes within a few
-		// commits without jittering per-tick decisions.
-		uint64_t sample = commit_ns - last_commit;
-		uint64_t prev = last_spacing_ns.load(std::memory_order_relaxed);
-		if (prev == 0)
-			last_spacing_ns.store(sample, std::memory_order_relaxed);
-		else
-		{
-			int64_t d = int64_t(sample) - int64_t(prev);
-			last_spacing_ns.store(uint64_t(int64_t(prev) + d / 4), std::memory_order_relaxed);
-		}
-	}
 
 	int i = acquire_image();
 
-	// Pool exhaustion (real or synth): the encoder/GPU is backed up.
-	// The tick degrades to drop/repeat by design; one throttled line so
-	// a sustained stall is visible instead of a silent freeze.
+	// Pool exhaustion: the encoder/GPU is backed up. The tick degrades
+	// to drop/repeat by design; one throttled line so a sustained stall
+	// is visible instead of a silent freeze.
 	auto note_acquire_fail = [] {
 		static uint64_t last_ns = 0;
 		uint64_t now_ns = os_monotonic_get_ns();
@@ -472,13 +455,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
-	// Serialized with the synth ticker (commit_mutex): record + submit
-	// share the reprojector, foveation UBO / descriptor writes, cmd
-	// buffer, sem_value and last_submit_value. Released before the
-	// present calls (each encoder bounds its slot wait at 1 s) and
-	// before the trailing GPU waits, so a wedged tick never parks the
-	// other path — and the synth ticker does the same around its
-	// record.
+	// Serialized record region (commit_mutex): record + submit share
+	// the reprojector, foveation UBO / descriptor writes, cmd buffer,
+	// sem_value and last_submit_value. Released before the present
+	// calls (each encoder bounds its slot wait at 1 s) and before the
+	// trailing GPU waits, so a wedged tick never parks recording.
 	std::unique_lock commit_lock{commit_mutex};
 
 	// Hoisted for the catch + post-try tail: everything recorded or
@@ -610,10 +591,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			// No fast-path, squash layers. Multi-layer frames carry no
 			// depth source (warping a squashed composite has no valid
-			// per-pixel depth), so has_depth_src stays false and the
-			// synth ticker stands down until the next depth commit.
+			// per-pixel depth), so has_depth_src stays false and repeats
+			// go out straight until the next depth commit.
 			// Fine for fullscreen X-Plane; a transient overlay pauses
-			// synthesis while it is up.
+			// warping while it is up.
 			std::array<xrt_pose, 2> poses;
 			const auto extent = images[0].image.info().extent;
 			std::tie(poses, src_fov, src_rect) = squasher.do_layers(
@@ -649,7 +630,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			                },
 			        });
 		}
-		last_had_depth.store(has_depth_src);
 
 		image_barriers.push_back(
 		        vk::ImageMemoryBarrier2{
@@ -702,10 +682,116 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        /*flip_depth=*/true);
 		}
 
-		// 6DoF depth warp never runs on the commit path by design: true
-		// frames go out straight (plus client-side 3DoF timewarp) and
-		// fabrication happens only on the synth ticker when no fresh
-		// commit covers a tick. Retention above still feeds the ticker.
+		// Repeat-frame warp: the multi layer recommits at display rate,
+		// so most commits re-present the last app frame with an
+		// identical timestamp (!app_fresh). Fresh commits always go
+		// straight (plus client-side 3DoF timewarp); repeats are warped
+		// from the retained sources to this tick and served INSTEAD of
+		// the straight repeat (at most one warp per commit). The source
+		// is the last fresh frame, so the warp is only valid while
+		// retention is young (2 s dead-app bound); older than that the
+		// straight repeat is correct and a warp would be garbage.
+		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight.
+		uint64_t last_retained = last_retained_ns.load();
+		bool retained_fresh = last_retained != 0 && commit_ns - last_retained <= kMaxRetainedAgeNs;
+		if (!app_fresh and has_depth_src and depth_reprojection_enabled and !warp_disabled() and retained_fresh)
+		{
+			xrt_space_relation head{};
+			bool synth_ok = session.get_hmd().get_view_poses(
+			                nullptr,
+			                frame.rendering.predicted_display_time_ns,
+			                XRT_VIEW_TYPE_STEREO,
+			                2,
+			                &head,
+			                synth_fov.data(),
+			                synth.poses.data()) == XRT_SUCCESS;
+
+			// The tracker reports an unservable tick via the head relation
+			// flags while eye poses fall back to identity+offsets: warping
+			// to those produces garbage, so require a valid head pose and
+			// otherwise skip silently (repeat instead).
+			constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+			synth_ok = synth_ok && (head.relation_flags & need_pose) == need_pose;
+			if (synth_ok)
+			{
+				// get_view_poses returns head-relative eye offsets in
+				// poses plus the head-in-world relation (Monado device
+				// contract): compose world-space targets here.
+				for (int view = 0; view < 2; ++view)
+				{
+					xrt_relation_chain xrc{};
+					xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+					m_relation_chain_push_pose_if_not_identity(&xrc, &synth.poses[view]);
+					m_relation_chain_push_relation(&xrc, &head);
+					m_relation_chain_resolve(&xrc, &rel);
+					synth.poses[view] = rel.pose;
+				}
+				// The synthetic tick must postdate the app frame it
+				// replaces; otherwise the warp below is meaningless.
+				synth_ok = frame.rendering.predicted_display_time_ns > app_layer_ts_ns;
+			}
+			if (synth_ok)
+			{
+				// Plausibility gate (see helper): violent ticks splat
+				// mostly-holes; repeat instead.
+				float worst_ms = 0.f, worst_rs = 0.f;
+				float peak_dist_m = 0.f, peak_angle_rad = 0.f;
+				double dt_s = double(frame.rendering.predicted_display_time_ns - app_layer_ts_ns) / 1e9;
+				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs,
+				                           peak_dist_m, peak_angle_rad))
+				{
+					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
+					                           peak_dist_m, peak_angle_rad);
+					wcounts.c_gate++;
+					synth_ok = false;
+				}
+			}
+			if (synth_ok)
+			{
+				synth.image = acquire_image();
+				if (synth.image < 0)
+				{
+					// Pool exhausted: degrade to repeat (throttled above).
+					synth_ok = false;
+				}
+			}
+			if (synth_ok)
+			{
+				for (int view = 0; view < 2 && synth_ok; ++view)
+				{
+					// Target uses the fresh tracker FOV (not the
+					// render-time one): identical unless the headset
+					// mutates FOV mid-session.
+					synth_ok = reprojector.reproject(
+					        cmd,
+					        view,
+					        src_pose[view],
+					        src_fov[view],
+					        src_near_z[view],
+					        src_far_z[view],
+					        synth.poses[view],
+					        synth_fov[view]);
+				}
+				if (!synth_ok and synth.image >= 0)
+				{
+					// reproject() only fails on degenerate frustum input
+					// (non-finite or inverted near/far/FOV): throttled, since
+					// a bad upstream header would fail every tick.
+					static std::atomic<uint64_t> last_degenerate_ns{0};
+					uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
+					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+					{
+						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
+						U_LOG_W("compositor: warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, repeat instead)",
+						        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1]);
+					}
+					wcounts.c_degenerate++;
+					images[synth.image].busy = false;
+					synth.image = -1;
+				}
+			}
+			have_synth = synth_ok;
+		}
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
 
 		if (session.get_info().eye_gaze)
@@ -800,10 +886,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// exceptions, drops and skips. (Slots hoisted above the try.)
 		// Release the record lock before the bounded slot waits: present
 		// touches only per-image state (already exclusive via busy) and
-		// per-encoder state (own locks), so holding commit_mutex across
-		// up to 3 s of slot waits would park the synth ticker behind a
-		// wedged encoder. Submit order is already fixed via the queue
-		// mutex inside submit_cmd_buffer.
+		// per-encoder state (own locks). Submit order is already fixed
+		// via the queue mutex inside submit_cmd_buffer.
 		commit_lock.unlock();
 		if (warp_replaces_real)
 		{
@@ -868,10 +952,38 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		queue_encode(i, real_slots);
 		wcounts.c_straight++;
 	}
-	// This output serves the frame's predicted tick: the ticker treats
-	// ticks near a queued output as covered (nearest-pick duality with
-	// the client's frame selection).
-	last_output_ns.store(uint64_t(frame.rendering.predicted_display_time_ns));
+	// Warp-debug heartbeat, re-homed from the retired synth ticker:
+	// 5 s cadence on the commit path (every tick commits, so commit
+	// count is display cadence). Per-path commit rates including the
+	// fresh/repeat split, skip reasons, last GPU warp time, and live
+	// retained clip planes. Silent unless WIVRN_WARP_DEBUG=1.
+	if (warp_debug)
+	{
+		static std::atomic<uint64_t> last_heartbeat_ns{0};
+		uint64_t now_hb_ns = uint64_t(os_monotonic_get_ns());
+		uint64_t prev_hb_ns = last_heartbeat_ns.load(std::memory_order_relaxed);
+		if (now_hb_ns - prev_hb_ns > 5'000'000'000ull)
+		{
+			last_heartbeat_ns.store(now_hb_ns, std::memory_order_relaxed);
+			double dt_s = prev_hb_ns == 0 ? 5.0 : double(now_hb_ns - prev_hb_ns) / 1e9;
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f) gpu commit %lluns bias %lldns retained near %.3f far %.1f",
+			        wcounts.c_total.exchange(0) / dt_s,
+			        wcounts.c_straight.exchange(0) / dt_s,
+			        wcounts.c_warped.exchange(0) / dt_s,
+			        wcounts.c_dropped.exchange(0) / dt_s,
+			        (unsigned long long)wcounts.c_gate.exchange(0),
+			        (unsigned long long)wcounts.c_degenerate.exchange(0),
+			        (unsigned long long)wcounts.c_prewait.exchange(0),
+			        (unsigned long long)wcounts.c_pool.exchange(0),
+			        (unsigned long long)wcounts.c_present.exchange(0),
+			        wcounts.c_fresh.exchange(0) / dt_s,
+			        wcounts.c_repeat.exchange(0) / dt_s,
+			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
+			        (long long)pacer.learned_render_latency_ns(),
+			        dbg_retained_near.load(std::memory_order_relaxed),
+			        dbg_retained_far.load(std::memory_order_relaxed));
+		}
+	}
 
 	// End of the serialized region: everything below touches only
 	// commit-private or self-synchronizing state (timeline wait, query
@@ -1127,443 +1239,6 @@ bool compositor::present_to_encoders(
 	return presented_any;
 }
 
-void compositor::synth_work(std::stop_token tok)
-{
-	// Lead and staleness bounds (monotonic ns). The lead starts work
-	// early enough to present in time for the tick: pacer-learned
-	// pipeline latency + a warp estimate + a small margin.
-	// Overestimating only adds constant latency (the client holds early
-	// frames); the retained-age bound stops synthesis from a long-dead
-	// app (static scene repeats instead, which is correct).
-	static constexpr uint64_t kSynthWarpEstNs = 3'000'000;
-	static constexpr uint64_t kSynthMarginNs = 1'000'000;
-	static constexpr uint64_t kSynthMaxRetainedAgeNs = 2'000'000'000ull;
-
-	// Carried grid position: consumed one tick per iteration so the
-	// loop can never spin on the same tick (each pass either sleeps
-	// to its tick or resyncs forward past missed ones).
-	uint64_t next_tick_ns = 0;
-	uint64_t last_period_ns = 0;
-	// Previous synth submit's timestamps not yet collected (set after
-	// submit, cleared on successful non-blocking collect). Ticker-thread
-	// only: record (reset) and collect both happen here, in order.
-	bool synth_query_pending = false;
-	uint64_t last_heartbeat_ns = 0;
-
-	while (!tok.stop_requested())
-	{
-		uint64_t period_ns = pacer.get_frame_duration();
-		if (period_ns == 0)
-		{
-			std::unique_lock lock{synth_mutex};
-			synth_cv.wait_for(lock, tok, std::chrono::milliseconds(100), [] { return false; });
-			continue;
-		}
-		if (period_ns != last_period_ns)
-		{
-			// Refresh rate changed: re-seed the grid on the new period
-			// instead of walking the old spacing into the new cadence.
-			next_tick_ns = 0;
-			last_period_ns = period_ns;
-		}
-		uint64_t now_ns = uint64_t(os_monotonic_get_ns());
-		if (next_tick_ns <= now_ns)
-			next_tick_ns = uint64_t(pacer.next_display_tick_ns(int64_t(now_ns)));
-		uint64_t tick_ns = next_tick_ns;
-		next_tick_ns += period_ns;
-		uint64_t lead_ns = uint64_t(pacer.present_lead_ns()) + kSynthWarpEstNs + kSynthMarginNs;
-		uint64_t wake_ns = tick_ns > now_ns + lead_ns ? tick_ns - lead_ns : now_ns;
-		{
-			std::unique_lock lock{synth_mutex};
-			synth_cv.wait_for(lock, tok, std::chrono::nanoseconds(wake_ns > now_ns ? wake_ns - now_ns : 0), [] { return false; });
-		}
-		if (tok.stop_requested())
-			return;
-		now_ns = uint64_t(os_monotonic_get_ns());
-		wcounts.s_ticks++;
-
-		// 5 s delta heartbeat (warp-debug runs only): warp/skip accounting
-		// per path + last collected GPU warp times. Silent in prod.
-		// Placed before the skip gates so it fires even when every tick
-		// is covered or the app runs at full rate.
-		if (warp_debug && now_ns - last_heartbeat_ns > 5'000'000'000ull)
-		{
-			double dt_s = last_heartbeat_ns == 0 ? 5.0 : double(now_ns - last_heartbeat_ns) / 1e9;
-			last_heartbeat_ns = now_ns;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f) synth %.1f ticks/s (warped %.1f covered %.1f expected %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns retained near %.3f far %.1f",
-			        wcounts.c_total.exchange(0) / dt_s,
-			        wcounts.c_straight.exchange(0) / dt_s,
-			        wcounts.c_warped.exchange(0) / dt_s,
-			        wcounts.c_dropped.exchange(0) / dt_s,
-			        (unsigned long long)wcounts.c_gate.exchange(0),
-			        (unsigned long long)wcounts.c_degenerate.exchange(0),
-			        (unsigned long long)wcounts.c_prewait.exchange(0),
-			        (unsigned long long)wcounts.c_pool.exchange(0),
-			        (unsigned long long)wcounts.c_present.exchange(0),
-			        wcounts.c_fresh.exchange(0) / dt_s,
-			        wcounts.c_repeat.exchange(0) / dt_s,
-			        wcounts.s_ticks.exchange(0) / dt_s,
-			        wcounts.s_warped.exchange(0) / dt_s,
-			        wcounts.s_covered.exchange(0) / dt_s,
-			        wcounts.s_expected.exchange(0) / dt_s,
-			        wcounts.s_inactive.exchange(0) / dt_s,
-			        (unsigned long long)wcounts.s_gate.exchange(0),
-			        (unsigned long long)wcounts.s_degenerate.exchange(0),
-			        (unsigned long long)wcounts.s_prewait.exchange(0),
-			        (unsigned long long)wcounts.s_pool.exchange(0),
-			        (unsigned long long)wcounts.s_present.exchange(0),
-			        (unsigned long long)wcounts.s_lock.exchange(0),
-			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
-			        (unsigned long long)last_synth_warp_ns.load(std::memory_order_relaxed),
-			        (long long)last_raw_dt_ns.load(std::memory_order_relaxed),
-			        (long long)pacer.learned_render_latency_ns(),
-			        dbg_retained_near.load(std::memory_order_relaxed),
-			        dbg_retained_far.load(std::memory_order_relaxed));
-		}
-
-		// Collect the previous synth submit's GPU timestamps without
-		// waiting (availability flag only): zero added latency, ~1 tick
-		// stale data. Runs only when warp_debug enabled the writes.
-		if (warp_debug && synth_query_pending)
-		{
-			auto [res, ts] = synth_query_pool.getResults<uint64_t>(
-			        0,
-			        4,
-			        8 * sizeof(uint64_t),
-			        2 * sizeof(uint64_t),
-			        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
-			if (res == vk::Result::eSuccess && ts.size() >= 8 && (ts[1] & ts[3] & ts[5] & ts[7]))
-			{
-				static const auto qperiod = vk.physical_device.getProperties().limits.timestampPeriod;
-				synth_warp_times.add((ts[4] - ts[2]) * qperiod / 1e3);
-				last_synth_warp_ns.store(uint64_t((ts[4] - ts[2]) * qperiod), std::memory_order_relaxed);
-				synth_query_pending = false;
-			}
-		}
-
-		// No output within half a period of this tick means the tick is
-		// uncovered (nearest-pick duality with the client's frame
-		// selection: an output that close IS this tick's frame).
-		// Commits stamp predicted display times (= grid + learned render
-		// latency) while ticks live on the unshifted grid: subtract the
-		// learned latency so the comparison is grid-vs-grid. Without this
-		// a learned latency near half a period systematically covers or
-		// uncovers every tick.
-		int64_t half_period_ns = int64_t(period_ns / 2);
-		int64_t render_bias_ns = pacer.learned_render_latency_ns();
-		int64_t cover_dt = int64_t(tick_ns) - (int64_t(last_output_ns.load()) - render_bias_ns);
-		last_raw_dt_ns.store(int64_t(tick_ns) - int64_t(last_output_ns.load()), std::memory_order_relaxed);
-		bool covered = cover_dt <= half_period_ns && cover_dt >= -half_period_ns;
-		uint64_t last_retained = last_retained_ns.load();
-		bool retained_fresh = last_retained != 0 && now_ns - last_retained <= kSynthMaxRetainedAgeNs;
-		if (covered)
-		{
-			wcounts.s_covered++;
-			continue;
-		}
-		if (!retained_fresh || !depth_reprojection_enabled || !last_had_depth.load() || !session.connected() || !session.get_offset() || warp_disabled())
-		{
-			wcounts.s_inactive++;
-			continue;
-		}
-
-		// Expected-commit skip: the app covers ticks on its own cadence,
-		// possibly arriving after this decision (a pipelined app commits
-		// ~a period behind the working tick, so "no output yet" does not
-		// mean "no output coming"). Skip ticks that coincide with an
-		// expected commit; synthesize only true gaps. Without this, an
-		// equal-rate pipelined app gets every tick duplicated (commit
-		// presents its frame AND the ticker warps it). A stalled app (no
-		// commit for 2+ spacings) gets synthesis everywhere, retained-
-		// bounded below. Windows tile the timeline, so phase luck plays
-		// no part: equal-rate apps always coincide, slow apps coincide
-		// only on their own ticks.
-		{
-			uint64_t last_c = last_commit_ns.load(std::memory_order_relaxed);
-			uint64_t est_s = last_spacing_ns.load(std::memory_order_relaxed);
-			if (last_c != 0 && est_s > 0)
-			{
-				int64_t quiet_ns = int64_t(now_ns) - int64_t(last_c);
-				uint64_t stall_bound_ns = std::max(2 * est_s, period_ns + period_ns / 2);
-				bool stalled = quiet_ns > int64_t(stall_bound_ns);
-				if (!stalled)
-				{
-					int64_t dt_c = int64_t(tick_ns) - int64_t(last_c);
-					if (dt_c >= 0)
-					{
-						uint64_t r = uint64_t(dt_c) % est_s;
-						uint64_t half = period_ns / 2;
-						if (r <= half || est_s - r <= half)
-						{
-							wcounts.s_expected++;
-							continue;
-						}
-					}
-				}
-			}
-		}
-
-		int synth_image = -1;
-		std::array<xrt_pose, 2> synth_poses{};
-		std::array<xrt_fov, 2> synth_fov{};
-		int64_t synth_id = -1;
-		bool have_synth = false;
-		std::array<int8_t, 3> synth_slots{-1, -1, -1};
-		try
-		{
-			// Opportunistic lock: a commit in flight has absolute priority
-			// on the pool (skipping one synth is always cheaper than
-			// dropping its fresh frame). No waiting here.
-			std::unique_lock commit_lock{commit_mutex, std::try_to_lock};
-			if (!commit_lock.owns_lock())
-			{
-				wcounts.s_lock++;
-				continue;
-			}
-			// Re-verify under lock: an EndFrame may have committed (and
-			// queued) while we slept.
-			int64_t cover_dt2 = int64_t(tick_ns) - (int64_t(last_output_ns.load()) - render_bias_ns);
-			bool covered2 = cover_dt2 <= half_period_ns && cover_dt2 >= -half_period_ns;
-			if (covered2)
-				wcounts.s_covered++;
-			bool ok = !covered2;
-			// Shared upload state (UBOs, descriptor sets) must be idle
-			// before recording: the commit path's submit may still be on
-			// the GPU (recording is serialized, execution is not).
-			// Bounded by one period; on timeout skip the tick instead of
-			// corrupting in-flight work. This also covers the command-pool
-			// reset below (the pool is only reset after this wait).
-			if (ok && !wait_for_last_submit(period_ns))
-			{
-				wcounts.s_prewait++;
-				ok = false;
-			}
-			if (ok)
-				ok = reprojector.has_retained();
-			xrt_space_relation head{};
-			if (ok)
-			{
-				if (session.get_hmd().get_view_poses(
-				            nullptr,
-				            int64_t(tick_ns),
-				            XRT_VIEW_TYPE_STEREO,
-				            2,
-				            &head,
-				            synth_fov.data(),
-				            synth_poses.data()) != XRT_SUCCESS)
-					ok = false;
-			}
-			constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
-			if (ok && (head.relation_flags & need_pose) != need_pose)
-				ok = false;
-			if (ok)
-			{
-				for (int view = 0; view < 2; ++view)
-				{
-					xrt_relation_chain xrc{};
-					xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
-					m_relation_chain_push_pose_if_not_identity(&xrc, &synth_poses[view]);
-					m_relation_chain_push_relation(&xrc, &head);
-					m_relation_chain_resolve(&xrc, &rel);
-					synth_poses[view] = rel.pose;
-				}
-			}
-			if (ok)
-			{
-				// The tick must postdate the retained frame: warping
-				// backward is never meaningful (guards clock confusion).
-				ok = tick_ns > last_retained_ns.load();
-			}
-			if (ok)
-			{
-				// Plausibility gate (see helper): violent ticks splat
-				// mostly-holes; skip the tick instead.
-				float worst_ms = 0.f, worst_rs = 0.f;
-				float peak_dist_m = 0.f, peak_angle_rad = 0.f;
-				double dt_s = double(tick_ns - last_retained_ns.load()) / 1e9;
-				if (!warp_motion_plausible(retained_src_pose, synth_poses, dt_s, worst_ms, worst_rs,
-				                           peak_dist_m, peak_angle_rad))
-				{
-					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
-					                           peak_dist_m, peak_angle_rad);
-					wcounts.s_gate++;
-					ok = false;
-				}
-			}
-			if (ok)
-			{
-				synth_image = acquire_image();
-				if (synth_image < 0)
-				{
-					wcounts.s_pool++;
-					ok = false; // Pool momentarily full (commit in flight): skip silently.
-				}
-			}
-
-			if (ok)
-			{
-				synth_pool.reset();
-				synth_cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
-				if (warp_debug)
-				{
-					synth_cmd.resetQueryPool(*synth_query_pool, 0, 4);
-					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *synth_query_pool, 0);
-				}
-
-				// Fresh or recycled images start UNDEFINED (same as the commit
-				// path: UNDEFINED discards, valid for any actual layout).
-				std::array image_barrier{
-				        vk::ImageMemoryBarrier2{
-				                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-				                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-				                .oldLayout = vk::ImageLayout::eUndefined,
-				                .newLayout = vk::ImageLayout::eGeneral,
-				                .image = images[synth_image].image,
-				                .subresourceRange = {
-				                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-				                        .levelCount = 1,
-				                        .layerCount = images[synth_image].image.info().arrayLayers,
-				                },
-				        },
-				};
-				synth_cmd.pipelineBarrier2({
-				        .imageMemoryBarrierCount = uint32_t(image_barrier.size()),
-				        .pImageMemoryBarriers = image_barrier.data(),
-				});
-				if (warp_debug)
-					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *synth_query_pool, 1);
-			}
-			if (ok)
-			{
-				for (int view = 0; view < 2 && ok; ++view)
-				{
-					ok = reprojector.reproject(
-					        synth_cmd,
-					        view,
-					        retained_src_pose[view],
-					        retained_src_fov[view],
-					        retained_src_near[view],
-					        retained_src_far[view],
-					        synth_poses[view],
-					        synth_fov[view]);
-				}
-				if (!ok && synth_image >= 0)
-				{
-					// reproject() only fails on degenerate frustum input
-					// (non-finite or inverted near/far/FOV): throttled, since
-					// a bad upstream header would fail every tick.
-					static std::atomic<uint64_t> last_degenerate_ns{0};
-					uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
-					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
-					{
-						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
-						U_LOG_W("compositor: synth warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, skipping tick)",
-						        retained_src_near[0], retained_src_near[1], retained_src_far[0], retained_src_far[1]);
-					}
-					wcounts.s_degenerate++;
-					images[synth_image].busy = false;
-					synth_image = -1;
-				}
-				if (warp_debug && ok)
-					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *synth_query_pool, 2);
-			}
-			if (ok)
-			{
-				synth_id = pacer.predict_synth(int64_t(tick_ns), int64_t(tick_ns));
-				images[synth_image].frame_index = uint64_t(synth_id);
-
-				const auto synth_extent = images[0].image.info().extent;
-				std::array<xrt_rect, 2> synth_rect{
-				        xrt_rect{
-				                .offset = {.w = 0, .h = 0},
-				                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
-				        },
-				        xrt_rect{
-				                .offset = {.w = 0, .h = 0},
-				                .extent = {.w = int(synth_extent.width), .h = int(synth_extent.height)},
-				        },
-				};
-				// Load once: the blend mode is published per commit and only
-				// changes on app layer switches, so a torn read would only
-				// mix one frame's worth of alpha handling.
-				const bool alpha_blend = last_alpha_blend.load();
-				auto synth_foveation = foveation.foveate(
-				        vk.device,
-				        synth_cmd,
-				        images[synth_image].view_y,
-				        images[synth_image].view_cbcr,
-				        true, // warped targets are always GL-ordered
-				        reprojector.get_views(),
-				        synth_rect,
-				        synth_fov,
-				        alpha_blend);
-
-				images[synth_image].view_info = {
-				        .display_time = session.get_offset().to_headset(int64_t(tick_ns)),
-				        .alpha = alpha_blend,
-				};
-				for (int view = 0; view < 2; ++view)
-				{
-					images[synth_image].view_info.pose[view] = xrt_cast(synth_poses[view]);
-					images[synth_image].view_info.fov[view] = xrt_cast(synth_fov[view]);
-					images[synth_image].view_info.foveation[view] = synth_foveation[view];
-				}
-
-
-				beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> image_barriers;
-				append_encoder_barriers(image_barriers, synth_image, images[synth_image].view_info);
-				synth_cmd.pipelineBarrier2({
-				        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
-				        .pImageMemoryBarriers = image_barriers.data(),
-				});
-
-				if (warp_debug)
-					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *synth_query_pool, 3);
-
-				synth_cmd.end();
-				have_synth = true;
-			}
-		if (!have_synth)
-			continue;
-		// Submit under the record lock (like the commit path): this
-		// publishes last_submit_value before any other path can pass
-		// its pre-record wait, so no record can start against
-		// in-flight upload state. Submit only takes the queue mutex
-		// (non-blocking). The slow bounded slot waits in
-		// present_to_encoders run unlocked below.
-		uint64_t sem_value_now = submit_cmd_buffer(synth_cmd);
-		const vk::SemaphoreSubmitInfo sem_info{
-		        .semaphore = *sem,
-		        .value = sem_value_now,
-		        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
-		};
-		synth_query_pending = warp_debug;
-		commit_lock.unlock();
-		if (!present_to_encoders(synth_image, images[synth_image].view_info, synth_id, sem_info, synth_slots))
-		{
-			images[synth_image].busy = false;
-			wcounts.s_present++;
-			continue;
-		}
-		queue_encode(synth_image, synth_slots);
-		wcounts.s_warped++;
-		last_output_ns.store(tick_ns);
-		}
-		catch (...)
-		{
-			// Same guarantee as the commit path: a record, submit or
-			// present throw must release what was acquired, never the
-			// thread (a dead ticker stops all synthesis silently). The
-			// encoder already released its own slot and logged.
-			for (size_t ei = 0; ei < encoders.size(); ++ei)
-				if (synth_slots[ei] >= 0)
-					encoders[ei]->release_slot(uint8_t(synth_slots[ei]));
-			if (synth_image >= 0)
-				images[synth_image].busy = false;
-			continue;
-		}
-	}
-}
 
 void compositor::queue_encode(int image, const std::array<int8_t, 3> & slots)
 {
@@ -1692,15 +1367,6 @@ compositor::compositor(wivrn_session & session) :
                                       .queryType = vk::QueryType::eTimestamp,
                                       .queryCount = 4,
                               }),
-        synth_pool(vk.device, vk::CommandPoolCreateInfo{
-                                    .flags = vk::CommandPoolCreateFlagBits::eTransient,
-                                    .queueFamilyIndex = vk.queue.family_index,
-                            }),
-        synth_cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *synth_pool, .commandBufferCount = 1})[0])},
-        synth_query_pool(vk.device, vk::QueryPoolCreateInfo{
-                                          .queryType = vk::QueryType::eTimestamp,
-                                          .queryCount = 4,
-                                  }),
         warp_debug(warp_debug_enabled()),
         settings(get_encoder_settings(vk, session)),
         images{make_images(vk, cmd_pool, settings)},
@@ -1772,7 +1438,6 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &warp_times.var, "depth warp");
-	u_var_add_f32_timing(this, &synth_warp_times.var, "synth depth warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
 	U_LOG_I("depth warp %s (source-reverse-z %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
@@ -1780,19 +1445,13 @@ compositor::compositor(wivrn_session & session) :
 	if (warp_disabled())
 		U_LOG_I("depth warp kill-switch active (WIVRN_WARP_DISABLE=1): serving straight/repeat for A/B triage");
 
-	// Start the threads after everything is initialized. The synth
-	// ticker is declared after the encoder thread so it stops (and
-	// joins) first: it produces frames, the worker drains them.
+	// Start the worker thread after everything is initialized.
 	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};
-	synth_thread = std::jthread{[&](std::stop_token t) { synth_work(t); }};
 }
 
 compositor::~compositor()
 {
 	u_var_remove_root(this);
-	synth_thread.request_stop();
-	synth_cv.notify_all();
-	synth_thread.join();
 	encoder_thread.request_stop();
 	encode_cv.notify_all();
 	comp_base * c_base = this;
@@ -1841,13 +1500,9 @@ void compositor::set_framerate(float hz)
 	U_LOG_IFL_D(log_level, "Framerate change from %.0f to %.0f", frame_rate.load(), hz);
 	pacer.set_frame_duration(U_TIME_1S_IN_NS / hz);
 	// Display ticks moved: forget the last app timestamp so the next
-	// commit counts as fresh, and the arrival spacing so it never counts
-	// as stale (no spurious replacement warp). Also forget retained
-	// freshness: the next frames may come from a different scene.
+	// commit counts as fresh. Also forget retained freshness: the next
+	// frames may come from a different scene.
 	last_app_layer_ts.store(-1);
-	last_commit_ns.store(0);
-	last_spacing_ns.store(0);
-	last_had_depth.store(false);
 	last_retained_ns.store(0);
 	for (auto & encoder: encoders)
 		encoder->set_framerate(hz);
@@ -1868,9 +1523,6 @@ void compositor::resume()
 	for (auto & encoder: encoders)
 		encoder->reset();
 	last_app_layer_ts.store(-1);
-	last_commit_ns.store(0);
-	last_spacing_ns.store(0);
-	last_had_depth.store(false);
 	last_retained_ns.store(0);
 	send_video_stream_description();
 }

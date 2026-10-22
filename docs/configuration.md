@@ -124,12 +124,11 @@ with its depth.
 Default value: `true`
 
 Master switch for the warp. `false` disables synthesis entirely (repeat
-last frame). When enabled and the app runs slower than the display, the
-synth ticker synthesizes warped frames at display cadence so the client
-stops repeating stale ones; fresh app frames always go out straight
-(plus client-side 3DoF timewarp). The commit path never 6DoF-warps a
-just-published frame — 6DoF fires only to fabricate intermediate ticks
-no fresh commit covers.
+last frame). When enabled, the commit path serves fresh app frames
+straight (plus client-side 3DoF timewarp) and 6DoF-warps display-tick
+replays of the last frame, so the client stops repeating stale ones;
+there is no separate synthesis thread — fabrication happens inline on
+repeat commits, at most one warp per commit.
 
 ### `source-reverse-z`
 Default value: `true`
@@ -161,10 +160,10 @@ grows with the square of the radius).
 ### Warp debug output
 Not a config key: set `WIVRN_WARP_DEBUG=1` in the server environment
 (`REPROJEX_DEBUG=1` also enables it, so one env lights the whole depth
-pipeline). Adds a 5 s `warp dbg:` heartbeat (per-path warp/skip rates,
-skip reasons, `fresh`/`repeat` commit split, last GPU warp times, live
-retained `near`/`far`) plus
-non-blocking synth warp GPU timestamps. Off by default; steady-state
+pipeline). Adds a 5 s `warp dbg:` heartbeat on the commit path (per-path commit
+rates, gate/degenerate/pool/present skip counts, `fresh`/`repeat`
+commit split, last GPU warp time, learned bias, live retained
+`near`/`far`). Off by default; steady-state
 prod logging is unchanged. `fresh` counts commits carrying a new app
 frame, `repeat` counts display-tick replays of the last one (the
 multi-system thread recommits at display rate, so `commit` runs at
@@ -173,11 +172,11 @@ replays).
 
 ### Warp kill-switch (A/B triage)
 Not a config key: set `WIVRN_WARP_DISABLE=1` in the server environment.
-Both warp paths stand down (commit serves straight, synth ticks go
-inactive) while depth flow, retention, counters, and the `warp dbg:`
-heartbeat keep running. If a visual defect disappears with `warped` at
-zero, the warped frames are the defect source. The server logs one
-confirmation line at startup when active.
+Repeat commits serve straight (no 6DoF warp) while depth flow,
+retention, counters, and the `warp dbg:` heartbeat keep running. If a
+visual defect disappears with `warped` at zero, the warped frames are
+the defect source. The server logs one confirmation line at startup
+when active.
 
 ## `publish-service`
 Default value: `avahi`

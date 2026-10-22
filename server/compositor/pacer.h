@@ -88,28 +88,11 @@ public:
 	        int64_t & out_present_slop_ns,
 	        int64_t & out_predicted_display_time_ns);
 
-	// Registers a server-synthesized tick (no app waitFrame behind it)
-	// and returns its frame id. Participates in in_flight_frames,
-	// feedback matching and phase tracking exactly like real
-	// predictions, so the existing learners keep working uniformly.
-	int64_t predict_synth(int64_t present_ns, int64_t predicted_display_time_ns);
-
-	// Next display tick strictly after `after_ns`, on the display grid.
-	// Grid phase comes from the feedback-locked last_ns, so no separate
-	// phase tracking is needed (residual constant offset = constant
-	// latency, not judder; the client's nearest-pick tolerates jitter).
-	int64_t next_display_tick_ns(int64_t after_ns);
-
-	// Pipeline lead for synth scheduling: present→decoded (learned p99)
-	// + render→display (learned mean). Learned from client feedback like
-	// everything else the pacer predicts.
-	int64_t present_lead_ns() const;
-
-	// Learned render→display latency (monotonic ns). The synth ticker
-	// compares its grid ticks against queued outputs' display times;
-	// both derive from the pacer's last_ns grid, offset by exactly this
-	// mean — subtracting it re-centers the comparison so a learned
-	// latency can't systematically cover or uncover ticks.
+	// Learned render→display latency (monotonic ns). The commit path
+	// subtracts it when comparing tick times against queued outputs'
+	// display times; both derive from the pacer's last_ns grid, offset
+	// by exactly this mean — so a learned latency can't systematically
+	// bias coverage. Reported on the warp-debug heartbeat as bias.
 	int64_t learned_render_latency_ns() const;
 
 	void on_feedback(const wivrn::from_headset::feedback &, const clock_offset &);

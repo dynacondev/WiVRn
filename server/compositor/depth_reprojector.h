@@ -82,8 +82,7 @@ struct vk_bundle;
 //
 // One instance owns both eyes' targets, retained sources and compute
 // pipelines. Runs on the compositor queue with no graphics capability
-// required. Use is serialized by the compositor's commit mutex across
-// the EndFrame path and the synth ticker (never concurrent).
+// required. All recording happens on the compositor's commit thread.
 class depth_reprojector
 {
 public:

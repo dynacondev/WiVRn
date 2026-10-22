@@ -91,26 +91,14 @@ private:
 	vk::raii::CommandPool cmd_pool;
 	vk::raii::QueryPool query_pool;
 
-	// Synth path command resources: the ticker records independently of
-	// layer_commit (serialized by commit_mutex, never concurrent), so it
-	// needs its own pool — resetting the shared pool would invalidate
-	// the in-flight record. Timestamp pool exists only for warp-debug
-	// runs (zero GPU overhead otherwise); results are collected
-	// non-blocking at the next tick, so timing never adds latency.
-	vk::raii::CommandPool synth_pool;
-	vk::raii::CommandBuffer synth_cmd;
-	vk::raii::QueryPool synth_query_pool;
-	timings synth_warp_times;
-
-	// Warp debug output (timing heartbeat + synth GPU timestamps): off in
+	// Warp debug output (timing heartbeat + commit warp GPU timestamps): off in
 	// prod. Enabled by WIVRN_WARP_DEBUG=1 (or REPROJEX_DEBUG=1, so one env
 	// lights the whole depth pipeline). Read once at construction.
 	const bool warp_debug;
 
-	// Warp debug counters: touched on both the EndFrame path and the
-	// synth ticker, hence relaxed atomics. The ticker emits a 5 s delta
-	// heartbeat when warp_debug is on; steady-state cost is a few atomic
-	// increments, zero logs.
+	// Warp debug counters: touched on the EndFrame path, hence relaxed
+	// atomics. layer_commit emits a 5 s delta heartbeat when warp_debug
+	// is on; steady-state cost is a few atomic increments, zero logs.
 	struct warp_counters
 	{
 		std::atomic<uint64_t> c_total{0};
@@ -129,27 +117,11 @@ private:
 		// frames advance it. Split here proves the ratio live.
 		std::atomic<uint64_t> c_fresh{0};
 		std::atomic<uint64_t> c_repeat{0};
-		std::atomic<uint64_t> s_ticks{0};
-		std::atomic<uint64_t> s_warped{0};
-		std::atomic<uint64_t> s_covered{0};
-		std::atomic<uint64_t> s_inactive{0};
-		std::atomic<uint64_t> s_gate{0};
-		std::atomic<uint64_t> s_degenerate{0};
-		std::atomic<uint64_t> s_prewait{0};
-		std::atomic<uint64_t> s_pool{0};
-		std::atomic<uint64_t> s_present{0};
-		std::atomic<uint64_t> s_lock{0};
-		std::atomic<uint64_t> s_expected{0};
 	};
 	warp_counters wcounts;
-	// Last collected warp GPU times (ns, any path): the heartbeat reports
-	// them alongside the counters.
+	// Last collected commit warp GPU time (ns): the heartbeat reports
+	// it alongside the counters.
 	std::atomic<uint64_t> last_commit_warp_ns{0};
-	std::atomic<uint64_t> last_synth_warp_ns{0};
-	// Last raw coverage delta (tick minus last output, before the
-	// render-bias correction) and lock-contention count, for diagnosing
-	// a coverage check that never fires.
-	std::atomic<int64_t> last_raw_dt_ns{0};
 
 	std::array<encoder_settings, 3> settings;
 
@@ -179,8 +151,8 @@ private:
 
 	// Render-time source metadata for the retained frame (pose/FOV/clip
 	// per eye). Written alongside refresh_retained on fresh depth
-	// commits, read by the synth ticker under the same commit lock.
-	// Lets the ticker warp without a layer in hand.
+	// commits; the commit path warps repeats from it without a layer
+	// in hand.
 	std::array<xrt_pose, 2> retained_src_pose{};
 	std::array<xrt_fov, 2> retained_src_fov{};
 	std::array<float, 2> retained_src_near{1, 1};
@@ -193,29 +165,8 @@ private:
 	// thread reset it while layer_commit reads it.
 	std::atomic<int64_t> last_app_layer_ts{-1};
 
-	// Arrival time of the previous layer_commit (monotonic ns). The warp
-	// gate compares inter-commit spacing against the display period:
-	// layer_commit runs once per app EndFrame, not per display tick, so
-	// staleness cannot come from timestamps (consecutive commits always
-	// carry fresh ones). Zero until the first commit. Atomic: the synth
-	// ticker reads it while layer_commit writes it.
-	std::atomic<uint64_t> last_commit_ns{0};
-	// Smoothed inter-commit spacing (monotonic ns, EMA α=1/4). The synth
-	// ticker predicts expected commit times from it (see expected-commit
-	// skip): a pipelined app commits ~a period behind the working tick,
-	// so "no output yet" does not mean "no output coming". Zero until
-	// two commits observed. Written by layer_commit, read by the ticker.
-	std::atomic<uint64_t> last_spacing_ns{0};
-
-	// Last queued output (monotonic ns, commit or synth path). The ticker
-	// synthesizes a tick only when no output covers it.
-	std::atomic<uint64_t> last_output_ns{0};
-	// Whether the latest commit carried depth. The ticker synthesizes
-	// only from depth frames (warping from stale retained content while
-	// the app shows non-depth layers would show the wrong frame).
-	std::atomic<bool> last_had_depth{false};
 	// Arrival time of the commit that last refreshed retained sources.
-	// Bounds how stale a synth source may be (dead-app guard).
+	// Bounds how stale a warp source may be (dead-app guard).
 	std::atomic<uint64_t> last_retained_ns{0};
 	// Snapshot of the retained clip planes for the warp-debug heartbeat
 	// (which runs without the commit lock). Written alongside the
@@ -225,10 +176,9 @@ private:
 	std::atomic<float> dbg_retained_near{1};
 	std::atomic<float> dbg_retained_far{1000};
 
-	// Alpha blend mode of the latest commit. The synth ticker cannot
-	// safely read layer_accum (owned by the commit path), so layer_commit
-	// publishes it here. Staleness is harmless (blend mode changes only
-	// on app layer changes).
+	// Alpha blend mode of the latest commit, published for the warp
+	// path (it cannot safely read layer_accum mid-commit). Staleness is
+	// harmless (blend mode changes only on app layer switches).
 	std::atomic<bool> last_alpha_blend{false};
 
 	// Last submitted timeline value (any path). Host-visible UBO and
@@ -240,8 +190,7 @@ private:
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 
-	// Serializes the record→submit→present→queue region across the
-	// EndFrame path and the synth ticker (reprojector, foveation UBO /
+	// Serializes the record path (reprojector, foveation UBO /
 	// descriptor writes, cmd buffer, resolve set, sem_value). Leaf lock:
 	// only ever taken alone, never nested inside another lock
 	// (queue_encode takes encode_mutex under it: commit → encode order
@@ -263,14 +212,6 @@ private:
 	// commit while the pool holds 4 (acquire_image drops past it).
 	std::deque<queued_frame> encode_queue;
 	std::jthread encoder_thread;
-
-	// Display-rate synth ticker: emits warped frames on ticks with no
-	// fresh EndFrame, so slow apps still feed the client at display
-	// cadence. Purely additive — the EndFrame path is untouched. Stopped
-	// + joined before the encoder thread (it produces; the worker drains).
-	std::jthread synth_thread;
-	std::mutex synth_mutex;
-	std::condition_variable_any synth_cv;
 
 	struct
 	{
@@ -324,8 +265,6 @@ private:
 	}
 
 	int acquire_image();
-
-	void synth_work(std::stop_token tok);
 
 	void append_encoder_barriers(
 	        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> & barriers,

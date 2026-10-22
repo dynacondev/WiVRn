@@ -222,39 +222,6 @@ pacer::frame_info pacer::present_to_info(int64_t present)
 	return {};
 }
 
-int64_t pacer::predict_synth(int64_t present_ns, int64_t predicted_display_time_ns)
-{
-	std::lock_guard lock(mutex);
-	int64_t id = frame_id++;
-	in_flight_frames[id % in_flight_frames.size()] = {
-	        .frame_id = id,
-	        .present_ns = present_ns,
-	        .predicted_display_time = predicted_display_time_ns,
-	};
-	return id;
-}
-
-int64_t pacer::next_display_tick_ns(int64_t after_ns)
-{
-	std::lock_guard lock(mutex);
-	int64_t period = int64_t(frame_duration_ns);
-	if (period <= 0)
-		return after_ns + 1;
-	int64_t phase = last_ns % period;
-	int64_t base = after_ns - (after_ns % period) + phase;
-	// Loop (not a single add): phase can be negative at startup (feedback
-	// drives last_ns), leaving base more than one period behind.
-	while (base <= after_ns)
-		base += period;
-	return base;
-}
-
-int64_t pacer::present_lead_ns() const
-{
-	std::lock_guard lock(mutex);
-	return safe_present_to_decoded_ns + mean_render_to_display_ns;
-}
-
 int64_t pacer::learned_render_latency_ns() const
 {
 	std::lock_guard lock(mutex);
