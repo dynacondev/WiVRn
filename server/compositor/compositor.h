@@ -132,6 +132,7 @@ private:
 		std::atomic<uint64_t> s_pool{0};
 		std::atomic<uint64_t> s_present{0};
 		std::atomic<uint64_t> s_lock{0};
+		std::atomic<uint64_t> s_expected{0};
 	};
 	warp_counters wcounts;
 	// Last collected warp GPU times (ns, any path): the heartbeat reports
@@ -196,6 +197,12 @@ private:
 	// carry fresh ones). Zero until the first commit. Atomic: the synth
 	// ticker reads it while layer_commit writes it.
 	std::atomic<uint64_t> last_commit_ns{0};
+	// Smoothed inter-commit spacing (monotonic ns, EMA α=1/4). The synth
+	// ticker predicts expected commit times from it (see expected-commit
+	// skip): a pipelined app commits ~a period behind the working tick,
+	// so "no output yet" does not mean "no output coming". Zero until
+	// two commits observed. Written by layer_commit, read by the ticker.
+	std::atomic<uint64_t> last_spacing_ns{0};
 
 	// Last queued output (monotonic ns, commit or synth path). The ticker
 	// synthesizes a tick only when no output covers it.

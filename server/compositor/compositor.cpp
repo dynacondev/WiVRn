@@ -406,6 +406,22 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		warp_armed_stale.store(false);
 	const bool stale_commit = warp_armed_stale.load();
 	last_commit_ns.store(commit_ns);
+	if (last_commit != 0 && commit_ns > last_commit)
+	{
+		// Smoothed spacing for the ticker's expected-commit skip.
+		// Updated only forward in time (clock confusion must not poison
+		// the estimate); EMA α=1/4 tracks rate changes within a few
+		// commits without jittering per-tick decisions.
+		uint64_t sample = commit_ns - last_commit;
+		uint64_t prev = last_spacing_ns.load(std::memory_order_relaxed);
+		if (prev == 0)
+			last_spacing_ns.store(sample, std::memory_order_relaxed);
+		else
+		{
+			int64_t d = int64_t(sample) - int64_t(prev);
+			last_spacing_ns.store(uint64_t(int64_t(prev) + d / 4), std::memory_order_relaxed);
+		}
+	}
 
 	int i = acquire_image();
 
@@ -1252,7 +1268,7 @@ void compositor::synth_work(std::stop_token tok)
 		{
 			double dt_s = last_heartbeat_ns == 0 ? 5.0 : double(now_ns - last_heartbeat_ns) / 1e9;
 			last_heartbeat_ns = now_ns;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f expected %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1265,6 +1281,7 @@ void compositor::synth_work(std::stop_token tok)
 			        wcounts.s_ticks.exchange(0) / dt_s,
 			        wcounts.s_warped.exchange(0) / dt_s,
 			        wcounts.s_covered.exchange(0) / dt_s,
+			        wcounts.s_expected.exchange(0) / dt_s,
 			        wcounts.s_inactive.exchange(0) / dt_s,
 			        (unsigned long long)wcounts.s_gate.exchange(0),
 			        (unsigned long long)wcounts.s_degenerate.exchange(0),
@@ -1322,6 +1339,42 @@ void compositor::synth_work(std::stop_token tok)
 		{
 			wcounts.s_inactive++;
 			continue;
+		}
+
+		// Expected-commit skip: the app covers ticks on its own cadence,
+		// possibly arriving after this decision (a pipelined app commits
+		// ~a period behind the working tick, so "no output yet" does not
+		// mean "no output coming"). Skip ticks that coincide with an
+		// expected commit; synthesize only true gaps. Without this, an
+		// equal-rate pipelined app gets every tick duplicated (commit
+		// presents its frame AND the ticker warps it). A stalled app (no
+		// commit for 2+ spacings) gets synthesis everywhere, retained-
+		// bounded below. Windows tile the timeline, so phase luck plays
+		// no part: equal-rate apps always coincide, slow apps coincide
+		// only on their own ticks.
+		{
+			uint64_t last_c = last_commit_ns.load(std::memory_order_relaxed);
+			uint64_t est_s = last_spacing_ns.load(std::memory_order_relaxed);
+			if (last_c != 0 && est_s > 0)
+			{
+				int64_t quiet_ns = int64_t(now_ns) - int64_t(last_c);
+				uint64_t stall_bound_ns = std::max(2 * est_s, period_ns + period_ns / 2);
+				bool stalled = quiet_ns > int64_t(stall_bound_ns);
+				if (!stalled)
+				{
+					int64_t dt_c = int64_t(tick_ns) - int64_t(last_c);
+					if (dt_c >= 0)
+					{
+						uint64_t r = uint64_t(dt_c) % est_s;
+						uint64_t half = period_ns / 2;
+						if (r <= half || est_s - r <= half)
+						{
+							wcounts.s_expected++;
+							continue;
+						}
+					}
+				}
+			}
 		}
 
 		int synth_image = -1;
@@ -1862,6 +1915,7 @@ void compositor::set_framerate(float hz)
 	// freshness: the next frames may come from a different scene.
 	last_app_layer_ts.store(-1);
 	last_commit_ns.store(0);
+	last_spacing_ns.store(0);
 	warp_armed_stale.store(false);
 	last_had_depth.store(false);
 	last_retained_ns.store(0);
@@ -1885,6 +1939,7 @@ void compositor::resume()
 		encoder->reset();
 	last_app_layer_ts.store(-1);
 	last_commit_ns.store(0);
+	last_spacing_ns.store(0);
 	warp_armed_stale.store(false);
 	last_had_depth.store(false);
 	last_retained_ns.store(0);
