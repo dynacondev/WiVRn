@@ -1343,6 +1343,10 @@ void scenes::stream::gui_passthrough()
 			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
 		}
 	}
+
+	// POSE_INVALID forensics: record whether any ImGui popup (e.g. a combo
+	// dropdown) is open at build time; read by the render_end catch.
+	last_frame_popup_open = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup);
 }
 
 void scenes::stream::gui_fiducial_status()
