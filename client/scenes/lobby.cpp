@@ -1013,17 +1013,30 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	if (kiosk_shown and head_position)
 	{
 		// Meta-dialog-style soft follow: rest head-locked, drift back into
-		// view when the head turns away past a small deadzone.
+		// view when the head turns away past a small deadzone. Head roll is
+		// ignored so the panel stays parallel with the horizon.
 		const glm::quat head_q = head_position->second;
+		glm::vec3 head_fwd = head_q * glm::vec3(0.f, 0.f, -1.f);
+		float yaw;
+		if (glm::length(glm::vec2(head_fwd.x, head_fwd.z)) > 1e-4f)
+			yaw = atan2(-head_fwd.x, -head_fwd.z);
+		else
+		{
+			// staring straight up/down: hold the current heading
+			glm::vec3 panel_fwd = kiosk_orientation * glm::vec3(0.f, 0.f, -1.f);
+			yaw = atan2(-panel_fwd.x, -panel_fwd.z);
+		}
+		float pitch = asin(glm::clamp(head_fwd.y, -1.f, 1.f));
+		glm::quat target = glm::angleAxis(yaw, glm::vec3(0.f, 1.f, 0.f)) * glm::angleAxis(pitch, glm::vec3(1.f, 0.f, 0.f));
 		if (not kiosk_orientation_init)
 		{
-			kiosk_orientation = head_q;
+			kiosk_orientation = target;
 			kiosk_orientation_init = true;
 		}
 		const float deadzone = 0.21f;   // ~12deg: rest inside this cone
 		const float catchup_span = 0.5f; // full catch-up rate this far past the deadzone
 		const float max_slew = 2.5f;     // rad/s catch-up rate at full deflection
-		float angle = glm::angle(head_q * glm::conjugate(kiosk_orientation));
+		float angle = glm::angle(target * glm::conjugate(kiosk_orientation));
 		if (angle > deadzone)
 		{
 			// smoothstep-eased catch-up: velocity ramps up from zero at the
@@ -1033,7 +1046,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			float t = std::clamp((angle - deadzone) / catchup_span, 0.f, 1.f);
 			float s = t * t * (3.f - 2.f * t);
 			float step = std::min(max_slew * s * dt, angle - deadzone);
-			kiosk_orientation = glm::normalize(glm::mix(kiosk_orientation, head_q, step / angle));
+			kiosk_orientation = glm::normalize(glm::mix(kiosk_orientation, target, step / angle));
 		}
 		imgui_ctx->layers()[0].orientation = kiosk_orientation;
 		imgui_ctx->layers()[0].position = head_position->first + kiosk_orientation * glm::vec3(0.f, -0.02f, -1.1f);
