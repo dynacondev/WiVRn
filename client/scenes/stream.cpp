@@ -962,7 +962,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		// TODO: stop/restart video stream
 		session.begin_frame();
-		session.end_frame(frame_state.predictedDisplayTime, {});
+		if (frame_state.shouldRender and state_ != state::shutdown)
+		{
+			// Idle server, no video: still submit the GUI so the waiting
+			// overlay (or an open settings page) stays usable, with
+			// passthrough behind the overlay mirroring the lobby kiosk.
+			// Per-frame enable matches the normal path below; it resumes
+			// owning passthrough state once video flows.
+			if (stream_kiosk_shown)
+				session.enable_passthrough(system);
+			render_start(stream_kiosk_shown, frame_state.predictedDisplayTime);
+			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+			render_end();
+		}
+		else
+			session.end_frame(frame_state.predictedDisplayTime, {});
 		return;
 	}
 

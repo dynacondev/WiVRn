@@ -424,6 +424,11 @@ void scenes::lobby::update_server_list()
 
 void scenes::lobby::connect(const configuration::server_data & data)
 {
+	// a pending scene would orphan its session: shut it down first so at
+	// most one connection is ever in flight (reached by manual connect
+	// while a kiosk auto-dial is pending)
+	if (next_scene)
+		next_scene->exit();
 	server_name = data.service.name;
 	async_error.reset();
 	kiosk_dismissed = false;
@@ -898,11 +903,13 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 			case scenes::stream::state::shutdown:
 				current_tab = tab::server_list;
-				if (kiosk_active())
+				// kiosk_active() is false while next_scene is set, so test
+				// the config half directly: kiosk sessions never reach the
+				// server-list flows that would clear next_scene. Surface
+				// errors in the full GUI, otherwise drop the dead scene and
+				// resume dialling.
+				if (kiosk_wanted() && !kiosk_dismissed && !async_error && !pin_request.lock()->pin_requested)
 				{
-					// kiosk sessions never reach the server-list flows that
-					// would clear next_scene: surface errors in the full GUI,
-					// otherwise drop the dead scene and resume dialling.
 					if (auto err = next_scene->pop_stream_error())
 						async_error = err;
 					else
@@ -957,7 +964,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		if (left and left->second and right and right->second and
 		    std::max(left->first, right->first) > last_kiosk_toggle and
 		    frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL and
-		    !async_session.valid() && !next_scene)
+		    !async_session.valid() && !pin_request.lock()->pin_requested && current_tab != tab::first_run)
 		{
 			last_kiosk_toggle = frame_state.predictedDisplayTime;
 			kiosk_dismissed = not kiosk_dismissed;
@@ -1453,23 +1460,32 @@ void scenes::lobby::setup_passthrough()
 		session.disable_passthrough();
 }
 
-bool scenes::lobby::kiosk_active()
+bool scenes::lobby::kiosk_wanted() const
 {
 	const auto & config = application::get_config();
-	if (not config.kiosk_mode or kiosk_dismissed or config.first_run or async_error)
-		return false;
-	if (pin_request.lock()->pin_requested)
-		return false;
-	if (current_tab == tab::connected)
-		return false;
-	// the connecting flow (dialling modal, app launcher) owns the UI while
-	// a connection is in flight: never cover or fight it
-	if (async_session.valid() || next_scene)
+	if (not config.kiosk_mode or config.first_run)
 		return false;
 	for (auto & [cookie, data]: config.servers)
 		if (data.autoconnect)
 			return true;
 	return false;
+}
+
+bool scenes::lobby::kiosk_active()
+{
+	const auto & config = application::get_config();
+	if (not kiosk_wanted() or kiosk_dismissed or async_error)
+		return false;
+	if (pin_request.lock()->pin_requested)
+		return false;
+	if (current_tab == tab::connected)
+		return false;
+	// the dialling modal owns the UI while dialling: never cover it. Once
+	// the connection exists but no video flows yet, the overlay returns
+	// (drawn as "Waiting for Simulation") instead of the app launcher.
+	if (async_session.valid())
+		return false;
+	return true;
 }
 
 void scenes::lobby::on_unfocused()

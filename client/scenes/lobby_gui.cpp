@@ -141,6 +141,7 @@ void scenes::lobby::gui_connecting(locked_notifiable<pin_request_data> & pin_req
 	{
 		async_session.cancel();
 		next_scene.reset();
+		async_error.reset();
 
 		pin_request->pin_cancelled = true;
 
@@ -827,7 +828,8 @@ void scenes::lobby::gui_kiosk()
 	const float r = ImGui::GetFontSize() * 0.55f;
 	ImSpinner::SpinnerAng("kiosk", r, ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
 	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
-	ImGui::TextUnformatted(_S("Waiting for Connection"));
+	// connected but no video yet: the simulation hasn't started
+	ImGui::TextUnformatted(next_scene ? _S("Waiting for Simulation") : _S("Waiting for Connection"));
 	ImGui::PopFont();
 
 	if (async_session.valid())

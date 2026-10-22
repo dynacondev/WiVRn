@@ -126,6 +126,9 @@ class lobby : public scene_impl<lobby>
 	XrTime last_kiosk_toggle = 0;
 	glm::quat kiosk_orientation{1, 0, 0, 0};
 	bool kiosk_orientation_init = false;
+	// config half of the kiosk predicate (mode on, server configured);
+	// the session half lives in kiosk_active()
+	bool kiosk_wanted() const;
 	bool kiosk_active();
 
 	// Which controller is used for recentering, position of the pointed point in the GUI, in GUI axes, and distance between the controller and the pointed point during recentering
