@@ -518,7 +518,7 @@ void settings_post_processing(const settings_context & ctx)
 		});
 	}
 
-	ui::page_header(_S("Post-processing"), _cS("page header subtitle", "OpenXR layer supersampling and sharpening."));
+	ui::page_header(_cS("page header title", "Post-processing"), _cS("page header subtitle", "OpenXR layer supersampling and sharpening, client-side filters."));
 	render_settings(ctx, "##post_processing", list);
 }
 
