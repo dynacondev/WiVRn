@@ -663,10 +663,6 @@ configuration::configuration()
 					else
 						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
 				}
-				if (it->find("hole-fill-radius") != it->end())
-				{
-					U_LOG_W("reprojection.hole-fill-radius was removed (mip-chain fill is constant-cost), ignoring");
-				}
 			}
 		}
 
