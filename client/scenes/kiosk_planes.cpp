@@ -64,10 +64,10 @@ struct paint
 	float variance;
 };
 const paint paints[]{
-        {{1.f, 1.f, 1.f}, 0.f},                          // white
-        {{0.62f, 0.62f, 0.62f}, 0.12f},                  // grey
-        {{1.f, 148.f / 255.f, 26.f / 255.f}, 0.07f},     // dynacon orange
-        {{14.f / 255.f, 27.f / 255.f, 141.f / 255.f}, 0.05f}, // #0E1B8D
+        {{1.f, 1.f, 1.f}, 0.f},                        // white
+        {{0.62f, 0.62f, 0.62f}, 0.12f},                // grey
+        {{0.75f, 0.38f, 0.04f}, 0.14f},                // dark dynacon orange
+        {{0.03f, 0.06f, 0.36f}, 0.10f},                // dark #0E1B8D navy
 };
 
 glm::vec3 random_unit(std::mt19937 & rng)
