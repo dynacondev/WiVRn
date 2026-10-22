@@ -118,6 +118,7 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 		// relying on whatever the runtime assumes for an unstyled layer.
 		XrPassthroughStyleFB projected_style{
 		        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
+		        .next = nullptr,
 		        .textureOpacityFactor = 1.0f,
 		        .edgeColor = {0.f, 0.f, 0.f, 0.f},
 		};
@@ -131,6 +132,7 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 	{
 		XrPassthroughStyleFB flat_style{
 		        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
+		        .next = nullptr,
 		        .textureOpacityFactor = 1.0f,
 		        .edgeColor = {0.f, 0.f, 0.f, 0.f},
 		};
@@ -299,6 +301,7 @@ XrPassthroughColorLutMETA xr::passthrough_fb::get_or_create_lut(passthrough_lut_
 	};
 	XrPassthroughColorLutCreateInfoMETA create_info{
 	        .type = XR_TYPE_PASSTHROUGH_COLOR_LUT_CREATE_INFO_META,
+	        .next = nullptr,
 	        .channels = XR_PASSTHROUGH_COLOR_LUT_CHANNELS_RGB_META,
 	        .resolution = resolution,
 	        .data = lut_data,
@@ -327,12 +330,14 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 
 	XrPassthroughStyleFB style{
 	        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
+	        .next = nullptr,
 	        .textureOpacityFactor = opacity,
 	        .edgeColor = edge,
 	};
 
 	XrPassthroughBrightnessContrastSaturationFB bcs{
 	        .type = XR_TYPE_PASSTHROUGH_BRIGHTNESS_CONTRAST_SATURATION_FB,
+	        .next = nullptr,
 	        .brightness = clamp_brightness(fx.brightness),
 	        .contrast = clamp_nonneg(fx.contrast),
 	        .saturation = clamp_nonneg(fx.saturation),
@@ -340,12 +345,21 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 
 	XrPassthroughColorMapMonoToRgbaFB mono{
 	        .type = XR_TYPE_PASSTHROUGH_COLOR_MAP_MONO_TO_RGBA_FB,
+	        .next = nullptr,
+	        .textureColorMap = {},
 	};
 	XrPassthroughColorMapLutMETA lut{
 	        .type = XR_TYPE_PASSTHROUGH_COLOR_MAP_LUT_META,
+	        .next = nullptr,
+	        .colorLut = XR_NULL_HANDLE,
+	        .weight = 0.0f,
 	};
 	XrPassthroughColorMapInterpolatedLutMETA interp{
 	        .type = XR_TYPE_PASSTHROUGH_COLOR_MAP_INTERPOLATED_LUT_META,
+	        .next = nullptr,
+	        .sourceColorLut = XR_NULL_HANDLE,
+	        .targetColorLut = XR_NULL_HANDLE,
+	        .weight = 0.0f,
 	};
 
 	// Only one color struct may be chained; mode selects it.
