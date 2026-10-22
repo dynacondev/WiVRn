@@ -879,7 +879,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 	float alpha = 1;
 	bool is_urgent = false;
-	if (gui_status == stream_tab::hidden)
+	if (gui_status == stream_tab::hidden and not stream_kiosk_shown)
 	{
 		auto toast = gui_toast.lock();
 		if (toast->has_value())

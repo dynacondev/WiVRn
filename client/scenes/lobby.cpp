@@ -426,6 +426,7 @@ void scenes::lobby::connect(const configuration::server_data & data)
 {
 	server_name = data.service.name;
 	async_error.reset();
+	kiosk_dismissed = false;
 
 	async_session = utils::async<std::unique_ptr<wivrn_session>, std::string>(
 	        [this](auto token, wivrn_discover::service service, bool manual) {
@@ -897,6 +898,19 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 			case scenes::stream::state::shutdown:
 				current_tab = tab::server_list;
+				if (kiosk_active())
+				{
+					// kiosk sessions never reach the server-list flows that
+					// would clear next_scene: surface errors in the full GUI,
+					// otherwise drop the dead scene and resume dialling.
+					if (auto err = next_scene->pop_stream_error())
+						async_error = err;
+					else
+					{
+						next_scene.reset();
+						autoconnect_enabled = true;
+					}
+				}
 				break;
 
 			default:
@@ -933,12 +947,14 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 
 	// Both-thumbsticks chord toggles the kiosk overlay. Edge-triggered off
-	// the actions' last-change times so holding the sticks fires once.
+	// the actions' last-change times so holding the sticks fires once, with
+	// a time gate so switch bounce can't double-toggle one press.
 	{
 		auto left = application::read_action_bool(kiosk_toggle_left_action);
 		auto right = application::read_action_bool(kiosk_toggle_right_action);
 		if (left and left->second and right and right->second and
-		    std::max(left->first, right->first) > last_kiosk_toggle)
+		    std::max(left->first, right->first) > last_kiosk_toggle and
+		    frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL)
 		{
 			last_kiosk_toggle = frame_state.predictedDisplayTime;
 			kiosk_dismissed = not kiosk_dismissed;

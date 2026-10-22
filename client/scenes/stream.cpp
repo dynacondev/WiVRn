@@ -879,21 +879,26 @@ bool scenes::stream::has_active_simulation()
 void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 {
 	const auto & config = application::get_config();
+	// no overlay (and no need to poll) when the in-stream GUI is disabled:
+	// the chord that would reveal it is dead too
+	const bool allowed = config.kiosk_mode and config.enable_stream_gui;
 
-	// keep the running-apps picture fresh while kiosk mode is on; the
+	// keep the running-apps picture fresh while the overlay may show; the
 	// applications tab polls itself when visible, this covers the overlay
-	if (config.kiosk_mode and predicted_display_time - last_kiosk_app_req > 2'000'000'000LL)
+	if (allowed and predicted_display_time - last_kiosk_app_req > 2'000'000'000LL)
 	{
 		last_kiosk_app_req = predicted_display_time;
 		network_session->send_control(from_headset::get_running_applications{});
 	}
 
-	bool has_active = config.kiosk_mode and stream_apps_known and has_active_simulation();
+	bool has_active = allowed and stream_apps_known and has_active_simulation();
+	if (has_active != stream_had_active_app)
+		spdlog::debug("Kiosk apps: active={} known={}", has_active, bool(stream_apps_known));
 	if (stream_had_active_app and not has_active)
 		stream_kiosk_dismissed = false; // app stopped: waiting overlay returns
 	stream_had_active_app = has_active;
 
-	stream_kiosk_shown = config.kiosk_mode and not stream_kiosk_dismissed and
+	stream_kiosk_shown = allowed and not stream_kiosk_dismissed and
 	                     stream_apps_known and not has_active and not is_gui_interactable();
 }
 
@@ -926,6 +931,51 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		next_gui_status = stream_tab::hidden;
 		application::pop_scene();
+	}
+
+	// Kiosk/chord input runs before the no-video early return below: the
+	// waiting overlay must work (and the chord must stay alive) while the
+	// server sends no video for an idle session.
+	read_actions();
+
+	update_stream_kiosk(frame_state.predictedDisplayTime);
+
+	if (application::get_config().enable_stream_gui)
+	{
+		XrActionStateGetInfo get_info{
+		        .type = XR_TYPE_ACTION_STATE_GET_INFO,
+		        .action = plots_toggle_1,
+		};
+
+		XrActionStateBoolean state_1{XR_TYPE_ACTION_STATE_BOOLEAN};
+		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_1));
+		get_info.action = plots_toggle_2;
+		XrActionStateBoolean state_2{XR_TYPE_ACTION_STATE_BOOLEAN};
+		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_2));
+
+		// time gate alongside the change edge so switch bounce on one
+		// physical press can't double-toggle
+		if (state_1.currentState and state_2.currentState and (state_1.changedSinceLastSync or state_2.changedSinceLastSync) and
+		    frame_state.predictedDisplayTime - last_stream_kiosk_toggle > 500'000'000LL)
+		{
+			last_stream_kiosk_toggle = frame_state.predictedDisplayTime;
+			// Arbitrary transitions can happen from network commands
+			// Ensure we can't have a set of 2 non interactable states
+			if (stream_kiosk_shown)
+			{
+				stream_kiosk_dismissed = true;
+				next_gui_status = stream_tab::applications;
+			}
+			else if (is_gui_interactable())
+			{
+				next_gui_status = stream_tab::hidden;
+				stream_kiosk_dismissed = false;
+			}
+			else if (is_interactable(stored_gui_status))
+				next_gui_status = stored_gui_status;
+			else
+				next_gui_status = stream_tab::applications;
+		}
 	}
 
 	// Deliberately blocking: with a single in-flight command buffer
@@ -2995,44 +3045,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				spdlog::warn("Exception while sending feedback packet: {}", e.what());
 			}
-		}
-	}
-
-	read_actions();
-
-	update_stream_kiosk(frame_state.predictedDisplayTime);
-
-	if (application::get_config().enable_stream_gui)
-	{
-		XrActionStateGetInfo get_info{
-		        .type = XR_TYPE_ACTION_STATE_GET_INFO,
-		        .action = plots_toggle_1,
-		};
-
-		XrActionStateBoolean state_1{XR_TYPE_ACTION_STATE_BOOLEAN};
-		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_1));
-		get_info.action = plots_toggle_2;
-		XrActionStateBoolean state_2{XR_TYPE_ACTION_STATE_BOOLEAN};
-		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_2));
-
-		if (state_1.currentState and state_2.currentState and (state_1.changedSinceLastSync or state_2.changedSinceLastSync))
-		{
-			// Arbitrary transitions can happen from network commands
-			// Ensure we can't have a set of 2 non interactable states
-			if (stream_kiosk_shown)
-			{
-				stream_kiosk_dismissed = true;
-				next_gui_status = stream_tab::applications;
-			}
-			else if (is_gui_interactable())
-			{
-				next_gui_status = stream_tab::hidden;
-				stream_kiosk_dismissed = false;
-			}
-			else if (is_interactable(stored_gui_status))
-				next_gui_status = stored_gui_status;
-			else
-				next_gui_status = stream_tab::applications;
 		}
 	}
 
