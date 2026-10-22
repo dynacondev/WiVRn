@@ -416,7 +416,7 @@ void xr::session::apply_passthrough_effects()
 bool xr::session::passthrough_color_lut_supported() const
 {
 #ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
-	if (auto * fb = std::get_if<const xr::passthrough_fb>(&passthrough))
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
 		return fb->color_lut_supported();
 	// No live fb yet (passthrough currently off): report extension
 	// availability so the GUI can enable LUT mode before first enable.

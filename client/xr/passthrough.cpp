@@ -348,12 +348,10 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 	        .type = XR_TYPE_PASSTHROUGH_COLOR_MAP_INTERPOLATED_LUT_META,
 	};
 
-	const void * next = nullptr;
 	// Only one color struct may be chained; mode selects it.
 	switch (fx.mode)
 	{
 		case passthrough_effect_mode::off:
-			next = nullptr;
 			break;
 		case passthrough_effect_mode::bcs:
 			style.next = &bcs;
