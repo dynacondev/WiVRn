@@ -1080,15 +1080,16 @@ uint64_t compositor::submit_cmd_buffer(vk::raii::CommandBuffer & cmd)
 	};
 	std::unique_lock lock{vk.queue.mutex};
 	uint64_t value = sem_value.fetch_add(1) + 1;
+	vk::SemaphoreSubmitInfo sem_info{
+	        .semaphore = *sem,
+	        .value = value,
+	        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	};
 	vk.queue.queue.submit2(vk::SubmitInfo2{
 	        .commandBufferInfoCount = 1,
 	        .pCommandBufferInfos = &cmd_info,
 	        .signalSemaphoreInfoCount = 1,
-	        .pSignalSemaphoreInfos = &vk::SemaphoreSubmitInfo{
-	                .semaphore = *sem,
-	                .value = value,
-	                .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
-	        },
+	        .pSignalSemaphoreInfos = &sem_info,
 	});
 	last_submit_value.store(value, std::memory_order_relaxed);
 	return value;
