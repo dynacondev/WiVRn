@@ -57,6 +57,7 @@
 
 #include "IconsFontAwesome7.h"
 #include "IconsFontAwesome7Brands.h"
+#include <imspinner.h>
 
 using namespace std::chrono_literals;
 
@@ -816,6 +817,27 @@ void scenes::lobby::gui_about()
 	ImGui::Image(about_picture, {win_width / 2, win_width / 2});
 }
 
+void scenes::lobby::gui_kiosk()
+{
+	namespace ui = wivrn::ui;
+	const auto & t = ui::current();
+
+	// spinner + title on one row, live connection stage below while dialling
+	ImGui::PushFont(nullptr, constants::gui::font_size_large);
+	const float r = ImGui::GetFontSize() * 0.55f;
+	ImSpinner::SpinnerAng("kiosk", r, ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
+	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
+	ImGui::TextUnformatted(_S("Waiting for Connection"));
+	ImGui::PopFont();
+
+	if (async_session.valid())
+	{
+		ImGui::PushStyleColor(ImGuiCol_Text, t.text_muted);
+		ImGui::TextWrapped("%s", async_session.get_progress().c_str());
+		ImGui::PopStyleColor();
+	}
+}
+
 void scenes::lobby::gui_first_run()
 {
 	float win_width = ImGui::GetWindowSize().x;
@@ -1053,6 +1075,9 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 	update_transfers();
 	update_file_picker();
 
+	// kiosk overlay is display-only: no controller interaction
+	imgui_ctx->set_controllers_enabled(!kiosk_shown);
+
 	ImGuiStyle & style = ImGui::GetStyle();
 	style.FontScaleMain = wivrn::ui::current().font_scale * wivrn::ui::metrics::font_base;
 
@@ -1111,6 +1136,20 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 		gui_connected(predicted_display_time);
 		ImGui::End();
 		ImGui::PopStyleVar(2); // ImGuiStyleVar_WindowPadding, ImGuiStyleVar_FrameRounding
+	}
+	else if (kiosk_shown)
+	{
+		// minimal waiting panel over passthrough instead of the full shell,
+		// centred on the (soft head-following) main layer
+		const wivrn::ui::theme & kiosk_th = wivrn::ui::current();
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{kiosk_th.background.x, kiosk_th.background.y, kiosk_th.background.z, wivrn::ui::background_alpha()});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, wivrn::ui::metrics::window_padding);
+		ImGui::SetNextWindowPos(imgui_ctx->layers()[0].vp_center(), ImGuiCond_Always, {0.5, 0.5});
+		ImGui::Begin("Kiosk", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
+		gui_kiosk();
+		ImGui::End();
+		ImGui::PopStyleVar();
+		ImGui::PopStyleColor();
 	}
 	else
 	{

@@ -34,6 +34,7 @@
 #include <openxr/openxr.h>
 
 #include <compare>
+#include <glm/gtc/quaternion.hpp>
 #include <optional>
 #include <uni_algo/case.h>
 #include <vector>
@@ -114,6 +115,18 @@ class lobby : public scene_impl<lobby>
 
 	XrAction recenter_left_action = XR_NULL_HANDLE;
 	XrAction recenter_right_action = XR_NULL_HANDLE;
+	XrAction kiosk_toggle_left_action = XR_NULL_HANDLE;
+	XrAction kiosk_toggle_right_action = XR_NULL_HANDLE;
+
+	// Kiosk overlay state: minimal waiting panel over passthrough until the
+	// both-thumbsticks chord reveals the full GUI. Dismissal, errors and PIN
+	// requests drop back to the full interface; per-session otherwise.
+	bool kiosk_dismissed = false;
+	bool kiosk_shown = false;
+	XrTime last_kiosk_toggle = 0;
+	glm::quat kiosk_orientation{1, 0, 0, 0};
+	bool kiosk_orientation_init = false;
+	bool kiosk_active();
 
 	// Which controller is used for recentering, position of the pointed point in the GUI, in GUI axes, and distance between the controller and the pointed point during recentering
 	std::optional<std::tuple<xr::spaces, glm::vec3, float>> recentering_context;
@@ -251,6 +264,7 @@ class lobby : public scene_impl<lobby>
 	void gui_licenses();
 	void gui_keyboard();
 	void gui_first_run();
+	void gui_kiosk();
 
 	void setup_passthrough();
 
