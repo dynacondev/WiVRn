@@ -1683,9 +1683,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// active: claimed whenever veiled so a B canvas always
 				// exists to lift to the uniform floor (boundary-only /
 				// projected-only / all-culled configs). The depth debug
-				// fullscreen claims it the same way. Empty draws
-				// (clear-only record); the submit-time bias lifts it.
-				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough();
+				// fullscreen and the passthrough effects demo claim it
+				// the same way. Empty draws (clear-only record); the
+				// submit-time bias lifts it.
+				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
 				if (need_debug)
 				{
 					auto & g = debug_group;
@@ -2024,10 +2025,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				// Debug group record (cutouts only, full-res, clear + hard
 				// punch): runs while claimed above. During the veil (or
-				// the depth debug fullscreen) it also runs with empty
-				// cutouts (clear-only): the promoted carrier lifted to
-				// the uniform floor at submit.
-				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough())
+				// the depth/effects debug fullscreen) it also runs with
+				// empty cutouts (clear-only): the promoted carrier lifted
+				// to the uniform floor at submit.
+				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
 				{
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
