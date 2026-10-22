@@ -157,7 +157,7 @@ std::vector<theme> presets()
 std::vector<accent_swatch> accent_swatches()
 {
 	return {
-	        {"Orange", rgb(202, 98, 0), rgb(222, 115, 10), rgb(178, 84, 0)},
+	        {"Orange", rgb(143, 74, 0), rgb(168, 90, 8), rgb(118, 60, 0)},
 	        {"Blue", rgb(30, 115, 255), rgb(64, 140, 255), rgb(18, 95, 228)},
 	        {"Violet", rgb(132, 72, 255), rgb(152, 98, 255), rgb(112, 52, 232)},
 	        {"Emerald", rgb(0, 200, 132), rgb(28, 214, 150), rgb(0, 172, 112)},
