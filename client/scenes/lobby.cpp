@@ -992,13 +992,20 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			kiosk_orientation = head_q;
 			kiosk_orientation_init = true;
 		}
-		const float deadzone = 0.21f; // ~12deg
-		const float slew = 1.2f;      // rad/s catch-up rate
+		const float deadzone = 0.21f;   // ~12deg: rest inside this cone
+		const float catchup_span = 0.5f; // full catch-up rate this far past the deadzone
+		const float max_slew = 2.5f;     // rad/s catch-up rate at full deflection
 		float angle = glm::angle(head_q * glm::conjugate(kiosk_orientation));
 		if (angle > deadzone)
 		{
+			// smoothstep-eased catch-up: velocity ramps up from zero at the
+			// deadzone edge and relaxes back to zero as it settles, so the
+			// panel glides to rest with no step at either end
 			float dt = frame_state.predictedDisplayPeriod * 1e-9f;
-			kiosk_orientation = glm::normalize(glm::mix(kiosk_orientation, head_q, std::clamp(slew * dt / angle, 0.f, 1.f)));
+			float t = std::clamp((angle - deadzone) / catchup_span, 0.f, 1.f);
+			float s = t * t * (3.f - 2.f * t);
+			float step = std::min(max_slew * s * dt, angle - deadzone);
+			kiosk_orientation = glm::normalize(glm::mix(kiosk_orientation, head_q, step / angle));
 		}
 		imgui_ctx->layers()[0].orientation = kiosk_orientation;
 		imgui_ctx->layers()[0].position = head_position->first + kiosk_orientation * glm::vec3(0.f, -0.02f, -1.1f);
