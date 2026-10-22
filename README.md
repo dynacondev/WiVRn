@@ -228,3 +228,5 @@ WiVRn uses the following software:
 - [VulkanMemoryAllocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)
 - [WebXR input profiles](https://www.npmjs.com/package/@webxr-input-profiles/motion-controllers)
 - [x264](https://www.videolan.org/developers/x264.html) optional, for software encoding
+
+The business jet 3D model shown on the headset waiting screens is by [Nikdox](https://www.cgtrader.com/free-3d-models/aircraft/jet/bussines-jet-3d-model-by-nikdox).

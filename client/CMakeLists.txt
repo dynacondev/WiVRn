@@ -335,6 +335,7 @@ if(WIVRN_COMPRESS_GLB)
 else()
     wivrn_copy_file(       SOURCE ${ASSETS_SRC_DIR}/ground.glb                          DESTINATION ${ASSETS_DIR}/ground.glb                          TARGET wivrn)
 endif()
+wivrn_copy_file(       SOURCE ${ASSETS_SRC_DIR}/plane.glb                           DESTINATION ${ASSETS_DIR}/plane.glb                           TARGET wivrn)
 
 wivrn_webxr_download()
 wivrn_webxr_controller(PROFILE generic-trigger-squeeze DESTINATION ${ASSETS_DIR}/controllers TARGET wivrn)

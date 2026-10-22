@@ -34,6 +34,7 @@
 #include <IconsFontAwesome7.h>
 #include <chrono>
 #include <cmath>
+#include <imspinner.h>
 #include <glm/ext.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/matrix_access.hpp>
@@ -807,6 +808,19 @@ void scenes::stream::gui_applications()
 	ImGui::PopStyleVar();
 }
 
+void scenes::stream::gui_kiosk_waiting()
+{
+	const auto & t = wivrn::ui::current();
+
+	// spinner + title on one row, matching the lobby kiosk overlay
+	ImGui::PushFont(nullptr, constants::gui::font_size_large);
+	const float r = ImGui::GetFontSize() * 0.55f;
+	ImSpinner::SpinnerAng("kiosk-waiting", r, wivrn::ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
+	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
+	ImGui::TextUnformatted(_S("Waiting for Simulation"));
+	ImGui::PopFont();
+}
+
 void scenes::stream::gui_toasts()
 {
 	auto toast = gui_toast.lock();
@@ -865,7 +879,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 	float alpha = 1;
 	bool is_urgent = false;
-	if (gui_status == stream_tab::hidden)
+	if (gui_status == stream_tab::hidden and not stream_kiosk_shown)
 	{
 		auto toast = gui_toast.lock();
 		if (toast->has_value())
@@ -945,9 +959,13 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 				break;
 
 			case stream_tab::hidden:
-				// Always use the same position for the GUI shortcut tip
 				imgui_ctx->layers()[0].orientation = head_position->second;
-				imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, -0.4, -1.0};
+				if (stream_kiosk_shown)
+					// waiting overlay sits centred in view, not low like the toast tip
+					imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, 0.0, -1.1};
+				else
+					// Always use the same position for the GUI shortcut tip
+					imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, -0.4, -1.0};
 				break;
 
 			case stream_tab::overlay_only:
@@ -984,7 +1002,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	const float tab_width = wivrn::ui::metrics::sidebar_width;
 	const float top_bar_h = wivrn::ui::metrics::top_bar_height;
 	const float content_margin = wivrn::ui::metrics::content_margin;
-	const ImVec2 margin_around_window{50, 50};
+	// vertical margin is tighter than the sides: the sidebar nav list
+	// overflows by ~12px with 50px all around, 30px gives it room
+	// without touching the XR viewport/swapchain sizes
+	const ImVec2 margin_around_window{50, 30};
 
 	ImGuiStyle & style = ImGui::GetStyle();
 	imgui_ctx->new_frame(predicted_display_time);
@@ -1002,6 +1023,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	wivrn::ui::set_popup_center(imgui_ctx->layers()[2].vp_center(), float(imgui_ctx->layers()[2].vp_size.y));
 	wivrn::ui::set_hover_haptic([this] { imgui_ctx->vibrate_on_hover(); });
 	wivrn::ui::set_tooltip_hook([this](const char * text) { imgui_ctx->tooltip(text); });
+
+	// model planes wheeling behind the waiting overlay (hidden otherwise)
+	if (kiosk_planes_)
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown);
 
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);
 	ImVec2 content_size{viewport_size - ImVec2{tab_width, 0} - margin_around_window * 2};
@@ -1046,9 +1071,11 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 4);
 	}
 
-	// themed translucent background, matching the lobby
+	// themed background, matching the lobby; fully opaque behind the kiosk
+	// waiting overlay so spawning planes stay hidden behind it
 	const wivrn::ui::theme & th = wivrn::ui::current();
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{th.background.x, th.background.y, th.background.z, wivrn::ui::background_alpha()});
+	const float bg_alpha = (gui_status == stream_tab::hidden && stream_kiosk_shown) ? 1.f : wivrn::ui::background_alpha();
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{th.background.x, th.background.y, th.background.z, bg_alpha});
 
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0);
 	if (always_auto_resize)
@@ -1074,7 +1101,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	switch (gui_status)
 	{
 		case stream_tab::hidden:
-			gui_toasts();
+			if (stream_kiosk_shown)
+				gui_kiosk_waiting();
+			else
+				gui_toasts();
 			break;
 
 		case stream_tab::overlay_only:

@@ -424,8 +424,14 @@ void scenes::lobby::update_server_list()
 
 void scenes::lobby::connect(const configuration::server_data & data)
 {
+	// a pending scene would orphan its session: shut it down first so at
+	// most one connection is ever in flight (reached by manual connect
+	// while a kiosk auto-dial is pending)
+	if (next_scene)
+		next_scene->exit();
 	server_name = data.service.name;
 	async_error.reset();
+	kiosk_dismissed = false;
 
 	async_session = utils::async<std::unique_ptr<wivrn_session>, std::string>(
 	        [this](auto token, wivrn_discover::service service, bool manual) {
@@ -897,6 +903,21 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 			case scenes::stream::state::shutdown:
 				current_tab = tab::server_list;
+				// kiosk_active() is false while next_scene is set, so test
+				// the config half directly: kiosk sessions never reach the
+				// server-list flows that would clear next_scene. Surface
+				// errors in the full GUI, otherwise drop the dead scene and
+				// resume dialling.
+				if (kiosk_wanted() && !kiosk_dismissed && !async_error && !pin_request.lock()->pin_requested)
+				{
+					if (auto err = next_scene->pop_stream_error())
+						async_error = err;
+					else
+					{
+						next_scene.reset();
+						autoconnect_enabled = true;
+					}
+				}
 				break;
 
 			default:
@@ -925,12 +946,47 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 				if (data.visible && (data.autoconnect || force_autoconnect) && data.compatible && autoconnect_enabled)
 				{
 					autoconnect_enabled = false;
+					spdlog::info("Autoconnecting to {}", data.service.name);
 					connect(data);
 					break;
 				}
 			}
 		}
 	}
+
+	// Both-thumbsticks chord toggles the kiosk overlay. Click semantics with
+	// a time gate: arm while both sticks are held, fire once on release. A
+	// press edge never refires while held, which stranded anyone still
+	// holding through the first toggle; the gate still eats switch bounce
+	// around the release. Allowed while dialling or pending (reveal lands
+	// on the connecting UI); with kiosk mode off, and during PIN entry and
+	// first-run, presses are ignored entirely.
+	{
+		auto left = application::read_action_bool(kiosk_toggle_left_action);
+		auto right = application::read_action_bool(kiosk_toggle_right_action);
+		bool chord_down = left and left->second and right and right->second;
+		if (chord_down)
+		{
+			kiosk_chord_held = true;
+		}
+		else if (kiosk_chord_held and
+		         frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL and
+		         application::get_config().kiosk_mode and
+		         !pin_request.lock()->pin_requested && current_tab != tab::first_run)
+		{
+			kiosk_chord_held = false;
+			last_kiosk_toggle = frame_state.predictedDisplayTime;
+			kiosk_dismissed = not kiosk_dismissed;
+			if (kiosk_dismissed)
+				// pending connection goes straight to its launcher,
+				// skipping the server-list frame (and its modal churn);
+				// true idle lands on Computers as before
+				current_tab = next_scene ? tab::connected : tab::server_list;
+			setup_passthrough();
+		}
+	}
+
+	kiosk_shown = kiosk_active();
 
 	if (not frame_state.shouldRender)
 	{
@@ -964,11 +1020,63 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	std::optional<std::pair<glm::vec3, glm::quat>> head_position = application::locate_controller(application::space(xr::spaces::view), world_space, frame_state.predictedDisplayTime);
 	std::optional<glm::vec3> new_gui_position;
 
-	if (head_position)
-		new_gui_position = check_recenter_gui(head_position->first, head_position->second);
+	if (kiosk_shown and head_position)
+	{
+		// Meta-dialog-style soft follow: rest head-locked, drift back into
+		// view when the head turns away past a small deadzone. Head roll is
+		// ignored so the panel stays parallel with the horizon.
+		const glm::quat head_q = head_position->second;
+		glm::vec3 head_fwd = head_q * glm::vec3(0.f, 0.f, -1.f);
+		float yaw;
+		if (glm::length(glm::vec2(head_fwd.x, head_fwd.z)) > 1e-4f)
+			yaw = atan2(-head_fwd.x, -head_fwd.z);
+		else
+		{
+			// staring straight up/down: hold the current heading
+			glm::vec3 panel_fwd = kiosk_orientation * glm::vec3(0.f, 0.f, -1.f);
+			yaw = atan2(-panel_fwd.x, -panel_fwd.z);
+		}
+		float pitch = asin(glm::clamp(head_fwd.y, -1.f, 1.f));
+		glm::quat target = glm::angleAxis(yaw, glm::vec3(0.f, 1.f, 0.f)) * glm::angleAxis(pitch, glm::vec3(1.f, 0.f, 0.f));
+		if (not kiosk_orientation_init)
+		{
+			kiosk_orientation = target;
+			kiosk_orientation_init = true;
+		}
+		const float deadzone = 0.21f;   // ~12deg: rest inside this cone
+		const float catchup_span = 0.5f; // full catch-up rate this far past the deadzone
+		const float max_slew = 2.5f;     // rad/s catch-up rate at full deflection
+		float angle = glm::angle(target * glm::conjugate(kiosk_orientation));
+		if (angle > deadzone)
+		{
+			// smoothstep-eased catch-up: velocity ramps up from zero at the
+			// deadzone edge and relaxes back to zero as it settles, so the
+			// panel glides to rest with no step at either end
+			float dt = frame_state.predictedDisplayPeriod * 1e-9f;
+			float t = std::clamp((angle - deadzone) / catchup_span, 0.f, 1.f);
+			float s = t * t * (3.f - 2.f * t);
+			float step = std::min(max_slew * s * dt, angle - deadzone);
+			kiosk_orientation = glm::normalize(glm::mix(kiosk_orientation, target, step / angle));
+		}
+		imgui_ctx->layers()[0].orientation = kiosk_orientation;
+		imgui_ctx->layers()[0].position = head_position->first + kiosk_orientation * glm::vec3(0.f, -0.02f, -1.1f);
 
-	if (!new_gui_position and head_position)
-		new_gui_position = check_recenter_action(frame_state.predictedDisplayTime, head_position->first);
+		// keep the popup/keyboard viewports posed so any overlapping
+		// window gets a valid quad (see AGENTS.md pose rules)
+		using constants::gui::popup_position;
+		using constants::lobby::keyboard_pitch;
+		using constants::lobby::keyboard_position;
+		imgui_ctx->place_layer_relative(1, 0, popup_position);
+		imgui_ctx->place_layer_relative(2, 0, keyboard_position, glm::quat(cos(keyboard_pitch / 2), sin(keyboard_pitch / 2), 0, 0));
+	}
+	else
+	{
+		if (head_position)
+			new_gui_position = check_recenter_gui(head_position->first, head_position->second);
+
+		if (!new_gui_position and head_position)
+			new_gui_position = check_recenter_action(frame_state.predictedDisplayTime, head_position->first);
+	}
 
 	if (left_hand and right_hand)
 	{
@@ -1076,11 +1184,11 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	renderer::animate(world, frame_state.predictedDisplayPeriod * 1.0e-9);
 
-	world.get<components::node>(lobby_entity).visible = not application::get_config().passthrough_enabled;
+	world.get<components::node>(lobby_entity).visible = not application::get_config().passthrough_enabled and not kiosk_shown;
 
-	render_start(application::get_config().passthrough_enabled, frame_state.predictedDisplayTime);
+	render_start(application::get_config().passthrough_enabled or kiosk_shown, frame_state.predictedDisplayTime);
 
-	const XrColor4f clear_color = application::get_config().passthrough_enabled ? XrColor4f{0, 0, 0, 0} : constants::lobby::sky_color;
+	const XrColor4f clear_color = (application::get_config().passthrough_enabled or kiosk_shown) ? XrColor4f{0, 0, 0, 0} : constants::lobby::sky_color;
 	render_world(
 	        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 	        world_space,
@@ -1196,6 +1304,8 @@ void scenes::lobby::on_focused()
 
 	recenter_left_action = get_action("recenter_left").first;
 	recenter_right_action = get_action("recenter_right").first;
+	kiosk_toggle_left_action = get_action("kiosk_toggle_left").first;
+	kiosk_toggle_right_action = get_action("kiosk_toggle_right").first;
 
 	if (system.hand_tracking_supported())
 	{
@@ -1363,16 +1473,42 @@ void scenes::lobby::on_focused()
 	setup_passthrough();
 	discover.emplace();
 
+	kiosk_planes_.emplace(*this, layer_controllers);
+
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 }
 
 void scenes::lobby::setup_passthrough()
 {
-	if (application::get_config().passthrough_enabled)
+	if (application::get_config().passthrough_enabled || kiosk_active())
 		session.enable_passthrough(system);
 	else
 		session.disable_passthrough();
+}
+
+bool scenes::lobby::kiosk_wanted() const
+{
+	const auto & config = application::get_config();
+	if (not config.kiosk_mode or config.first_run)
+		return false;
+	for (auto & [cookie, data]: config.servers)
+		if (data.autoconnect)
+			return true;
+	return false;
+}
+
+bool scenes::lobby::kiosk_active()
+{
+	const auto & config = application::get_config();
+	if (not kiosk_wanted() or kiosk_dismissed or async_error)
+		return false;
+	if (pin_request.lock()->pin_requested)
+		return false;
+	// (no connected-tab exclusion: the overlay owns the pending state,
+	// and this branch draws before it; dialling progress shows inside
+	// the overlay itself)
+	return true;
 }
 
 void scenes::lobby::on_unfocused()
@@ -1387,6 +1523,7 @@ void scenes::lobby::on_unfocused()
 
 	imgui_ctx.reset();
 	world = entt::registry{};
+	kiosk_planes_.reset();
 
 	input.reset();
 	left_hand.reset();
@@ -1431,6 +1568,9 @@ scene::meta & scenes::lobby::get_meta_scene()
 
 	                {"recenter_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
 	                {"recenter_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
+
+	                {"kiosk_toggle_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
+	                {"kiosk_toggle_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
 	        },
 	        .bindings = {
 	                suggested_binding{
@@ -1461,6 +1601,9 @@ scene::meta & scenes::lobby::get_meta_scene()
 
 	                                {"recenter_left", "/user/hand/left/input/squeeze/value"},
 	                                {"recenter_right", "/user/hand/right/input/squeeze/value"},
+
+	                                {"kiosk_toggle_left", "/user/hand/left/input/thumbstick/click"},
+	                                {"kiosk_toggle_right", "/user/hand/right/input/thumbstick/click"},
 	                        },
 	                },
 	                suggested_binding{

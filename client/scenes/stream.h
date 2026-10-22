@@ -24,6 +24,7 @@
 #include "audio/audio.h"
 #include "configuration.h"
 #include "decoder/shard_accumulator.h"
+#include "kiosk_planes.h"
 #include "render/debug_lines.h"
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
@@ -207,8 +208,8 @@ private:
 
 	thread_safe<std::queue<std::string>> stream_error_queue;
 
-	XrAction plots_toggle_1 = XR_NULL_HANDLE;
-	XrAction plots_toggle_2 = XR_NULL_HANDLE;
+	XrAction kiosk_chord_left_action = XR_NULL_HANDLE;
+	XrAction kiosk_chord_right_action = XR_NULL_HANDLE;
 	XrAction recenter_left = XR_NULL_HANDLE;
 	XrAction recenter_right = XR_NULL_HANDLE;
 	XrAction gui_distance_left = XR_NULL_HANDLE;
@@ -249,6 +250,20 @@ private:
 
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
+
+	// Kiosk "Waiting for Simulation" overlay: shown over the (idle) video
+	// while connected with no XR application active. Render thread only,
+	// except stream_apps_known which latches on the network thread.
+	bool stream_kiosk_dismissed = false;
+	bool stream_kiosk_shown = false;
+	bool stream_had_active_app = false;
+	XrTime last_kiosk_app_req = 0;
+	XrTime last_stream_kiosk_toggle = 0;
+	bool stream_chord_held = false;
+	std::optional<wivrn::kiosk_planes> kiosk_planes_;
+	std::atomic<bool> stream_apps_known = false;
+	bool has_active_simulation();
+	void update_stream_kiosk(XrTime predicted_display_time);
 
 	// Fiducial tracking markers (Quest only, see docs/configuration.md).
 	// Latest map from the server; model files cached under
@@ -780,6 +795,7 @@ private:
 	void gui_foveation_settings(float predicted_display_period);
 	void gui_applications();
 	void gui_toasts();
+	void gui_kiosk_waiting();
 	void gui_passthrough();
 	void gui_fiducial_status();
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});

@@ -57,6 +57,7 @@
 
 #include "IconsFontAwesome7.h"
 #include "IconsFontAwesome7Brands.h"
+#include <imspinner.h>
 
 using namespace std::chrono_literals;
 
@@ -140,6 +141,7 @@ void scenes::lobby::gui_connecting(locked_notifiable<pin_request_data> & pin_req
 	{
 		async_session.cancel();
 		next_scene.reset();
+		async_error.reset();
 
 		pin_request->pin_cancelled = true;
 
@@ -816,6 +818,30 @@ void scenes::lobby::gui_about()
 	ImGui::Image(about_picture, {win_width / 2, win_width / 2});
 }
 
+void scenes::lobby::gui_kiosk()
+{
+	namespace ui = wivrn::ui;
+	const auto & t = ui::current();
+
+	// spinner + title on one row, live connection stage below while dialling
+	ImGui::PushFont(nullptr, constants::gui::font_size_large);
+	const float r = ImGui::GetFontSize() * 0.55f;
+	ImSpinner::SpinnerAng("kiosk", r, ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
+	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
+	// connected but no video yet: the simulation hasn't started
+	ImGui::TextUnformatted(next_scene ? _S("Waiting for Simulation") : _S("Waiting for Connection"));
+	ImGui::PopFont();
+
+	if (async_session.valid())
+	{
+		// progress is empty until the worker thread sets its first stage
+		const std::string progress = async_session.get_progress();
+		ImGui::PushStyleColor(ImGuiCol_Text, t.text_muted);
+		ImGui::TextWrapped("%s", progress.empty() ? _S("Connecting…") : progress.c_str());
+		ImGui::PopStyleColor();
+	}
+}
+
 void scenes::lobby::gui_first_run()
 {
 	float win_width = ImGui::GetWindowSize().x;
@@ -834,6 +860,11 @@ void scenes::lobby::gui_first_run()
 	                .f = feature::microphone,
 	                .text = _S("Enable the microphone?"),
 	                .supported = true,
+	        },
+	        item{
+	                .f = feature::hand_tracking,
+	                .text = _S("Enable hand tracking?"),
+	                .supported = system.hand_tracking_supported(),
 	        },
 	        item{
 	                .f = feature::eye_gaze,
@@ -857,8 +888,6 @@ void scenes::lobby::gui_first_run()
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
 	CenterTextH(_("Welcome to DynaconVR"));
 	ImGui::PopFont();
-
-	config.set_feature(feature::hand_tracking, true);
 
 	while (optional_feature_index < optional_features.size() and
 	       (not optional_features[optional_feature_index].supported or
@@ -1050,6 +1079,13 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 	update_transfers();
 	update_file_picker();
 
+	// kiosk overlay is display-only: no controller interaction
+	imgui_ctx->set_controllers_enabled(!kiosk_shown);
+
+	// model planes wheeling behind the overlay panel (hidden otherwise)
+	if (kiosk_planes_)
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, kiosk_shown);
+
 	ImGuiStyle & style = ImGui::GetStyle();
 	style.FontScaleMain = wivrn::ui::current().font_scale * wivrn::ui::metrics::font_base;
 
@@ -1098,6 +1134,24 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 		gui_first_run();
 		ImGui::End();
 		ImGui::PopStyleVar(4); // ImGuiStyleVar_FrameRounding, ImGuiStyleVar_WindowPadding, ImGuiStyleVar_WindowRounding, ImGuiStyleVar_WindowBorderSize
+	}
+	// kiosk overlay wins over the connected launcher while a connection is
+	// pending without video; the launcher still shows when revealed or
+	// with kiosk mode off
+	else if (kiosk_shown)
+	{
+		// minimal waiting panel over passthrough instead of the full shell,
+		// centred on the (soft head-following) main layer; fully opaque so
+		// spawning planes stay hidden behind it
+		const wivrn::ui::theme & kiosk_th = wivrn::ui::current();
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{kiosk_th.background.x, kiosk_th.background.y, kiosk_th.background.z, 1.f});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, wivrn::ui::metrics::window_padding);
+		ImGui::SetNextWindowPos(imgui_ctx->layers()[0].vp_center(), ImGuiCond_Always, {0.5, 0.5});
+		ImGui::Begin("Kiosk", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);
+		gui_kiosk();
+		ImGui::End();
+		ImGui::PopStyleVar();
+		ImGui::PopStyleColor();
 	}
 	else if (current_tab == tab::connected)
 	{

@@ -1,9 +1,14 @@
-#wivrn
-{
-	filter:url(#blue-tint)
-}
-
 #night-sky
 {
 	display: inline !important
+}
+
+#bg-stop-0
+{
+	stop-color: #c25e00 !important
+}
+
+#bg-stop-1
+{
+	stop-color: #963800 !important
 }

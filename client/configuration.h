@@ -91,13 +91,18 @@ public:
 
 	bool enable_stream_gui = true;
 
+	// Kiosk mode: at startup, when an auto-connect computer is configured,
+	// show only a minimal "Waiting for Connection" overlay over passthrough
+	// instead of the full lobby. Both thumbsticks reveal the full GUI.
+	bool kiosk_mode = true;
+
 	// application launcher: list vs grid, and grid icon size, 0 small 1 medium 2 large
 	bool app_list_view = false;
 	uint32_t app_icon_size = 0;
 
-	// interface theme, defaults match the built-in "Dark" preset and "Blue" accent
-	std::string theme_preset = "Dark";
-	std::string theme_accent = "Blue";
+	// interface theme, defaults match the built-in "OLED" preset and "Orange" accent
+	std::string theme_preset = "OLED";
+	std::string theme_accent = "Orange";
 	float theme_rounding = 8;
 	float theme_card_rounding = 14;
 	float theme_font_scale = 1.0;

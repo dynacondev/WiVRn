@@ -604,8 +604,10 @@ void scenes::stream::on_focused()
 		}
 	}
 
-	plots_toggle_1 = get_action("plots_toggle_1").first;
-	plots_toggle_2 = get_action("plots_toggle_2").first;
+	kiosk_chord_left_action = get_action("kiosk_chord_left").first;
+	kiosk_chord_right_action = get_action("kiosk_chord_right").first;
+
+	kiosk_planes_.emplace(*this, layer_controllers);
 	recenter_left = get_action("recenter_left").first;
 	recenter_right = get_action("recenter_right").first;
 	gui_distance_left = get_action("gui_distance_left").first;
@@ -630,6 +632,7 @@ void scenes::stream::on_focused()
 void scenes::stream::on_unfocused()
 {
 	renderer->wait_idle(); // Must be before the scene data because the renderer uses its descriptor sets;
+	kiosk_planes_.reset();
 	world.clear();
 	input.reset();
 	left_hand.reset();
@@ -867,6 +870,39 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
+bool scenes::stream::has_active_simulation()
+{
+	auto apps = running_applications.lock();
+	for (auto & app: apps->applications)
+		if (app.active and not app.overlay)
+			return true;
+	return false;
+}
+
+void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
+{
+	const auto & config = application::get_config();
+	// no overlay (and no need to poll) when the in-stream GUI is disabled:
+	// the chord that would reveal it is dead too
+	const bool allowed = config.kiosk_mode and config.enable_stream_gui;
+
+	// keep the running-apps picture fresh while the overlay may show; the
+	// applications tab polls itself when visible, this covers the overlay
+	if (allowed and predicted_display_time - last_kiosk_app_req > 2'000'000'000LL)
+	{
+		last_kiosk_app_req = predicted_display_time;
+		network_session->send_control(from_headset::get_running_applications{});
+	}
+
+	bool has_active = allowed and stream_apps_known and has_active_simulation();
+	if (stream_had_active_app and not has_active)
+		stream_kiosk_dismissed = false; // app stopped: waiting overlay returns
+	stream_had_active_app = has_active;
+
+	stream_kiosk_shown = allowed and not stream_kiosk_dismissed and
+	                     stream_apps_known and not has_active and not is_gui_interactable();
+}
+
 void scenes::stream::render(const XrFrameState & frame_state)
 {
 	if (state_ == state::shutdown)
@@ -877,12 +913,93 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	real_display_period = last_display_time ? frame_state.predictedDisplayTime - last_display_time : frame_state.predictedDisplayPeriod;
 	last_display_time = frame_state.predictedDisplayTime;
 
+	// Kiosk/chord input runs above the no-video early return below: the
+	// waiting overlay must work (and the chord must stay alive) while the
+	// server sends no video for an idle session.
+	read_actions();
+
+	update_stream_kiosk(frame_state.predictedDisplayTime);
+
+	if (application::get_config().enable_stream_gui)
+	{
+		XrActionStateGetInfo get_info{
+		        .type = XR_TYPE_ACTION_STATE_GET_INFO,
+		        .action = kiosk_chord_left_action,
+		};
+
+		XrActionStateBoolean state_1{XR_TYPE_ACTION_STATE_BOOLEAN};
+		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_1));
+		get_info.action = kiosk_chord_right_action;
+		XrActionStateBoolean state_2{XR_TYPE_ACTION_STATE_BOOLEAN};
+		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_2));
+
+		// Click semantics with a time gate: arm while both sticks are held,
+		// fire once on release. A press edge never refires while held, which
+		// stranded anyone still holding through the first toggle; the gate
+		// still eats switch bounce around the release.
+		bool chord_down = state_1.currentState and state_2.currentState;
+		if (!state_1.isActive || !state_2.isActive)
+		{
+			static bool chord_inactive_warned = false;
+			if (!chord_inactive_warned)
+			{
+				chord_inactive_warned = true;
+				spdlog::warn("Kiosk chord actions inactive, thumbstick toggle unavailable");
+			}
+		}
+		if (chord_down)
+		{
+			stream_chord_held = true;
+		}
+		else if (stream_chord_held and
+		         frame_state.predictedDisplayTime - last_stream_kiosk_toggle > 500'000'000LL)
+		{
+			stream_chord_held = false;
+			last_stream_kiosk_toggle = frame_state.predictedDisplayTime;
+			// Arbitrary transitions can happen from network commands
+			// Ensure we can't have a set of 2 non interactable states
+			if (stream_kiosk_shown)
+			{
+				stream_kiosk_dismissed = true;
+				next_gui_status = stream_tab::settings;
+			}
+			else if (is_gui_interactable())
+			{
+				next_gui_status = stream_tab::hidden;
+				stream_kiosk_dismissed = false;
+				// fresh app list so the reshow decision isn't stale
+				last_kiosk_app_req = frame_state.predictedDisplayTime;
+				network_session->send_control(from_headset::get_running_applications{});
+			}
+			else if (is_interactable(stored_gui_status))
+				next_gui_status = stored_gui_status;
+			else
+				next_gui_status = stream_tab::applications;
+		}
+	}
+
 	std::shared_lock lock(decoder_mutex);
 	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
 	{
 		// TODO: stop/restart video stream
 		session.begin_frame();
-		session.end_frame(frame_state.predictedDisplayTime, {});
+		if (frame_state.shouldRender and state_ != state::shutdown)
+		{
+			// Idle server, no video: still submit the GUI so the waiting
+			// overlay (or an open settings page) stays usable, with
+			// passthrough behind the overlay mirroring the lobby kiosk.
+			// Per-frame enable matches the normal path below; it resumes
+			// owning passthrough state once video flows.
+			if (stream_kiosk_shown)
+				session.enable_passthrough(system);
+			else
+				session.disable_passthrough();
+			render_start(stream_kiosk_shown, frame_state.predictedDisplayTime);
+			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
+			render_end();
+		}
+		else
+			session.end_frame(frame_state.predictedDisplayTime, {});
 		return;
 	}
 
@@ -2968,34 +3085,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
-	read_actions();
-
-	if (application::get_config().enable_stream_gui)
-	{
-		XrActionStateGetInfo get_info{
-		        .type = XR_TYPE_ACTION_STATE_GET_INFO,
-		        .action = plots_toggle_1,
-		};
-
-		XrActionStateBoolean state_1{XR_TYPE_ACTION_STATE_BOOLEAN};
-		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_1));
-		get_info.action = plots_toggle_2;
-		XrActionStateBoolean state_2{XR_TYPE_ACTION_STATE_BOOLEAN};
-		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_2));
-
-		if (state_1.currentState and state_2.currentState and (state_1.changedSinceLastSync or state_2.changedSinceLastSync))
-		{
-			// Arbitrary transitions can happen from network commands
-			// Ensure we can't have a set of 2 non interactable states
-			if (is_gui_interactable())
-				next_gui_status = stream_tab::hidden;
-			else if (is_interactable(stored_gui_status))
-				next_gui_status = stored_gui_status;
-			else
-				next_gui_status = stream_tab::applications;
-		}
-	}
-
 	query_pool_filled = true;
 }
 
@@ -3111,8 +3200,8 @@ scene::meta & scenes::stream::get_meta_scene()
 	                {"right_scroll", XR_ACTION_TYPE_VECTOR2F_INPUT},
 	                {"right_haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT},
 
-	                {"plots_toggle_1", XR_ACTION_TYPE_BOOLEAN_INPUT},
-	                {"plots_toggle_2", XR_ACTION_TYPE_BOOLEAN_INPUT},
+	                {"kiosk_chord_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
+	                {"kiosk_chord_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
 
 	                {"recenter_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
 	                {"recenter_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
@@ -3160,8 +3249,9 @@ scene::meta & scenes::stream::get_meta_scene()
 	                                {"foveation_ok", "/user/hand/right/input/a/click"},
 	                                {"foveation_cancel", "/user/hand/right/input/b/click"},
 
-	                                {"plots_toggle_1", "/user/hand/left/input/thumbstick/click"},
-	                                {"plots_toggle_2", "/user/hand/right/input/thumbstick/click"},
+	                                {"kiosk_chord_left", "/user/hand/left/input/thumbstick/click"},
+	                                {"kiosk_chord_right", "/user/hand/right/input/thumbstick/click"},
+	                                {"kiosk_chord_right", "/user/hand/right/input/thumbstick/click"},
 	                        },
 	                },
 	                suggested_binding{

@@ -221,7 +221,7 @@ void configuration::set_feature(feature f, bool state)
 configuration::configuration(xr::system & system, xr::session & session)
 {
 	passthrough_enabled = system.passthrough_supported() == xr::passthrough_type::color;
-	features[feature::hand_tracking] = system.hand_tracking_supported();
+	features[feature::hand_tracking] = false;
 
 	const auto & rates = session.get_refresh_rates();
 	preferred_refresh_rate = rates.empty() ? 0 : rates[0];
@@ -318,6 +318,7 @@ const std::vector<config_field> & configuration::config_fields()
 	        scalar("resolution_scale", &configuration::resolution_scale),
 	        scalar("bitrate_bps", &configuration::bitrate_bps),
 	        scalar("enable_stream_gui", &configuration::enable_stream_gui),
+	        scalar("kiosk_mode", &configuration::kiosk_mode),
 	        scalar("app_list_view", &configuration::app_list_view),
 	        scalar("app_icon_size", &configuration::app_icon_size),
 	        scalar("theme_preset", &configuration::theme_preset),

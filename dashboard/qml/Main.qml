@@ -359,6 +359,9 @@ Kirigami.ApplicationWindow {
 
                 Image {
                     source: Qt.resolvedUrl("wivrn.svg")
+                    // keep the logo compact so the server form keeps its space
+                    sourceSize.width: 240
+                    sourceSize.height: 240
                     Layout.columnSpan: parent.width < implicitWidth + main_form.implicitWidth ? 3 : 1
                 }
 

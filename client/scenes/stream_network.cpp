@@ -169,6 +169,7 @@ void scenes::stream::operator()(to_headset::application_icon && icon)
 void scenes::stream::operator()(to_headset::running_applications && apps)
 {
 	*running_applications.lock() = std::move(apps);
+	stream_apps_known = true;
 }
 
 void scenes::stream::operator()(to_headset::fiducial_map && map)

@@ -821,6 +821,16 @@ void settings_system(const settings_context & ctx)
 	        .default_bool = default_config.enable_stream_gui,
 	});
 
+	list.push_back({
+	        .id = "##kiosk",
+	        .label = _C("setting name", "Kiosk mode"),
+	        .description = _("At startup, when an auto-connect computer is configured, show only a minimal waiting overlay over passthrough. Press both thumbsticks to reveal the full interface."),
+	        .ui = ui_kind::toggle,
+	        .get_bool = [&config] { return config.kiosk_mode; },
+	        .set_bool = [&config](bool v) { config.kiosk_mode = v; config.save(); },
+	        .default_bool = default_config.kiosk_mode,
+	});
+
 	ui::page_header(_cS("page header title", "System"), _cS("page header suibtitle", "Language and advanced options."));
 	render_settings(ctx, "##system", list);
 
@@ -871,7 +881,7 @@ void settings_theme(const settings_context & ctx)
 			for (int i = 0; i < int(preset_list.size()); ++i)
 				if (preset_list[i].name == cfg.theme_preset)
 					return i;
-			return 1; // dark_default
+			return 0; // oled
 		};
 		static int preset = f(config);
 		static const int preset_default = f(default_config);
