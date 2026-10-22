@@ -956,15 +956,17 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	// Both-thumbsticks chord toggles the kiosk overlay. Edge-triggered off
 	// the actions' last-change times so holding the sticks fires once, with
-	// a time gate so switch bounce can't double-toggle one press. Ignored
-	// while a connection is in flight: the connecting flow owns the UI.
+	// a time gate so switch bounce can't double-toggle one press. Allowed
+	// while dialling or pending (reveal lands on the connecting UI); PIN
+	// entry and first-run own the screen and are never disturbed.
 	{
 		auto left = application::read_action_bool(kiosk_toggle_left_action);
 		auto right = application::read_action_bool(kiosk_toggle_right_action);
 		if (left and left->second and right and right->second and
 		    std::max(left->first, right->first) > last_kiosk_toggle and
 		    frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL and
-		    !async_session.valid() && !pin_request.lock()->pin_requested && current_tab != tab::first_run)
+		    application::get_config().kiosk_mode and
+		    !pin_request.lock()->pin_requested && current_tab != tab::first_run)
 		{
 			last_kiosk_toggle = frame_state.predictedDisplayTime;
 			kiosk_dismissed = not kiosk_dismissed;
@@ -1480,11 +1482,8 @@ bool scenes::lobby::kiosk_active()
 		return false;
 	if (current_tab == tab::connected)
 		return false;
-	// the dialling modal owns the UI while dialling: never cover it. Once
-	// the connection exists but no video flows yet, the overlay returns
-	// (drawn as "Waiting for Simulation") instead of the app launcher.
-	if (async_session.valid())
-		return false;
+	// the dialling progress shows inside the overlay itself; PIN entry and
+	// errors take over the full UI through the guards above
 	return true;
 }
 
