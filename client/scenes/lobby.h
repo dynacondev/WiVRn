@@ -124,6 +124,7 @@ class lobby : public scene_impl<lobby>
 	bool kiosk_dismissed = false;
 	bool kiosk_shown = false;
 	XrTime last_kiosk_toggle = 0;
+	bool kiosk_chord_held = false;
 	glm::quat kiosk_orientation{1, 0, 0, 0};
 	bool kiosk_orientation_init = false;
 	// config half of the kiosk predicate (mode on, server configured);

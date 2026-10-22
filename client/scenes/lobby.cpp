@@ -954,21 +954,29 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		}
 	}
 
-	// Both-thumbsticks chord toggles the kiosk overlay. Edge-triggered off
-	// the actions' last-change times so holding the sticks fires once, with
-	// a time gate so switch bounce can't double-toggle one press. Allowed
-	// while dialling or pending (reveal lands on the connecting UI); PIN
-	// entry and first-run own the screen and are never disturbed.
+	// Both-thumbsticks chord toggles the kiosk overlay. Click semantics with
+	// a time gate: arm while both sticks are held, fire once on release. A
+	// press edge never refires while held, which stranded anyone still
+	// holding through the first toggle; the gate still eats switch bounce
+	// around the release. Allowed while dialling or pending (reveal lands
+	// on the connecting UI); with kiosk mode off, and during PIN entry and
+	// first-run, presses are ignored entirely.
 	{
 		auto left = application::read_action_bool(kiosk_toggle_left_action);
 		auto right = application::read_action_bool(kiosk_toggle_right_action);
-		if (left and left->second and right and right->second and
-		    std::max(left->first, right->first) > last_kiosk_toggle and
-		    frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL and
-		    application::get_config().kiosk_mode and
-		    !pin_request.lock()->pin_requested && current_tab != tab::first_run)
+		bool chord_down = left and left->second and right and right->second;
+		if (chord_down)
 		{
+			kiosk_chord_held = true;
+		}
+		else if (kiosk_chord_held and
+		         frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL and
+		         application::get_config().kiosk_mode and
+		         !pin_request.lock()->pin_requested && current_tab != tab::first_run)
+		{
+			kiosk_chord_held = false;
 			last_kiosk_toggle = frame_state.predictedDisplayTime;
+			spdlog::info("Kiosk chord fired: shown={} dismissed={}", kiosk_shown, kiosk_dismissed);
 			kiosk_dismissed = not kiosk_dismissed;
 			if (kiosk_dismissed)
 				current_tab = tab::server_list;
