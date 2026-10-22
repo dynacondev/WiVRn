@@ -969,6 +969,18 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	// popup layer floats in front of the main panel so combos and modals pop as their own quad
 	imgui_ctx->place_layer_relative(2, 0, constants::gui::popup_position);
 
+	// Tooltip strip sits directly beneath the main panel in the swapchain
+	// image (same pixel density): stack it flush below so any window
+	// overlapping its region (tooltips, low combo popups) gets a valid
+	// quad pose. Without this a popup crossing into the strip emits a
+	// zero-quaternion quad, failing the whole xrEndFrame with
+	// XR_ERROR_POSE_INVALID (fullscreen black, GUI included).
+	{
+		const auto & main = imgui_ctx->layers()[0];
+		const auto & strip = imgui_ctx->layers()[1];
+		imgui_ctx->place_layer_relative(1, 0, {0, -(main.size.y + strip.size.y) / 2, 0});
+	}
+
 	const float tab_width = wivrn::ui::metrics::sidebar_width;
 	const float top_bar_h = wivrn::ui::metrics::top_bar_height;
 	const float content_margin = wivrn::ui::metrics::content_margin;

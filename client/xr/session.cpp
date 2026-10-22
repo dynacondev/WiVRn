@@ -373,6 +373,12 @@ void xr::session::sync_actions(XrActionSet action_set, const std::string & subac
 
 void xr::session::enable_passthrough(xr::system & system)
 {
+	// Already live: do NOT re-apply style here. enable_passthrough() runs
+	// every frame from stream::render; re-applying (2 IPCs + logs) each
+	// frame stalls the frame and was observed to precede a
+	// CALL_ORDER_INVALID on swapchain release. Style is applied once on
+	// creation below and on explicit GUI edits via
+	// apply_passthrough_effects().
 	if (not std::holds_alternative<std::monostate>(passthrough))
 		return;
 
@@ -381,7 +387,26 @@ void xr::session::enable_passthrough(xr::system & system)
 
 	if (inst->has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
-		passthrough.emplace<xr::passthrough_fb>(*inst, *this);
+		// Guard the emplace: a throwing ctor would leave the variant
+		// valueless_by_exception, after which every frame throws
+		// bad_variant_access in add_passthrough_layer, skips end_frame,
+		// and all later acquire/release calls fail with
+		// CALL_ORDER_INVALID. Fall back to no passthrough instead.
+		// set_effects is inside the guard too: it only allocates on LUT
+		// preset changes, but a throw here would poison the frame loop
+		// the same way, so keep creation + first style atomic.
+		try
+		{
+			passthrough.emplace<xr::passthrough_fb>(*inst, *this);
+			if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+				fb->set_effects(effects_state);
+		}
+		catch (std::exception & e)
+		{
+			spdlog::warn("Passthrough creation failed, disabling: {}", e.what());
+			passthrough.emplace<std::monostate>();
+			return;
+		}
 	}
 	else if (inst->has_extension(XR_HTC_PASSTHROUGH_EXTENSION_NAME))
 	{
@@ -391,6 +416,25 @@ void xr::session::enable_passthrough(xr::system & system)
 	{
 		passthrough.emplace<xr::passthrough_alpha_blend>();
 	}
+}
+
+void xr::session::apply_passthrough_effects()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->set_effects(effects_state);
+}
+
+bool xr::session::passthrough_color_lut_supported() const
+{
+#ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		return fb->color_lut_supported();
+	// No live fb yet (passthrough currently off): report extension
+	// availability so the GUI can enable LUT mode before first enable.
+	return inst && inst->has_extension(XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME);
+#else
+	return false;
+#endif
 }
 
 void xr::session::disable_passthrough()

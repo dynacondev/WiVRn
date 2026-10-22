@@ -1174,6 +1174,175 @@ void scenes::stream::gui_passthrough()
 	}
 	ImGui::EndDisabled();
 
+	ImGui::SeparatorText(_S("Passthrough effects demo"));
+	{
+		auto & fx = session.mutable_passthrough_effects();
+		bool lut_supported = session.passthrough_color_lut_supported();
+		bool dirty = false;
+
+		if (ImGui::Checkbox(_S("Enable passthrough effects"), &fx.enabled))
+		{
+			dirty = true;
+			spdlog::info("Passthrough effects {}", fx.enabled ? "enabled (fullscreen)" : "disabled");
+		}
+		ImGui::BeginDisabled(not fx.enabled);
+
+		float op_pct = fx.opacity * 100.0f;
+		if (ImGui::SliderFloat(_S("Opacity"), &op_pct, 0, 100, "%.0f%%"))
+		{
+			fx.opacity = std::clamp(op_pct / 100.0f, 0.0f, 1.0f);
+			dirty = true;
+		}
+		float edge_pct = fx.edge_alpha * 100.0f;
+		if (ImGui::SliderFloat(_S("Edge strength"), &edge_pct, 0, 100, "%.0f%%"))
+		{
+			fx.edge_alpha = std::clamp(edge_pct / 100.0f, 0.0f, 1.0f);
+			dirty = true;
+		}
+		float edge_col[3] = {fx.edge_r, fx.edge_g, fx.edge_b};
+		if (ImGui::ColorEdit3(_S("Edge color"), edge_col))
+		{
+			fx.edge_r = edge_col[0];
+			fx.edge_g = edge_col[1];
+			fx.edge_b = edge_col[2];
+			dirty = true;
+		}
+
+		ImGui::Text("%s", _S("Effect mode (one at a time)"));
+		int mode = (int)fx.mode;
+		if (ImGui::RadioButton(_S("Off"), mode == (int)xr::passthrough_effect_mode::off))
+		{
+			mode = (int)xr::passthrough_effect_mode::off;
+			dirty = true;
+		}
+		ImGui::SameLine();
+		if (ImGui::RadioButton("BCS", mode == (int)xr::passthrough_effect_mode::bcs))
+		{
+			mode = (int)xr::passthrough_effect_mode::bcs;
+			dirty = true;
+		}
+		ImGui::SameLine();
+		if (ImGui::RadioButton(_S("Mono"), mode == (int)xr::passthrough_effect_mode::mono_rgba))
+		{
+			mode = (int)xr::passthrough_effect_mode::mono_rgba;
+			dirty = true;
+		}
+		ImGui::SameLine();
+		ImGui::BeginDisabled(!lut_supported);
+		if (ImGui::RadioButton("LUT", mode == (int)xr::passthrough_effect_mode::lut))
+		{
+			mode = (int)xr::passthrough_effect_mode::lut;
+			dirty = true;
+		}
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::BeginDisabled(!lut_supported);
+		if (ImGui::RadioButton(_S("LUT mix"), mode == (int)xr::passthrough_effect_mode::interpolated_lut))
+		{
+			mode = (int)xr::passthrough_effect_mode::interpolated_lut;
+			dirty = true;
+		}
+		ImGui::EndDisabled();
+		fx.mode = (xr::passthrough_effect_mode)mode;
+
+		// BCS: brightness/contrast/saturation (CIELAB, Quest runtime).
+		ImGui::BeginDisabled(fx.mode != xr::passthrough_effect_mode::bcs);
+		if (ImGui::SliderFloat(_S("Brightness"), &fx.brightness, -100, 100, "%.0f"))
+		{
+			fx.brightness = std::clamp(fx.brightness, -100.0f, 100.0f);
+			dirty = true;
+		}
+		if (ImGui::SliderFloat(_S("Contrast"), &fx.contrast, 0, 4, "%.2f"))
+		{
+			fx.contrast = std::max(fx.contrast, 0.0f);
+			dirty = true;
+		}
+		if (ImGui::SliderFloat(_S("Saturation"), &fx.saturation, 0, 4, "%.2f"))
+		{
+			fx.saturation = std::max(fx.saturation, 0.0f);
+			dirty = true;
+		}
+		ImGui::EndDisabled();
+
+		// Mono false-color (luminance -> RGBA ramp). Stepper, not a combo:
+		// popups dangling past the panel split across GUI viewports.
+		ImGui::BeginDisabled(fx.mode != xr::passthrough_effect_mode::mono_rgba);
+		{
+			static const char * mono_names[] = {"Gray", "Thermal", "Posterize"};
+			constexpr int mono_preset_count = (int)(sizeof(mono_names) / sizeof(mono_names[0]));
+			ImGui::Text("%s", _S("Mono preset"));
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##mono_prev", ImGuiDir_Left))
+			{
+				fx.mono_preset = (xr::passthrough_mono_preset)(((int)fx.mono_preset + mono_preset_count - 1) % mono_preset_count);
+				dirty = true;
+			}
+			ImGui::SameLine();
+			ImGui::TextUnformatted(mono_names[(int)fx.mono_preset]);
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##mono_next", ImGuiDir_Right))
+			{
+				fx.mono_preset = (xr::passthrough_mono_preset)(((int)fx.mono_preset + 1) % mono_preset_count);
+				dirty = true;
+			}
+		}
+		ImGui::EndDisabled();
+
+		// LUT presets + weights. Disabled when the ext is missing.
+		// Steppers, not combos: this section sits at the bottom of a
+		// scrollable page, so a combo popup would dangle past the panel
+		// into the next GUI viewport and split across quads (chopped,
+		// detached look). ‹ › cycles with no popup.
+		static const char * lut_names[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
+		constexpr int lut_preset_count = (int)(sizeof(lut_names) / sizeof(lut_names[0]));
+		auto lut_stepper = [&](const char * prev_id, const char * next_id, xr::passthrough_lut_preset & preset) {
+			if (ImGui::ArrowButton(prev_id, ImGuiDir_Left))
+			{
+				preset = (xr::passthrough_lut_preset)(((int)preset + lut_preset_count - 1) % lut_preset_count);
+				dirty = true;
+			}
+			ImGui::SameLine();
+			ImGui::TextUnformatted(lut_names[(int)preset]);
+			ImGui::SameLine();
+			if (ImGui::ArrowButton(next_id, ImGuiDir_Right))
+			{
+				preset = (xr::passthrough_lut_preset)(((int)preset + 1) % lut_preset_count);
+				dirty = true;
+			}
+		};
+		ImGui::BeginDisabled((fx.mode != xr::passthrough_effect_mode::lut && fx.mode != xr::passthrough_effect_mode::interpolated_lut) || !lut_supported);
+		{
+			ImGui::Text("%s", _S("LUT preset"));
+			ImGui::SameLine();
+			lut_stepper("##lut_prev", "##lut_next", fx.lut_preset);
+			float w_pct = fx.lut_weight * 100.0f;
+			if (ImGui::SliderFloat(_S("LUT strength"), &w_pct, 0, 100, "%.0f%%"))
+			{
+				fx.lut_weight = std::clamp(w_pct / 100.0f, 0.0f, 1.0f);
+				dirty = true;
+			}
+		}
+		ImGui::EndDisabled();
+		ImGui::BeginDisabled(fx.mode != xr::passthrough_effect_mode::interpolated_lut || !lut_supported);
+		{
+			ImGui::Text("%s", _S("LUT preset B"));
+			ImGui::SameLine();
+			lut_stepper("##lutb_prev", "##lutb_next", fx.lut_preset_b);
+			float m_pct = fx.lut_mix * 100.0f;
+			if (ImGui::SliderFloat(_S("LUT mix A->B"), &m_pct, 0, 100, "%.0f%%"))
+			{
+				fx.lut_mix = std::clamp(m_pct / 100.0f, 0.0f, 1.0f);
+				dirty = true;
+			}
+		}
+		ImGui::EndDisabled();
+		if (!lut_supported)
+			ImGui::Text("%s", _S("Color LUT not supported on this runtime"));
+		if (dirty)
+			session.apply_passthrough_effects();
+		ImGui::EndDisabled();
+	}
+
 	ImGui::SeparatorText(_S("Surface-projected mapping"));
 	if (not composition_layer_alpha_blend_supported)
 		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));

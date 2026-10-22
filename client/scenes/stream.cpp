@@ -1683,9 +1683,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// active: claimed whenever veiled so a B canvas always
 				// exists to lift to the uniform floor (boundary-only /
 				// projected-only / all-culled configs). The depth debug
-				// fullscreen claims it the same way. Empty draws
-				// (clear-only record); the submit-time bias lifts it.
-				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough();
+				// fullscreen and the passthrough effects demo claim it
+				// the same way. Empty draws (clear-only record); the
+				// submit-time bias lifts it.
+				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
 				if (need_debug)
 				{
 					auto & g = debug_group;
@@ -2024,14 +2025,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				// Debug group record (cutouts only, full-res, clear + hard
 				// punch): runs while claimed above. During the veil (or
-				// the depth debug fullscreen) it also runs with empty
-				// cutouts (clear-only): the promoted carrier lifted to
-				// the uniform floor at submit.
-				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough())
+				// the depth/effects debug fullscreen) it also runs with
+				// empty cutouts (clear-only): the promoted carrier lifted
+				// to the uniform floor at submit.
+				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
 				{
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
 					{
+						// Match the mask-group recreation discipline above:
+						// wait for in-flight GPU work before destroying
+						// the swapchain out from under it.
+						device.waitIdle();
 						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
 						g.extent = {(int32_t)mw, (int32_t)mh};
 						g.renderer->reset_targets();
@@ -2567,9 +2572,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		// The debug window cutout needs a live passthrough to reveal,
 		// map or not (it punches every live vote). The depth debug
-		// overlay needs fullscreen passthrough underneath it.
+		// overlay and the passthrough effects demo need fullscreen
+		// passthrough underneath them.
 		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
-		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough())
+		bool effects_full = session.effects_fullscreen_passthrough();
+		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
@@ -2579,7 +2586,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// union pass each (A projected, B flat), then debug/GUI. Without
 		// it, previous behavior is untouched (flat auto-submit), except the
 		// boundary veil hard switch forces passthrough when outside.
-		bool veil_hard_nomask = ((boundary_veil and boundary_s < 0.5f) or depth_fullscreen_passthrough()) and not mask_frame;
+		bool veil_hard_nomask = ((boundary_veil and boundary_s < 0.5f) or depth_fullscreen_passthrough() or effects_full) and not mask_frame;
 		render_start(mask_frame ? false : (use_alpha or veil_hard_nomask), frame_state.predictedDisplayTime);
 
 		// Add the layer with the streamed content
@@ -2681,21 +2688,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// degrades to a hard switch at s = 0.5 (opaque fullscreen flat
 			// when outside, no masks needed).
 			float veil_s = std::clamp(boundary_s, 0.f, 1.f);
-			// Depth debug fullscreen: full passthrough under the viz via
-			// the same B floor lift (scale 0 + bias 1), no geometry.
+			// Depth debug fullscreen + effects demo fullscreen: full
+			// passthrough under the viz via the same B floor lift
+			// (scale 0 + bias 1), no geometry.
 			bool depth_full = depth_fullscreen_passthrough();
-			if (depth_full)
+			bool effects_full_inner = session.effects_fullscreen_passthrough();
+			bool full_passthrough_demo = depth_full or effects_full_inner;
+			if (full_passthrough_demo)
 				veil_s = 0;
-			bool veil_lift = (boundary_veil or depth_full) and veil_s < 0.999f and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported;
-			bool veil_hard_out = ((boundary_veil or depth_full) and veil_s < 0.5f) and not composition_layer_color_scale_bias_supported;
+			bool veil_lift = (boundary_veil or full_passthrough_demo) and veil_s < 0.999f and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported;
+			bool veil_hard_out = ((boundary_veil or full_passthrough_demo) and veil_s < 0.5f) and not composition_layer_color_scale_bias_supported;
 			// No-mask-path runtimes have no alpha control to ramp through
 			// either: hard switch there too (forced in render_start below
 			// for the non-mask branch; here for the mask branch without
 			// colorScaleBias).
-			if ((boundary_veil or depth_full) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
+			if ((boundary_veil or full_passthrough_demo) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
 				veil_hard_out = true;
 			bool submit_projected = have_projected and a_active > 0;
-			bool submit_flat = (need_flat or ((boundary_veil or depth_full) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
+			bool submit_flat = (need_flat or ((boundary_veil or full_passthrough_demo) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
 			        (b_active > 0 or veil_hard_out);
 			// Forensic submit decisions (change-triggered): which camera layer
 			// submits and why. Permanent: coexistence bugs read as wrong output
@@ -2707,7 +2717,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					last_submit_flat = submit_flat;
 					last_submit_projected = submit_projected;
-					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={} depth_full={})",
+					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={} depth_full={} effects_full={})",
 					             (submit_flat and submit_projected) ? "projected+flat"
 					             : submit_flat                      ? "flat"
 					             : submit_projected                 ? "projected"
@@ -2717,7 +2727,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					             a_active,
 					             b_active,
 					             cutouts_punched,
-					             depth_full);
+					             depth_full,
+					             effects_full_inner);
 				}
 			}
 			// One mask submit pass per union (A then B): each union's first

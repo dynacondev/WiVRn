@@ -1052,6 +1052,30 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_context::end_frame()
 		if (not visible)
 			continue;
 
+		// Never emit a quad with an invalid pose: a single bad layer fails
+		// the whole xrEndFrame with XR_ERROR_POSE_INVALID and blacks out
+		// video + GUI. (Hit when a window overlapped a viewport whose pose
+		// was never assigned, e.g. the tooltip strip under a low combo
+		// popup: zero-quaternion quad, every frame while open.)
+		{
+			float n = std::sqrt(
+			        i.orientation.x * i.orientation.x + i.orientation.y * i.orientation.y +
+			        i.orientation.z * i.orientation.z + i.orientation.w * i.orientation.w);
+			bool pose_ok = std::isfinite(i.position.x) and std::isfinite(i.position.y) and
+			               std::isfinite(i.position.z) and std::isfinite(n) and std::abs(n - 1.0f) < 1e-2f;
+			if (not pose_ok)
+			{
+				static bool warned = false;
+				if (not warned)
+				{
+					warned = true;
+					spdlog::warn("Skipping GUI quad with invalid viewport pose (origin {}x{} size {}x{})",
+					             (int)i.vp_origin.x, (int)i.vp_origin.y, (int)i.vp_size.x, (int)i.vp_size.y);
+				}
+				continue;
+			}
+		}
+
 		quads.emplace_back(
 		        i.z_index,
 		        XrCompositionLayerQuad{
