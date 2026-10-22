@@ -2033,6 +2033,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
 					{
+						// Match the mask-group recreation discipline above:
+						// wait for in-flight GPU work before destroying
+						// the swapchain out from under it.
+						device.waitIdle();
 						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
 						g.extent = {(int32_t)mw, (int32_t)mh};
 						g.renderer->reset_targets();

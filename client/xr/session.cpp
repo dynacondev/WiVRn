@@ -387,7 +387,21 @@ void xr::session::enable_passthrough(xr::system & system)
 
 	if (inst->has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
-		passthrough.emplace<xr::passthrough_fb>(*inst, *this);
+		// Guard the emplace: a throwing ctor would leave the variant
+		// valueless_by_exception, after which every frame throws
+		// bad_variant_access in add_passthrough_layer, skips end_frame,
+		// and all later acquire/release calls fail with
+		// CALL_ORDER_INVALID. Fall back to no passthrough instead.
+		try
+		{
+			passthrough.emplace<xr::passthrough_fb>(*inst, *this);
+		}
+		catch (std::exception & e)
+		{
+			spdlog::warn("Passthrough creation failed, disabling: {}", e.what());
+			passthrough.emplace<std::monostate>();
+			return;
+		}
 		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
 			fb->set_effects(effects_state);
 	}

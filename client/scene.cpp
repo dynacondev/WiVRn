@@ -324,7 +324,13 @@ void scene::add_passthrough_layer()
 	std::visit(
 	        utils::overloaded{
 	                [&](std::monostate &) {
+		                // Effects demo / depth fullscreen can request a
+		                // passthrough submit when the runtime has no
+		                // passthrough (enable_passthrough no-op). Release
+		                // builds must not abort here; skip the layer.
+		                // (Debug assert retained below as documentation.)
 		                assert(false);
+		                spdlog::warn("add_passthrough_layer with no passthrough active, skipping");
 	                },
 	                [&](xr::passthrough_alpha_blend & p) {
 		                blend_mode = XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND;

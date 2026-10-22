@@ -87,6 +87,7 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 
 	composition_layer = XrCompositionLayerPassthroughFB{
 	        .type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
+	        .next = nullptr,
 	        .flags = 0,
 	        .space = XR_NULL_HANDLE,
 	        .layerHandle = passthrough_layer,
@@ -102,6 +103,7 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 		                                });
 		projected_composition_layer = XrCompositionLayerPassthroughFB{
 		        .type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
+		        .next = nullptr,
 		        // Non-zero flags are required by the composition-layer
 		        // VUID (unlike the layer-create struct, where 0 is
 		        // legal), and signal that the layer carries meaningful
@@ -122,7 +124,13 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 		        .textureOpacityFactor = 1.0f,
 		        .edgeColor = {0.f, 0.f, 0.f, 0.f},
 		};
-		CHECK_XR(xrPassthroughLayerSetStyleFB(*projected_layer, &projected_style));
+		// Warn-only: a throw here inside enable_passthrough()'s emplace
+		// would leave the passthrough variant valueless_by_exception and
+		// poison every later frame (bad_variant_access skips end_frame,
+		// surfacing as CALL_ORDER_INVALID). Flat default below is
+		// already warn-only; keep both consistent.
+		if (auto res = xrPassthroughLayerSetStyleFB(*projected_layer, &projected_style); res != XR_SUCCESS)
+			spdlog::warn("Default projected passthrough style failed: {}", (int)res);
 	}
 	else
 		spdlog::info("XR_FB_triangle_mesh not available, surface-projected passthrough disabled");
