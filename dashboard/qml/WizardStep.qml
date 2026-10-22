@@ -17,8 +17,8 @@ Kirigami.Page {
                 source: Qt.resolvedUrl("wivrn.svg")
                 // rasterize well below the 512px natural size so the
                 // logo doesn't crowd the step content out
-                sourceSize.width: 300
-                sourceSize.height: 300
+                sourceSize.width: 240
+                sourceSize.height: 240
             }
             Item {
                 Layout.fillHeight: true
