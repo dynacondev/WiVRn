@@ -261,6 +261,20 @@ static bool warp_debug_enabled()
 // violent would splat mostly-holes (every hole pixel costs a
 // full-radius expanding-ring search); a single repeat degrades far more
 // gracefully. Pure CPU, no GPU readback.
+//
+// Two guards, either trips a skip:
+// - Absolute displacement caps (0.6 rad / 0.6 m per warp): catches
+//   tracking glitches (identity/stale poses jump meters) independent
+//   of dt. Real per-tick motion is degrees/millimeters.
+// - Velocity with an 8 ms noise floor: sub-tick dt (common when the
+//   app runs near display rate - e.g. 0.3 ms) amplifies tracker noise
+//   into absurd velocities (a normal 2.6-degree sample reads as
+//   149 rad/s), so dt is floored before dividing. Glitches exceed
+//   the caps by orders of magnitude, so the floor costs no real
+//   protection.
+static constexpr double kGateMinDtS = 0.008;
+static constexpr float kGateMaxAngleRad = 0.6f;
+static constexpr float kGateMaxDistM = 0.6f;
 static constexpr float kMaxWarpSpeedMps = 10.f;
 static constexpr float kMaxWarpSpeedRps = 12.f;
 static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
@@ -273,6 +287,7 @@ static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
 	worst_rs = 0.f;
 	if (!(dt_s > 0.))
 		return false;
+	double dt_eff = dt_s > kGateMinDtS ? dt_s : kGateMinDtS;
 	for (int view = 0; view < 2; ++view)
 	{
 		const auto & a = src[view];
@@ -285,8 +300,10 @@ static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
 		                  a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w);
 		dot = fminf(fmaxf(dot, 0.f), 1.f);
 		float angle = 2.f * acosf(dot);
-		worst_ms = fmaxf(worst_ms, float(dist / dt_s));
-		worst_rs = fmaxf(worst_rs, float(angle / dt_s));
+		if (angle > kGateMaxAngleRad || dist > kGateMaxDistM)
+			return false;
+		worst_ms = fmaxf(worst_ms, float(dist / dt_eff));
+		worst_rs = fmaxf(worst_rs, float(angle / dt_eff));
 	}
 	return worst_ms <= kMaxWarpSpeedMps && worst_rs <= kMaxWarpSpeedRps;
 }
