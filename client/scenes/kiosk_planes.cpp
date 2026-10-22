@@ -26,6 +26,7 @@
 #include <functional>
 #include <glm/geometric.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <iterator>
 #include <map>
 #include <numbers>
 #include <string>
@@ -55,6 +56,20 @@ double smoothstep(double e0, double e1, double x)
 	return t * t * (3. - 2. * t);
 }
 
+// body paint jobs for the "Material" part, with per-channel variance;
+// glass, emissive and dark/metal parts stay as authored
+struct paint
+{
+	glm::vec3 base;
+	float variance;
+};
+const paint paints[]{
+        {{1.f, 1.f, 1.f}, 0.f},                          // white
+        {{0.62f, 0.62f, 0.62f}, 0.12f},                  // grey
+        {{1.f, 148.f / 255.f, 26.f / 255.f}, 0.07f},     // dynacon orange
+        {{14.f / 255.f, 27.f / 255.f, 141.f / 255.f}, 0.05f}, // #0E1B8D
+};
+
 glm::vec3 random_unit(std::mt19937 & rng)
 {
 	std::uniform_real_distribution<float> dist(-1.f, 1.f);
@@ -80,9 +95,17 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 
 		// one material clone per source material so each plane fades
 		// independently; textures stay shared, only flags and the uniform
-		// staging are per-plane
+		// staging are per-plane. The white body part gets a per-plane
+		// paint job from the palette above.
 		flight f;
 		f.root = entity;
+		const paint & paint = paints[std::uniform_int_distribution<size_t>(0, std::size(paints) - 1)(rng_)];
+		std::uniform_real_distribution<float> jitter(-paint.variance, paint.variance);
+		const glm::vec3 body_tint{
+		        std::clamp(paint.base.x + jitter(rng_), 0.f, 1.f),
+		        std::clamp(paint.base.y + jitter(rng_), 0.f, 1.f),
+		        std::clamp(paint.base.z + jitter(rng_), 0.f, 1.f),
+		};
 		std::map<std::shared_ptr<renderer::material>, std::shared_ptr<renderer::material>> clones;
 		std::function<void(entt::entity)> visit = [&](entt::entity e) {
 			if (auto * n = scene_.world.try_get<components::node>(e))
@@ -95,7 +118,7 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 						if (inserted)
 						{
 							auto src = primitive.material_;
-							it->second = scene_.create_material([src](renderer::material & m) {
+							it->second = scene_.create_material([src, body_tint](renderer::material & m) {
 								m.staging = src->staging;
 								m.base_color_texture = src->base_color_texture;
 								m.metallic_roughness_texture = src->metallic_roughness_texture;
@@ -105,6 +128,8 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 								m.double_sided = src->double_sided;
 								m.fragment_shader = src->fragment_shader;
 								m.name = src->name + "-kiosk";
+								if (src->name == "Material")
+									m.staging.base_color_factor = glm::vec4(body_tint, 1.f);
 								m.blend_enable = true;
 								m.depth_write_enable = false;
 							});
