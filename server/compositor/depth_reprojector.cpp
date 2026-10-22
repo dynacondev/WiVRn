@@ -171,9 +171,12 @@ namespace wivrn
 // fill path is proven on the failing driver). kForceDisableBlits kills
 // the whole blit chain + fill pass (holes stay black). kSkipFillDispatch
 // keeps the blits running but skips only the fill dispatch, to split a
-// blit-chain fault from a fill-dispatch fault.
+// blit-chain fault from a fill-dispatch fault. kSkipBlitImage keeps all
+// the mip barriers but skips the blitImage calls themselves, to split
+// barrier/layout handling from the blit itself.
 static constexpr bool kForceDisableBlits = false;
 static constexpr bool kSkipFillDispatch = true;
+static constexpr bool kSkipBlitImage = true;
 
 depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         reverse_z{configuration().reprojection.source_reverse_z},
@@ -196,6 +199,8 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		U_LOG_W("depth warp: hole fill FORCE-DISABLED (temporary triage, remove me)");
 	if (!kForceDisableBlits && kSkipFillDispatch)
 		U_LOG_W("depth warp: fill dispatch SKIPPED, blits running (temporary triage, remove me)");
+	if (!kForceDisableBlits && kSkipBlitImage)
+		U_LOG_W("depth warp: blitImage calls SKIPPED, barriers running (temporary triage, remove me)");
 	// Retained last-real-frame sources, sized to the render eye size.
 	// Full-eye, GL-ordered by the resolve pass.
 	retained_color = image_allocation{
@@ -1219,9 +1224,11 @@ bool depth_reprojector::reproject(
 			        1,
 			};
 			blit.dstOffsets[1] = vk::Offset3D{int32_t(mw), int32_t(mh), 1};
-			cmd.blitImage(
-			        target[view], vk::ImageLayout::eTransferSrcOptimal, target[view],
-			        vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+			// TEMPORARY bisect: barriers run, blit itself skipped.
+			if (!kSkipBlitImage)
+				cmd.blitImage(
+				        target[view], vk::ImageLayout::eTransferSrcOptimal, target[view],
+				        vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
 			std::array blit_post_barriers{
 			        vk::ImageMemoryBarrier{
 			                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
