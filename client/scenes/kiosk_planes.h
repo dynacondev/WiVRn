@@ -53,6 +53,10 @@ private:
 	{
 		entt::entity root;
 		std::vector<std::shared_ptr<renderer::material>> materials;
+		// per-material base colors for the CPU-side premultiplied fade,
+		// index-aligned with materials
+		std::vector<glm::vec4> base_colors;
+		std::vector<glm::vec3> base_emissives;
 		glm::vec3 p0, p1, p2, p3;
 		XrTime t0 = 0;
 		XrDuration dur = 0;

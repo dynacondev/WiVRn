@@ -33,10 +33,10 @@
 namespace
 {
 // tuning knobs, all device-tunable: model is ~13.4m wingspan in file units
-constexpr int plane_count = 5;
-constexpr float model_scale = 0.018f; // ~0.35m wingspan
-constexpr double dur_min = 7.0;
-constexpr double dur_max = 11.0;
+constexpr int plane_count = 4;
+constexpr float model_scale = 0.009f; // ~0.18m wingspan
+constexpr double dur_min = 5.0;
+constexpr double dur_max = 8.0;
 constexpr double fade_in = 1.2;
 constexpr double fade_out = 2.0;
 
@@ -47,7 +47,7 @@ constexpr float model_yaw_adjust = 0.f;
 // mirrored model X flips the apparent bank direction; flip once on device
 // if planes roll out of their turns instead of into them
 constexpr float bank_sign = 1.f;
-constexpr float bank_amount = 0.45f;
+constexpr float bank_amount = 0.25f;
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -91,11 +91,11 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 				{
 					for (auto & primitive: n->mesh->primitives)
 					{
-						auto it = clones.find(primitive.material_);
-						if (it == clones.end())
+						auto [it, inserted] = clones.try_emplace(primitive.material_, nullptr);
+						if (inserted)
 						{
 							auto src = primitive.material_;
-							auto clone = scene_.create_material([src](renderer::material & m) {
+							it->second = scene_.create_material([src](renderer::material & m) {
 								m.staging = src->staging;
 								m.base_color_texture = src->base_color_texture;
 								m.metallic_roughness_texture = src->metallic_roughness_texture;
@@ -108,10 +108,11 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 								m.blend_enable = true;
 								m.depth_write_enable = false;
 							});
-							it = clones.emplace(primitive.material_, std::move(clone)).first;
+							f.materials.push_back(it->second);
+							f.base_colors.push_back(it->second->staging.base_color_factor);
+							f.base_emissives.push_back(glm::vec3(it->second->staging.base_emissive_factor));
 						}
 						primitive.material_ = it->second;
-						f.materials.push_back(it->second);
 					}
 				}
 				for (auto && [child, child_node]: scene_.world.view<components::node>().each())
@@ -145,7 +146,7 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	std::uniform_real_distribution<float> vertical(-0.2f, 0.2f);
 	std::uniform_real_distribution<float> near_dist(0.8f, 1.4f);
 	std::uniform_real_distribution<float> mid_dist(1.2f, 2.2f);
-	std::uniform_real_distribution<float> far_dist(2.2f, 3.2f);
+	std::uniform_real_distribution<float> far_dist(3.0f, 4.5f);
 	std::uniform_real_distribution<double> dur_dist(dur_min, dur_max);
 	std::uniform_real_distribution<float> phase_dist(0.f, 2.f * std::numbers::pi_v<float>);
 
@@ -220,13 +221,18 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		}
 
 		glm::vec3 pos = bezier(f, t);
-		pos.y += 0.05f * std::sin(2. * std::numbers::pi * age * 0.7 + f.phase);
+		pos.y += 0.015f * std::sin(2. * std::numbers::pi * age * 0.7 + f.phase);
 		node->position = pos;
 
 		float alpha = float(smoothstep(0., fade_in, age) * (1. - smoothstep(dur - fade_out, dur, age)));
-		for (auto & material: f.materials)
+		for (size_t i = 0; i < f.materials.size(); ++i)
 		{
-			material->staging.base_color_factor.a = alpha;
+			auto & material = f.materials[i];
+			// the transparent pipeline blends premultiplied (ONE,
+			// ONE_MINUS_SRC_ALPHA) while lit.frag outputs straight alpha,
+			// which made alpha fades no-ops: premultiply on the CPU
+			material->staging.base_color_factor = glm::vec4(glm::vec3(f.base_colors[i]) * alpha, alpha);
+			material->staging.base_emissive_factor = glm::vec4(f.base_emissives[i] * alpha, 0.f);
 			std::memcpy(material->buffer->map(), &material->staging, sizeof(material->staging));
 			material->buffer->unmap();
 		}

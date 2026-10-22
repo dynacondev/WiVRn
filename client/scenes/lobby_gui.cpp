@@ -1141,9 +1141,10 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 	else if (kiosk_shown)
 	{
 		// minimal waiting panel over passthrough instead of the full shell,
-		// centred on the (soft head-following) main layer
+		// centred on the (soft head-following) main layer; fully opaque so
+		// spawning planes stay hidden behind it
 		const wivrn::ui::theme & kiosk_th = wivrn::ui::current();
-		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{kiosk_th.background.x, kiosk_th.background.y, kiosk_th.background.z, wivrn::ui::background_alpha()});
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{kiosk_th.background.x, kiosk_th.background.y, kiosk_th.background.z, 1.f});
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, wivrn::ui::metrics::window_padding);
 		ImGui::SetNextWindowPos(imgui_ctx->layers()[0].vp_center(), ImGuiCond_Always, {0.5, 0.5});
 		ImGui::Begin("Kiosk", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize);

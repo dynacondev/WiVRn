@@ -1071,9 +1071,11 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 4);
 	}
 
-	// themed translucent background, matching the lobby
+	// themed background, matching the lobby; fully opaque behind the kiosk
+	// waiting overlay so spawning planes stay hidden behind it
 	const wivrn::ui::theme & th = wivrn::ui::current();
-	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{th.background.x, th.background.y, th.background.z, wivrn::ui::background_alpha()});
+	const float bg_alpha = (gui_status == stream_tab::hidden && stream_kiosk_shown) ? 1.f : wivrn::ui::background_alpha();
+	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{th.background.x, th.background.y, th.background.z, bg_alpha});
 
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0);
 	if (always_auto_resize)
