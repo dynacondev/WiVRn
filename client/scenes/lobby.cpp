@@ -939,6 +939,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 				if (data.visible && (data.autoconnect || force_autoconnect) && data.compatible && autoconnect_enabled)
 				{
 					autoconnect_enabled = false;
+					spdlog::info("Autoconnecting to {}", data.service.name);
 					connect(data);
 					break;
 				}
@@ -948,13 +949,15 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 
 	// Both-thumbsticks chord toggles the kiosk overlay. Edge-triggered off
 	// the actions' last-change times so holding the sticks fires once, with
-	// a time gate so switch bounce can't double-toggle one press.
+	// a time gate so switch bounce can't double-toggle one press. Ignored
+	// while a connection is in flight: the connecting flow owns the UI.
 	{
 		auto left = application::read_action_bool(kiosk_toggle_left_action);
 		auto right = application::read_action_bool(kiosk_toggle_right_action);
 		if (left and left->second and right and right->second and
 		    std::max(left->first, right->first) > last_kiosk_toggle and
-		    frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL)
+		    frame_state.predictedDisplayTime - last_kiosk_toggle > 500'000'000LL and
+		    !async_session.valid() && !next_scene)
 		{
 			last_kiosk_toggle = frame_state.predictedDisplayTime;
 			kiosk_dismissed = not kiosk_dismissed;
@@ -1458,6 +1461,10 @@ bool scenes::lobby::kiosk_active()
 	if (pin_request.lock()->pin_requested)
 		return false;
 	if (current_tab == tab::connected)
+		return false;
+	// the connecting flow (dialling modal, app launcher) owns the UI while
+	// a connection is in flight: never cover or fight it
+	if (async_session.valid() || next_scene)
 		return false;
 	for (auto & [cookie, data]: config.servers)
 		if (data.autoconnect)

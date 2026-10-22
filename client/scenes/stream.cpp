@@ -912,28 +912,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	real_display_period = last_display_time ? frame_state.predictedDisplayTime - last_display_time : frame_state.predictedDisplayPeriod;
 	last_display_time = frame_state.predictedDisplayTime;
 
-	std::shared_lock lock(decoder_mutex);
-	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
-	{
-		// TODO: stop/restart video stream
-		session.begin_frame();
-		session.end_frame(frame_state.predictedDisplayTime, {});
-		return;
-	}
-
-	if (state_ == state::stalled)
-	{
-		network_session->send_control(from_headset::get_application_list{
-		        .language = application::get_messages_info().language,
-		        .country = application::get_messages_info().country,
-		        .variant = application::get_messages_info().variant,
-		});
-
-		next_gui_status = stream_tab::hidden;
-		application::pop_scene();
-	}
-
-	// Kiosk/chord input runs before the no-video early return below: the
+	// Kiosk/chord input runs above the no-video early return below: the
 	// waiting overlay must work (and the chord must stay alive) while the
 	// server sends no video for an idle session.
 	read_actions();
@@ -964,7 +943,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (stream_kiosk_shown)
 			{
 				stream_kiosk_dismissed = true;
-				next_gui_status = stream_tab::applications;
+				next_gui_status = stream_tab::settings;
 			}
 			else if (is_gui_interactable())
 			{
@@ -976,6 +955,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			else
 				next_gui_status = stream_tab::applications;
 		}
+	}
+
+	std::shared_lock lock(decoder_mutex);
+	if (not frame_state.shouldRender or decoders[0].empty() or decoders[1].empty() or state_ == state::shutdown)
+	{
+		// TODO: stop/restart video stream
+		session.begin_frame();
+		session.end_frame(frame_state.predictedDisplayTime, {});
+		return;
+	}
+
+	if (state_ == state::stalled)
+	{
+		network_session->send_control(from_headset::get_application_list{
+		        .language = application::get_messages_info().language,
+		        .country = application::get_messages_info().country,
+		        .variant = application::get_messages_info().variant,
+		});
+
+		next_gui_status = stream_tab::hidden;
+		application::pop_scene();
 	}
 
 	// Deliberately blocking: with a single in-flight command buffer

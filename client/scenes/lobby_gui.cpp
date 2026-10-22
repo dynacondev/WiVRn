@@ -832,8 +832,10 @@ void scenes::lobby::gui_kiosk()
 
 	if (async_session.valid())
 	{
+		// progress is empty until the worker thread sets its first stage
+		const std::string progress = async_session.get_progress();
 		ImGui::PushStyleColor(ImGuiCol_Text, t.text_muted);
-		ImGui::TextWrapped("%s", async_session.get_progress().c_str());
+		ImGui::TextWrapped("%s", progress.empty() ? _S("Connecting…") : progress.c_str());
 		ImGui::PopStyleColor();
 	}
 }
