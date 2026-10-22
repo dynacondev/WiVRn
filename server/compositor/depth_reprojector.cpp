@@ -151,6 +151,7 @@ namespace wivrn
 
 depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         reverse_z{configuration().reprojection.source_reverse_z},
+        hole_fill_radius{uint32_t(std::clamp(configuration().reprojection.hole_fill_radius, 0, int(kHoleRadius)))},
         color_sampler{make_sampler(vk, vk::Filter::eLinear, vk::SamplerAddressMode::eClampToBorder)},
         depth_sampler{make_sampler(vk, vk::Filter::eNearest, vk::SamplerAddressMode::eClampToEdge)},
         resolve_pool{nullptr},
@@ -850,7 +851,7 @@ bool depth_reprojector::reproject(
 	reproject_pull_ubo pull_data{};
 	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &pull_data.dst_inv);
 	math_matrix_4x4_multiply(&src_proj, &src_view, &pull_data.src_vp);
-	pull_data.hole_radius = float(kHoleRadius);
+	pull_data.hole_radius = float(hole_fill_radius);
 	pull_data.pad[0] = pull_data.pad[1] = pull_data.pad[2] = 0;
 	upload_ubo(pull_ubo[view], pull_data);
 

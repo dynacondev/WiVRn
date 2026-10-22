@@ -663,6 +663,13 @@ configuration::configuration()
 					else
 						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
 				}
+				if (auto jt = it->find("hole-fill-radius"); jt != it->end())
+				{
+					if (jt->is_number_integer() && jt->get<int>() >= 0 && jt->get<int>() <= 8)
+						reprojection.hole_fill_radius = jt->get<int>();
+					else
+						U_LOG_W("reprojection.hole-fill-radius must be an integer 0-8, ignoring");
+				}
 			}
 		}
 

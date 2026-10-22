@@ -166,6 +166,12 @@ struct configuration
 		// this, so the default encodes the pipeline assumption;
 		// normal-Z apps set it false explicitly.
 		bool source_reverse_z = true;
+		// Pull-pass hole-fill radius in pixels (0-8, default 8):
+		// disoccluded pixels search this radius for the nearest valid
+		// splat (background stretch). 0 disables the search — holes
+		// render black directly, much cheaper on the server GPU.
+		// Worst-case fill cost grows with the square of the radius.
+		int hole_fill_radius = 8;
 	};
 	reprojection reprojection;
 

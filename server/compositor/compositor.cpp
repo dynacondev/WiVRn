@@ -410,26 +410,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
-	// Staleness gate for the warp below: a commit is stale when the app
-	// is running slower than the display, measured by inter-commit
-	// spacing against the display period. layer_commit runs once per app
-	// EndFrame, so timestamp comparison can never detect a repeat —
-	// consecutive commits always carry fresh timestamps. A stale commit's
-	// frame will still be on screen when the next display tick needs one,
-	// so warping it to display time is pure win; at full rate this never
-	// fires (zero cost, zero risk).
+	// Inter-commit spacing (arrival clock) feeds the synth ticker's
+	// expected-commit skip below: a pipelined app commits ~a period
+	// behind the working tick. layer_commit runs once per app EndFrame.
 	const uint64_t commit_ns = os_monotonic_get_ns();
 	const uint64_t display_period_ns = uint64_t(pacer.get_frame_duration());
 	const uint64_t last_commit = last_commit_ns.load();
-	// Hysteresis latch (not a pure threshold): arm when the spacing
-	// exceeds 1.5 periods, release only when it drops back below one
-	// period. A threshold alone flaps at exactly-half-rate apps,
-	// alternating warped/plain frames every tick.
-	if (last_commit != 0 && commit_ns - last_commit > display_period_ns + display_period_ns / 2)
-		warp_armed_stale.store(true);
-	else if (last_commit == 0 || commit_ns - last_commit < display_period_ns)
-		warp_armed_stale.store(false);
-	const bool stale_commit = warp_armed_stale.load();
 	last_commit_ns.store(commit_ns);
 	if (last_commit != 0 && commit_ns > last_commit)
 	{
@@ -564,8 +550,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// (synth/have_synth/synth_fov are hoisted above the try for the
 		// catch + queue tail; reused here.)
 		// App-frame freshness for refresh gating: a changed client timestamp
-		// means this commit carries a new app frame. (Freshness can never
-		// signal a repeat — see the staleness gate above.)
+		// means this commit carries a new app frame.
 		bool app_fresh = true;
 		int64_t app_layer_ts_ns = 0;
 
@@ -710,112 +695,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        /*flip_depth=*/true);
 		}
 
-		// Depth reprojection for stale app frames: the app is running slower
-		// than the display (see the staleness gate above), so this frame will
-		// still be on screen when the next display tick needs one. Warp the
-		// retained sources to this tick and serve that INSTEAD of the stale
-		// frame (at most one warp per commit). Fresh app frames are served
-		// straight (client-side rotation timewarp covers them).
-		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight for
-		// black-frame A/B runs; retention and counters keep running.
-		if (stale_commit and has_depth_src and depth_reprojection_enabled and !warp_disabled())
-		{
-			xrt_space_relation head{};
-			bool synth_ok = session.get_hmd().get_view_poses(
-			                nullptr,
-			                frame.rendering.predicted_display_time_ns,
-			                XRT_VIEW_TYPE_STEREO,
-			                2,
-			                &head,
-			                synth_fov.data(),
-			                synth.poses.data()) == XRT_SUCCESS;
-
-			// The tracker reports an unservable tick via the head relation
-			// flags while eye poses fall back to identity+offsets: warping
-			// to those produces garbage, so require a valid head pose and
-			// otherwise skip silently (repeat instead).
-			constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
-			synth_ok = synth_ok && (head.relation_flags & need_pose) == need_pose;
-			if (synth_ok)
-			{
-				// get_view_poses returns head-relative eye offsets in
-				// poses plus the head-in-world relation (Monado device
-				// contract): compose world-space targets here.
-				for (int view = 0; view < 2; ++view)
-				{
-					xrt_relation_chain xrc{};
-					xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
-					m_relation_chain_push_pose_if_not_identity(&xrc, &synth.poses[view]);
-					m_relation_chain_push_relation(&xrc, &head);
-					m_relation_chain_resolve(&xrc, &rel);
-					synth.poses[view] = rel.pose;
-				}
-				// The synthetic tick must postdate the app frame it
-				// replaces; otherwise the warp below is meaningless.
-				synth_ok = frame.rendering.predicted_display_time_ns > app_layer_ts_ns;
-			}
-			if (synth_ok)
-			{
-				// Plausibility gate (see helper): violent ticks splat
-				// mostly-holes; repeat instead.
-				float worst_ms = 0.f, worst_rs = 0.f;
-				float peak_dist_m = 0.f, peak_angle_rad = 0.f;
-				double dt_s = double(frame.rendering.predicted_display_time_ns - app_layer_ts_ns) / 1e9;
-				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs,
-				                           peak_dist_m, peak_angle_rad))
-				{
-					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
-					                           peak_dist_m, peak_angle_rad);
-					wcounts.c_gate++;
-					synth_ok = false;
-				}
-			}
-			if (synth_ok)
-			{
-				synth.image = acquire_image();
-				if (synth.image < 0)
-				{
-					// Pool exhausted: degrade to repeat (throttled above).
-					synth_ok = false;
-				}
-			}
-			if (synth_ok)
-			{
-				for (int view = 0; view < 2 && synth_ok; ++view)
-				{
-					// Target uses the fresh tracker FOV (not the
-					// render-time one): identical unless the headset
-					// mutates FOV mid-session.
-					synth_ok = reprojector.reproject(
-					        cmd,
-					        view,
-					        src_pose[view],
-					        src_fov[view],
-					        src_near_z[view],
-					        src_far_z[view],
-					        synth.poses[view],
-					        synth_fov[view]);
-				}
-				if (!synth_ok and synth.image >= 0)
-				{
-					// reproject() only fails on degenerate frustum input
-					// (non-finite or inverted near/far/FOV): throttled, since
-					// a bad upstream header would fail every tick.
-					static std::atomic<uint64_t> last_degenerate_ns{0};
-					uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
-					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
-					{
-						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
-						U_LOG_W("compositor: warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, repeat instead)",
-						        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1]);
-					}
-					wcounts.c_degenerate++;
-					images[synth.image].busy = false;
-					synth.image = -1;
-				}
-			}
-			have_synth = synth_ok;
-		}
+		// 6DoF depth warp never runs on the commit path by design: true
+		// frames go out straight (plus client-side 3DoF timewarp) and
+		// fabrication happens only on the synth ticker when no fresh
+		// commit covers a tick. Retention above still feeds the ticker.
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
 
 		if (session.get_info().eye_gaze)
@@ -1955,7 +1838,6 @@ void compositor::set_framerate(float hz)
 	last_app_layer_ts.store(-1);
 	last_commit_ns.store(0);
 	last_spacing_ns.store(0);
-	warp_armed_stale.store(false);
 	last_had_depth.store(false);
 	last_retained_ns.store(0);
 	for (auto & encoder: encoders)
@@ -1979,7 +1861,6 @@ void compositor::resume()
 	last_app_layer_ts.store(-1);
 	last_commit_ns.store(0);
 	last_spacing_ns.store(0);
-	warp_armed_stale.store(false);
 	last_had_depth.store(false);
 	last_retained_ns.store(0);
 	send_video_stream_description();

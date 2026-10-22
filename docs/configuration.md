@@ -125,8 +125,11 @@ Default value: `true`
 
 Master switch for the warp. `false` disables synthesis entirely (repeat
 last frame). When enabled and the app runs slower than the display, the
-server synthesizes warped frames at display cadence so the client stops
-repeating stale ones; fresh app frames always go out straight.
+synth ticker synthesizes warped frames at display cadence so the client
+stops repeating stale ones; fresh app frames always go out straight
+(plus client-side 3DoF timewarp). The commit path never 6DoF-warps a
+just-published frame — 6DoF fires only to fabricate intermediate ticks
+no fresh commit covers.
 
 ### `source-reverse-z`
 Default value: `true`
@@ -134,12 +137,23 @@ Default value: `true`
 Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
 Vulkan). Normal-Z apps set `false` explicitly.
 
+### `hole-fill-radius`
+Default value: `8`
+
+Pull-pass hole-fill radius in pixels (0-8). Disoccluded pixels search
+this radius for the nearest valid splat (background stretch). `0`
+disables the search: holes render black directly at much lower server
+GPU cost. Lower this if warped frames show heavy GPU time; raise back
+toward 8 only after measuring worst-case warp GPU time (fill cost
+grows with the square of the radius).
+
 ### Example
 ```json
 {
 	"reprojection": {
 		"enabled": true,
-		"source-reverse-z": true
+		"source-reverse-z": true,
+		"hole-fill-radius": 8
 	}
 }
 ```

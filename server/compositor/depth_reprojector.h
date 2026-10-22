@@ -140,6 +140,9 @@ private:
 	// reverse-Z sources are converted once in the resolve pass. Read
 	// once here so the hot path never touches the config file.
 	const bool reverse_z;
+	// Hole-fill radius at construction (config hole-fill-radius,
+	// clamped 0-kHoleRadius): 0 renders disocclusions black directly.
+	const uint32_t hole_fill_radius;
 
 	vk::raii::Sampler color_sampler = nullptr;
 	vk::raii::Sampler depth_sampler = nullptr;

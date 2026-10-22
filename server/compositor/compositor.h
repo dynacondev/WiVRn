@@ -186,10 +186,6 @@ private:
 	// thread reset it while layer_commit reads it.
 	std::atomic<int64_t> last_app_layer_ts{-1};
 
-	// Hysteresis latch for the stale-frame warp (see layer_commit):
-	// plain bool would race set_framerate/resume on the session thread.
-	std::atomic<bool> warp_armed_stale{false};
-
 	// Arrival time of the previous layer_commit (monotonic ns). The warp
 	// gate compares inter-commit spacing against the display period:
 	// layer_commit runs once per app EndFrame, not per display tick, so
