@@ -415,12 +415,6 @@ void xr::session::enable_passthrough(xr::system & system)
 	}
 }
 
-void xr::session::set_passthrough_effects(const passthrough_effects & fx)
-{
-	effects_state = fx;
-	apply_passthrough_effects();
-}
-
 void xr::session::apply_passthrough_effects()
 {
 	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))

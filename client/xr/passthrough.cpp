@@ -72,7 +72,6 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 		{
 			xrCreatePassthroughColorLutMETA = inst.get_proc<PFN_xrCreatePassthroughColorLutMETA>("xrCreatePassthroughColorLutMETA");
 			xrDestroyPassthroughColorLutMETA = inst.get_proc<PFN_xrDestroyPassthroughColorLutMETA>("xrDestroyPassthroughColorLutMETA");
-			xrUpdatePassthroughColorLutMETA = inst.get_proc<PFN_xrUpdatePassthroughColorLutMETA>("xrUpdatePassthroughColorLutMETA");
 			lut_supported = xrCreatePassthroughColorLutMETA && xrDestroyPassthroughColorLutMETA;
 			if (lut_supported)
 				spdlog::info("Passthrough color LUT functions loaded");
@@ -444,15 +443,6 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 void xr::passthrough_fb::set_effects(const passthrough_effects & fx)
 {
 	apply_style(fx);
-}
-
-void xr::passthrough_fb::reset_effects()
-{
-	passthrough_effects def{};
-	def.mode = passthrough_effect_mode::off;
-	def.opacity = 1.0f;
-	def.edge_alpha = 0.0f;
-	apply_style(def);
 }
 
 void xr::passthrough_fb::start()

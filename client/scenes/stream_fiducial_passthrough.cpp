@@ -1278,25 +1278,28 @@ void scenes::stream::gui_passthrough()
 		// scrollable page, so a combo popup would dangle past the panel
 		// into the next GUI viewport and split across quads (chopped,
 		// detached look). ‹ › cycles with no popup.
+		static const char * lut_names[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
+		constexpr int lut_preset_count = 5;
+		auto lut_stepper = [&](const char * prev_id, const char * next_id, xr::passthrough_lut_preset & preset) {
+			if (ImGui::ArrowButton(prev_id, ImGuiDir_Left))
+			{
+				preset = (xr::passthrough_lut_preset)(((int)preset + lut_preset_count - 1) % lut_preset_count);
+				dirty = true;
+			}
+			ImGui::SameLine();
+			ImGui::TextUnformatted(lut_names[(int)preset]);
+			ImGui::SameLine();
+			if (ImGui::ArrowButton(next_id, ImGuiDir_Right))
+			{
+				preset = (xr::passthrough_lut_preset)(((int)preset + 1) % lut_preset_count);
+				dirty = true;
+			}
+		};
 		ImGui::BeginDisabled((fx.mode != xr::passthrough_effect_mode::lut && fx.mode != xr::passthrough_effect_mode::interpolated_lut) || !lut_supported);
 		{
-			static const char * luts[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
-			constexpr int lut_count = 5;
 			ImGui::Text("%s", _S("LUT preset"));
 			ImGui::SameLine();
-			if (ImGui::ArrowButton("##lut_prev", ImGuiDir_Left))
-			{
-				fx.lut_preset = (xr::passthrough_lut_preset)(((int)fx.lut_preset + lut_count - 1) % lut_count);
-				dirty = true;
-			}
-			ImGui::SameLine();
-			ImGui::TextUnformatted(luts[(int)fx.lut_preset]);
-			ImGui::SameLine();
-			if (ImGui::ArrowButton("##lut_next", ImGuiDir_Right))
-			{
-				fx.lut_preset = (xr::passthrough_lut_preset)(((int)fx.lut_preset + 1) % lut_count);
-				dirty = true;
-			}
+			lut_stepper("##lut_prev", "##lut_next", fx.lut_preset);
 			float w_pct = fx.lut_weight * 100.0f;
 			if (ImGui::SliderFloat(_S("LUT strength"), &w_pct, 0, 100, "%.0f%%"))
 			{
@@ -1307,23 +1310,9 @@ void scenes::stream::gui_passthrough()
 		ImGui::EndDisabled();
 		ImGui::BeginDisabled(fx.mode != xr::passthrough_effect_mode::interpolated_lut || !lut_supported);
 		{
-			static const char * luts_b[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
-			constexpr int lut_count_b = 5;
 			ImGui::Text("%s", _S("LUT preset B"));
 			ImGui::SameLine();
-			if (ImGui::ArrowButton("##lutb_prev", ImGuiDir_Left))
-			{
-				fx.lut_preset_b = (xr::passthrough_lut_preset)(((int)fx.lut_preset_b + lut_count_b - 1) % lut_count_b);
-				dirty = true;
-			}
-			ImGui::SameLine();
-			ImGui::TextUnformatted(luts_b[(int)fx.lut_preset_b]);
-			ImGui::SameLine();
-			if (ImGui::ArrowButton("##lutb_next", ImGuiDir_Right))
-			{
-				fx.lut_preset_b = (xr::passthrough_lut_preset)(((int)fx.lut_preset_b + 1) % lut_count_b);
-				dirty = true;
-			}
+			lut_stepper("##lutb_prev", "##lutb_next", fx.lut_preset_b);
 			float m_pct = fx.lut_mix * 100.0f;
 			if (ImGui::SliderFloat(_S("LUT mix A->B"), &m_pct, 0, 100, "%.0f%%"))
 			{
@@ -1367,10 +1356,6 @@ void scenes::stream::gui_passthrough()
 			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
 		}
 	}
-
-	// POSE_INVALID forensics: record whether any ImGui popup (e.g. a combo
-	// dropdown) is open at build time; read by the render_end catch.
-	last_frame_popup_open = ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopup);
 }
 
 void scenes::stream::gui_fiducial_status()

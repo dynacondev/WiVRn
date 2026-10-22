@@ -38,7 +38,6 @@
 #include "spdlog/spdlog.h"
 #include "utils/i18n.h"
 #include "utils/named_thread.h"
-#include "utils/overloaded.h"
 #include "utils/ranges.h"
 #include "wivrn_packets.h"
 #include <algorithm>
@@ -1169,7 +1168,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		XrSpace live_space = application::space(xr::spaces::world);
 		auto [view_flags, live_views] = session.locate_views(viewconfig, frame_state.predictedDisplayTime, live_space);
-		last_view_flags = view_flags;
 		if (live_views.size() == view_count and (view_flags & XR_VIEW_STATE_POSITION_VALID_BIT) and
 		    (view_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
 		{
@@ -2926,22 +2924,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		try
 		{
 			render_end();
-			last_frame_pose_invalid = false;
 		}
 		catch (std::system_error & e)
 		{
 			if (not (e.code().category() == xr::error_category() and e.code().value() == XR_ERROR_POSE_INVALID))
 				throw;
 			spdlog::info("Invalid pose submitted");
-			// Full layer dump on the first bad frame and at most every
-			// 5s while it persists (90Hz warn spam would drown logcat).
-			XrTime now = instance.now();
-			if (not last_frame_pose_invalid or now - last_pose_dump > 5'000'000'000LL)
-			{
-				last_pose_dump = now;
-				log_pose_invalid_diagnostics();
-			}
-			last_frame_pose_invalid = true;
 		}
 		submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - submit_t0).count();
 
@@ -3009,78 +2997,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	query_pool_filled = true;
-}
-
-void scenes::stream::log_pose_invalid_diagnostics()
-{
-	// Read-only forensics: identify which submitted layer carries the
-	// invalid pose. layers[] still holds this frame's fixup'd content
-	// (render_end threw at xrEndFrame, after fixup, before clear).
-	auto finite3 = [](const XrVector3f & v) {
-		return std::isfinite(v.x) and std::isfinite(v.y) and std::isfinite(v.z);
-	};
-	auto finite4 = [](const XrQuaternionf & q) {
-		return std::isfinite(q.x) and std::isfinite(q.y) and std::isfinite(q.z) and std::isfinite(q.w);
-	};
-	auto pose_ok = [&](const XrPosef & p) {
-		if (not finite3(p.position) or not finite4(p.orientation))
-			return false;
-		float n = std::sqrt(p.orientation.x * p.orientation.x + p.orientation.y * p.orientation.y +
-		                    p.orientation.z * p.orientation.z + p.orientation.w * p.orientation.w);
-		return std::isfinite(n) and std::abs(n - 1.0f) < 1e-2f;
-	};
-	auto fov_ok = [](const XrFovf & f) {
-		return std::isfinite(f.angleLeft) and std::isfinite(f.angleRight) and
-		       std::isfinite(f.angleUp) and std::isfinite(f.angleDown);
-	};
-
-	spdlog::warn("POSE_INVALID diag: popup_open={} view_flags={:#x} layers={} blend={}",
-	             last_frame_popup_open,
-	             (unsigned long long)last_view_flags,
-	             layers.size(),
-	             (int)blend_mode);
-	for (size_t li = 0; li < layers.size(); ++li)
-	{
-		std::visit(
-		        utils::overloaded{
-		                [&](const XrCompositionLayerProjection & pl) {
-			                for (size_t vi = 0; vi < layers[li].color_views.size(); ++vi)
-			                {
-				                const auto & v = layers[li].color_views[vi];
-				                const auto & p = v.pose;
-				                const auto & f = v.fov;
-				                if (not pose_ok(p) or not fov_ok(f))
-					                spdlog::warn("POSE_INVALID layer[{}] proj view[{}] BAD pos=({:.2f},{:.2f},{:.2f}) quat=({:.2f},{:.2f},{:.2f},{:.2f}) fov=({:.2f},{:.2f},{:.2f},{:.2f})",
-					                             li, vi,
-					                             (double)p.position.x, (double)p.position.y, (double)p.position.z,
-					                             (double)p.orientation.x, (double)p.orientation.y, (double)p.orientation.z, (double)p.orientation.w,
-					                             (double)f.angleLeft, (double)f.angleRight, (double)f.angleUp, (double)f.angleDown);
-			                }
-		                },
-		                [&](const XrCompositionLayerQuad & q) {
-			                const auto & p = q.pose;
-			                bool ok = pose_ok(p) and std::isfinite(q.size.width) and std::isfinite(q.size.height) and
-			                          q.size.width > 0 and q.size.height > 0;
-			                if (not ok)
-				                spdlog::warn("POSE_INVALID layer[{}] quad BAD pos=({:.2f},{:.2f},{:.2f}) quat=({:.2f},{:.2f},{:.2f},{:.2f}) size=({:.3f},{:.3f})",
-				                             li,
-				                             (double)p.position.x, (double)p.position.y, (double)p.position.z,
-				                             (double)p.orientation.x, (double)p.orientation.y, (double)p.orientation.z, (double)p.orientation.w,
-				                             (double)q.size.width, (double)q.size.height);
-		                },
-		                [&](XrCompositionLayerBaseHeader *) {
-			                // Passthrough / depth / custom layers carry no poses.
-		                }},
-		        layers[li].composition_layer);
-	}
-	if (imgui_ctx)
-	{
-		auto ils = imgui_ctx->layers();
-		std::string sizes;
-		for (auto & vp: ils)
-			sizes += fmt::format("[{:.0f}x{:.0f}]", (double)vp.vp_size.x, (double)vp.vp_size.y);
-		spdlog::warn("POSE_INVALID imgui viewports={} sizes={}", ils.size(), sizes);
-	}
 }
 
 void scenes::stream::update_video_stall_status(bool starved)

@@ -116,11 +116,6 @@ public:
 
 	// Session-owned passthrough structs carry per-frame chains: reset
 	// before appending so a stale pointer can never survive the frame.
-	void reset_passthrough_chain()
-	{
-		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-			fb->reset_chain();
-	}
 	void reset_projected_chain()
 	{
 		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
@@ -172,9 +167,8 @@ public:
 	void on_boundary_visibility_changed(XrBoundaryVisibilityMETA);
 
 	// Demo passthrough effects (Passthrough tab subsection).
-	// Stored desired state, applied to the live fb layer(s) immediately
+	// Stored desired state, applied to the live fb layer(s) on creation
 	// and re-applied after enable_passthrough() recreates them.
-	void set_passthrough_effects(const passthrough_effects & fx);
 	const passthrough_effects & get_passthrough_effects() const
 	{
 		return effects_state;

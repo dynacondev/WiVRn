@@ -105,7 +105,6 @@ class passthrough_fb : public utils::handle<XrPassthroughFB>
 #ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
 	PFN_xrCreatePassthroughColorLutMETA xrCreatePassthroughColorLutMETA{};
 	PFN_xrDestroyPassthroughColorLutMETA xrDestroyPassthroughColorLutMETA{};
-	PFN_xrUpdatePassthroughColorLutMETA xrUpdatePassthroughColorLutMETA{};
 #endif
 	bool lut_supported = false;
 
@@ -155,7 +154,6 @@ public:
 	// Safe to call when LUT ext is missing (LUT modes fall back to plain
 	// style with a warn). Called by session on enable + on GUI change.
 	void set_effects(const passthrough_effects & fx);
-	void reset_effects();
 	bool color_lut_supported() const
 	{
 		return lut_supported;

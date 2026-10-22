@@ -761,15 +761,6 @@ private:
 		return debug_depth_overlay and (not env_depth_probed or env_depth_supported);
 	}
 
-	// POSE_INVALID forensics (diagnostic only, no behavior change).
-	// Stashed per frame so the render_end catch can name the exact
-	// offending layer instead of a bare "Invalid pose submitted".
-	bool last_frame_popup_open = false;
-	bool last_frame_pose_invalid = false;
-	XrTime last_pose_dump = 0;
-	XrViewStateFlags last_view_flags = 0;
-	void log_pose_invalid_diagnostics();
-
 	// Stale-hold multiplier for debug visuals: full presence on fresh
 	// data, smooth 3s fade-out on hold. Returns 0 (gone) .. 1 (fresh).
 	static constexpr double kStaleFadeS = 3.0;
