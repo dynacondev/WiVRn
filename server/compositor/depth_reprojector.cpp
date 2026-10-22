@@ -167,11 +167,13 @@ void upload_ubo(buffer_allocation & ubo, const T & data)
 namespace wivrn
 {
 
-// TEMPORARY triage switch for a GPU hang bisect (remove once the fill
-// path is proven on the failing driver): forces the blit chain + fill
-// pass off, leaving holes black, without touching format support
-// detection.
-static constexpr bool kForceDisableBlits = true;
+// TEMPORARY triage switches for a GPU hang bisect (remove once the
+// fill path is proven on the failing driver). kForceDisableBlits kills
+// the whole blit chain + fill pass (holes stay black). kSkipFillDispatch
+// keeps the blits running but skips only the fill dispatch, to split a
+// blit-chain fault from a fill-dispatch fault.
+static constexpr bool kForceDisableBlits = false;
+static constexpr bool kSkipFillDispatch = true;
 
 depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         reverse_z{configuration().reprojection.source_reverse_z},
@@ -192,6 +194,8 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 		U_LOG_W("depth warp: R8G8B8A8 blits unsupported, hole fill disabled (holes stay black)");
 	if (kForceDisableBlits)
 		U_LOG_W("depth warp: hole fill FORCE-DISABLED (temporary triage, remove me)");
+	if (!kForceDisableBlits && kSkipFillDispatch)
+		U_LOG_W("depth warp: fill dispatch SKIPPED, blits running (temporary triage, remove me)");
 	// Retained last-real-frame sources, sized to the render eye size.
 	// Full-eye, GL-ordered by the resolve pass.
 	retained_color = image_allocation{
@@ -1284,7 +1288,9 @@ bool depth_reprojector::reproject(
 		// View-relative LOD cap: the fill view covers levels 1..N.
 		int32_t max_view_lod = int32_t(mip_levels) - 2;
 		cmd.pushConstants<int32_t>(*fill_layout, vk::ShaderStageFlagBits::eCompute, 0, max_view_lod);
-		cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
+		// TEMPORARY bisect: blits run, fill dispatch skipped.
+		if (!kSkipFillDispatch)
+			cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
 	}
 	
 
