@@ -34,15 +34,15 @@ namespace
 {
 // tuning knobs, all device-tunable: model is ~13.4m wingspan in file units
 constexpr int plane_count = 4;
-constexpr float model_scale = 0.009f; // ~0.18m wingspan
+constexpr float model_scale = 0.00675f; // ~0.13m wingspan
 constexpr double dur_min = 5.0;
 constexpr double dur_max = 8.0;
 constexpr double fade_in = 1.2;
 constexpr double fade_out = 2.0;
 
-// model nose is assumed along -Y (twin-prop cluster forward, long tail
-// back); if planes fly sideways/backwards, rotate about model +Y here
-// (e.g. pi for +Y nose) instead of touching the basis code below
+// model nose points along +Z once the file's own root rotation (-90deg
+// about X on "Air Plane") is applied; tweak below only if a re-export
+// changes that convention
 constexpr float model_yaw_adjust = 0.f;
 // mirrored model X flips the apparent bank direction; flip once on device
 // if planes roll out of their turns instead of into them
@@ -163,18 +163,25 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	f.p3 = clamp_height(anchor_pos + random_unit(rng_) * far_dist(rng_));
 	f.dur = XrDuration(dur_dist(rng_) * 1e9);
 	f.phase = phase_dist(rng_);
-	f.t0 = now - XrTime(age_offset * 1e9);
+	double off = std::clamp(age_offset, 0., double(f.dur) * 1e-9);
+	f.t0 = now - XrTime(off * 1e9);
 }
 
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
 {
 	if (active && !was_active_)
 	{
-		// (re)opening with a sky already in flight: stagger ages so the
-		// fleet doesn't launch in formation
-		std::uniform_real_distribution<double> stagger(0., dur_max);
-		for (auto & f: flights_)
-			respawn(f, now, anchor_pos, anchor_orient, stagger(rng_));
+		// (re)opening with a sky already in flight: spread ages evenly
+		// with jitter so expiry (and hence respawn) flows continuously
+		// instead of bunching
+		std::uniform_real_distribution<double> jitter(0., 1.);
+		for (size_t i = 0; i < flights_.size(); ++i)
+		{
+			auto & f = flights_[i];
+			respawn(f, now, anchor_pos, anchor_orient, 0.);
+			double frac = (double(i) + jitter(rng_)) / double(flights_.size());
+			f.t0 = now - XrTime(double(f.dur) * frac);
+		}
 	}
 	was_active_ = active;
 
@@ -202,17 +209,16 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		if (glm::length(vel) > 1e-6f)
 		{
 			glm::vec3 fwd = glm::normalize(vel);
-			// model nose (-Y) onto the flight direction; X comes out
-			// mirrored, bank_sign absorbs the resulting roll sense
-			glm::vec3 nose = -fwd;
+			// model nose (+Z after the file's root rotation) onto the
+			// flight direction; mirrored X is absorbed by bank_sign
 			glm::vec3 up0{0.f, 1.f, 0.f};
-			glm::vec3 up = up0 - nose * glm::dot(up0, nose);
-			if (glm::length(up) < 1e-4f)
-				up = {1.f, 0.f, 0.f};
+			glm::vec3 right = glm::cross(up0, fwd);
+			if (glm::length(right) < 1e-4f)
+				right = {1.f, 0.f, 0.f};
 			else
-				up = glm::normalize(up);
-			glm::vec3 right = glm::cross(nose, up);
-			glm::quat orient = glm::quat_cast(glm::mat3(right, nose, up));
+				right = glm::normalize(right);
+			glm::vec3 up = glm::cross(fwd, right);
+			glm::quat orient = glm::quat_cast(glm::mat3(right, up, fwd));
 			float bank = bank_sign * bank_amount * std::sin(2. * std::numbers::pi * t + f.phase);
 			orient = glm::angleAxis(bank, fwd) * orient;
 			if (model_yaw_adjust != 0.f)
