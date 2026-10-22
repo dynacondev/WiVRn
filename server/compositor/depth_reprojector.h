@@ -37,19 +37,13 @@ struct reproject_splat_ubo
 static_assert(sizeof(reproject_splat_ubo) == 128);
 
 // UBO mirror of server/compositor/shaders/reproject_pull.comp:
-// target clip -> world -> source clip, plus the hole-fill radius. The
-// products are folded on the CPU.
+// target clip -> world -> source clip. The products are folded on the CPU.
 struct reproject_pull_ubo
 {
 	xrt_matrix_4x4 dst_inv;
 	xrt_matrix_4x4 src_vp;
-	// Packs as one vec4 in std140 (float arrays stride to 16): hole
-	// radius at +128, 12 pad bytes after. Must stay byte-exact with
-	// the PullUBO block.
-	float hole_radius;
-	float pad[3];
 };
-static_assert(sizeof(reproject_pull_ubo) == 144);
+static_assert(sizeof(reproject_pull_ubo) == 128);
 
 // Push block mirror of reproject_resolve.comp.
 struct reproject_resolve_push
@@ -68,11 +62,15 @@ namespace wivrn
 struct vk_bundle;
 
 // Server-side 6DoF reprojection for missed frame deadlines.
-// All-compute backward warp in two passes: splat forwards each
+// All-compute backward warp in three passes: splat forwards each
 // retained source pixel's depth to the target pose (atomic min wins =
 // foreground), pull warps color backward per target pixel through the
-// splatted depth. Disoccluded pixels keep black; the caller repeats the
-// last frame instead when the input is degenerate.
+// splatted depth (premultiplied: valid (rgb, 1), holes black), fill
+// patches disocclusions with the local average sampled from a mip
+// chain of the pull output (validity-weighted, blurred never
+// stretched). Pixels still invalid (nothing valid anywhere) keep
+// black; the caller repeats the last frame instead when the input is
+// degenerate.
 //
 // The last real frame is held in compositor-owned retained images
 // (refreshed by refresh_retained on every depth commit), so synthetic
@@ -86,11 +84,6 @@ struct vk_bundle;
 class depth_reprojector
 {
 public:
-	// Worst-case cost of the pull hole fill grows with the square of
-	// this radius per hole pixel: never raise it without measuring
-	// worst-case warp GPU time on the server GPU first.
-	static constexpr uint32_t kHoleRadius = 8;
-
 	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size);
 
 	// Copies the current real frame into the retained sources.
@@ -132,9 +125,10 @@ private:
 	// reverse-Z sources are converted once in the resolve pass. Read
 	// once here so the hot path never touches the config file.
 	const bool reverse_z;
-	// Hole-fill radius at construction (config hole-fill-radius,
-	// clamped 0-kHoleRadius): 0 renders disocclusions black directly.
-	const uint32_t hole_fill_radius;
+	// Whether R8G8B8A8 blits are supported (format features): without
+	// them the mip-chain fill cannot run and disocclusions stay black
+	// (pre-fill behavior). Universal on desktop GPUs, checked anyway.
+	const bool blit_supported;
 
 	vk::raii::Sampler color_sampler = nullptr;
 	vk::raii::Sampler depth_sampler = nullptr;
@@ -161,25 +155,35 @@ private:
 	// each warp). SHADER_READ_ONLY (targets) / GENERAL (scratch)
 	// between warps. Per-view: the two eyes warp independently, so a
 	// view-0 warp must not mark view 1's resources transitioned.
+	// Targets carry a full mip chain for the fill pass (blits read
+	// level 0, fill samples levels 1..N).
 	std::array<bool, 2> warp_targets_ready = {false, false};
+	uint32_t mip_levels = 1;
 	std::array<image_allocation, 2> target;
 	std::array<vk::raii::ImageView, 2> target_view = {nullptr, nullptr};
+	std::array<vk::raii::ImageView, 2> target_mip_view = {nullptr, nullptr};
 	std::array<image_allocation, 2> splat_depth;
 	std::array<vk::raii::ImageView, 2> splat_view = {nullptr, nullptr};
 
 	// Splat: depth sampler + splat UBO + splat storage image.
 	// Pull: color sampler + pull UBO + splat storage image (read) +
-	// color storage target (write). Sets are written once at
-	// construction; only the UBO contents change per warp.
+	// color storage target (write). Fill: dst storage (read-write) +
+	// splat storage (read) + dst mip-chain sampled (levels 1..N).
+	// Sets are written once at construction; only the UBO contents
+	// change per warp.
 	vk::raii::DescriptorSetLayout splat_ds_layout = nullptr;
 	vk::raii::PipelineLayout splat_layout = nullptr;
 	vk::raii::Pipeline splat_pipeline = nullptr;
 	vk::raii::DescriptorSetLayout pull_ds_layout = nullptr;
 	vk::raii::PipelineLayout pull_layout = nullptr;
 	vk::raii::Pipeline pull_pipeline = nullptr;
+	vk::raii::DescriptorSetLayout fill_ds_layout = nullptr;
+	vk::raii::PipelineLayout fill_layout = nullptr;
+	vk::raii::Pipeline fill_pipeline = nullptr;
 	vk::raii::DescriptorPool warp_pool = nullptr;
 	std::array<vk::DescriptorSet, 2> splat_sets;
 	std::array<vk::DescriptorSet, 2> pull_sets;
+	std::array<vk::DescriptorSet, 2> fill_sets;
 
 	std::array<buffer_allocation, 2> splat_ubo;
 	std::array<buffer_allocation, 2> pull_ubo;

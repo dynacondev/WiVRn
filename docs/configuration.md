@@ -137,22 +137,17 @@ Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
 Vulkan). Normal-Z apps set `false` explicitly.
 
 ### `hole-fill-radius`
-Default value: `8`
-
-Pull-pass hole-fill radius in pixels (0-8). Disoccluded pixels search
-this radius for the nearest valid splat (background stretch). `0`
-disables the search: holes render black directly at much lower server
-GPU cost. Lower this if warped frames show heavy GPU time; raise back
-toward 8 only after measuring worst-case warp GPU time (fill cost
-grows with the square of the radius).
+Removed. The old expanding-ring search (0-8px) grew with hole width;
+disocclusions are now patched with a blurred local average from a
+blit-built mip chain (constant cost per hole pixel). Config files that
+still set the key log a warning and ignore it.
 
 ### Example
 ```json
 {
 	"reprojection": {
 		"enabled": true,
-		"source-reverse-z": true,
-		"hole-fill-radius": 8
+		"source-reverse-z": true
 	}
 }
 ```

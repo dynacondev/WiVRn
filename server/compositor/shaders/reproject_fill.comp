@@ -1,0 +1,53 @@
+/*
+ * Mip-chain hole fill (pass 3 of the compute backward warp).
+ *
+ * Patches pixels the pull pass left black (no valid splat) with the
+ * local average from the pull output's own mip chain. The pull output
+ * is premultiplied (valid pixels (rgb, 1), holes (0,0,0,0)), so mip
+ * averages are validity-weighted: dividing rgb by alpha yields the
+ * blurred mean of valid neighbors only. Constant cost per hole pixel
+ * (<=3 taps) no matter how wide the disocclusion is, and far cheaper
+ * than the old expanding-ring search it replaces.
+ *
+ * Warp math follows the OpenWarp family (https://github.com/Zee2/openwarp,
+ * NCSA-licensed).
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rgba8) uniform image2D dst_img;
+layout(set = 0, binding = 1, r32ui) uniform uimage2D splat_depth;
+layout(set = 0, binding = 2) uniform sampler2D dst_mips;
+
+layout(push_constant) uniform Push
+{
+	int max_view_lod;
+} pc;
+
+#define SPLAT_EMPTY 0xffffffffu
+#define VALID_EPS (0.5 / 255.0)
+
+void main()
+{
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(dst_img);
+	if (xy.x >= size.x || xy.y >= size.y)
+		return;
+	// Valid pixels keep the pull result untouched.
+	if (imageLoad(splat_depth, xy).x != SPLAT_EMPTY)
+		return;
+
+	vec2 tuv = (vec2(xy) + vec2(0.5)) / vec2(size);
+	int lod_b = min(5, pc.max_view_lod);
+	float lod_a = min(2.0, float(pc.max_view_lod));
+	vec4 c = textureLod(dst_mips, tuv, lod_a);
+	if (c.a < VALID_EPS)
+		c = textureLod(dst_mips, tuv, float(lod_b));
+	if (c.a < VALID_EPS)
+		c = textureLod(dst_mips, tuv, float(pc.max_view_lod));
+	if (c.a < VALID_EPS)
+		return; // Nothing valid anywhere: stays black.
+	imageStore(dst_img, xy, vec4(c.rgb / c.a, 1.0));
+}

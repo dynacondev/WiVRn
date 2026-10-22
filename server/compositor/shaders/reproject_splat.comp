@@ -40,6 +40,12 @@ void main()
 	// converts reverse-Z sources).
 	float z = texture(src_depth, guv).x;
 
+	// Far-plane clamp (mesh parity): sky/clear pixels sit at exactly
+	// 1.0, and without this any backward motion pushes their reprojected
+	// target.z past 1.0 so the frustum reject below drops the whole
+	// background. 0.995 keeps them on the far plane instead.
+	z = min(z, 0.995);
+
 	vec4 clip_pos = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
 	vec4 frag_worldspace = ubo.render_inv_vp * clip_pos;
 	vec4 result = ubo.warp_vp * frag_worldspace;
