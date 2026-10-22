@@ -1268,6 +1268,20 @@ void scenes::lobby::on_focused()
 
 	auto & config = application::get_config();
 
+	// Apply the configured refresh rate: the runtime starts at its own
+	// default (72Hz on Quest) and nothing sets it until a stream starts or
+	// the setting is toggled, so the lobby would otherwise ignore it.
+	// Re-applied on every focus to also cover returning from a stream that
+	// changed the rate; skipped when already active to avoid request spam.
+	if (config.preferred_refresh_rate != 0)
+	{
+		bool need_apply = true;
+		if (instance.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+			need_apply = session.get_current_refresh_rate() != config.preferred_refresh_rate;
+		if (need_apply)
+			session.set_refresh_rate(config.preferred_refresh_rate);
+	}
+
 	try
 	{
 		lobby_entity = add_gltf(config.environment_model, layer_lobby).first;

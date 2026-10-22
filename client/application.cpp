@@ -2098,6 +2098,19 @@ void application::session_state_changed(XrSessionState new_state, XrTime timesta
 		case XR_SESSION_STATE_FOCUSED:
 			session_visible = true;
 			session_focused = true;
+			refresh_rate_restores = 0;
+			// The runtime resets the display rate around session start
+			// (back to its default on Quest), undoing any earlier request:
+			// re-apply the configured rate now that the session is up, the
+			// same thing a manual toggle does. Skipped when already active.
+			if (config and config->preferred_refresh_rate != 0)
+			{
+				bool need_apply = true;
+				if (xr_instance.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+					need_apply = xr_session.get_current_refresh_rate() != config->preferred_refresh_rate;
+				if (need_apply)
+					xr_session.set_refresh_rate(config->preferred_refresh_rate);
+			}
 			break;
 
 		case XR_SESSION_STATE_STOPPING:
@@ -2145,6 +2158,19 @@ void application::poll_events()
 				spdlog::info("Refresh rate changed from {} to {}",
 				             e.refresh_rate_changed.fromDisplayRefreshRate,
 				             e.refresh_rate_changed.toDisplayRefreshRate);
+				// The runtime resets the rate around session start, after any
+				// proactive request: restore the configured rate once the
+				// reset lands. Bounded per focused session so a runtime that
+				// enforces another rate (or a deliberate system-side change)
+				// is not fought forever; each honored restore ends the
+				// cycle since to == preferred stops further restores.
+				if (config and config->preferred_refresh_rate != 0 and
+				    e.refresh_rate_changed.toDisplayRefreshRate != config->preferred_refresh_rate and
+				    refresh_rate_restores < 3)
+				{
+					++refresh_rate_restores;
+					xr_session.set_refresh_rate(config->preferred_refresh_rate);
+				}
 			}
 			break;
 			case XR_TYPE_EVENT_DATA_PASSTHROUGH_STATE_CHANGED_FB: {

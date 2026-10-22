@@ -140,6 +140,9 @@ private:
 	bool session_running = false;
 	bool session_focused = false;
 	bool session_visible = false;
+	// Budget of automatic refresh-rate restores per focused session (see
+	// the display-refresh-rate-changed handler in poll_events).
+	int refresh_rate_restores = 0;
 	std::optional<std::chrono::steady_clock::time_point> timestamp_unsynchronized; // Timestamp when session_synchronized becomes false
 
 	bool debug_extensions_found = false;
