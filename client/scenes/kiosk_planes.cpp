@@ -106,39 +106,51 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 		        std::clamp(paint.base.y + jitter(rng_), 0.f, 1.f),
 		        std::clamp(paint.base.z + jitter(rng_), 0.f, 1.f),
 		};
+		// add_gltf shares mesh objects (and their materials) across
+		// instantiations: deep-copy each mesh so per-plane material clones
+		// don't leak into the other planes. GPU buffers stay shared.
+		std::map<std::shared_ptr<renderer::mesh>, std::shared_ptr<renderer::mesh>> mesh_copies;
 		std::map<std::shared_ptr<renderer::material>, std::shared_ptr<renderer::material>> clones;
 		std::function<void(entt::entity)> visit = [&](entt::entity e) {
 			if (auto * n = scene_.world.try_get<components::node>(e))
 			{
 				if (n->mesh)
 				{
-					for (auto & primitive: n->mesh->primitives)
+					auto [mesh_it, mesh_new] = mesh_copies.try_emplace(n->mesh, nullptr);
+					if (mesh_new)
 					{
-						auto [it, inserted] = clones.try_emplace(primitive.material_, nullptr);
-						if (inserted)
+						mesh_it->second = std::make_shared<renderer::mesh>();
+						mesh_it->second->buffer = n->mesh->buffer;
+						mesh_it->second->primitives = n->mesh->primitives;
+						for (auto & primitive: mesh_it->second->primitives)
 						{
-							auto src = primitive.material_;
-							it->second = scene_.create_material([src, body_tint](renderer::material & m) {
-								m.staging = src->staging;
-								m.base_color_texture = src->base_color_texture;
-								m.metallic_roughness_texture = src->metallic_roughness_texture;
-								m.occlusion_texture = src->occlusion_texture;
-								m.emissive_texture = src->emissive_texture;
-								m.normal_texture = src->normal_texture;
-								m.double_sided = src->double_sided;
-								m.fragment_shader = src->fragment_shader;
-								m.name = src->name + "-kiosk";
-								if (src->name == "Material")
-									m.staging.base_color_factor = glm::vec4(body_tint, 1.f);
-								m.blend_enable = true;
-								m.depth_write_enable = false;
-							});
-							f.materials.push_back(it->second);
-							f.base_colors.push_back(it->second->staging.base_color_factor);
-							f.base_emissives.push_back(glm::vec3(it->second->staging.base_emissive_factor));
+							auto [it, inserted] = clones.try_emplace(primitive.material_, nullptr);
+							if (inserted)
+							{
+								auto src = primitive.material_;
+								it->second = scene_.create_material([src, body_tint](renderer::material & m) {
+									m.staging = src->staging;
+									m.base_color_texture = src->base_color_texture;
+									m.metallic_roughness_texture = src->metallic_roughness_texture;
+									m.occlusion_texture = src->occlusion_texture;
+									m.emissive_texture = src->emissive_texture;
+									m.normal_texture = src->normal_texture;
+									m.double_sided = src->double_sided;
+									m.fragment_shader = src->fragment_shader;
+									m.name = src->name + "-kiosk";
+									if (src->name == "Material")
+										m.staging.base_color_factor = glm::vec4(body_tint, 1.f);
+									m.blend_enable = true;
+									m.depth_write_enable = false;
+								});
+								f.materials.push_back(it->second);
+								f.base_colors.push_back(it->second->staging.base_color_factor);
+								f.base_emissives.push_back(glm::vec3(it->second->staging.base_emissive_factor));
+							}
+							primitive.material_ = it->second;
 						}
-						primitive.material_ = it->second;
 					}
+					n->mesh = mesh_it->second;
 				}
 				for (auto && [child, child_node]: scene_.world.view<components::node>().each())
 				{
@@ -196,15 +208,19 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 {
 	if (active && !was_active_)
 	{
-		// (re)opening with a sky already in flight: spread ages evenly
-		// with jitter so expiry (and hence respawn) flows continuously
-		// instead of bunching
+		// (re)opening: only (re)spawn planes that never flew or expired
+		// while hidden, spread evenly with jitter. Untouched planes keep
+		// their own clocks, so a flickering overlay can't regroup the
+		// fleet into synchronized bundles.
 		std::uniform_real_distribution<double> jitter(0., 1.);
-		for (size_t i = 0; i < flights_.size(); ++i)
+		size_t slot = 0;
+		for (auto & f: flights_)
 		{
-			auto & f = flights_[i];
+			double age = f.dur == 0 ? 1. : double(now - f.t0) / double(f.dur);
+			if (f.dur != 0 && age < 1.)
+				continue;
 			respawn(f, now, anchor_pos, anchor_orient, 0.);
-			double frac = (double(i) + jitter(rng_)) / double(flights_.size());
+			double frac = (double(slot++) + jitter(rng_)) / double(flights_.size());
 			f.t0 = now - XrTime(double(f.dur) * frac);
 		}
 	}
