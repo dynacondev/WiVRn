@@ -374,7 +374,13 @@ void xr::session::sync_actions(XrActionSet action_set, const std::string & subac
 void xr::session::enable_passthrough(xr::system & system)
 {
 	if (not std::holds_alternative<std::monostate>(passthrough))
+	{
+		// Already live: re-apply desired demo style (covers first enable
+		// before GUI edits + any runtime layer recreation).
+		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+			fb->set_effects(effects_state);
 		return;
+	}
 
 	if (system.passthrough_supported() == xr::passthrough_type::none)
 		return;
@@ -382,6 +388,8 @@ void xr::session::enable_passthrough(xr::system & system)
 	if (inst->has_extension(XR_FB_PASSTHROUGH_EXTENSION_NAME))
 	{
 		passthrough.emplace<xr::passthrough_fb>(*inst, *this);
+		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+			fb->set_effects(effects_state);
 	}
 	else if (inst->has_extension(XR_HTC_PASSTHROUGH_EXTENSION_NAME))
 	{
@@ -391,6 +399,31 @@ void xr::session::enable_passthrough(xr::system & system)
 	{
 		passthrough.emplace<xr::passthrough_alpha_blend>();
 	}
+}
+
+void xr::session::set_passthrough_effects(const passthrough_effects & fx)
+{
+	effects_state = fx;
+	apply_passthrough_effects();
+}
+
+void xr::session::apply_passthrough_effects()
+{
+	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
+		fb->set_effects(effects_state);
+}
+
+bool xr::session::passthrough_color_lut_supported() const
+{
+#ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
+	if (auto * fb = std::get_if<const xr::passthrough_fb>(&passthrough))
+		return fb->color_lut_supported();
+	// No live fb yet (passthrough currently off): report extension
+	// availability so the GUI can enable LUT mode before first enable.
+	return inst && inst->has_extension(XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME);
+#else
+	return false;
+#endif
 }
 
 void xr::session::disable_passthrough()

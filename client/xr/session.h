@@ -41,6 +41,10 @@ class session : public utils::handle<XrSession, xrDestroySession>
 {
 	instance * inst = nullptr;
 	xr::passthrough passthrough;
+	// Desired demo effects (Passthrough tab). Persists across
+	// disable/enable cycles: re-applied after recreation in
+	// enable_passthrough(). Render thread only (GUI + render same thread).
+	passthrough_effects effects_state;
 	thread_safe<vk::raii::Queue> * queue = nullptr;
 
 	PFN_xrGetDisplayRefreshRateFB xrGetDisplayRefreshRateFB = nullptr;
@@ -166,5 +170,27 @@ public:
 	}
 	void set_passthrough_boundary_enabled(bool);
 	void on_boundary_visibility_changed(XrBoundaryVisibilityMETA);
+
+	// Demo passthrough effects (Passthrough tab subsection).
+	// Stored desired state, applied to the live fb layer(s) immediately
+	// and re-applied after enable_passthrough() recreates them.
+	void set_passthrough_effects(const passthrough_effects & fx);
+	const passthrough_effects & get_passthrough_effects() const
+	{
+		return effects_state;
+	}
+	passthrough_effects & mutable_passthrough_effects()
+	{
+		return effects_state;
+	}
+	// Re-push stored state to the live layers (call after in-place GUI edits).
+	void apply_passthrough_effects();
+	bool passthrough_color_lut_supported() const;
+	// Fullscreen demo passthrough request, ORed with depth/mask reasons in
+	// stream::render like depth_fullscreen_passthrough().
+	bool effects_fullscreen_passthrough() const
+	{
+		return effects_state.enabled;
+	}
 };
 } // namespace xr
