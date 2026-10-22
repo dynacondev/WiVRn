@@ -1252,7 +1252,7 @@ void compositor::synth_work(std::stop_token tok)
 		{
 			double dt_s = last_heartbeat_ns == 0 ? 5.0 : double(now_ns - last_heartbeat_ns) / 1e9;
 			last_heartbeat_ns = now_ns;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) gpu commit %lluns synth %lluns",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1271,8 +1271,11 @@ void compositor::synth_work(std::stop_token tok)
 			        (unsigned long long)wcounts.s_prewait.exchange(0),
 			        (unsigned long long)wcounts.s_pool.exchange(0),
 			        (unsigned long long)wcounts.s_present.exchange(0),
+			        (unsigned long long)wcounts.s_lock.exchange(0),
 			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
-			        (unsigned long long)last_synth_warp_ns.load(std::memory_order_relaxed));
+			        (unsigned long long)last_synth_warp_ns.load(std::memory_order_relaxed),
+			        (long long)last_raw_dt_ns.load(std::memory_order_relaxed),
+			        (long long)pacer.learned_render_latency_ns());
 		}
 
 		// Collect the previous synth submit's GPU timestamps without
@@ -1306,6 +1309,7 @@ void compositor::synth_work(std::stop_token tok)
 		int64_t half_period_ns = int64_t(period_ns / 2);
 		int64_t render_bias_ns = pacer.learned_render_latency_ns();
 		int64_t cover_dt = int64_t(tick_ns) - (int64_t(last_output_ns.load()) - render_bias_ns);
+		last_raw_dt_ns.store(int64_t(tick_ns) - int64_t(last_output_ns.load()), std::memory_order_relaxed);
 		bool covered = cover_dt <= half_period_ns && cover_dt >= -half_period_ns;
 		uint64_t last_retained = last_retained_ns.load();
 		bool retained_fresh = last_retained != 0 && now_ns - last_retained <= kSynthMaxRetainedAgeNs;
@@ -1333,7 +1337,10 @@ void compositor::synth_work(std::stop_token tok)
 			// dropping its fresh frame). No waiting here.
 			std::unique_lock commit_lock{commit_mutex, std::try_to_lock};
 			if (!commit_lock.owns_lock())
+			{
+				wcounts.s_lock++;
 				continue;
+			}
 			// Re-verify under lock: an EndFrame may have committed (and
 			// queued) while we slept.
 			int64_t cover_dt2 = int64_t(tick_ns) - (int64_t(last_output_ns.load()) - render_bias_ns);

@@ -131,12 +131,17 @@ private:
 		std::atomic<uint64_t> s_prewait{0};
 		std::atomic<uint64_t> s_pool{0};
 		std::atomic<uint64_t> s_present{0};
+		std::atomic<uint64_t> s_lock{0};
 	};
 	warp_counters wcounts;
 	// Last collected warp GPU times (ns, any path): the heartbeat reports
 	// them alongside the counters.
 	std::atomic<uint64_t> last_commit_warp_ns{0};
 	std::atomic<uint64_t> last_synth_warp_ns{0};
+	// Last raw coverage delta (tick minus last output, before the
+	// render-bias correction) and lock-contention count, for diagnosing
+	// a coverage check that never fires.
+	std::atomic<int64_t> last_raw_dt_ns{0};
 
 	std::array<encoder_settings, 3> settings;
 
