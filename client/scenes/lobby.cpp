@@ -1501,10 +1501,9 @@ bool scenes::lobby::kiosk_active()
 		return false;
 	if (pin_request.lock()->pin_requested)
 		return false;
-	if (current_tab == tab::connected)
-		return false;
-	// the dialling progress shows inside the overlay itself; PIN entry and
-	// errors take over the full UI through the guards above
+	// (no connected-tab exclusion: the overlay owns the pending state,
+	// and this branch draws before it; dialling progress shows inside
+	// the overlay itself)
 	return true;
 }
 

@@ -1131,16 +1131,9 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 		ImGui::End();
 		ImGui::PopStyleVar(4); // ImGuiStyleVar_FrameRounding, ImGuiStyleVar_WindowPadding, ImGuiStyleVar_WindowRounding, ImGuiStyleVar_WindowBorderSize
 	}
-	else if (current_tab == tab::connected)
-	{
-		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
-		ImGui::SetNextWindowSize({1400, 900});
-		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10);
-		ImGui::Begin("WiVRn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
-		gui_connected(predicted_display_time);
-		ImGui::End();
-		ImGui::PopStyleVar(2); // ImGuiStyleVar_WindowPadding, ImGuiStyleVar_FrameRounding
-	}
+	// kiosk overlay wins over the connected launcher while a connection is
+	// pending without video; the launcher still shows when revealed or
+	// with kiosk mode off
 	else if (kiosk_shown)
 	{
 		// minimal waiting panel over passthrough instead of the full shell,
@@ -1154,6 +1147,16 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 		ImGui::End();
 		ImGui::PopStyleVar();
 		ImGui::PopStyleColor();
+	}
+	else if (current_tab == tab::connected)
+	{
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0, 0});
+		ImGui::SetNextWindowSize({1400, 900});
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 10);
+		ImGui::Begin("WiVRn", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+		gui_connected(predicted_display_time);
+		ImGui::End();
+		ImGui::PopStyleVar(2); // ImGuiStyleVar_WindowPadding, ImGuiStyleVar_FrameRounding
 	}
 	else
 	{
