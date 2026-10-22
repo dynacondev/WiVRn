@@ -148,8 +148,17 @@ Vulkan). Normal-Z apps set `false` explicitly.
 Not a config key: set `WIVRN_WARP_DEBUG=1` in the server environment
 (`REPROJEX_DEBUG=1` also enables it, so one env lights the whole depth
 pipeline). Adds a 5 s `warp dbg:` heartbeat (per-path warp/skip rates,
-skip reasons, last GPU warp times) plus non-blocking synth warp GPU
-timestamps. Off by default; steady-state prod logging is unchanged.
+skip reasons, last GPU warp times, live retained `near`/`far`) plus
+non-blocking synth warp GPU timestamps. Off by default; steady-state
+prod logging is unchanged.
+
+### Warp kill-switch (A/B triage)
+Not a config key: set `WIVRN_WARP_DISABLE=1` in the server environment.
+Both warp paths stand down (commit serves straight, synth ticks go
+inactive) while depth flow, retention, counters, and the `warp dbg:`
+heartbeat keep running. If a visual defect disappears with `warped` at
+zero, the warped frames are the defect source. The server logs one
+confirmation line at startup when active.
 
 ## `publish-service`
 Default value: `avahi`

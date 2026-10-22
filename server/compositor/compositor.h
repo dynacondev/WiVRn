@@ -214,6 +214,13 @@ private:
 	// Arrival time of the commit that last refreshed retained sources.
 	// Bounds how stale a synth source may be (dead-app guard).
 	std::atomic<uint64_t> last_retained_ns{0};
+	// Snapshot of the retained clip planes for the warp-debug heartbeat
+	// (which runs without the commit lock). Written alongside the
+	// retained refresh, read by the 5 s heartbeat. Shows which near/far
+	// the warps actually used — the producer constants are open-loop,
+	// so the next live run must prove them against the app's projection.
+	std::atomic<float> dbg_retained_near{1};
+	std::atomic<float> dbg_retained_far{1000};
 
 	// Alpha blend mode of the latest commit. The synth ticker cannot
 	// safely read layer_accum (owned by the commit path), so layer_commit

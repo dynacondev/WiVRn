@@ -256,6 +256,21 @@ static bool warp_debug_enabled()
 	return on("WIVRN_WARP_DEBUG") || on("REPROJEX_DEBUG");
 }
 
+// Warp kill-switch for A/B triage (black-frame attribution): when
+// WIVRN_WARP_DISABLE=1 both warp paths stand down (commit serves
+// straight, synth ticks go inactive) while depth flow, retention, and
+// all counters/logging keep running. If the black flicker disappears
+// with warps at zero, the warped frames are the defect source. Read
+// once, process-wide: the two warp paths only read it.
+static bool warp_disabled()
+{
+	static const bool off = [] {
+		const char * v = getenv("WIVRN_WARP_DISABLE");
+		return v && (*v == '1' || *v == 't' || *v == 'T' || *v == 'y' || *v == 'Y');
+	}();
+	return off;
+}
+
 // Plausibility gate for depth warps (prototype parity): implied head
 // velocity between source capture and target display. A tick this
 // violent would splat mostly-holes (every hole pixel costs a
@@ -281,10 +296,14 @@ static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
                                   const std::array<xrt_pose, 2> & dst,
                                   double dt_s,
                                   float & worst_ms,
-                                  float & worst_rs)
+                                  float & worst_rs,
+                                  float & peak_dist_m,
+                                  float & peak_angle_rad)
 {
 	worst_ms = 0.f;
 	worst_rs = 0.f;
+	peak_dist_m = 0.f;
+	peak_angle_rad = 0.f;
 	if (!(dt_s > 0.))
 		return false;
 	double dt_eff = dt_s > kGateMinDtS ? dt_s : kGateMinDtS;
@@ -300,25 +319,31 @@ static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
 		                  a.orientation.z * b.orientation.z + a.orientation.w * b.orientation.w);
 		dot = fminf(fmaxf(dot, 0.f), 1.f);
 		float angle = 2.f * acosf(dot);
-		if (angle > kGateMaxAngleRad || dist > kGateMaxDistM)
-			return false;
+		// Record peaks BEFORE the absolute-cap early return: a trip
+		// used to log worst 0/0 (never updated), hiding a meters-wide
+		// tracking jump behind "0.0 m/s 0.0 rad/s".
+		peak_dist_m = fmaxf(peak_dist_m, dist);
+		peak_angle_rad = fmaxf(peak_angle_rad, angle);
 		worst_ms = fmaxf(worst_ms, float(dist / dt_eff));
 		worst_rs = fmaxf(worst_rs, float(angle / dt_eff));
+		if (angle > kGateMaxAngleRad || dist > kGateMaxDistM)
+			return false;
 	}
 	return worst_ms <= kMaxWarpSpeedMps && worst_rs <= kMaxWarpSpeedRps;
 }
 
 // Throttled skip note shared by both warp paths (same 5 s window:
 // a violent motion episode trips both).
-static void note_warp_skip_implausible(float worst_ms, float worst_rs, double dt_ms)
+static void note_warp_skip_implausible(float worst_ms, float worst_rs, double dt_ms,
+                                       float peak_dist_m, float peak_angle_rad)
 {
 	static std::atomic<uint64_t> last_ns{0};
 	uint64_t now_ns = uint64_t(os_monotonic_get_ns());
 	if (now_ns - last_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
 	{
 		last_ns.store(now_ns, std::memory_order_relaxed);
-		U_LOG_W("compositor: skipping warp (implausible head motion %.1f m/s %.1f rad/s dt=%.1fms, repeat instead)",
-		        worst_ms, worst_rs, dt_ms);
+		U_LOG_W("compositor: skipping warp (implausible head motion %.1f m/s %.1f rad/s dt=%.1fms peak_dist=%.2fm peak_angle=%.2frad, repeat instead)",
+		        worst_ms, worst_rs, dt_ms, peak_dist_m, peak_angle_rad);
 	}
 }
 
@@ -672,6 +697,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			retained_src_fov = src_fov;
 			retained_src_near = src_near_z;
 			retained_src_far = src_far_z;
+			dbg_retained_near.store(src_near_z[0], std::memory_order_relaxed);
+			dbg_retained_far.store(src_far_z[0], std::memory_order_relaxed);
 			reprojector.refresh_retained(
 			        vk.device,
 			        cmd,
@@ -689,7 +716,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// retained sources to this tick and serve that INSTEAD of the stale
 		// frame (at most one warp per commit). Fresh app frames are served
 		// straight (client-side rotation timewarp covers them).
-		if (stale_commit and has_depth_src and depth_reprojection_enabled)
+		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight for
+		// black-frame A/B runs; retention and counters keep running.
+		if (stale_commit and has_depth_src and depth_reprojection_enabled and !warp_disabled())
 		{
 			xrt_space_relation head{};
 			bool synth_ok = session.get_hmd().get_view_poses(
@@ -730,10 +759,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				// Plausibility gate (see helper): violent ticks splat
 				// mostly-holes; repeat instead.
 				float worst_ms = 0.f, worst_rs = 0.f;
+				float peak_dist_m = 0.f, peak_angle_rad = 0.f;
 				double dt_s = double(frame.rendering.predicted_display_time_ns - app_layer_ts_ns) / 1e9;
-				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs))
+				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs,
+				                           peak_dist_m, peak_angle_rad))
 				{
-					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3);
+					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
+					                           peak_dist_m, peak_angle_rad);
 					wcounts.c_gate++;
 					synth_ok = false;
 				}
@@ -1268,7 +1300,7 @@ void compositor::synth_work(std::stop_token tok)
 		{
 			double dt_s = last_heartbeat_ns == 0 ? 5.0 : double(now_ns - last_heartbeat_ns) / 1e9;
 			last_heartbeat_ns = now_ns;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f expected %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f expected %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns retained near %.3f far %.1f",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1292,7 +1324,9 @@ void compositor::synth_work(std::stop_token tok)
 			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
 			        (unsigned long long)last_synth_warp_ns.load(std::memory_order_relaxed),
 			        (long long)last_raw_dt_ns.load(std::memory_order_relaxed),
-			        (long long)pacer.learned_render_latency_ns());
+			        (long long)pacer.learned_render_latency_ns(),
+			        dbg_retained_near.load(std::memory_order_relaxed),
+			        dbg_retained_far.load(std::memory_order_relaxed));
 		}
 
 		// Collect the previous synth submit's GPU timestamps without
@@ -1335,7 +1369,7 @@ void compositor::synth_work(std::stop_token tok)
 			wcounts.s_covered++;
 			continue;
 		}
-		if (!retained_fresh || !depth_reprojection_enabled || !last_had_depth.load() || !session.connected() || !session.get_offset())
+		if (!retained_fresh || !depth_reprojection_enabled || !last_had_depth.load() || !session.connected() || !session.get_offset() || warp_disabled())
 		{
 			wcounts.s_inactive++;
 			continue;
@@ -1453,10 +1487,13 @@ void compositor::synth_work(std::stop_token tok)
 				// Plausibility gate (see helper): violent ticks splat
 				// mostly-holes; skip the tick instead.
 				float worst_ms = 0.f, worst_rs = 0.f;
+				float peak_dist_m = 0.f, peak_angle_rad = 0.f;
 				double dt_s = double(tick_ns - last_retained_ns.load()) / 1e9;
-				if (!warp_motion_plausible(retained_src_pose, synth_poses, dt_s, worst_ms, worst_rs))
+				if (!warp_motion_plausible(retained_src_pose, synth_poses, dt_s, worst_ms, worst_rs,
+				                           peak_dist_m, peak_angle_rad))
 				{
-					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3);
+					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
+					                           peak_dist_m, peak_angle_rad);
 					wcounts.s_gate++;
 					ok = false;
 				}
@@ -1848,6 +1885,8 @@ compositor::compositor(wivrn_session & session) :
 	U_LOG_I("depth warp %s (source-reverse-z %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
 	        configuration().reprojection.source_reverse_z ? "true" : "false");
+	if (warp_disabled())
+		U_LOG_I("depth warp kill-switch active (WIVRN_WARP_DISABLE=1): serving straight/repeat for A/B triage");
 
 	// Start the threads after everything is initialized. The synth
 	// ticker is declared after the encoder thread so it stops (and
