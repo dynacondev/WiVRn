@@ -28,7 +28,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <cstring>
 #include <format>
 
@@ -168,22 +167,15 @@ void upload_ubo(buffer_allocation & ubo, const T & data)
 namespace wivrn
 {
 
-// TEMPORARY triage switch for a GPU hang bisects (remove once the fill
-// path is proven on the failing driver): WIVRN_WARP_NO_BLIT=1 forces
-// the blit chain + fill pass off, leaving holes black, without
-// touching format support detection.
-static bool blit_force_disabled()
-{
-	static const bool off = [] {
-		const char * v = getenv("WIVRN_WARP_NO_BLIT");
-		return v && (*v == '1' || *v == 't' || *v == 'T' || *v == 'y' || *v == 'Y');
-	}();
-	return off;
-}
+// TEMPORARY triage switch for a GPU hang bisect (remove once the fill
+// path is proven on the failing driver): forces the blit chain + fill
+// pass off, leaving holes black, without touching format support
+// detection.
+static constexpr bool kForceDisableBlits = true;
 
 depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         reverse_z{configuration().reprojection.source_reverse_z},
-        blit_supported{blit_supported_format(vk) && !blit_force_disabled()},
+        blit_supported{blit_supported_format(vk) && !kForceDisableBlits},
         // Color sampler: linear, edge-clamped, uncapped LOD. Out-of-bounds
         // taps are rejected in-shader, so border-black would only darken
         // the valid rim; the fill pass needs explicit mip LODs.
@@ -198,8 +190,8 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 {
 	if (!blit_supported)
 		U_LOG_W("depth warp: R8G8B8A8 blits unsupported, hole fill disabled (holes stay black)");
-	if (blit_force_disabled())
-		U_LOG_W("depth warp: hole fill FORCE-DISABLED by WIVRN_WARP_NO_BLIT=1 (triage, remove me)");
+	if (kForceDisableBlits)
+		U_LOG_W("depth warp: hole fill FORCE-DISABLED (temporary triage, remove me)");
 	// Retained last-real-frame sources, sized to the render eye size.
 	// Full-eye, GL-ordered by the resolve pass.
 	retained_color = image_allocation{
