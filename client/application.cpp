@@ -1403,6 +1403,11 @@ void application::initialize()
 	        XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME,
 	        XR_META_LOCAL_DIMMING_EXTENSION_NAME,
 	        XR_META_BOUNDARY_VISIBILITY_EXTENSION_NAME,
+#ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
+	        // Color LUT passthrough effects (Quest): probed like all opt
+	        // extensions; absent runtimes/headers are unaffected.
+	        XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME,
+#endif
 #ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
 	        // Environment-depth debug overlay (Quest 3/3S): probed like
 	        // all opt extensions; absent runtimes/headers are unaffected.
@@ -1463,6 +1468,11 @@ void application::initialize()
 		spdlog::info("    OpenXR post-processing extension support: true");
 		openxr_post_processing_supported = true;
 	}
+
+#ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME
+	if (xr_instance.has_extension(XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME))
+		spdlog::info("    Passthrough color LUT support: true");
+#endif
 
 	switch (xr_system_id.passthrough_supported())
 	{
