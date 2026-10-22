@@ -657,12 +657,26 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// held data, valid until the next real frame refreshes it.
 		if (has_depth_src and depth_reprojection_enabled and app_fresh)
 		{
-			// Depth rows arrive Vulkan top-first by producer construction
-			// (dma-buf import chain, row 0 = top), independent of the color
-			// layer's flip_y: retained rows mirror so the images stay
-			// GL-ordered (row 0 = frustum bottom) whatever the color order.
+			// Both planes travel the same import chain, so they share one
+			// row-order decision: retained rows mirror so the images stay
+			// GL-ordered (row 0 = frustum bottom) whatever the source
+			// order. (A hardcoded depth flip here rendered warped frames
+			// vertically mirrored: live evidence beats the old assumption
+			// that depth rows arrive top-first independent of flip_y.)
 			// Retained refresh also stamps the source clock (repeat-warp
 			// fabrication measures source age from here).
+			{
+				// Log once per change: the next live run shows the
+				// decision explicitly instead of requiring inference
+				// from artifacts.
+				static int last_logged_flip_y = -1;
+				if ((int)flip_y != last_logged_flip_y)
+				{
+					last_logged_flip_y = (int)flip_y;
+					U_LOG_I("depth warp: row order flip_y=%d -> flip_color=%d flip_depth=%d",
+					        (int)flip_y, (int)!flip_y, (int)!flip_y);
+				}
+			}
 			last_retained_ns.store(commit_ns);
 			retained_src_pose = src_pose;
 			retained_src_fov = src_fov;
@@ -678,7 +692,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        src_color_nrect,
 			        src_depth_nrect,
 			        /*flip_color=*/!flip_y,
-			        /*flip_depth=*/true);
+			        /*flip_depth=*/!flip_y);
 		}
 
 		// Repeat-frame warp: the multi layer recommits at display rate,
