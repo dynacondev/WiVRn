@@ -411,7 +411,7 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 		if (res != XR_SUCCESS)
 			spdlog::warn("xrPassthroughLayerSetStyleFB({}) failed mode={}: {}", name, (int)fx.mode, (int)res);
 		else
-			spdlog::info("Passthrough style {}: opacity {:.2f} edge_a {:.2f} mode {}", name, opacity, (double)edge.a, (int)fx.mode);
+			spdlog::debug("Passthrough style {}: opacity {:.2f} edge_a {:.2f} mode {}", name, opacity, (double)edge.a, (int)fx.mode);
 	};
 	apply_one(passthrough_layer, "flat");
 	if (projected_layer)

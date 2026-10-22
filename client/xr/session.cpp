@@ -373,14 +373,14 @@ void xr::session::sync_actions(XrActionSet action_set, const std::string & subac
 
 void xr::session::enable_passthrough(xr::system & system)
 {
+	// Already live: do NOT re-apply style here. enable_passthrough() runs
+	// every frame from stream::render; re-applying (2 IPCs + logs) each
+	// frame stalls the frame and was observed to precede a
+	// CALL_ORDER_INVALID on swapchain release. Style is applied once on
+	// creation below and on explicit GUI edits via
+	// apply_passthrough_effects().
 	if (not std::holds_alternative<std::monostate>(passthrough))
-	{
-		// Already live: re-apply desired demo style (covers first enable
-		// before GUI edits + any runtime layer recreation).
-		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-			fb->set_effects(effects_state);
 		return;
-	}
 
 	if (system.passthrough_supported() == xr::passthrough_type::none)
 		return;
