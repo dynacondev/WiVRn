@@ -122,6 +122,13 @@ private:
 		std::atomic<uint64_t> c_prewait{0};
 		std::atomic<uint64_t> c_pool{0};
 		std::atomic<uint64_t> c_present{0};
+		// Fresh vs repeated client frames: the multi-system thread
+		// recommits the last delivered layers every display tick, so
+		// c_total runs at display rate while the app may be far slower.
+		// A repeat carries the identical client timestamp; only fresh
+		// frames advance it. Split here proves the ratio live.
+		std::atomic<uint64_t> c_fresh{0};
+		std::atomic<uint64_t> c_repeat{0};
 		std::atomic<uint64_t> s_ticks{0};
 		std::atomic<uint64_t> s_warped{0};
 		std::atomic<uint64_t> s_covered{0};

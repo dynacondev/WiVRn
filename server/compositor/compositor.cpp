@@ -596,6 +596,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			int64_t last_ts = last_app_layer_ts.load();
 			app_fresh = last_ts < 0 || last_ts != app_layer_ts_ns;
 			last_app_layer_ts.store(app_layer_ts_ns);
+			// Origin-tag every native commit: the multi-system thread
+			// recommits at display rate, so this splits true app rate
+			// from display-tick replays live on the heartbeat.
+			if (app_fresh)
+				wcounts.c_fresh++;
+			else
+				wcounts.c_repeat++;
 			if (layer.data.type == XRT_LAYER_PROJECTION_DEPTH)
 				has_depth_src = true;
 		}
@@ -1183,7 +1190,7 @@ void compositor::synth_work(std::stop_token tok)
 		{
 			double dt_s = last_heartbeat_ns == 0 ? 5.0 : double(now_ns - last_heartbeat_ns) / 1e9;
 			last_heartbeat_ns = now_ns;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f expected %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns retained near %.3f far %.1f",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f) synth %.1f ticks/s (warped %.1f covered %.1f expected %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu lock %llu) gpu commit %lluns synth %lluns rawdt %lldns bias %lldns retained near %.3f far %.1f",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1193,6 +1200,8 @@ void compositor::synth_work(std::stop_token tok)
 			        (unsigned long long)wcounts.c_prewait.exchange(0),
 			        (unsigned long long)wcounts.c_pool.exchange(0),
 			        (unsigned long long)wcounts.c_present.exchange(0),
+			        wcounts.c_fresh.exchange(0) / dt_s,
+			        wcounts.c_repeat.exchange(0) / dt_s,
 			        wcounts.s_ticks.exchange(0) / dt_s,
 			        wcounts.s_warped.exchange(0) / dt_s,
 			        wcounts.s_covered.exchange(0) / dt_s,

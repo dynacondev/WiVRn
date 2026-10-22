@@ -162,9 +162,14 @@ grows with the square of the radius).
 Not a config key: set `WIVRN_WARP_DEBUG=1` in the server environment
 (`REPROJEX_DEBUG=1` also enables it, so one env lights the whole depth
 pipeline). Adds a 5 s `warp dbg:` heartbeat (per-path warp/skip rates,
-skip reasons, last GPU warp times, live retained `near`/`far`) plus
+skip reasons, `fresh`/`repeat` commit split, last GPU warp times, live
+retained `near`/`far`) plus
 non-blocking synth warp GPU timestamps. Off by default; steady-state
-prod logging is unchanged.
+prod logging is unchanged. `fresh` counts commits carrying a new app
+frame, `repeat` counts display-tick replays of the last one (the
+multi-system thread recommits at display rate, so `commit` runs at
+90/s even when the app is slower — the split tells true app rate from
+replays).
 
 ### Warp kill-switch (A/B triage)
 Not a config key: set `WIVRN_WARP_DISABLE=1` in the server environment.
