@@ -258,6 +258,7 @@ private:
 	bool stream_had_active_app = false;
 	XrTime last_kiosk_app_req = 0;
 	XrTime last_stream_kiosk_toggle = 0;
+	bool stream_chord_held = false;
 	std::atomic<bool> stream_apps_known = false;
 	bool has_active_simulation();
 	void update_stream_kiosk(XrTime predicted_display_time);

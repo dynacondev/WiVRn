@@ -932,12 +932,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		XrActionStateBoolean state_2{XR_TYPE_ACTION_STATE_BOOLEAN};
 		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_2));
 
-		// time gate alongside the change edge so switch bounce on one
-		// physical press can't double-toggle
-		if (state_1.currentState and state_2.currentState and (state_1.changedSinceLastSync or state_2.changedSinceLastSync) and
-		    frame_state.predictedDisplayTime - last_stream_kiosk_toggle > 500'000'000LL)
+		// Click semantics with a time gate: arm while both sticks are held,
+		// fire once on release. A press edge never refires while held, which
+		// stranded anyone still holding through the first toggle; the gate
+		// still eats switch bounce around the release.
+		bool chord_down = state_1.currentState and state_2.currentState;
+		if (!state_1.isActive || !state_2.isActive)
 		{
+			static bool chord_inactive_warned = false;
+			if (!chord_inactive_warned)
+			{
+				chord_inactive_warned = true;
+				spdlog::warn("Kiosk chord actions inactive, thumbstick toggle unavailable");
+			}
+		}
+		if (chord_down)
+		{
+			stream_chord_held = true;
+		}
+		else if (stream_chord_held and
+		         frame_state.predictedDisplayTime - last_stream_kiosk_toggle > 500'000'000LL)
+		{
+			stream_chord_held = false;
 			last_stream_kiosk_toggle = frame_state.predictedDisplayTime;
+			spdlog::info(
+			        "Kiosk chord fired: shown={} dismissed={} apps_known={} tab={}",
+			        stream_kiosk_shown,
+			        stream_kiosk_dismissed,
+			        bool(stream_apps_known),
+			        magic_enum::enum_name(gui_status));
 			// Arbitrary transitions can happen from network commands
 			// Ensure we can't have a set of 2 non interactable states
 			if (stream_kiosk_shown)
@@ -949,6 +972,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				next_gui_status = stream_tab::hidden;
 				stream_kiosk_dismissed = false;
+				// fresh app list so the reshow decision isn't stale
+				last_kiosk_app_req = frame_state.predictedDisplayTime;
+				network_session->send_control(from_headset::get_running_applications{});
 			}
 			else if (is_interactable(stored_gui_status))
 				next_gui_status = stored_gui_status;
@@ -971,6 +997,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// owning passthrough state once video flows.
 			if (stream_kiosk_shown)
 				session.enable_passthrough(system);
+			else
+				session.disable_passthrough();
 			render_start(stream_kiosk_shown, frame_state.predictedDisplayTime);
 			draw_gui(frame_state.predictedDisplayTime, frame_state.predictedDisplayPeriod);
 			render_end();
