@@ -207,8 +207,8 @@ private:
 
 	thread_safe<std::queue<std::string>> stream_error_queue;
 
-	XrAction plots_toggle_1 = XR_NULL_HANDLE;
-	XrAction plots_toggle_2 = XR_NULL_HANDLE;
+	XrAction kiosk_chord_left_action = XR_NULL_HANDLE;
+	XrAction kiosk_chord_right_action = XR_NULL_HANDLE;
 	XrAction recenter_left = XR_NULL_HANDLE;
 	XrAction recenter_right = XR_NULL_HANDLE;
 	XrAction gui_distance_left = XR_NULL_HANDLE;

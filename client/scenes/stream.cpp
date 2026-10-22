@@ -604,8 +604,8 @@ void scenes::stream::on_focused()
 		}
 	}
 
-	plots_toggle_1 = get_action("plots_toggle_1").first;
-	plots_toggle_2 = get_action("plots_toggle_2").first;
+	kiosk_chord_left_action = get_action("kiosk_chord_left").first;
+	kiosk_chord_right_action = get_action("kiosk_chord_right").first;
 	recenter_left = get_action("recenter_left").first;
 	recenter_right = get_action("recenter_right").first;
 	gui_distance_left = get_action("gui_distance_left").first;
@@ -892,8 +892,6 @@ void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 	}
 
 	bool has_active = allowed and stream_apps_known and has_active_simulation();
-	if (has_active != stream_had_active_app)
-		spdlog::debug("Kiosk apps: active={} known={}", has_active, bool(stream_apps_known));
 	if (stream_had_active_app and not has_active)
 		stream_kiosk_dismissed = false; // app stopped: waiting overlay returns
 	stream_had_active_app = has_active;
@@ -923,12 +921,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		XrActionStateGetInfo get_info{
 		        .type = XR_TYPE_ACTION_STATE_GET_INFO,
-		        .action = plots_toggle_1,
+		        .action = kiosk_chord_left_action,
 		};
 
 		XrActionStateBoolean state_1{XR_TYPE_ACTION_STATE_BOOLEAN};
 		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_1));
-		get_info.action = plots_toggle_2;
+		get_info.action = kiosk_chord_right_action;
 		XrActionStateBoolean state_2{XR_TYPE_ACTION_STATE_BOOLEAN};
 		CHECK_XR(xrGetActionStateBoolean(session, &get_info, &state_2));
 
@@ -955,12 +953,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			stream_chord_held = false;
 			last_stream_kiosk_toggle = frame_state.predictedDisplayTime;
-			spdlog::info(
-			        "Kiosk chord fired: shown={} dismissed={} apps_known={} tab={}",
-			        stream_kiosk_shown,
-			        stream_kiosk_dismissed,
-			        bool(stream_apps_known),
-			        magic_enum::enum_name(gui_status));
 			// Arbitrary transitions can happen from network commands
 			// Ensure we can't have a set of 2 non interactable states
 			if (stream_kiosk_shown)
@@ -3205,8 +3197,8 @@ scene::meta & scenes::stream::get_meta_scene()
 	                {"right_scroll", XR_ACTION_TYPE_VECTOR2F_INPUT},
 	                {"right_haptic", XR_ACTION_TYPE_VIBRATION_OUTPUT},
 
-	                {"plots_toggle_1", XR_ACTION_TYPE_BOOLEAN_INPUT},
-	                {"plots_toggle_2", XR_ACTION_TYPE_BOOLEAN_INPUT},
+	                {"kiosk_chord_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
+	                {"kiosk_chord_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
 
 	                {"recenter_left", XR_ACTION_TYPE_BOOLEAN_INPUT},
 	                {"recenter_right", XR_ACTION_TYPE_BOOLEAN_INPUT},
@@ -3254,8 +3246,9 @@ scene::meta & scenes::stream::get_meta_scene()
 	                                {"foveation_ok", "/user/hand/right/input/a/click"},
 	                                {"foveation_cancel", "/user/hand/right/input/b/click"},
 
-	                                {"plots_toggle_1", "/user/hand/left/input/thumbstick/click"},
-	                                {"plots_toggle_2", "/user/hand/right/input/thumbstick/click"},
+	                                {"kiosk_chord_left", "/user/hand/left/input/thumbstick/click"},
+	                                {"kiosk_chord_right", "/user/hand/right/input/thumbstick/click"},
+	                                {"kiosk_chord_right", "/user/hand/right/input/thumbstick/click"},
 	                        },
 	                },
 	                suggested_binding{

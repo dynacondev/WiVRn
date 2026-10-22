@@ -976,7 +976,6 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		{
 			kiosk_chord_held = false;
 			last_kiosk_toggle = frame_state.predictedDisplayTime;
-			spdlog::info("Kiosk chord fired: shown={} dismissed={}", kiosk_shown, kiosk_dismissed);
 			kiosk_dismissed = not kiosk_dismissed;
 			if (kiosk_dismissed)
 				// pending connection goes straight to its launcher,
