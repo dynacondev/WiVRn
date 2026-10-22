@@ -10,7 +10,8 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 - Rules:
   1. Every viewport in `layers_` must hold a valid pose on *every* frame it could overlap a window — place fallback poses up front (see `place_layer_relative(1, 0, ...)` in `stream_gui.cpp`), refine per-window after (tooltip hook pattern).
   2. `end_frame()` now skips non-normalized viewport poses with a one-shot warn instead of submitting — never let one bad quad fail the frame.
-  3. Diagnose with the `POSE_INVALID diag` block (`stream::log_pose_invalid_diagnostics`): it names the exact layer (`quad BAD ... quat=(0,0,0,0)`), view flags, and popup-open state. `popup_open=true` + a quad with zero quat = this bug, not tracking loss.
+  3. Prefer non-popup selectors (‹ › steppers, radios) for controls near the bottom of scrollable pages: combo popups open downward past the panel into the next viewport's image rect and split across quads (chopped, detached look even when poses are valid).
+  4. Diagnose with the `POSE_INVALID diag` block (`stream::log_pose_invalid_diagnostics`): it names the exact layer (`quad BAD ... quat=(0,0,0,0)`), view flags, and popup-open state. `popup_open=true` + a quad with zero quat = this bug, not tracking loss.
 - Related trap: the same "everything black" signature previously also came from `xrReleaseSwapchainImage ... CALL_ORDER_INVALID` after a throw between `begin_frame`/`end_frame` skipped the submit (valueless `passthrough` variant poisoned every later frame). If the diag block is *absent* and the error is `CALL_ORDER_INVALID` instead, suspect frame-loop poisoning (`session::enable_passthrough` emplace guard), not poses.
 
 ## Adreno: never use `mat3` constructors/ternaries in fragment shaders (Quest 3, Adreno 740, driver 512.837.9)

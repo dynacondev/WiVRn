@@ -1274,13 +1274,27 @@ void scenes::stream::gui_passthrough()
 		ImGui::EndDisabled();
 
 		// LUT presets + weights. Disabled when the ext is missing.
+		// Steppers, not combos: this section sits at the bottom of a
+		// scrollable page, so a combo popup would dangle past the panel
+		// into the next GUI viewport and split across quads (chopped,
+		// detached look). ‹ › cycles with no popup.
 		ImGui::BeginDisabled((fx.mode != xr::passthrough_effect_mode::lut && fx.mode != xr::passthrough_effect_mode::interpolated_lut) || !lut_supported);
 		{
-			const char * luts[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
-			int cur = (int)fx.lut_preset;
-			if (ImGui::Combo(_S("LUT preset"), &cur, luts, 5))
+			static const char * luts[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
+			constexpr int lut_count = 5;
+			ImGui::Text("%s", _S("LUT preset"));
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##lut_prev", ImGuiDir_Left))
 			{
-				fx.lut_preset = (xr::passthrough_lut_preset)cur;
+				fx.lut_preset = (xr::passthrough_lut_preset)(((int)fx.lut_preset + lut_count - 1) % lut_count);
+				dirty = true;
+			}
+			ImGui::SameLine();
+			ImGui::TextUnformatted(luts[(int)fx.lut_preset]);
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##lut_next", ImGuiDir_Right))
+			{
+				fx.lut_preset = (xr::passthrough_lut_preset)(((int)fx.lut_preset + 1) % lut_count);
 				dirty = true;
 			}
 			float w_pct = fx.lut_weight * 100.0f;
@@ -1293,11 +1307,21 @@ void scenes::stream::gui_passthrough()
 		ImGui::EndDisabled();
 		ImGui::BeginDisabled(fx.mode != xr::passthrough_effect_mode::interpolated_lut || !lut_supported);
 		{
-			const char * luts[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
-			int cur_b = (int)fx.lut_preset_b;
-			if (ImGui::Combo(_S("LUT preset B"), &cur_b, luts, 5))
+			static const char * luts_b[] = {"Identity", "Sepia", "Invert", "High contrast", "Night vision"};
+			constexpr int lut_count_b = 5;
+			ImGui::Text("%s", _S("LUT preset B"));
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##lutb_prev", ImGuiDir_Left))
 			{
-				fx.lut_preset_b = (xr::passthrough_lut_preset)cur_b;
+				fx.lut_preset_b = (xr::passthrough_lut_preset)(((int)fx.lut_preset_b + lut_count_b - 1) % lut_count_b);
+				dirty = true;
+			}
+			ImGui::SameLine();
+			ImGui::TextUnformatted(luts_b[(int)fx.lut_preset_b]);
+			ImGui::SameLine();
+			if (ImGui::ArrowButton("##lutb_next", ImGuiDir_Right))
+			{
+				fx.lut_preset_b = (xr::passthrough_lut_preset)(((int)fx.lut_preset_b + 1) % lut_count_b);
 				dirty = true;
 			}
 			float m_pct = fx.lut_mix * 100.0f;
