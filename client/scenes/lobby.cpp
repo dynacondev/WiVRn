@@ -979,7 +979,10 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			spdlog::info("Kiosk chord fired: shown={} dismissed={}", kiosk_shown, kiosk_dismissed);
 			kiosk_dismissed = not kiosk_dismissed;
 			if (kiosk_dismissed)
-				current_tab = tab::server_list;
+				// pending connection goes straight to its launcher,
+				// skipping the server-list frame (and its modal churn);
+				// true idle lands on Computers as before
+				current_tab = next_scene ? tab::connected : tab::server_list;
 			setup_passthrough();
 		}
 	}
