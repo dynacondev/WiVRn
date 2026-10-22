@@ -29,8 +29,6 @@
 #include <iterator>
 #include <map>
 #include <numbers>
-#include <set>
-#include <spdlog/spdlog.h>
 #include <string>
 
 namespace
@@ -108,8 +106,6 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 		        std::clamp(paint.base.y + jitter(rng_), 0.f, 1.f),
 		        std::clamp(paint.base.z + jitter(rng_), 0.f, 1.f),
 		};
-		spdlog::info("Kiosk plane {}: body tint ({:.2f}, {:.2f}, {:.2f})", i, body_tint.x, body_tint.y, body_tint.z);
-		std::set<std::string> walked_materials;
 		// add_gltf shares mesh objects (and their materials) across
 		// instantiations: deep-copy each mesh so per-plane material clones
 		// don't leak into the other planes. GPU buffers stay shared.
@@ -132,7 +128,6 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 							if (inserted)
 							{
 								auto src = primitive.material_;
-								walked_materials.insert(src ? src->name : std::string("<null>"));
 								it->second = scene_.create_material([src, body_tint](renderer::material & m) {
 									m.staging = src->staging;
 									m.base_color_texture = src->base_color_texture;
@@ -165,12 +160,6 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 			}
 		};
 		visit(entity);
-		{
-			std::string names;
-			for (auto & n: walked_materials)
-				names += (names.empty() ? "" : ", ") + n;
-			spdlog::info("Kiosk plane {}: {} materials ({}), mesh copies {}", i, f.materials.size(), names, mesh_copies.size());
-		}
 		flights_.push_back(std::move(f));
 	}
 }
