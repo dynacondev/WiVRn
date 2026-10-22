@@ -250,6 +250,17 @@ private:
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
 
+	// Kiosk "Waiting for Simulation" overlay: shown over the (idle) video
+	// while connected with no XR application active. Render thread only,
+	// except stream_apps_known which latches on the network thread.
+	bool stream_kiosk_dismissed = false;
+	bool stream_kiosk_shown = false;
+	bool stream_had_active_app = false;
+	XrTime last_kiosk_app_req = 0;
+	std::atomic<bool> stream_apps_known = false;
+	bool has_active_simulation();
+	void update_stream_kiosk(XrTime predicted_display_time);
+
 	// Fiducial tracking markers (Quest only, see docs/configuration.md).
 	// Latest map from the server; model files cached under
 	// application::get_config_path() / "fiducial_models" / <hash>.glb.
@@ -780,6 +791,7 @@ private:
 	void gui_foveation_settings(float predicted_display_period);
 	void gui_applications();
 	void gui_toasts();
+	void gui_kiosk_waiting();
 	void gui_passthrough();
 	void gui_fiducial_status();
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});

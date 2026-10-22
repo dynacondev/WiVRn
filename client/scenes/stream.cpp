@@ -867,6 +867,36 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
+bool scenes::stream::has_active_simulation()
+{
+	auto apps = running_applications.lock();
+	for (auto & app: apps->applications)
+		if (app.active and not app.overlay)
+			return true;
+	return false;
+}
+
+void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
+{
+	const auto & config = application::get_config();
+
+	// keep the running-apps picture fresh while kiosk mode is on; the
+	// applications tab polls itself when visible, this covers the overlay
+	if (config.kiosk_mode and predicted_display_time - last_kiosk_app_req > 2'000'000'000LL)
+	{
+		last_kiosk_app_req = predicted_display_time;
+		network_session->send_control(from_headset::get_running_applications{});
+	}
+
+	bool has_active = config.kiosk_mode and stream_apps_known and has_active_simulation();
+	if (stream_had_active_app and not has_active)
+		stream_kiosk_dismissed = false; // app stopped: waiting overlay returns
+	stream_had_active_app = has_active;
+
+	stream_kiosk_shown = config.kiosk_mode and not stream_kiosk_dismissed and
+	                     stream_apps_known and not has_active and not is_gui_interactable();
+}
+
 void scenes::stream::render(const XrFrameState & frame_state)
 {
 	if (state_ == state::shutdown)
@@ -2970,6 +3000,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	read_actions();
 
+	update_stream_kiosk(frame_state.predictedDisplayTime);
+
 	if (application::get_config().enable_stream_gui)
 	{
 		XrActionStateGetInfo get_info{
@@ -2987,8 +3019,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			// Arbitrary transitions can happen from network commands
 			// Ensure we can't have a set of 2 non interactable states
-			if (is_gui_interactable())
+			if (stream_kiosk_shown)
+			{
+				stream_kiosk_dismissed = true;
+				next_gui_status = stream_tab::applications;
+			}
+			else if (is_gui_interactable())
+			{
 				next_gui_status = stream_tab::hidden;
+				stream_kiosk_dismissed = false;
+			}
 			else if (is_interactable(stored_gui_status))
 				next_gui_status = stored_gui_status;
 			else

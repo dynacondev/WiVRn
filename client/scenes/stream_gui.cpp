@@ -34,6 +34,7 @@
 #include <IconsFontAwesome7.h>
 #include <chrono>
 #include <cmath>
+#include <imspinner.h>
 #include <glm/ext.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/matrix_access.hpp>
@@ -807,6 +808,19 @@ void scenes::stream::gui_applications()
 	ImGui::PopStyleVar();
 }
 
+void scenes::stream::gui_kiosk_waiting()
+{
+	const auto & t = wivrn::ui::current();
+
+	// spinner + title on one row, matching the lobby kiosk overlay
+	ImGui::PushFont(nullptr, constants::gui::font_size_large);
+	const float r = ImGui::GetFontSize() * 0.55f;
+	ImSpinner::SpinnerAng("kiosk-waiting", r, wivrn::ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
+	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
+	ImGui::TextUnformatted(_S("Waiting for Simulation"));
+	ImGui::PopFont();
+}
+
 void scenes::stream::gui_toasts()
 {
 	auto toast = gui_toast.lock();
@@ -945,9 +959,13 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 				break;
 
 			case stream_tab::hidden:
-				// Always use the same position for the GUI shortcut tip
 				imgui_ctx->layers()[0].orientation = head_position->second;
-				imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, -0.4, -1.0};
+				if (stream_kiosk_shown)
+					// waiting overlay sits centred in view, not low like the toast tip
+					imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, 0.0, -1.1};
+				else
+					// Always use the same position for the GUI shortcut tip
+					imgui_ctx->layers()[0].position = head_position->first + M * glm::vec3{0.0, -0.4, -1.0};
 				break;
 
 			case stream_tab::overlay_only:
@@ -1077,7 +1095,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	switch (gui_status)
 	{
 		case stream_tab::hidden:
-			gui_toasts();
+			if (stream_kiosk_shown)
+				gui_kiosk_waiting();
+			else
+				gui_toasts();
 			break;
 
 		case stream_tab::overlay_only:
