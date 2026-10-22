@@ -91,6 +91,11 @@ public:
 
 	bool enable_stream_gui = true;
 
+	// Kiosk mode: at startup, when an auto-connect computer is configured,
+	// show only a minimal "Waiting for Connection" overlay over passthrough
+	// instead of the full lobby. Both thumbsticks reveal the full GUI.
+	bool kiosk_mode = true;
+
 	// application launcher: list vs grid, and grid icon size, 0 small 1 medium 2 large
 	bool app_list_view = false;
 	uint32_t app_icon_size = 0;
