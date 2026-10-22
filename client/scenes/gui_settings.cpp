@@ -871,7 +871,7 @@ void settings_theme(const settings_context & ctx)
 			for (int i = 0; i < int(preset_list.size()); ++i)
 				if (preset_list[i].name == cfg.theme_preset)
 					return i;
-			return 1; // dark_default
+			return 0; // oled
 		};
 		static int preset = f(config);
 		static const int preset_default = f(default_config);

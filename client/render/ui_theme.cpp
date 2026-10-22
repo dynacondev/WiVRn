@@ -157,6 +157,7 @@ std::vector<theme> presets()
 std::vector<accent_swatch> accent_swatches()
 {
 	return {
+	        {"Orange", rgb(255, 148, 26), rgb(255, 165, 60), rgb(225, 120, 5)},
 	        {"Blue", rgb(30, 115, 255), rgb(64, 140, 255), rgb(18, 95, 228)},
 	        {"Violet", rgb(132, 72, 255), rgb(152, 98, 255), rgb(112, 52, 232)},
 	        {"Emerald", rgb(0, 200, 132), rgb(28, 214, 150), rgb(0, 172, 112)},
@@ -176,7 +177,7 @@ void set_accent(const accent_swatch & swatch)
 
 theme & current()
 {
-	static theme t = dark_default();
+	static theme t = oled();
 	return t;
 }
 

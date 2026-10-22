@@ -836,6 +836,11 @@ void scenes::lobby::gui_first_run()
 	                .supported = true,
 	        },
 	        item{
+	                .f = feature::hand_tracking,
+	                .text = _S("Enable hand tracking?"),
+	                .supported = system.hand_tracking_supported(),
+	        },
+	        item{
 	                .f = feature::eye_gaze,
 	                .text = _S("Enable eye tracking?"),
 	                .supported = application::get_eye_gaze_supported(),
@@ -857,8 +862,6 @@ void scenes::lobby::gui_first_run()
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
 	CenterTextH(_("Welcome to DynaconVR"));
 	ImGui::PopFont();
-
-	config.set_feature(feature::hand_tracking, true);
 
 	while (optional_feature_index < optional_features.size() and
 	       (not optional_features[optional_feature_index].supported or
