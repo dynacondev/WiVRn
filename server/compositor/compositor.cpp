@@ -46,6 +46,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <thread>
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
@@ -242,6 +243,19 @@ void compositor::timings::add(float us)
 	values[index] = us;
 }
 
+// Warp debug output (timing heartbeat + synth GPU timestamps): off in
+// prod. Enabled by WIVRN_WARP_DEBUG=1 (or REPROJEX_DEBUG=1, so one env
+// lights the whole depth pipeline; the producer's blocking validation
+// stays independent). Read once at construction.
+static bool warp_debug_enabled()
+{
+	auto on = [](const char * name) {
+		const char * v = getenv(name);
+		return v && (*v == '1' || *v == 't' || *v == 'T' || *v == 'y' || *v == 'Y');
+	};
+	return on("WIVRN_WARP_DEBUG") || on("REPROJEX_DEBUG");
+}
+
 // Plausibility gate for depth warps (prototype parity): implied head
 // velocity between source capture and target display. A tick this
 // violent would splat mostly-holes (every hole pixel costs a
@@ -341,6 +355,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 {
 	u_graphics_sync_unref(&sync_handle);
 
+	wcounts.c_total++;
+
 	// Move waited frame to rendering frame, clear waited.
 	comp_frame_move_and_clear_locked(&frame.rendering, &frame.waited);
 
@@ -391,6 +407,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (i < 0)
 	{
 		note_acquire_fail();
+		wcounts.c_pool++;
+		wcounts.c_dropped++;
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
@@ -459,6 +477,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				U_LOG_W("compositor: previous GPU work never completed, dropping frame");
 			}
 			images[i].busy = false;
+			wcounts.c_prewait++;
+			wcounts.c_dropped++;
 			comp_frame_clear_locked(&frame.rendering);
 			return XRT_SUCCESS;
 		}
@@ -681,6 +701,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs))
 				{
 					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3);
+					wcounts.c_gate++;
 					synth_ok = false;
 				}
 			}
@@ -723,6 +744,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 						U_LOG_W("compositor: warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, repeat instead)",
 						        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1]);
 					}
+					wcounts.c_degenerate++;
 					images[synth.image].busy = false;
 					synth.image = -1;
 				}
@@ -840,6 +862,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				// above): drop the tick rather than queue a frame no
 				// stream can encode.
 				images[synth.image].busy = false;
+				wcounts.c_present++;
+				wcounts.c_dropped++;
 				comp_frame_clear_locked(&frame.rendering);
 				return XRT_SUCCESS;
 			}
@@ -849,6 +873,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			if (!present_to_encoders(i, view_info, present_info.frame_id, sem_info, real_slots))
 			{
 				images[i].busy = false;
+				wcounts.c_present++;
+				wcounts.c_dropped++;
 				comp_frame_clear_locked(&frame.rendering);
 				return XRT_SUCCESS;
 			}
@@ -878,9 +904,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	}
 
 	if (warp_replaces_real)
+	{
 		queue_encode(synth.image, synth_slots);
+		wcounts.c_warped++;
+	}
 	else
+	{
 		queue_encode(i, real_slots);
+		wcounts.c_straight++;
+	}
 	// This output serves the frame's predicted tick: the ticker treats
 	// ticks near a queued output as covered (nearest-pick duality with
 	// the client's frame selection).
@@ -948,6 +980,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			squasher_times.add((ts[2] - ts[0]) * period / 1e3);
 			warp_times.add((ts[4] - ts[2]) * period / 1e3);
 			foveation_times.add((ts[6] - ts[4]) * period / 1e3);
+			last_commit_warp_ns.store(uint64_t((ts[4] - ts[2]) * period), std::memory_order_relaxed);
 			break;
 		}
 	}
@@ -1156,6 +1189,11 @@ void compositor::synth_work(std::stop_token tok)
 	// to its tick or resyncs forward past missed ones).
 	uint64_t next_tick_ns = 0;
 	uint64_t last_period_ns = 0;
+	// Previous synth submit's timestamps not yet collected (set after
+	// submit, cleared on successful non-blocking collect). Ticker-thread
+	// only: record (reset) and collect both happen here, in order.
+	bool synth_query_pending = false;
+	uint64_t last_heartbeat_ns = 0;
 
 	while (!tok.stop_requested())
 	{
@@ -1187,6 +1225,58 @@ void compositor::synth_work(std::stop_token tok)
 		if (tok.stop_requested())
 			return;
 		now_ns = uint64_t(os_monotonic_get_ns());
+		wcounts.s_ticks++;
+
+		// 5 s delta heartbeat (warp-debug runs only): warp/skip accounting
+		// per path + last collected GPU warp times. Silent in prod.
+		// Placed before the skip gates so it fires even when every tick
+		// is covered or the app runs at full rate.
+		if (warp_debug && now_ns - last_heartbeat_ns > 5'000'000'000ull)
+		{
+			double dt_s = last_heartbeat_ns == 0 ? 5.0 : double(now_ns - last_heartbeat_ns) / 1e9;
+			last_heartbeat_ns = now_ns;
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) synth %.1f ticks/s (warped %.1f covered %.1f inactive %.1f gate %llu degen %llu prewait %llu pool %llu present %llu) gpu commit %lluns synth %lluns",
+			        wcounts.c_total.exchange(0) / dt_s,
+			        wcounts.c_straight.exchange(0) / dt_s,
+			        wcounts.c_warped.exchange(0) / dt_s,
+			        wcounts.c_dropped.exchange(0) / dt_s,
+			        (unsigned long long)wcounts.c_gate.exchange(0),
+			        (unsigned long long)wcounts.c_degenerate.exchange(0),
+			        (unsigned long long)wcounts.c_prewait.exchange(0),
+			        (unsigned long long)wcounts.c_pool.exchange(0),
+			        (unsigned long long)wcounts.c_present.exchange(0),
+			        wcounts.s_ticks.exchange(0) / dt_s,
+			        wcounts.s_warped.exchange(0) / dt_s,
+			        wcounts.s_covered.exchange(0) / dt_s,
+			        wcounts.s_inactive.exchange(0) / dt_s,
+			        (unsigned long long)wcounts.s_gate.exchange(0),
+			        (unsigned long long)wcounts.s_degenerate.exchange(0),
+			        (unsigned long long)wcounts.s_prewait.exchange(0),
+			        (unsigned long long)wcounts.s_pool.exchange(0),
+			        (unsigned long long)wcounts.s_present.exchange(0),
+			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
+			        (unsigned long long)last_synth_warp_ns.load(std::memory_order_relaxed));
+		}
+
+		// Collect the previous synth submit's GPU timestamps without
+		// waiting (availability flag only): zero added latency, ~1 tick
+		// stale data. Runs only when warp_debug enabled the writes.
+		if (warp_debug && synth_query_pending)
+		{
+			auto [res, ts] = synth_query_pool.getResults<uint64_t>(
+			        0,
+			        4,
+			        8 * sizeof(uint64_t),
+			        2 * sizeof(uint64_t),
+			        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWithAvailability);
+			if (res == vk::Result::eSuccess && ts.size() >= 8 && (ts[1] & ts[3] & ts[5] & ts[7]))
+			{
+				static const auto qperiod = vk.physical_device.getProperties().limits.timestampPeriod;
+				synth_warp_times.add((ts[4] - ts[2]) * qperiod / 1e3);
+				last_synth_warp_ns.store(uint64_t((ts[4] - ts[2]) * qperiod), std::memory_order_relaxed);
+				synth_query_pending = false;
+			}
+		}
 
 		// No output within half a period of this tick means the tick is
 		// uncovered (nearest-pick duality with the client's frame
@@ -1202,10 +1292,16 @@ void compositor::synth_work(std::stop_token tok)
 		bool covered = cover_dt <= half_period_ns && cover_dt >= -half_period_ns;
 		uint64_t last_retained = last_retained_ns.load();
 		bool retained_fresh = last_retained != 0 && now_ns - last_retained <= kSynthMaxRetainedAgeNs;
-		if (covered || !retained_fresh || !depth_reprojection_enabled || !last_had_depth.load())
+		if (covered)
+		{
+			wcounts.s_covered++;
 			continue;
-		if (!session.connected() || !session.get_offset())
+		}
+		if (!retained_fresh || !depth_reprojection_enabled || !last_had_depth.load() || !session.connected() || !session.get_offset())
+		{
+			wcounts.s_inactive++;
 			continue;
+		}
 
 		int synth_image = -1;
 		std::array<xrt_pose, 2> synth_poses{};
@@ -1225,6 +1321,8 @@ void compositor::synth_work(std::stop_token tok)
 			// queued) while we slept.
 			int64_t cover_dt2 = int64_t(tick_ns) - (int64_t(last_output_ns.load()) - render_bias_ns);
 			bool covered2 = cover_dt2 <= half_period_ns && cover_dt2 >= -half_period_ns;
+			if (covered2)
+				wcounts.s_covered++;
 			bool ok = !covered2;
 			// Shared upload state (UBOs, descriptor sets) must be idle
 			// before recording: the commit path's submit may still be on
@@ -1233,7 +1331,10 @@ void compositor::synth_work(std::stop_token tok)
 			// corrupting in-flight work. This also covers the command-pool
 			// reset below (the pool is only reset after this wait).
 			if (ok && !wait_for_last_submit(period_ns))
+			{
+				wcounts.s_prewait++;
 				ok = false;
+			}
 			if (ok)
 				ok = reprojector.has_retained();
 			xrt_space_relation head{};
@@ -1279,6 +1380,7 @@ void compositor::synth_work(std::stop_token tok)
 				if (!warp_motion_plausible(retained_src_pose, synth_poses, dt_s, worst_ms, worst_rs))
 				{
 					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3);
+					wcounts.s_gate++;
 					ok = false;
 				}
 			}
@@ -1286,13 +1388,21 @@ void compositor::synth_work(std::stop_token tok)
 			{
 				synth_image = acquire_image();
 				if (synth_image < 0)
+				{
+					wcounts.s_pool++;
 					ok = false; // Pool momentarily full (commit in flight): skip silently.
+				}
 			}
 
 			if (ok)
 			{
 				synth_pool.reset();
 				synth_cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
+				if (warp_debug)
+				{
+					synth_cmd.resetQueryPool(*synth_query_pool, 0, 4);
+					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *synth_query_pool, 0);
+				}
 
 				// Fresh or recycled images start UNDEFINED (same as the commit
 				// path: UNDEFINED discards, valid for any actual layout).
@@ -1314,6 +1424,8 @@ void compositor::synth_work(std::stop_token tok)
 				        .imageMemoryBarrierCount = uint32_t(image_barrier.size()),
 				        .pImageMemoryBarriers = image_barrier.data(),
 				});
+				if (warp_debug)
+					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *synth_query_pool, 1);
 			}
 			if (ok)
 			{
@@ -1342,9 +1454,12 @@ void compositor::synth_work(std::stop_token tok)
 						U_LOG_W("compositor: synth warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, skipping tick)",
 						        retained_src_near[0], retained_src_near[1], retained_src_far[0], retained_src_far[1]);
 					}
+					wcounts.s_degenerate++;
 					images[synth_image].busy = false;
 					synth_image = -1;
 				}
+				if (warp_debug && ok)
+					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *synth_query_pool, 2);
 			}
 			if (ok)
 			{
@@ -1396,6 +1511,9 @@ void compositor::synth_work(std::stop_token tok)
 				        .pImageMemoryBarriers = image_barriers.data(),
 				});
 
+				if (warp_debug)
+					synth_cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *synth_query_pool, 3);
+
 				synth_cmd.end();
 				have_synth = true;
 			}
@@ -1413,13 +1531,16 @@ void compositor::synth_work(std::stop_token tok)
 		        .value = sem_value_now,
 		        .stageMask = vk::PipelineStageFlagBits2::eComputeShader,
 		};
+		synth_query_pending = warp_debug;
 		commit_lock.unlock();
 		if (!present_to_encoders(synth_image, images[synth_image].view_info, synth_id, sem_info, synth_slots))
 		{
 			images[synth_image].busy = false;
+			wcounts.s_present++;
 			continue;
 		}
 		queue_encode(synth_image, synth_slots);
+		wcounts.s_warped++;
 		last_output_ns.store(tick_ns);
 		}
 		catch (...)
@@ -1570,6 +1691,11 @@ compositor::compositor(wivrn_session & session) :
                                     .queueFamilyIndex = vk.queue.family_index,
                             }),
         synth_cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *synth_pool, .commandBufferCount = 1})[0])},
+        synth_query_pool(vk.device, vk::QueryPoolCreateInfo{
+                                          .queryType = vk::QueryType::eTimestamp,
+                                          .queryCount = 4,
+                                  }),
+        warp_debug(warp_debug_enabled()),
         settings(get_encoder_settings(vk, session)),
         images{make_images(vk, cmd_pool, settings)},
         cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1})[0])},
@@ -1640,6 +1766,7 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &warp_times.var, "depth warp");
+	u_var_add_f32_timing(this, &synth_warp_times.var, "synth depth warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
 	U_LOG_I("depth warp %s (source-reverse-z %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",

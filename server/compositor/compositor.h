@@ -94,10 +94,49 @@ private:
 	// Synth path command resources: the ticker records independently of
 	// layer_commit (serialized by commit_mutex, never concurrent), so it
 	// needs its own pool — resetting the shared pool would invalidate
-	// the in-flight record. No query pool: synth warps skip timestamp
-	// reads (warp cost is estimated, corrected by the lateness signal).
+	// the in-flight record. Timestamp pool exists only for warp-debug
+	// runs (zero GPU overhead otherwise); results are collected
+	// non-blocking at the next tick, so timing never adds latency.
 	vk::raii::CommandPool synth_pool;
 	vk::raii::CommandBuffer synth_cmd;
+	vk::raii::QueryPool synth_query_pool;
+	timings synth_warp_times;
+
+	// Warp debug output (timing heartbeat + synth GPU timestamps): off in
+	// prod. Enabled by WIVRN_WARP_DEBUG=1 (or REPROJEX_DEBUG=1, so one env
+	// lights the whole depth pipeline). Read once at construction.
+	const bool warp_debug;
+
+	// Warp debug counters: touched on both the EndFrame path and the
+	// synth ticker, hence relaxed atomics. The ticker emits a 5 s delta
+	// heartbeat when warp_debug is on; steady-state cost is a few atomic
+	// increments, zero logs.
+	struct warp_counters
+	{
+		std::atomic<uint64_t> c_total{0};
+		std::atomic<uint64_t> c_straight{0};
+		std::atomic<uint64_t> c_warped{0};
+		std::atomic<uint64_t> c_dropped{0};
+		std::atomic<uint64_t> c_gate{0};
+		std::atomic<uint64_t> c_degenerate{0};
+		std::atomic<uint64_t> c_prewait{0};
+		std::atomic<uint64_t> c_pool{0};
+		std::atomic<uint64_t> c_present{0};
+		std::atomic<uint64_t> s_ticks{0};
+		std::atomic<uint64_t> s_warped{0};
+		std::atomic<uint64_t> s_covered{0};
+		std::atomic<uint64_t> s_inactive{0};
+		std::atomic<uint64_t> s_gate{0};
+		std::atomic<uint64_t> s_degenerate{0};
+		std::atomic<uint64_t> s_prewait{0};
+		std::atomic<uint64_t> s_pool{0};
+		std::atomic<uint64_t> s_present{0};
+	};
+	warp_counters wcounts;
+	// Last collected warp GPU times (ns, any path): the heartbeat reports
+	// them alongside the counters.
+	std::atomic<uint64_t> last_commit_warp_ns{0};
+	std::atomic<uint64_t> last_synth_warp_ns{0};
 
 	std::array<encoder_settings, 3> settings;
 

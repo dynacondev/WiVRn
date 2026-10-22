@@ -144,6 +144,13 @@ Vulkan). Normal-Z apps set `false` explicitly.
 }
 ```
 
+### Warp debug output
+Not a config key: set `WIVRN_WARP_DEBUG=1` in the server environment
+(`REPROJEX_DEBUG=1` also enables it, so one env lights the whole depth
+pipeline). Adds a 5 s `warp dbg:` heartbeat (per-path warp/skip rates,
+skip reasons, last GPU warp times) plus non-blocking synth warp GPU
+timestamps. Off by default; steady-state prod logging is unchanged.
+
 ## `publish-service`
 Default value: `avahi`
 
