@@ -295,6 +295,9 @@ static constexpr float kMaxWarpSpeedRps = 12.f;
 // Retained-source age bound for repeat-warp fabrication: warping from
 // older sources repeats garbage instead of motion.
 static constexpr uint64_t kMaxRetainedAgeNs = 2'000'000'000ull;
+// TEMPORARY diagnostic blackout (remove after verification): fresh
+// commits present black so only repeat-warps carry image.
+static constexpr bool kBlackoutFreshFrames = true;
 static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
                                   const std::array<xrt_pose, 2> & dst,
                                   double dt_s,
@@ -872,6 +875,52 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				images[synth.image].view_info.fov[view] = xrt_cast(synth_fov[view]);
 				images[synth.image].view_info.foveation[view] = synth_foveation[view];
 			}
+		}
+
+		// TEMPORARY diagnostic blackout (remove after verification):
+		// fresh (true-frame) commits present black, so any visible
+		// image on the client must come from a repeat-warp. Proves
+		// warps actually present every frame instead of being masked
+		// by straight repeats. Expect black flicker at app cadence
+		// with warped content between: that IS the system working.
+		if (!have_synth && kBlackoutFreshFrames)
+		{
+			static bool blackout_logged = false;
+			if (!blackout_logged)
+			{
+				blackout_logged = true;
+				U_LOG_W("depth warp: TEMPORARY fresh-frame blackout active (remove me)");
+			}
+			uint32_t black_layers = images[i].image.info().arrayLayers;
+			vk::ImageSubresourceRange black_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, black_layers};
+			std::array black_to_dst{
+			        vk::ImageMemoryBarrier2{
+			                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+			                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+			                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+			                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+			                .oldLayout = vk::ImageLayout::eGeneral,
+			                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+			                .image = images[i].image,
+			                .subresourceRange = black_range,
+			        },
+			};
+			cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = black_to_dst.data()});
+			static const vk::ClearColorValue black{};
+			cmd.clearColorImage(images[i].image, vk::ImageLayout::eTransferDstOptimal, &black, black_range);
+			std::array black_to_general{
+			        vk::ImageMemoryBarrier2{
+			                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+			                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+			                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+			                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+			                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+			                .newLayout = vk::ImageLayout::eGeneral,
+			                .image = images[i].image,
+			                .subresourceRange = black_range,
+			        },
+			};
+			cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = black_to_general.data()});
 		}
 
 		if (!warp_replaces_real)
