@@ -122,6 +122,10 @@ private:
 	// Last collected commit warp GPU time (ns): the heartbeat reports
 	// it alongside the counters.
 	std::atomic<uint64_t> last_commit_warp_ns{0};
+	// Predicted tick time minus commit wall time (ns, signed): shows
+	// whether ticks run ahead of the wall clock. A large positive lead
+	// means the destination poses are extrapolated far into the future.
+	std::atomic<int64_t> last_tick_lead_ns{0};
 
 	std::array<encoder_settings, 3> settings;
 

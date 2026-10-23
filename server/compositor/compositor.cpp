@@ -427,6 +427,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// Arrival clock for retained-freshness and heartbeat cadence.
 	const uint64_t commit_ns = os_monotonic_get_ns();
 	const uint64_t display_period_ns = uint64_t(pacer.get_frame_duration());
+	// Tick lead: predicted tick time minus wall clock. Shows whether
+	// ticks run ahead of reality (destination poses extrapolated far
+	// into the future). Read by the warp-debug heartbeat.
+	last_tick_lead_ns.store(int64_t(frame.rendering.predicted_display_time_ns) - int64_t(commit_ns),
+	                       std::memory_order_relaxed);
 
 	int i = acquire_image();
 
@@ -1064,7 +1069,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			last_heartbeat_ns.store(now_hb_ns, std::memory_order_relaxed);
 			double dt_s = prev_hb_ns == 0 ? 5.0 : double(now_hb_ns - prev_hb_ns) / 1e9;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f) gpu commit %lluns bias %lldns retained near %.3f far %.1f",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f) gpu commit %lluns bias %lldns lead %.1fms retained near %.3f far %.1f",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1078,6 +1083,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        wcounts.c_repeat.exchange(0) / dt_s,
 			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
 			        (long long)pacer.learned_render_latency_ns(),
+			        double(last_tick_lead_ns.load(std::memory_order_relaxed)) / 1e6,
 			        dbg_retained_near.load(std::memory_order_relaxed),
 			        dbg_retained_far.load(std::memory_order_relaxed));
 		}

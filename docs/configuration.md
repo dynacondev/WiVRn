@@ -157,8 +157,10 @@ Not a config key: set `WIVRN_WARP_DEBUG=1` in the server environment
 (`REPROJEX_DEBUG=1` also enables it, so one env lights the whole depth
 pipeline). Adds a 5 s `warp dbg:` heartbeat on the commit path (per-path commit
 rates, gate/degenerate/pool/present skip counts, `fresh`/`repeat`
-commit split, last GPU warp time, learned bias, live retained
-`near`/`far`). Off by default; steady-state
+commit split, last GPU warp time, learned bias, tick-vs-wall `lead`,
+live retained `near`/`far`) plus a throttled `fresh frame` pose line
+(render timestamp vs tick, per-eye source pose — proves whether the
+warped-from pose tracks the head). Off by default; steady-state
 prod logging is unchanged. `fresh` counts commits carrying a new app
 frame, `repeat` counts display-tick replays of the last one (the
 multi-system thread recommits at display rate, so `commit` runs at
