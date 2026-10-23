@@ -906,8 +906,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        },
 			};
 			cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = black_to_dst.data()});
-			static const vk::ClearColorValue black{};
-			cmd.clearColorImage(images[i].image, vk::ImageLayout::eTransferDstOptimal, &black, black_range);
+			// Zeroed bytes = transparent black. Matches the established
+			// splat_empty_bytes pattern (VULKAN_HPP_NO_CONSTRUCTORS
+			// leaves vk::ClearColorValue without a usable constructor;
+			// the call takes it by const reference).
+			alignas(VkClearColorValue) unsigned char black_bytes[sizeof(VkClearColorValue)] = {};
+			cmd.clearColorImage(images[i].image, vk::ImageLayout::eTransferDstOptimal,
+			                    *reinterpret_cast<const vk::ClearColorValue *>(black_bytes), black_range);
 			std::array black_to_general{
 			        vk::ImageMemoryBarrier2{
 			                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
