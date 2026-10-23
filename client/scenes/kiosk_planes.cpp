@@ -87,6 +87,8 @@ constexpr float trail_width_head = 0.02f;  // ribbon half-width at the engine (m
 constexpr float trail_width_tail = 0.055f; // ... at the faded end
 constexpr float trail_alpha_max = 0.15f;
 constexpr glm::vec3 trail_tint{0.9f, 0.92f, 0.98f};
+// Gap between the tail and the start of the ribbon (m).
+constexpr float trail_gap = 0.05f;
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -541,9 +543,12 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		tt = f.total_len > 1e-6f ? arc_param(f.dist_flown) : tt;
 
 		glm::vec3 vel = bezier_vel(f, tt);
+		glm::vec3 fwd{0.f, 0.f, 1.f};
+		bool have_fwd = false;
 		if (glm::length(vel) > 1e-6f)
 		{
-			glm::vec3 fwd = glm::normalize(vel);
+			fwd = glm::normalize(vel);
+			have_fwd = true;
 			// model nose (+Z after the file's root rotation) onto the
 			// flight direction; mirrored X is absorbed by bank_sign
 			glm::vec3 up0{0.f, 1.f, 0.f};
@@ -588,10 +593,11 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 
 		// Record the engine position for the trail ribbon: the measured
 		// tail offset is already in world units at the construction
-		// scale, so only the orientation applies (uniform scale).
-		// A long stall (hidden overlay, hitches) clears the trail instead
-		// of streaking across the scene on resume.
-		glm::vec3 tail = pos + node->orientation * tail_root;
+		// scale, so only the orientation applies (uniform scale). The
+		// sample hangs a little behind the tail so the ribbon never
+		// touches the body. A long stall (hidden overlay, hitches) clears
+		// the trail instead of streaking across the scene on resume.
+		glm::vec3 tail = pos + node->orientation * tail_root - (have_fwd ? fwd * trail_gap : glm::vec3{0.f});
 		if (f.last_sample_t != 0 and double(now - f.last_sample_t) * 1e-9 > 0.5)
 		{
 			f.trail.clear();
