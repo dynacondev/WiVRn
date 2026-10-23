@@ -743,6 +743,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight.
 		uint64_t last_retained = last_retained_ns.load();
 		bool retained_fresh = last_retained != 0 && commit_ns - last_retained <= kMaxRetainedAgeNs;
+		// TEMPORARY group-diagnostic captures (remove with wgroup):
+		// gate pose deltas, valid only when the gate below runs.
+		float dbg_gate_dist = 0.f, dbg_gate_ang = 0.f;
+		float dbg_gate_dt_ms = 0.f;
+		bool dbg_gate_ran = false;
 		if ((!app_fresh || kWarpFreshFrames) and has_depth_src and depth_reprojection_enabled and !warp_disabled() and retained_fresh)
 		{
 			xrt_space_relation head{};
@@ -794,6 +799,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					wcounts.c_gate++;
 					synth_ok = false;
 				}
+				// TEMPORARY: feed the group diagnostic (valid pass or
+				// trip; both describe the tick's pose delta).
+				dbg_gate_dist = peak_dist_m;
+				dbg_gate_ang = peak_angle_rad;
+				dbg_gate_dt_ms = float(dt_s * 1e3);
+				dbg_gate_ran = true;
 			}
 			if (synth_ok)
 			{
@@ -843,6 +854,122 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				}
 			}
 			have_synth = synth_ok;
+		}
+		// TEMPORARY rotation-only-group diagnostic (remove with wgroup):
+		// one line per closed app-frame group. A rotation-only group
+		// (video shows rotation + holes but no translation, then a
+		// jump on the next real frame) reads as dst_d ~ 0 with
+		// healthy angles (frozen tracker position) or as healthy
+		// dist range with nil image translation (flat depth).
+		// src_d must stay ~0 on repeats (same recommitted layer);
+		// a large src_d means the source itself moved mid-group.
+		if (warp_debug)
+		{
+			bool usable_ts = app_layer_ts_ns != 0;
+			if (!usable_ts)
+			{
+				// Non-fast-path commit (overlay squash): close any
+				// open group (the interruption is itself signal)
+				// and sit out until depth commits resume.
+				if (wgroup.active)
+				{
+					wgroup.active = false;
+					U_LOG_I("depth warp: group ts=%lld closed by non-depth commit",
+					        (long long)wgroup.app_ts);
+				}
+			}
+			else
+			{
+				if (wgroup.active && wgroup.app_ts != app_layer_ts_ns)
+				{
+					// Previous group closed by this fresh frame.
+					float sdx = wgroup.last_src.position.x - wgroup.first_src.position.x;
+					float sdy = wgroup.last_src.position.y - wgroup.first_src.position.y;
+					float sdz = wgroup.last_src.position.z - wgroup.first_src.position.z;
+					float ddx = 0.f, ddy = 0.f, ddz = 0.f, src_d = 0.f, dst_d = 0.f;
+					src_d = sqrtf(sdx * sdx + sdy * sdy + sdz * sdz);
+					if (wgroup.has_dst)
+					{
+						ddx = wgroup.last_dst.position.x - wgroup.first_dst.position.x;
+						ddy = wgroup.last_dst.position.y - wgroup.first_dst.position.y;
+						ddz = wgroup.last_dst.position.z - wgroup.first_dst.position.z;
+						dst_d = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz);
+					}
+					U_LOG_I("depth warp: group ts=%lld nwarp=%d nstraight=%d(nodepth=%d) nroto=%d dist[%.4f,%.4f]m ang[%.4f,%.4f]rad src_d=%.4f dst_d=%.4f dtmax=%.1fms ticks=%lld-%lld",
+					        (long long)wgroup.app_ts, wgroup.n_warp, wgroup.n_straight,
+					        wgroup.n_straight_nodepth, wgroup.n_roto,
+					        wgroup.n_warp > 0 ? wgroup.dist_min : -1.f,
+					        wgroup.dist_max, wgroup.n_warp > 0 ? wgroup.ang_min : -1.f,
+					        wgroup.ang_max, src_d, dst_d, wgroup.dt_max_ms,
+					        wgroup.first_tick, wgroup.last_tick);
+					wgroup.active = false;
+				}
+				if (!wgroup.active)
+				{
+					wgroup.active = true;
+					wgroup.app_ts = app_layer_ts_ns;
+					wgroup.n_warp = 0;
+					wgroup.n_straight = 0;
+					wgroup.n_straight_nodepth = 0;
+					wgroup.n_roto = 0;
+					wgroup.dist_min = 1e9f;
+					wgroup.dist_max = 0.f;
+					wgroup.ang_min = 1e9f;
+					wgroup.ang_max = 0.f;
+					wgroup.dt_max_ms = 0.f;
+					wgroup.has_dst = false;
+					wgroup.first_src = src_pose[0];
+					wgroup.last_src = src_pose[0];
+					wgroup.first_tick = (long long)frame.rendering.id;
+					wgroup.last_tick = (long long)frame.rendering.id;
+				}
+				wgroup.last_tick = (long long)frame.rendering.id;
+				wgroup.last_src = src_pose[0];
+				wgroup.retained_age_ms = last_retained != 0
+				        ? (commit_ns - last_retained) / 1000000ull
+				        : 0ull;
+				if (have_synth)
+				{
+					wgroup.n_warp++;
+					if (!wgroup.has_dst)
+					{
+						wgroup.has_dst = true;
+						wgroup.first_dst = synth.poses[0];
+						wgroup.last_dst = synth.poses[0];
+					}
+					else
+					{
+						wgroup.last_dst = synth.poses[0];
+					}
+					if (dbg_gate_ran)
+					{
+						if (dbg_gate_dist < wgroup.dist_min)
+							wgroup.dist_min = dbg_gate_dist;
+						if (dbg_gate_dist > wgroup.dist_max)
+							wgroup.dist_max = dbg_gate_dist;
+						if (dbg_gate_ang < wgroup.ang_min)
+							wgroup.ang_min = dbg_gate_ang;
+						if (dbg_gate_ang > wgroup.ang_max)
+							wgroup.ang_max = dbg_gate_ang;
+						if (dbg_gate_dt_ms > wgroup.dt_max_ms)
+							wgroup.dt_max_ms = dbg_gate_dt_ms;
+						// Rotation-only tick: sub-2mm translation
+						// with non-trivial rotation. Head-still
+						// ticks fail the angle leg; genuine
+						// rotation-in-place passes it, and the
+						// group-level dst_d (~0 vs advancing)
+						// tells the two apart.
+						if (dbg_gate_dist < 0.002f && dbg_gate_ang > 0.005f)
+							wgroup.n_roto++;
+					}
+				}
+				else
+				{
+					wgroup.n_straight++;
+					if (!has_depth_src)
+						wgroup.n_straight_nodepth++;
+				}
+			}
 		}
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
 

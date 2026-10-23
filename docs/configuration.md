@@ -160,8 +160,13 @@ rates, gate/degenerate/pool/present skip counts, `fresh`/`repeat`
 commit split, last GPU warp time, learned bias, tick-vs-wall `lead`,
 live retained `near`/`far`) plus a throttled `fresh frame` pose line
 (render timestamp vs tick, per-eye source pose — proves whether the
-warped-from pose tracks the head). Off by default; steady-state
-prod logging is unchanged. `fresh` counts commits carrying a new app
+warped-from pose tracks the head). TEMPORARY: while the rotation-only
+group question is open it also logs one `group` line per closed
+app-frame group (warp/straight split, rotation-only tick count,
+pose-delta range, src/dst travel across the group, tick span —
+frozen `dst_d` with healthy angles means a tracker position stall;
+healthy deltas with nil image translation means flat depth).
+Off by default; steady-state prod logging is unchanged. `fresh` counts commits carrying a new app
 frame, `repeat` counts display-tick replays of the last one (the
 multi-system thread recommits at display rate, so `commit` runs at
 90/s even when the app is slower — the split tells true app rate from

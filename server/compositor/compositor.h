@@ -179,6 +179,40 @@ private:
 	std::atomic<float> dbg_retained_near{1};
 	std::atomic<float> dbg_retained_far{1000};
 
+	// TEMPORARY rotation-only-group diagnostic (remove once pinned):
+	// per-app-frame group summary of warp pose deltas. The headset
+	// video shows every 2nd/3rd repeat group applying rotation only
+	// (with holes) then jumping on the next real frame. Per-group
+	// first/last src/dst positions decide between frozen-dst-position
+	// (dst_d ~ 0 across the group: tracker stall) and healthy pose
+	// deltas with nil image translation (flat depth). Updated on every
+	// commit while warp_debug is on; dumped when the next fresh frame
+	// closes the group. Commit path only (same serialization as the
+	// other plain retained_* members).
+	struct warp_group_dbg
+	{
+		bool active = false;
+		int64_t app_ts = 0;
+		int n_warp = 0;
+		int n_straight = 0;
+		int n_straight_nodepth = 0;
+		int n_roto = 0;
+		float dist_min = 1e9f;
+		float dist_max = 0.f;
+		float ang_min = 1e9f;
+		float ang_max = 0.f;
+		float dt_max_ms = 0.f;
+		bool has_dst = false;
+		xrt_pose first_src{};
+		xrt_pose last_src{};
+		xrt_pose first_dst{};
+		xrt_pose last_dst{};
+		long long first_tick = 0;
+		long long last_tick = 0;
+		uint64_t retained_age_ms = 0;
+	};
+	warp_group_dbg wgroup;
+
 	// Alpha blend mode of the latest commit, published for the warp
 	// path (it cannot safely read layer_accum mid-commit). Staleness is
 	// harmless (blend mode changes only on app layer switches).
