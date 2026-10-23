@@ -695,6 +695,24 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			retained_src_far = src_far_z;
 			dbg_retained_near.store(src_near_z[0], std::memory_order_relaxed);
 			dbg_retained_far.store(src_far_z[0], std::memory_order_relaxed);
+			if (warp_debug)
+			{
+				// Pose-vs-frame association check (one line per 5 s):
+				// proves live whether the stored source pose tracks the
+				// head (world render pose, meters, varying) or sits
+				// constant (head-relative eye offsets, ~cm). Also shows
+				// the tick-vs-render offset the warp bridges.
+				static std::atomic<uint64_t> last_pose_log_ns{0};
+				uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+				if (now_ns - last_pose_log_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+				{
+					last_pose_log_ns.store(now_ns, std::memory_order_relaxed);
+					U_LOG_I("depth warp: fresh frame ts=%lld tick=%lld src_pose L(%.3f,%.3f,%.3f) R(%.3f,%.3f,%.3f)",
+					        (long long)app_layer_ts_ns, (long long)frame.rendering.predicted_display_time_ns,
+					        src_pose[0].position.x, src_pose[0].position.y, src_pose[0].position.z,
+					        src_pose[1].position.x, src_pose[1].position.y, src_pose[1].position.z);
+				}
+			}
 			reprojector.refresh_retained(
 			        vk.device,
 			        cmd,
