@@ -297,7 +297,15 @@ static constexpr float kMaxWarpSpeedRps = 12.f;
 static constexpr uint64_t kMaxRetainedAgeNs = 2'000'000'000ull;
 // TEMPORARY diagnostic blackout (remove after verification): fresh
 // commits present black so only repeat-warps carry image.
-static constexpr bool kBlackoutFreshFrames = true;
+static constexpr bool kBlackoutFreshFrames = false;
+// TEMPORARY diagnostic: warp EVERY frame with depth, including fresh
+// app frames (the headset shows the app's pose lags the warp target,
+// i.e. real frames carry an outdated head pose). Fresh frames are
+// warped from the just-refreshed retained sources, exactly like
+// repeats. Remove after the pose-lag question is settled (expect:
+// everything, including the cockpit, tracks the head; gate trips on
+// violent motion still fall back to straight).
+static constexpr bool kWarpFreshFrames = true;
 static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
                                   const std::array<xrt_pose, 2> & dst,
                                   double dt_s,
@@ -700,17 +708,19 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 		// Repeat-frame warp: the multi layer recommits at display rate,
 		// so most commits re-present the last app frame with an
-		// identical timestamp (!app_fresh). Fresh commits always go
+		// identical timestamp (!app_fresh). Fresh commits normally go
 		// straight (plus client-side 3DoF timewarp); repeats are warped
 		// from the retained sources to this tick and served INSTEAD of
-		// the straight repeat (at most one warp per commit). The source
-		// is the last fresh frame, so the warp is only valid while
-		// retention is young (2 s dead-app bound); older than that the
-		// straight repeat is correct and a warp would be garbage.
+		// the straight repeat (at most one warp per commit). TEMPORARY:
+		// kWarpFreshFrames also warps fresh frames (the app's pose lags
+		// the warp target), reusing the just-refreshed retained
+		// sources. The source is only valid while retention is young
+		// (2 s dead-app bound); older than that the straight repeat
+		// is correct and a warp would be garbage.
 		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight.
 		uint64_t last_retained = last_retained_ns.load();
 		bool retained_fresh = last_retained != 0 && commit_ns - last_retained <= kMaxRetainedAgeNs;
-		if (!app_fresh and has_depth_src and depth_reprojection_enabled and !warp_disabled() and retained_fresh)
+		if ((!app_fresh || kWarpFreshFrames) and has_depth_src and depth_reprojection_enabled and !warp_disabled() and retained_fresh)
 		{
 			xrt_space_relation head{};
 			bool synth_ok = session.get_hmd().get_view_poses(
