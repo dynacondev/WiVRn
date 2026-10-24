@@ -124,11 +124,16 @@ with its depth.
 Default value: `true`
 
 Master switch for the warp. `false` disables synthesis entirely (repeat
-last frame). When enabled, the commit path serves fresh app frames
-straight (plus client-side 3DoF timewarp) and 6DoF-warps display-tick
+last frame). When enabled, the commit path 6DoF-warps display-tick
 replays of the last frame, so the client stops repeating stale ones;
 there is no separate synthesis thread — fabrication happens inline on
-repeat commits, at most one warp per commit.
+repeat commits, at most one warp per commit. TEMPORARY (pose-lag
+triage, see `kWarpFreshFrames` in `server/compositor/compositor.cpp`):
+while this diagnostic is active fresh app frames are *also* warped from
+the just-refreshed retained sources instead of going straight (plus
+client-side 3DoF timewarp). Do not rely on straight-fresh behavior in
+this build; the steady-state "fresh goes straight" description above
+resumes once the temporary flag is removed.
 
 ### `source-reverse-z`
 Default value: `true`

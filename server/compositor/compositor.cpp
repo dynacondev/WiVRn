@@ -440,7 +440,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// is visible instead of a silent freeze.
 	auto note_acquire_fail = [] {
 		static uint64_t last_ns = 0;
-		uint64_t now_ns = os_monotonic_get_ns();
+		uint64_t now_ns = uint64_t(os_monotonic_get_ns());
 		if (now_ns - last_ns > 5'000'000'000ull)
 		{
 			last_ns = now_ns;
@@ -666,6 +666,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		});
 		image_barriers.clear();
 
+		// WV-N3: q1 precedes refresh_retained below, so the q2-q1 interval
+		// reported as warp includes the retained resolve dispatch. Queries
+		// stay in place (moving them would churn dashboards); the warp
+		// bucket is therefore labelled pre-warp+warp.
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
 		// Hold the current frame: copy color + depth into the
@@ -684,11 +688,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			{
 				// Log once per change: the next live run shows the
 				// decision explicitly instead of requiring inference
-				// from artifacts.
-				static int last_logged_flip_y = -1;
-				if ((int)flip_y != last_logged_flip_y)
+				// from artifacts. Atomic to match the surrounding
+				// throttled logs; still commit-thread-only in practice.
+				static std::atomic<int> last_logged_flip_y{-1};
+				int prev_flip_y = last_logged_flip_y.load(std::memory_order_relaxed);
+				if ((int)flip_y != prev_flip_y)
 				{
-					last_logged_flip_y = (int)flip_y;
+					last_logged_flip_y.store((int)flip_y, std::memory_order_relaxed);
 					U_LOG_I("depth warp: row order flip_y=%d -> flip_color=%d flip_depth=%d",
 					        (int)flip_y, (int)!flip_y, (int)!flip_y);
 				}
@@ -820,12 +826,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 			if (synth_ok)
 			{
+				// Failing eye for the degenerate-frustum note below (-1
+				// when both views pass; the loop exits on first failure).
+				int degen_eye = -1;
 				for (int view = 0; view < 2 && synth_ok; ++view)
 				{
 					// Target uses the fresh tracker FOV (not the
 					// render-time one): identical unless the headset
 					// mutates FOV mid-session.
-					synth_ok = reprojector.reproject(
+					bool ok = reprojector.reproject(
 					        cmd,
 					        view,
 					        src_pose[view],
@@ -834,6 +843,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					        src_far_z[view],
 					        synth.poses[view],
 					        synth_fov[view]);
+					if (!ok)
+						degen_eye = view;
+					synth_ok = ok;
 				}
 				if (!synth_ok and synth.image >= 0)
 				{
@@ -845,8 +857,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
 					{
 						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
-						U_LOG_W("compositor: warp rejected (degenerate frustum near=%.4f/%.4f far=%.1f/%.1f, repeat instead)",
-						        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1]);
+						int de = degen_eye >= 0 ? degen_eye : 0;
+						U_LOG_W("compositor: warp rejected (degenerate frustum eye=%d near=%.4f/%.4f far=%.1f/%.1f src_fov=[%.3f,%.3f,%.3f,%.3f] dst_fov=[%.3f,%.3f,%.3f,%.3f], repeat instead)",
+						        degen_eye, src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1],
+						        src_fov[de].angle_left, src_fov[de].angle_right, src_fov[de].angle_up, src_fov[de].angle_down,
+						        synth_fov[de].angle_left, synth_fov[de].angle_right, synth_fov[de].angle_up, synth_fov[de].angle_down);
 					}
 					wcounts.c_degenerate++;
 					images[synth.image].busy = false;
@@ -1275,6 +1290,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				continue;
 			}
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
+			// WV-N3: q1 precedes the retained resolve, so q2-q1 (warp bucket)
+			// covers resolve+warp; q1-q0 (squasher bucket) is squash/setup only.
 			squasher_times.add((ts[2] - ts[0]) * period / 1e3);
 			warp_times.add((ts[4] - ts[2]) * period / 1e3);
 			foveation_times.add((ts[6] - ts[4]) * period / 1e3);
@@ -1668,7 +1685,7 @@ compositor::compositor(wivrn_session & session) :
 
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
-	u_var_add_f32_timing(this, &warp_times.var, "depth warp");
+	u_var_add_f32_timing(this, &warp_times.var, "pre-warp+warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
 	U_LOG_I("depth warp %s (source-reverse-z %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
