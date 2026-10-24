@@ -287,6 +287,15 @@ static bool warp_disabled()
 //   149 rad/s), so dt is floored before dividing. Glitches exceed
 //   the caps by orders of magnitude, so the floor costs no real
 //   protection.
+// WV-R13 tuning analysis (values are undocumented tuning until this
+// note; kept as-is, do not tune blindly): the 8 ms floor means a
+// sub-tick fresh warp (dt ~= 0.3 ms, common at display rate) divides
+// by 8 ms, i.e. passes ~25x-inflated velocities into the 10 m/s /
+// 12 rad/s caps — so for fresh frames the velocity caps are nearly
+// vacuous and the absolute 0.6 rad / 0.6 m caps are the real guard.
+// Repeat warps (dt ~= 11 ms) divide (nearly) unscaled, so the
+// velocity caps only bite on genuine violent ticks. No false trip
+// in the observed window; promoting caps to config is WV-S22 scope.
 static constexpr double kGateMinDtS = 0.008;
 static constexpr float kGateMaxAngleRad = 0.6f;
 static constexpr float kGateMaxDistM = 0.6f;
@@ -644,7 +653,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        .display_time = session.get_offset().to_headset(frame.rendering.predicted_display_time_ns),
 	        .alpha = layer_accum.data.env_blend_mode == XRT_BLEND_MODE_ALPHA_BLEND,
 	};
-	last_alpha_blend.store(view_info.alpha);
 
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
@@ -912,8 +920,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				}
 			}
 			last_retained_ns.store(commit_ns);
-			retained_src_pose = src_pose;
-			retained_src_fov = src_fov;
 			retained_clip.near_z.store(src_near_z[0], std::memory_order_relaxed);
 			retained_clip.far_z.store(src_far_z[0], std::memory_order_relaxed);
 			if (warp_debug)
@@ -1023,12 +1029,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 						ddz = wgroup.last_dst.position.z - wgroup.first_dst.position.z;
 						dst_d = sqrtf(ddx * ddx + ddy * ddy + ddz * ddz);
 					}
-					U_LOG_I("depth warp: group ts=%lld nwarp=%d nstraight=%d(nodepth=%d) nroto=%d dist[%.4f,%.4f]m ang[%.4f,%.4f]rad src_d=%.4f dst_d=%.4f dtmax=%.1fms ticks=%lld-%lld",
+					U_LOG_I("depth warp: group ts=%lld nwarp=%d nstraight=%d(nodepth=%d) nroto=%d dist[%.4f,%.4f]m ang[%.4f,%.4f]rad src_d=%.4f dst_d=%.4f dtmax=%.1fms retained_age=%llums ticks=%lld-%lld",
 					        (long long)wgroup.app_ts, wgroup.n_warp, wgroup.n_straight,
 					        wgroup.n_straight_nodepth, wgroup.n_roto,
 					        wgroup.n_warp > 0 ? wgroup.dist_min : -1.f,
 					        wgroup.dist_max, wgroup.n_warp > 0 ? wgroup.ang_min : -1.f,
 					        wgroup.ang_max, src_d, dst_d, wgroup.dt_max_ms,
+					        (unsigned long long)wgroup.retained_age_ms,
 					        wgroup.first_tick, wgroup.last_tick);
 					wgroup.active = false;
 				}

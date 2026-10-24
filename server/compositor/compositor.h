@@ -202,14 +202,6 @@ private:
 	// behavior). Cached at construction like the knobs above.
 	const bool warp_fresh_frames;
 
-	// Render-time source metadata for the retained frame (pose/FOV per
-	// eye). Written alongside refresh_retained on fresh depth commits;
-	// the commit path warps repeats from it without a layer in hand.
-	// (The clip planes that used to sit here were written but never read;
-	// they now live in retained_clip below — single owner, WV-S21.)
-	std::array<xrt_pose, 2> retained_src_pose{};
-	std::array<xrt_fov, 2> retained_src_fov{};
-
 	// Last client app-frame timestamp seen on a fast-path commit, for
 	// refresh gating: a changed timestamp means the commit carries a new
 	// app frame whose color+depth must be retained. -1 until the first
@@ -267,11 +259,6 @@ private:
 		uint64_t retained_age_ms = 0;
 	};
 	warp_group_dbg wgroup;
-
-	// Alpha blend mode of the latest commit, published for the warp
-	// path (it cannot safely read layer_accum mid-commit). Staleness is
-	// harmless (blend mode changes only on app layer switches).
-	std::atomic<bool> last_alpha_blend{false};
 
 	// Last submitted timeline value. Host-visible UBO and descriptor
 	// writes must not land while the GPU still reads them (recording

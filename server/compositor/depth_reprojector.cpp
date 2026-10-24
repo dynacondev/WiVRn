@@ -27,6 +27,7 @@
 #include "util/u_logging.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <format>
@@ -1085,6 +1086,13 @@ bool depth_reprojector::reproject(
 	                },
 	        },
 	};
+	// WV-R11: warp_targets_ready[view] is the only first/repeat
+	// distinguisher for these layouts (set true just above; first_warp
+	// captured before). Assert the expected level-0 start layouts.
+	assert((first_warp && splat_start == vk::ImageLayout::eUndefined &&
+	        target_start == vk::ImageLayout::eUndefined) ||
+	       (!first_warp && splat_start == vk::ImageLayout::eGeneral &&
+	        target_start == vk::ImageLayout::eShaderReadOnlyOptimal));
 	cmd.pipelineBarrier(
 	        reuse_stage,
 	        vk::PipelineStageFlagBits::eTransfer | vk::PipelineStageFlagBits::eComputeShader,
@@ -1117,6 +1125,11 @@ bool depth_reprojector::reproject(
 	                },
 	        },
 	};
+	// WV-R11: clear input must be the TRANSFER_DST_OPTIMAL the pre
+	// barrier produced; output GENERAL is what the splat pass reads.
+	assert(pre_barriers[0].newLayout == vk::ImageLayout::eTransferDstOptimal);
+	assert(clear_barriers[0].oldLayout == vk::ImageLayout::eTransferDstOptimal &&
+	       clear_barriers[0].newLayout == vk::ImageLayout::eGeneral);
 	cmd.pipelineBarrier(
 	        vk::PipelineStageFlagBits::eTransfer,
 	        vk::PipelineStageFlagBits::eComputeShader,
@@ -1187,6 +1200,9 @@ bool depth_reprojector::reproject(
 		                },
 		        },
 		};
+		// WV-R11: fill_sync input must be the GENERAL the pull pass wrote
+		// (via clear GENERAL).
+		assert(fill_sync_barriers[0].oldLayout == vk::ImageLayout::eGeneral);
 		cmd.pipelineBarrier(
 		        vk::PipelineStageFlagBits::eComputeShader,
 		        vk::PipelineStageFlagBits::eTransfer,
@@ -1204,6 +1220,10 @@ bool depth_reprojector::reproject(
 		vk::PipelineStageFlags mips_src_stage = first_warp
 		        ? vk::PipelineStageFlagBits::eTopOfPipe
 		        : vk::PipelineStageFlagBits::eComputeShader;
+		// WV-R11: mips keep SHADER_READ_ONLY across warps and restart
+		// from UNDEFINED on the first warp (mips_old/first_warp).
+		assert((first_warp && mips_old == vk::ImageLayout::eUndefined) ||
+		       (!first_warp && mips_old == vk::ImageLayout::eShaderReadOnlyOptimal));
 		for (uint32_t i = 1; i < mip_levels; i++)
 		{
 			std::array blit_pre_barriers{
@@ -1275,9 +1295,17 @@ bool depth_reprojector::reproject(
 		}
 		// Levels 1..N become shader-readable for the fill tap; level 0
 		// goes back to GENERAL for fill writes.
+		// WV-R10: src mask is the WRITE|READ superset on purpose. Levels
+		// 1..N-1 were last used as blit *sources* (TRANSFER_READ in
+		// TRANSFER_SRC_OPTIMAL, see the blit_post barriers above); only the
+		// top level was write-only. A pure WRITE mask relies on the
+		// TRANSFER->COMPUTE edge plus luck; the superset cannot remove
+		// needed sync. NOTE: GPU-hang-bisect territory (fill/blit chain)
+		// — any bisect result must be re-validated on the failing driver
+		// before trusting it (see WV-B7).
 		std::array fill_read_barriers{
 		        vk::ImageMemoryBarrier{
-		                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		                .srcAccessMask = vk::AccessFlagBits::eTransferWrite | vk::AccessFlagBits::eTransferRead,
 		                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 		                .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
 		                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -1303,6 +1331,17 @@ bool depth_reprojector::reproject(
 		                },
 		        },
 		};
+		// WV-R11: level-0 vs fill-write window. Levels 1..N must be the
+		// TRANSFER_SRC_OPTIMAL the fill_sync + blit_post barriers left
+		// (mip_levels >= 2 floored at construction, so levels 1..N exist);
+		// level 0 must be TRANSFER_SRC_OPTIMAL heading back to GENERAL for
+		// fill writes. Debug-only; release no-op.
+		assert(mip_levels >= 2);
+		assert(fill_sync_barriers[0].newLayout == vk::ImageLayout::eTransferSrcOptimal);
+		assert(fill_read_barriers[0].oldLayout == vk::ImageLayout::eTransferSrcOptimal &&
+		       fill_read_barriers[0].newLayout == vk::ImageLayout::eShaderReadOnlyOptimal);
+		assert(fill_read_barriers[1].oldLayout == vk::ImageLayout::eTransferSrcOptimal &&
+		       fill_read_barriers[1].newLayout == vk::ImageLayout::eGeneral);
 		cmd.pipelineBarrier(
 		        vk::PipelineStageFlagBits::eTransfer,
 		        vk::PipelineStageFlagBits::eComputeShader,
@@ -1343,6 +1382,11 @@ bool depth_reprojector::reproject(
 	                },
 	        },
 	};
+	// WV-R11: level 0 is GENERAL here on both paths (fill wrote it,
+	// or pull wrote it when blits are unsupported); it ends
+	// SHADER_READ_ONLY_OPTIMAL feeding foveation. Debug-only.
+	assert(out_barriers[0].oldLayout == vk::ImageLayout::eGeneral &&
+	       out_barriers[0].newLayout == vk::ImageLayout::eShaderReadOnlyOptimal);
 	cmd.pipelineBarrier(
 	        vk::PipelineStageFlagBits::eComputeShader,
 	        vk::PipelineStageFlagBits::eComputeShader,

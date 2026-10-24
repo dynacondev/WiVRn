@@ -206,6 +206,15 @@ app-frame group (warp/straight split, rotation-only tick count,
 pose-delta range, src/dst travel across the group, tick span —
 frozen `dst_d` with healthy angles means a tracker position stall;
 healthy deltas with nil image translation means flat depth).
+
+`nroto` runbook (WV-R18): a tick counts as rotation-only when its pose
+delta is sub-2mm translation with >0.3° rotation (`dist<0.002f &&
+ang>0.005f`) — that is normal 90Hz head physiology (mm drift plus
+0.4°–7°/s tremor over 1–2 ticks per group), not pathology, so isolated
+`nroto` ticks are expected and must not be triaged as tracker stalls.
+Only a group-level `dst_d≈0` combined with healthy per-tick angles
+means a tracker position stall; healthy pose deltas with nil image
+translation instead mean flat depth (see WV-B4/WV-B7).
 Off by default; steady-state prod logging is unchanged. `fresh` counts commits carrying a new app
 frame, `repeat` counts display-tick replays of the last one (the
 multi-system thread recommits at display rate, so `commit` runs at
