@@ -21,6 +21,7 @@
 
 #include "scene.h"
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -31,6 +32,7 @@
 #include <limits>
 #include <map>
 #include <numbers>
+#include <spdlog/spdlog.h>
 #include <string>
 
 namespace
@@ -40,6 +42,10 @@ constexpr int plane_count = 4;
 constexpr float model_scale = 0.00675f; // ~0.13m wingspan
 constexpr double dur_min = 9.0;
 constexpr double dur_max = 14.0;
+// Speed floor: paths shorter than dur would otherwise crawl (and a loop
+// extension makes it worse). Over-long flights are shortened so cruise
+// never drops below this; loop scheduling must respect it too.
+constexpr float min_cruise_speed = 0.25f;
 constexpr double fade_in = 1.2;
 constexpr double fade_out = 2.0;
 
@@ -51,9 +57,9 @@ constexpr float model_yaw_adjust = 0.f;
 // if planes bank out of their turns instead of into them
 constexpr float bank_sign = 1.f;
 // radians of bank per m/s^2 of lateral acceleration (coordinated-turn feel)
-constexpr float bank_gain = 0.9f;
-// hard bank limit, ~29 deg
-constexpr float bank_max = 0.5f;
+constexpr float bank_gain = 1.6f;
+// hard bank limit, ~66 deg: steep wing-over turns stay readable at this scale
+constexpr float bank_max = 1.15f;
 
 // half-angle of the exclusion cone around the anchor-to-user axis (+Z in
 // anchor space): flights inside it cross right in front of the face
@@ -63,8 +69,8 @@ constexpr float exclusion_tan = 0.2679491924f; // tan(15 deg)
 // the plane into a pivot) and no ultra-steep turns between legs. Yaw is
 // allowed more freedom than pitch, like a real aircraft.
 constexpr float min_leg_len = 0.45f;
-constexpr float max_yaw_turn = 1.3963f;    // 80 deg direction change per leg
-constexpr float min_turn_radius = 0.4f;    // legs must span this much arc per radian of turn: big turns go wide
+constexpr float max_yaw_turn = 1.7453f;    // 100 deg direction change per leg: steep wing-over turns
+constexpr float min_turn_radius = 0.32f;   // legs must span this much arc per radian of turn: big turns go wide
 constexpr float max_flight_range = 5.0f;   // control points stay within this distance of the anchor
 constexpr float launch_yaw_dev = 3.14159265f; // full circle: spawn headings cover all directions, cone-trimmed into flybys
 constexpr float launch_pitch_dev = 0.5f;
@@ -78,6 +84,29 @@ constexpr float homing_blend = 0.55f;
 constexpr float min_turn_fraction = 0.25f;
 constexpr float max_pitch_change = 0.5236f; // 30 deg climb/dive change per leg
 constexpr float max_abs_pitch = 0.7854f;   // 45 deg absolute climb/dive
+
+// Aerobatic maneuvers: at most one per flight, centered mid-flight so the
+// fade never hides it. Rolls/knife are single-axis about the nose (same
+// pattern as the coordinated bank, so provably safe); the loop is a true
+// energy-shaped circle integrated live (entry speed in, slow apex, fast
+// exit), so there are no velocity steps at either end.
+constexpr double man_none_prob = 0.10;
+constexpr double man_barrel_prob = 0.27;
+constexpr double man_aileron_prob = 0.20;
+constexpr double man_knife_prob = 0.13;
+constexpr double man_loop_prob = 0.30; // remainder
+constexpr double barrel_secs = 2.2;
+constexpr double aileron_secs = 1.2;
+constexpr double knife_hold_secs = 2.0;
+constexpr double knife_trans_secs = 0.8;
+constexpr float knife_angle = 1.45f; // ~83 deg: reads edge-on, never fully vanishes
+// True-loop shape: radius and apex-speed fraction are randomized per flight
+// (visibly different loops); duration emerges from the energy profile,
+// and the figure is shrunk until it fits its distance slot.
+constexpr float loop_r_lo = 0.20f;
+constexpr float loop_r_hi = 0.45f;
+constexpr double loop_top_lo = 0.45;
+constexpr double loop_top_hi = 0.65;
 
 // Engine trail ribbon: resampled while moving, fades out by age.
 constexpr size_t trail_points = 60;
@@ -96,19 +125,73 @@ double smoothstep(double e0, double e1, double x)
 	return t * t * (3. - 2. * t);
 }
 
+// Maneuver angle profile: trapezoidal angular velocity with smoothstep
+// corners — spins up over the first `ramp` fraction of the window, holds a
+// constant rate, spins back down. Total sweep is exactly `turns` revolutions
+// and both rate and acceleration hit zero at the ends, so entries/exits
+// never snap (plain smoothstep whips through the middle at 1.5x average
+// rate, which reads as a violent flick on small fast figures).
+double maneuver_angle(double phase, double turns, double ramp)
+{
+	ramp = std::clamp(ramp, 0.05, 0.45);
+	phase = std::clamp(phase, 0., 1.);
+	auto ss = [](double s) {
+		s = std::clamp(s, 0., 1.);
+		return s * s * (3. - 2. * s);
+	};
+	auto ss_int = [](double s) { // ∫₀ˢ smoothstep, for the ramp corners
+		s = std::clamp(s, 0., 1.);
+		return s * s * s - 0.5 * s * s * s * s;
+	};
+	double integral;
+	if (phase < ramp)
+		integral = ramp * ss_int(phase / ramp);
+	else if (phase <= 1. - ramp)
+		integral = ramp * 0.5 + (phase - ramp);
+	else
+		integral = (1. - ramp) - ramp * ss_int((1. - phase) / ramp);
+	return turns * 2. * std::numbers::pi * integral / (1. - ramp);
+}
+
+// Energy-shaped loop speed: full entry speed at the bottom, `top` fraction
+// at the apex, full again at exit — like trading airspeed for altitude and
+// back. Rate and along-track acceleration both vanish at bottom and apex,
+// so handoffs are smooth in velocity as well as position.
+double loop_shape(double theta, double top)
+{
+	double a = 1. - top * top;
+	return std::sqrt(std::max(1. - a * (1. - std::cos(theta)) * 0.5, 1e-6));
+}
+
+// ∫₀^{2π} dθ/shape: loop duration = r·J/entry_speed. Simpson, 64 panels —
+double loop_J(double top)
+{
+	const int n = 64;
+	double h = 2. * std::numbers::pi / n, sum = 0.;
+	for (int i = 0; i <= n; ++i)
+	{
+		double w = (i == 0 || i == n) ? 0.5 : (i % 2 ? 4. : 2.);
+		sum += w / loop_shape(i * h, top);
+	}
+	return sum * h / 3.;
+}
+
 // body paint jobs for the "Material" part, with per-channel variance;
 // glass, emissive and dark/metal parts stay as authored
 struct paint
 {
+	const char * name;
 	glm::vec3 base;
 	float variance;
 };
 const paint paints[]{
-        {{1.f, 1.f, 1.f}, 0.f},                        // white
-        {{0.62f, 0.62f, 0.62f}, 0.12f},                // grey
-        {{0.75f, 0.38f, 0.04f}, 0.14f},                // dark dynacon orange
-        {{0.03f, 0.06f, 0.36f}, 0.10f},                // dark #0E1B8D navy
+        {"white", {1.f, 1.f, 1.f}, 0.f},
+        {"grey", {0.62f, 0.62f, 0.62f}, 0.12f},
+        {"orange", {0.95f, 0.27f, 0.02f}, 0.06f}, // vivid dynacon orange: high red, low green so it never reads yellow
+        {"navy", {0.03f, 0.06f, 0.36f}, 0.10f},   // dark #0E1B8D indigo
 };
+// Fleet livery mix: mostly orange, some grey and navy, white rare.
+const std::array<double, std::size(paints)> paint_weights{1.0, 3.0, 6.0, 2.0};
 
 } // namespace
 
@@ -146,7 +229,7 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_
 		// paint job from the palette above.
 		flight f;
 		f.root = entity;
-		const paint & paint = paints[std::uniform_int_distribution<size_t>(0, std::size(paints) - 1)(rng_)];
+		const paint & paint = paints[std::discrete_distribution<size_t>(paint_weights.begin(), paint_weights.end())(rng_)];
 		std::uniform_real_distribution<float> jitter(-paint.variance, paint.variance);
 		const glm::vec3 body_tint{
 		        std::clamp(paint.base.x + jitter(rng_), 0.f, 1.f),
@@ -469,6 +552,14 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	}
 
 	f.dur = XrDuration(dur_dist(rng_) * 1e9);
+	// Floor the cruise speed: a short path on a long draw would otherwise
+	// crawl (0.1 m/s reads as hovering, and it stretches any loop into an
+	// eternal slow circle). Shorten the flight instead of slowing the plane.
+	{
+		double dur_s = double(f.dur) * 1e-9;
+		if (f.total_len > 1e-3f && f.total_len / dur_s < min_cruise_speed)
+			f.dur = XrDuration((f.total_len / min_cruise_speed) * 1e9);
+	}
 	double off = std::clamp(age_offset, 0., double(f.dur) * 1e-9);
 	f.t0 = now - XrTime(off * 1e9);
 	f.trail.clear();
@@ -476,17 +567,140 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	f.last_sample_t = 0;
 	f.dist_flown = 0.f;
 	f.prev_now = 0;
+	// Fresh livery every flight: paints were construction-locked before, so
+	// an unlucky 4-plane draw could hide a color all session. The respawn
+	// always happens invisible (faded out or pre-launch), so the swap never
+	// pops. Logcat records the pick for on-device color forensics.
+	{
+		const paint & p = paints[std::discrete_distribution<size_t>(paint_weights.begin(), paint_weights.end())(rng_)];
+		std::uniform_real_distribution<float> jitter(-p.variance, p.variance);
+		const glm::vec3 body_tint{
+		        std::clamp(p.base.x + jitter(rng_), 0.f, 1.f),
+		        std::clamp(p.base.y + jitter(rng_), 0.f, 1.f),
+		        std::clamp(p.base.z + jitter(rng_), 0.f, 1.f),
+		};
+		for (size_t i = 0; i < f.materials.size(); ++i)
+		{
+			if (f.materials[i]->name == "Material-kiosk")
+			{
+				f.materials[i]->staging.base_color_factor = glm::vec4(body_tint, 1.f);
+				f.base_colors[i] = glm::vec4(body_tint, 1.f);
+			}
+		}
+		spdlog::info("kiosk_planes: respawn livery {}", p.name);
+	}
+	// Aerobatic maneuver for this flight. Everything is scheduled in DISTANCE
+	// fraction (dist_flown/total_len), never time: climb-coupled airspeed
+	// means fast downhill flights exhaust their path early, and a
+	// time-scheduled figure would never trigger. Rolls/knife run on
+	// distance windows; the loop starts at a distance mark and exits on
+	// θ = 2π (duration emerges, so the figure is shrunk — never the flight
+	// stretched — until it fits).
+	f.man = flight::maneuver::none;
+	f.loop_active = false;
+	f.loop_done = false;
+	f.loop_theta = 0.;
+	f.loop_t = 0.;
+	f.loop_exit_t = -1.;
+	{
+		double u = std::uniform_real_distribution<double>(0., 1.)(rng_);
+		double dur_s = double(f.dur) * 1e-9;
+		double v_c = f.total_len / std::max(dur_s, 1e-3);
+		double len = std::max(f.total_len, 1e-3f);
+		const char * man_name = "none";
+		if (u < man_none_prob + man_barrel_prob + man_aileron_prob + man_knife_prob)
+		{
+			double secs = 0.;
+			if (u < man_none_prob)
+				f.man = flight::maneuver::none;
+			else if (u < man_none_prob + man_barrel_prob)
+			{
+				f.man = flight::maneuver::barrel;
+				secs = barrel_secs;
+				man_name = "barrel";
+			}
+			else if (u < man_none_prob + man_barrel_prob + man_aileron_prob)
+			{
+				f.man = flight::maneuver::aileron;
+				secs = aileron_secs;
+				man_name = "aileron";
+			}
+			else
+			{
+				f.man = flight::maneuver::knife;
+				secs = knife_hold_secs + 2. * knife_trans_secs;
+				man_name = "knife";
+			}
+			if (f.man != flight::maneuver::none)
+			{
+				f.man_dir = std::uniform_real_distribution<float>(0., 1.)(rng_) < 0.5f ? -1.f : 1.f;
+				// window in distance fraction: seconds of cruise mapped
+				// onto path length, clear of both fades
+				double width = std::min(secs * v_c / len, 0.5);
+				double lo = width * 0.5 + (fade_in + 0.5) * v_c / len;
+				double hi = 1. - width * 0.5 - (fade_out + 0.5) * v_c / len;
+				if (hi > lo)
+				{
+					f.man_width = width;
+					f.man_center = std::uniform_real_distribution<double>(lo, hi)(rng_);
+				}
+				else
+				{
+					f.man = flight::maneuver::none;
+					man_name = "none";
+				}
+			}
+		}
+		else
+		{
+			// True loop: randomized diameter and apex energy. Shrinks the
+			// figure (tighter radius, gentler dip) until the estimated
+			// duration fits the slot — the flight is never stretched, so
+			// cruise (and its floor) stays intact.
+			f.man = flight::maneuver::loop;
+			man_name = "loop";
+			f.loop_r = std::uniform_real_distribution<float>(loop_r_lo, loop_r_hi)(rng_);
+			f.loop_top = std::uniform_real_distribution<double>(loop_top_lo, loop_top_hi)(rng_);
+			bool placed = false;
+			for (int attempt = 0; attempt < 6 && !placed; ++attempt)
+			{
+				double J = loop_J(f.loop_top);
+				double T_est = f.loop_r * J / std::max(v_c, 0.05);
+				double lo = std::max(0.22, (fade_in + 0.5) * v_c / len);
+				double hi = std::min(0.72, 1. - (fade_out + 0.5 + T_est * 1.2) * v_c / len);
+				if (hi > lo)
+				{
+					f.loop_start_d = std::uniform_real_distribution<double>(lo, hi)(rng_);
+					placed = true;
+				}
+				else
+				{
+					f.loop_r = std::max(f.loop_r * 0.8f, 0.15f);
+					f.loop_top = std::min(f.loop_top + 0.08, 0.7);
+				}
+			}
+			if (!placed)
+			{
+				f.man = flight::maneuver::none;
+				man_name = "none";
+			}
+		}
+		spdlog::info("kiosk_planes: maneuver {} r={:.2f} top={:.2f} start={:.2f}", man_name, f.loop_r, f.loop_top, f.loop_start_d);
+	}
 }
 
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera)
 {
 	if (active && !was_active_)
 	{
-		// (re)opening: only (re)spawn planes that never flew or expired
-		// while hidden, spread evenly with jitter. Untouched planes keep
-		// their own clocks, so a flickering overlay can't regroup the
-		// fleet into synchronized bundles.
-		std::uniform_real_distribution<double> jitter(0., 1.);
+		// (re)opening: respawn planes that never flew or expired, staggered
+		// in *time* so they launch one at a time instead of bunching at the
+		// spawn point. (Spreading their clocks alone does not work: the
+		// arc-length walk starts every fresh flight at dist_flown = 0, so
+		// staggered clocks without staggered start times still pile up at
+		// p0.) Untouched planes keep their own clocks, so a flickering
+		// overlay can't regroup the fleet into synchronized bundles.
+		std::uniform_real_distribution<double> jitter(0., 0.5);
 		size_t slot = 0;
 		for (auto & f: flights_)
 		{
@@ -494,8 +708,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			if (f.dur != 0 && age < 1.)
 				continue;
 			respawn(f, now, anchor_pos, anchor_orient, 0.);
-			double frac = (double(slot++) + jitter(rng_)) / double(flights_.size());
-			f.t0 = now - XrTime(double(f.dur) * frac);
+			f.t0 = now + XrTime((double(slot++) + jitter(rng_)) * 1.5e9);
 		}
 	}
 	was_active_ = active;
@@ -513,7 +726,9 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		double dur = double(f.dur) * 1e-9;
 		if (age < 0.)
 			age = 0.;
-		if (age >= dur or f.dist_flown >= f.total_len)
+		// A loop overrun past dur keeps flying (invisible under the fade-out)
+		// and respawns on exit: figures never pop mid-air.
+		if ((age >= dur or f.dist_flown >= f.total_len) && !f.loop_active)
 		{
 			respawn(f, now, anchor_pos, anchor_orient, 0.);
 			continue;
@@ -531,51 +746,195 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			return (float(seg - 1) + (s1 > s0 ? (s - s0) / (s1 - s0) : 0.f)) / float(f.arclen.size() - 1);
 		};
 		float tt = f.total_len > 1e-6f ? arc_param(f.dist_flown) : float(age / std::max(dur, 1e-3));
+		float v_cruise = f.total_len / float(std::max(dur, 1e-3));
 
 		glm::vec3 vel_probe = bezier_vel(f, tt);
 		float probe_len = glm::length(vel_probe);
 		float slope = probe_len > 1e-6f ? vel_probe.y / probe_len : 0.f;
-		float v_cruise = f.total_len / float(std::max(dur, 1e-3));
 		double dt = f.prev_now == 0 ? 1. / 60. : std::clamp(double(now - f.prev_now) * 1e-9, 0.001, 0.1);
 		f.prev_now = now;
 		float v = v_cruise * std::clamp(1.f - 0.35f * slope, 0.7f, 1.35f);
-		f.dist_flown = std::min(f.dist_flown + v * float(dt), f.total_len);
-		tt = f.total_len > 1e-6f ? arc_param(f.dist_flown) : tt;
 
-		glm::vec3 vel = bezier_vel(f, tt);
-		glm::vec3 fwd{0.f, 0.f, 1.f};
-		bool have_fwd = false;
-		if (glm::length(vel) > 1e-6f)
+		// True loop-the-loop, event-driven: starts at a distance mark, exits
+		// on θ = 2π. Entry frame is frozen from live state; θ integrates
+		// the energy profile at the *entry* speed, so position and velocity
+		// are exactly continuous at both ends — fast in, slow over the
+		// top, fast out. Path progress pauses mid-loop; expiry waits for
+		// the exit so a long loop can never pop mid-figure.
+		bool in_loop = false;
+		if (f.man == flight::maneuver::loop && !f.loop_done && dur > 1e-3)
 		{
-			fwd = glm::normalize(vel);
-			have_fwd = true;
-			// model nose (+Z after the file's root rotation) onto the
-			// flight direction; mirrored X is absorbed by bank_sign
-			glm::vec3 up0{0.f, 1.f, 0.f};
-			glm::vec3 right = glm::cross(up0, fwd);
-			if (glm::length(right) < 1e-4f)
-				right = {1.f, 0.f, 0.f};
-			else
-				right = glm::normalize(right);
-			glm::vec3 up = glm::cross(fwd, right);
-			glm::quat orient = glm::quat_cast(glm::mat3(right, up, fwd));
-
-			// Coordinated-turn bank from path curvature instead of the old
-			// sine wobble: lateral acceleration over speed squared, scaled to
-			// an arcade feel and clamped. Positive bank about the nose rolls
-			// into the turn; flip bank_sign once on device if they bank out.
-			glm::vec3 acc = bezier_acc(f, tt);
-			float v2 = glm::dot(vel, vel);
-			float kappa = glm::dot(glm::cross(vel, acc), up0) / std::max(v2 * std::sqrt(v2), 1e-6f);
-			float bank = std::clamp(bank_sign * -kappa * v * v * bank_gain, -bank_max, bank_max);
-			orient = glm::angleAxis(bank, fwd) * orient;
-
-			if (model_yaw_adjust != 0.f)
-				orient = orient * glm::angleAxis(model_yaw_adjust, glm::vec3(0.f, 1.f, 0.f));
-			node->orientation = orient;
+			double dist_frac = f.total_len > 1e-3f ? f.dist_flown / f.total_len : age / dur;
+			if (!f.loop_active && dist_frac >= f.loop_start_d && age >= fade_in + 0.3)
+			{
+				glm::vec3 entry_vel = bezier_vel(f, tt);
+				glm::vec3 f0 = glm::length(entry_vel) > 1e-6f ? glm::normalize(entry_vel) : glm::vec3{0.f, 0.f, -1.f};
+				glm::vec3 world_up{0.f, 1.f, 0.f};
+				glm::vec3 u = world_up - f0 * glm::dot(world_up, f0);
+				u = glm::length(u) > 1e-4f ? glm::normalize(u) : world_up;
+				glm::vec3 r0 = glm::cross(world_up, f0);
+				r0 = glm::length(r0) > 1e-4f ? glm::normalize(r0) : glm::vec3{1.f, 0.f, 0.f};
+				f.loop_p0 = bezier(f, tt);
+				f.loop_f = f0;
+				f.loop_u = u;
+				f.loop_right = r0;
+				f.loop_v = v;
+				f.loop_theta = 0.;
+				f.loop_t = 0.;
+				// Blend duration scales with the entry turn rate (r/v):
+				// tighter or faster loops get a longer ease-in, capped to
+				// stay a small fraction of the figure.
+				f.loop_blend = std::clamp(0.8f * f.loop_r / std::max(v, 0.05f), 0.4f, 1.2f);
+				glm::vec3 entry_acc = bezier_acc(f, tt);
+				float v2 = glm::dot(entry_vel, entry_vel);
+				float kappa = glm::dot(glm::cross(entry_vel, entry_acc), world_up) / std::max(v2 * std::sqrt(v2), 1e-6f);
+				f.loop_bank = std::clamp(bank_sign * -kappa * v * v * bank_gain, -bank_max, bank_max);
+				f.loop_active = true;
+			}
+			in_loop = f.loop_active;
+		}
+		if (in_loop)
+		{
+			f.loop_t += dt;
+			f.loop_theta += f.loop_v * loop_shape(f.loop_theta, f.loop_top) / f.loop_r * dt;
+			if (f.loop_theta >= 2. * std::numbers::pi)
+			{
+				f.loop_theta = 2. * std::numbers::pi;
+				f.loop_active = false;
+				f.loop_done = true;
+			}
+		}
+		if (!in_loop)
+		{
+			f.dist_flown = std::min(f.dist_flown + v * float(dt), f.total_len);
+			tt = f.total_len > 1e-6f ? arc_param(f.dist_flown) : tt;
 		}
 
 		glm::vec3 pos = bezier(f, tt);
+		glm::vec3 fwd{0.f, 0.f, 1.f};
+		bool have_fwd = false;
+		if (in_loop)
+		{
+			// Circle frame: tangent carries the nose, fixed entry right
+			// keeps the wings stable through vertical. Entry bank eases
+			// out over the top (cos²: zero rate at ends and apex) and is
+			// fully restored at exit, where frame meets frozen path frame.
+			// Position eases from the straight-line path extension onto
+			// the circle over loop_blend: curvature ramps 0 → 1/r instead
+			// of stepping, so the pull-up has no entry yank (velocity is
+			// continuous throughout; only higher derivatives ease).
+			float c = float(std::cos(f.loop_theta)), s = float(std::sin(f.loop_theta));
+			glm::vec3 circle = f.loop_p0 + f.loop_r * ((1.f - c) * f.loop_u + s * f.loop_f);
+			double ease = smoothstep(0., 1., std::min(f.loop_t / f.loop_blend, 1.));
+			if (f.loop_t < f.loop_blend)
+			{
+				glm::vec3 straight = f.loop_p0 + f.loop_f * (f.loop_v * float(f.loop_t));
+				pos = glm::mix(straight, circle, float(ease));
+			}
+			else
+				pos = circle;
+			// Nose angle eases with the same weight (φ = θ·ease): zero
+			// pitch rate on the entry frame, converging exactly onto the
+			// tangent by blend end. Briefly lags the path like angle of
+			// attack, then flies the circle nose-on.
+			double phi = f.loop_theta * ease;
+			float cn = float(std::cos(phi)), sn = float(std::sin(phi));
+			glm::vec3 tangent = sn * f.loop_u + cn * f.loop_f;
+			fwd = s * f.loop_u + c * f.loop_f; // trail follows true motion
+			have_fwd = true;
+			glm::vec3 upv = glm::cross(tangent, f.loop_right);
+			float bank_blend = f.loop_bank * (cn * 0.5f + 0.5f);
+			bank_blend *= bank_blend; // cos²(φ/2): 1 at ends, 0 inverted
+			node->orientation = glm::angleAxis(bank_blend, tangent) *
+			                    glm::quat_cast(glm::mat3(f.loop_right, upv, tangent));
+			// Closure frame exits through here: stash it so the post-loop
+			// handoff below can slerp home instead of stepping.
+			if (f.loop_theta >= 2. * std::numbers::pi - 1e-9)
+			{
+				f.loop_exit_o = node->orientation;
+				f.loop_exit_t = 0.;
+			}
+		}
+		else
+		{
+			glm::vec3 vel = bezier_vel(f, tt);
+			if (glm::length(vel) > 1e-6f)
+			{
+				fwd = glm::normalize(vel);
+				have_fwd = true;
+				// model nose (+Z after the file's root rotation) onto the
+				// flight direction; mirrored X is absorbed by bank_sign
+				glm::vec3 up0{0.f, 1.f, 0.f};
+				glm::vec3 right = glm::cross(up0, fwd);
+				if (glm::length(right) < 1e-4f)
+					right = {1.f, 0.f, 0.f};
+				else
+					right = glm::normalize(right);
+				glm::vec3 up = glm::cross(fwd, right);
+				glm::quat orient = glm::quat_cast(glm::mat3(right, up, fwd));
+
+				// Coordinated-turn bank from path curvature instead of the old
+				// sine wobble: lateral acceleration over speed squared, scaled to
+				// an arcade feel and clamped. Positive bank about the nose rolls
+				// into the turn; flip bank_sign once on device if they bank out.
+				glm::vec3 acc = bezier_acc(f, tt);
+				float v2 = glm::dot(vel, vel);
+				float kappa = glm::dot(glm::cross(vel, acc), up0) / std::max(v2 * std::sqrt(v2), 1e-6f);
+				float bank = std::clamp(bank_sign * -kappa * v * v * bank_gain, -bank_max, bank_max);
+				// Aerobatic maneuver overlay, all eased so nothing snaps:
+				// rolls/knife rotate about the nose. Heading-preserving
+				// by construction.
+				float extra_roll = 0.f;
+				if ((f.man == flight::maneuver::barrel || f.man == flight::maneuver::aileron ||
+				     f.man == flight::maneuver::knife) &&
+				    dur > 1e-3)
+				{
+					// distance-driven phase: fast flights exhaust path
+					// early, so a time window could never open
+					double dfrac = f.total_len > 1e-3f ? f.dist_flown / f.total_len : age / dur;
+					double phase = std::clamp((dfrac - (f.man_center - f.man_width * 0.5)) / f.man_width, 0., 1.);
+					switch (f.man)
+					{
+					case flight::maneuver::barrel:
+						extra_roll = f.man_dir * float(maneuver_angle(phase, 1., 0.30));
+						break;
+					case flight::maneuver::aileron:
+						extra_roll = f.man_dir * float(maneuver_angle(phase, 1., 0.25));
+						break;
+					case flight::maneuver::knife:
+					{
+						// hold near 90 deg through the middle of the window,
+						// eased in/out over knife_trans_secs each side
+						double window_s = f.man_width * f.total_len / std::max(v_cruise, 0.05f);
+						double t_in = knife_trans_secs / window_s;
+						double pulse = smoothstep(0., std::min(t_in, 0.5), phase) *
+						               (1. - smoothstep(std::max(1. - t_in, 0.5), 1., phase));
+						extra_roll = f.man_dir * knife_angle * float(pulse);
+						break;
+					}
+					default:
+						break;
+					}
+				}
+				orient = glm::angleAxis(bank + extra_roll, fwd) * orient;
+
+				if (model_yaw_adjust != 0.f)
+					orient = orient * glm::angleAxis(model_yaw_adjust, glm::vec3(0.f, 1.f, 0.f));
+				// Post-loop handoff: ease from the stashed closure frame
+				// onto the live path frame over the same blend duration.
+				// Zero rotation rate at both ends, so the pull-out never
+				// steps the nose.
+				if (f.loop_exit_t >= 0.)
+				{
+					f.loop_exit_t += dt;
+					float b = float(smoothstep(0., 1., std::min(f.loop_exit_t / f.loop_blend, 1.)));
+					orient = glm::slerp(f.loop_exit_o, orient, b);
+					if (f.loop_exit_t >= f.loop_blend)
+						f.loop_exit_t = -1.;
+				}
+				node->orientation = orient;
+			}
+		}
 		node->position = pos;
 
 		float alpha = float(smoothstep(0., fade_in, age) * (1. - smoothstep(dur - fade_out, dur, age)));
@@ -597,13 +956,21 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		// sample hangs a little behind the tail so the ribbon never
 		// touches the body. A long stall (hidden overlay, hitches) clears
 		// the trail instead of streaking across the scene on resume.
+		// Pre-launch (staggered start still in the future) records nothing:
+		// the trail must grow out of the flight, not pre-exist it.
 		glm::vec3 tail = pos + node->orientation * tail_root - (have_fwd ? fwd * trail_gap : glm::vec3{0.f});
-		if (f.last_sample_t != 0 and double(now - f.last_sample_t) * 1e-9 > 0.5)
+		if (age <= 0.)
+		{
+			f.trail.clear();
+			f.trail_t.clear();
+			f.last_sample_t = 0;
+		}
+		else if (f.last_sample_t != 0 and double(now - f.last_sample_t) * 1e-9 > 0.5)
 		{
 			f.trail.clear();
 			f.trail_t.clear();
 		}
-		if (f.last_sample_t == 0 or double(now - f.last_sample_t) * 1e-9 >= trail_sample_dt)
+		else if (f.last_sample_t == 0 or double(now - f.last_sample_t) * 1e-9 >= trail_sample_dt)
 		{
 			f.trail.push_back(tail);
 			f.trail_t.push_back(now);

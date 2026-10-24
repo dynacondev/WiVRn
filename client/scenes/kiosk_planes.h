@@ -79,6 +79,47 @@ private:
 		XrTime last_sample_t = 0;
 		// Current plane fade, applied to the trail so it fades with the body.
 		float trail_alpha = 0.f;
+		// Aerobatic maneuver for this flight. Rolls/knife are orientation
+		// overlays on top of the bank; the loop is a true vertical circle
+		// flown off the frozen path (position and nose track the circle,
+		// rejoining with zero pop). Exactly one per flight; heading always
+		// returns to the path heading (heading-reversing figures would
+		// fly tail-first).
+		enum class maneuver
+		{
+			none,
+			barrel,  // lazy 360 about the nose (~2.2 s)
+			aileron, // snappy 360 about the nose (~1.2 s)
+			knife,   // eased hold near 90 deg bank, then back level
+			loop,    // true circle in the entry vertical plane
+		} man = maneuver::none;
+		// Rolls/knife run on distance windows (fraction of total_len);
+		// the loop starts at a distance mark and exits on θ = 2π.
+		double man_center = 0.;
+		double man_width = 1.;
+		float man_dir = 1.f; // roll/knife direction
+		// True-loop state: scheduled start (fraction of flight), randomized
+		// shape (radius + apex speed fraction), live integration state, and
+		// the entry frame captured on the first in-loop frame. Entry bank
+		// rides along, eases out over the top, and is restored at exit so
+		// the handoff never pops.
+		double loop_start_d = 0.; // distance fraction of total_len
+		float loop_r = 0.35f, loop_top = 0.5f;
+		bool loop_active = false, loop_done = false;
+		double loop_theta = 0.;
+		float loop_v = 0.3f;
+		// Post-loop handoff: stashed closure orientation and seconds since
+		// exit (< 0 while inactive). Slerps onto the live path frame.
+		glm::quat loop_exit_o{1.f, 0.f, 0.f, 0.f};
+		double loop_exit_t = -1.;
+		// Pull-up blend: seconds since entry and its duration. Position
+		// eases from the straight-line path extension onto the circle,
+		// so curvature ramps 0 → 1/r instead of stepping (the nose would
+		// otherwise whip upward at v/r on the entry frame).
+		double loop_t = 0.;
+		float loop_blend = 0.7f;
+		glm::vec3 loop_p0{0.f}, loop_f{0.f, 0.f, -1.f}, loop_u{0.f, 1.f, 0.f}, loop_right{1.f, 0.f, 0.f};
+		float loop_bank = 0.f;
 	};
 
 	::scene & scene_;
