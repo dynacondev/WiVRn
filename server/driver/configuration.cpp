@@ -663,6 +663,19 @@ configuration::configuration()
 					else
 						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
 				}
+				if (auto jt = it->find("max-retained-age"); jt != it->end())
+				{
+					if (not jt->is_number())
+						U_LOG_W("reprojection.max-retained-age must be a number of seconds, ignoring");
+					else
+					{
+						double age_s = jt->get<double>();
+						if (not std::isfinite(age_s) or age_s <= 0)
+							U_LOG_W("reprojection.max-retained-age must be finite and > 0, ignoring");
+						else
+							reprojection.max_retained_age_s = age_s;
+					}
+				}
 			}
 		}
 

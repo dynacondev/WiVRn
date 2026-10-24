@@ -166,6 +166,11 @@ struct configuration
 		// this, so the default encodes the pipeline assumption;
 		// normal-Z apps set it false explicitly.
 		bool source_reverse_z = true;
+		// Retained-source age bound for repeat-warp fabrication, in
+		// seconds (default 2.0): warping from older sources repeats
+		// garbage instead of motion. Must be finite and > 0; invalid
+		// values warn and keep the default.
+		double max_retained_age_s = 2.0;
 		// Mip-chain hole fill (reproject_fill.comp) patches disoccluded
 		// pixels with the local average from a blit-built mip chain of
 		// the pull output: blurred fill, constant cost per hole pixel.

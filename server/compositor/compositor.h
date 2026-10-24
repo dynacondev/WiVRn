@@ -96,6 +96,28 @@ private:
 	// lights the whole depth pipeline). Read once at construction.
 	const bool warp_debug;
 
+	// Repeat-warp skip reasons (WV-S20): every warp-eligibility exit in
+	// try_build_synth_target() maps to one value, each with its own
+	// heartbeat counter (implausible/pool_exhausted/degenerate reuse the
+	// pre-existing c_gate/c_pool/c_degenerate). Decision-identical: the
+	// warp/no-warp outcome for every input is unchanged; only attribution
+	// is added (fixes WV-B3/WV-R8 observability).
+	enum class synth_skip_reason
+	{
+		ok,             // target built, caller may warp (counted in c_warped)
+		fresh_frame,    // c_skip_fresh: fresh app frame goes straight (kWarpFreshFrames=false)
+		no_depth_src,   // c_skip_nodepth: commit carried no depth layer
+		disabled,       // c_skip_disabled: reprojection.enabled=false
+		warp_killed,    // c_skip_killed: WIVRN_WARP_DISABLE=1 kill-switch
+		stale_retained, // c_stale_retained: retained source older than max_retained_age_ns
+		poses_failed,   // c_skip_poses: get_view_poses failed
+		head_invalid,   // c_head_invalid: tracker head relation flags invalid
+		time_inversion, // c_time_inversion: predicted tick <= app frame timestamp
+		implausible,    // c_gate: plausibility gate tripped
+		pool_exhausted, // c_pool: synth present image unavailable
+		degenerate,     // c_degenerate: reproject() rejected degenerate frustum
+	};
+
 	// Warp debug counters: touched on the EndFrame path, hence relaxed
 	// atomics. layer_commit emits a 5 s delta heartbeat when warp_debug
 	// is on; steady-state cost is a few atomic increments, zero logs.
@@ -117,6 +139,17 @@ private:
 		// frames advance it. Split here proves the ratio live.
 		std::atomic<uint64_t> c_fresh{0};
 		std::atomic<uint64_t> c_repeat{0};
+		// WV-S20 per-reason warp-skip counters for the 5 s heartbeat:
+		// one per synth_skip_reason except ok (c_warped) and the three
+		// that reuse c_gate/c_pool/c_degenerate (see enum comments).
+		std::atomic<uint64_t> c_skip_fresh{0};
+		std::atomic<uint64_t> c_skip_nodepth{0};
+		std::atomic<uint64_t> c_skip_disabled{0};
+		std::atomic<uint64_t> c_skip_killed{0};
+		std::atomic<uint64_t> c_stale_retained{0};
+		std::atomic<uint64_t> c_skip_poses{0};
+		std::atomic<uint64_t> c_head_invalid{0};
+		std::atomic<uint64_t> c_time_inversion{0};
 	};
 	warp_counters wcounts;
 	// Last collected commit warp GPU time (ns): the heartbeat reports
@@ -151,15 +184,20 @@ private:
 
 	// Cached at construction: server config is startup-read.
 	const bool depth_reprojection_enabled;
+	// Retained-source age bound for repeat-warp fabrication (WV-S22):
+	// warping from older sources repeats garbage instead of motion.
+	// From reprojection.max-retained-age (seconds, default 2.0 = the old
+	// kMaxRetainedAgeNs); cached at construction like
+	// depth_reprojection_enabled above.
+	const uint64_t max_retained_age_ns;
 
-	// Render-time source metadata for the retained frame (pose/FOV/clip
-	// per eye). Written alongside refresh_retained on fresh depth
-	// commits; the commit path warps repeats from it without a layer
-	// in hand.
+	// Render-time source metadata for the retained frame (pose/FOV per
+	// eye). Written alongside refresh_retained on fresh depth commits;
+	// the commit path warps repeats from it without a layer in hand.
+	// (The clip planes that used to sit here were written but never read;
+	// they now live in retained_clip below — single owner, WV-S21.)
 	std::array<xrt_pose, 2> retained_src_pose{};
 	std::array<xrt_fov, 2> retained_src_fov{};
-	std::array<float, 2> retained_src_near{1, 1};
-	std::array<float, 2> retained_src_far{1000, 1000};
 
 	// Last client app-frame timestamp seen on a fast-path commit, for
 	// refresh gating: a changed timestamp means the commit carries a new
@@ -171,13 +209,19 @@ private:
 	// Arrival time of the commit that last refreshed retained sources.
 	// Bounds how stale a warp source may be (dead-app guard).
 	std::atomic<uint64_t> last_retained_ns{0};
-	// Snapshot of the retained clip planes for the warp-debug heartbeat
-	// (which runs without the commit lock). Written alongside the
-	// retained refresh, read by the 5 s heartbeat. Shows which near/far
-	// the warps actually used — the producer constants are open-loop,
-	// so the next live run must prove them against the app's projection.
-	std::atomic<float> dbg_retained_near{1};
-	std::atomic<float> dbg_retained_far{1000};
+	// Single owner for the retained clip planes (WV-S21): written once
+	// per retained refresh from the live src_near_z/far, read by the 5 s
+	// warp-debug heartbeat (which runs without the commit lock, hence
+	// relaxed atomics). Shows which near/far the warps actually used —
+	// the producer constants are open-loop, so the next live run must
+	// prove them against the app's projection. Eye 0, matching the
+	// previous dbg_retained_* snapshot values exactly.
+	struct retained_clip_planes
+	{
+		std::atomic<float> near_z{1};
+		std::atomic<float> far_z{1000};
+	};
+	retained_clip_planes retained_clip;
 
 	// TEMPORARY rotation-only-group diagnostic (remove once pinned):
 	// per-app-frame group summary of warp pose deltas. The headset
@@ -302,6 +346,33 @@ private:
 	}
 
 	int acquire_image();
+
+	// Repeat-warp target builder (WV-S20): the layer_commit warp chain
+	// (eligibility, then poses/head/time/gate/pool/frustum) as a function
+	// returning the skip reason. ok means the target was built into
+	// synth_image/synth_poses/synth_fov and recorded into cmd; every other
+	// reason increments its own heartbeat counter. Decision-identical to
+	// the inlined chain it replaces. Runs under commit_mutex on the
+	// commit thread; the dbg_gate_* outs feed the wgroup diagnostic and
+	// are set whenever the gate runs (pass or trip), as before.
+	synth_skip_reason try_build_synth_target(
+	        int64_t predicted_ts_ns,
+	        int64_t app_layer_ts_ns,
+	        bool app_fresh,
+	        bool has_depth_src,
+	        bool retained_fresh,
+	        const std::array<xrt_pose, 2> & src_pose,
+	        const std::array<xrt_fov, 2> & src_fov,
+	        const std::array<float, 2> & src_near_z,
+	        const std::array<float, 2> & src_far_z,
+	        vk::raii::CommandBuffer & cmd,
+	        int & synth_image,
+	        std::array<xrt_pose, 2> & synth_poses,
+	        std::array<xrt_fov, 2> & synth_fov,
+	        float & dbg_gate_dist,
+	        float & dbg_gate_ang,
+	        float & dbg_gate_dt_ms,
+	        bool & dbg_gate_ran);
 
 	void append_encoder_barriers(
 	        beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 6> & barriers,

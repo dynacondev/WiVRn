@@ -141,6 +141,14 @@ Default value: `true`
 Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
 Vulkan). Normal-Z apps set `false` explicitly.
 
+### `max-retained-age`
+Default value: `2.0` (seconds)
+
+Retained-source age bound for repeat-warp fabrication: warping from
+older sources repeats garbage instead of motion, so ticks past this
+age go out straight. Must be finite and `> 0`; invalid values warn
+and keep the default.
+
 ### `hole-fill-radius`
 Removed. The old expanding-ring search (0-8px) grew with hole width;
 disocclusions are now patched with a blurred local average from a
@@ -152,7 +160,8 @@ still set the key log a warning and ignore it.
 {
 	"reprojection": {
 		"enabled": true,
-		"source-reverse-z": true
+		"source-reverse-z": true,
+		"max-retained-age": 2.0
 	}
 }
 ```
@@ -161,8 +170,9 @@ still set the key log a warning and ignore it.
 Not a config key: set `WIVRN_WARP_DEBUG=1` in the server environment
 (`REPROJEX_DEBUG=1` also enables it, so one env lights the whole depth
 pipeline). Adds a 5 s `warp dbg:` heartbeat on the commit path (per-path commit
-rates, gate/degenerate/pool/present skip counts, `fresh`/`repeat`
-commit split, last GPU warp time, learned bias, tick-vs-wall `lead`,
+rates, per-reason warp-skip counts — gate/degenerate/pool/present plus
+fresh/nodepth/disabled/kill-switch/stale/poses/head/time-inversion —,
+`fresh`/`repeat` commit split, last GPU warp time, learned bias, tick-vs-wall `lead`,
 live retained `near`/`far`) plus a throttled `fresh frame` pose line
 (render timestamp vs tick, per-eye source pose — proves whether the
 warped-from pose tracks the head). TEMPORARY: while the rotation-only

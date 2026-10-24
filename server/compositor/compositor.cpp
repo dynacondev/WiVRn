@@ -292,9 +292,15 @@ static constexpr float kGateMaxAngleRad = 0.6f;
 static constexpr float kGateMaxDistM = 0.6f;
 static constexpr float kMaxWarpSpeedMps = 10.f;
 static constexpr float kMaxWarpSpeedRps = 12.f;
-// Retained-source age bound for repeat-warp fabrication: warping from
-// older sources repeats garbage instead of motion.
-static constexpr uint64_t kMaxRetainedAgeNs = 2'000'000'000ull;
+// WV-S22: config seconds (double) to integer nanoseconds for the
+// max-retained-age member. Exact for the 2.0 s default (2e9 < 2^53), so
+// the default path is bit-identical to the kMaxRetainedAgeNs constant
+// this replaces.
+static constexpr uint64_t secs_to_ns(double s)
+{
+	return uint64_t(s * 1e9);
+}
+static_assert(secs_to_ns(2.0) == 2'000'000'000ull, "default max-retained-age must stay 2s");
 // TEMPORARY diagnostic blackout (remove after verification): fresh
 // commits present black so only repeat-warps carry image.
 static constexpr bool kBlackoutFreshFrames = false;
@@ -405,6 +411,182 @@ xrt_result_t compositor::mark_frame(int64_t frame_id,
 			assert(false);
 	}
 	return XRT_ERROR_VULKAN;
+}
+
+// Repeat-warp target builder: the layer_commit warp-condition chain as
+// a function returning the skip reason (WV-S20). Every warp/no-warp
+// exit maps to a distinct synth_skip_reason with its own heartbeat
+// counter — the previously silent fresh-frame skips (poses/head/time)
+// and the retention-expiry exit now attribute instead of vanishing
+// (fixes WV-B3/WV-R8 observability). Otherwise behavior-preserving:
+// same conjunct order, same short-circuits, same throttled logs, same
+// dbg_gate_* capture (set whenever the gate runs, pass or trip).
+compositor::synth_skip_reason compositor::try_build_synth_target(
+        int64_t predicted_ts_ns,
+        int64_t app_layer_ts_ns,
+        bool app_fresh,
+        bool has_depth_src,
+        bool retained_fresh,
+        const std::array<xrt_pose, 2> & src_pose,
+        const std::array<xrt_fov, 2> & src_fov,
+        const std::array<float, 2> & src_near_z,
+        const std::array<float, 2> & src_far_z,
+        vk::raii::CommandBuffer & cmd,
+        int & synth_image,
+        std::array<xrt_pose, 2> & synth_poses,
+        std::array<xrt_fov, 2> & synth_fov,
+        float & dbg_gate_dist,
+        float & dbg_gate_ang,
+        float & dbg_gate_dt_ms,
+        bool & dbg_gate_ran)
+{
+	if (app_fresh && !kWarpFreshFrames)
+	{
+		wcounts.c_skip_fresh++;
+		return synth_skip_reason::fresh_frame;
+	}
+	if (!has_depth_src)
+	{
+		wcounts.c_skip_nodepth++;
+		return synth_skip_reason::no_depth_src;
+	}
+	if (!depth_reprojection_enabled)
+	{
+		wcounts.c_skip_disabled++;
+		return synth_skip_reason::disabled;
+	}
+	if (warp_disabled())
+	{
+		wcounts.c_skip_killed++;
+		return synth_skip_reason::warp_killed;
+	}
+	if (!retained_fresh)
+	{
+		wcounts.c_stale_retained++;
+		return synth_skip_reason::stale_retained;
+	}
+
+	xrt_space_relation head{};
+	if (session.get_hmd().get_view_poses(
+	            nullptr,
+	            predicted_ts_ns,
+	            XRT_VIEW_TYPE_STEREO,
+	            2,
+	            &head,
+	            synth_fov.data(),
+	            synth_poses.data()) != XRT_SUCCESS)
+	{
+		wcounts.c_skip_poses++;
+		return synth_skip_reason::poses_failed;
+	}
+
+	// The tracker reports an unservable tick via the head relation
+	// flags while eye poses fall back to identity+offsets: warping
+	// to those produces garbage, so require a valid head pose and
+	// otherwise skip silently (repeat instead).
+	constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
+	if ((head.relation_flags & need_pose) != need_pose)
+	{
+		wcounts.c_head_invalid++;
+		return synth_skip_reason::head_invalid;
+	}
+
+	// get_view_poses returns head-relative eye offsets in
+	// poses plus the head-in-world relation (Monado device
+	// contract): compose world-space targets here.
+	for (int view = 0; view < 2; ++view)
+	{
+		xrt_relation_chain xrc{};
+		xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+		m_relation_chain_push_pose_if_not_identity(&xrc, &synth_poses[view]);
+		m_relation_chain_push_relation(&xrc, &head);
+		m_relation_chain_resolve(&xrc, &rel);
+		synth_poses[view] = rel.pose;
+	}
+	// The synthetic tick must postdate the app frame it
+	// replaces; otherwise the warp below is meaningless.
+	if (predicted_ts_ns <= app_layer_ts_ns)
+	{
+		wcounts.c_time_inversion++;
+		return synth_skip_reason::time_inversion;
+	}
+
+	// Plausibility gate (see helper): violent ticks splat
+	// mostly-holes; repeat instead.
+	float worst_ms = 0.f, worst_rs = 0.f;
+	float peak_dist_m = 0.f, peak_angle_rad = 0.f;
+	double dt_s = double(predicted_ts_ns - app_layer_ts_ns) / 1e9;
+	bool plausible = warp_motion_plausible(src_pose, synth_poses, dt_s, worst_ms, worst_rs,
+	                                       peak_dist_m, peak_angle_rad);
+	// TEMPORARY: feed the group diagnostic (valid pass or
+	// trip; both describe the tick's pose delta).
+	dbg_gate_dist = peak_dist_m;
+	dbg_gate_ang = peak_angle_rad;
+	dbg_gate_dt_ms = float(dt_s * 1e3);
+	dbg_gate_ran = true;
+	if (!plausible)
+	{
+		note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
+		                           peak_dist_m, peak_angle_rad);
+		wcounts.c_gate++;
+		return synth_skip_reason::implausible;
+	}
+
+	synth_image = acquire_image();
+	if (synth_image < 0)
+	{
+		// Pool exhausted: degrade to repeat (throttled above).
+		// Count it: the straight fallback still presents, so
+		// this is pool pressure, not a dropped tick.
+		wcounts.c_pool++;
+		return synth_skip_reason::pool_exhausted;
+	}
+
+	// Failing eye for the degenerate-frustum note below (-1
+	// when both views pass; the loop exits on first failure).
+	int degen_eye = -1;
+	bool synth_ok = true;
+	for (int view = 0; view < 2 && synth_ok; ++view)
+	{
+		// Target uses the fresh tracker FOV (not the
+		// render-time one): identical unless the headset
+		// mutates FOV mid-session.
+		bool ok = reprojector.reproject(
+		        cmd,
+		        view,
+		        src_pose[view],
+		        src_fov[view],
+		        src_near_z[view],
+		        src_far_z[view],
+		        synth_poses[view],
+		        synth_fov[view]);
+		if (!ok)
+			degen_eye = view;
+		synth_ok = ok;
+	}
+	if (!synth_ok)
+	{
+		// reproject() only fails on degenerate frustum input
+		// (non-finite or inverted near/far/FOV): throttled, since
+		// a bad upstream header would fail every tick.
+		static std::atomic<uint64_t> last_degenerate_ns{0};
+		uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
+		if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+		{
+			last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
+			int de = degen_eye >= 0 ? degen_eye : 0;
+			U_LOG_W("compositor: warp rejected (degenerate frustum eye=%d near=%.4f/%.4f far=%.1f/%.1f src_fov=[%.3f,%.3f,%.3f,%.3f] dst_fov=[%.3f,%.3f,%.3f,%.3f], repeat instead)",
+			        degen_eye, src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1],
+			        src_fov[de].angle_left, src_fov[de].angle_right, src_fov[de].angle_up, src_fov[de].angle_down,
+			        synth_fov[de].angle_left, synth_fov[de].angle_right, synth_fov[de].angle_up, synth_fov[de].angle_down);
+		}
+		wcounts.c_degenerate++;
+		images[synth_image].busy = false;
+		synth_image = -1;
+		return synth_skip_reason::degenerate;
+	}
+
+	return synth_skip_reason::ok;
 }
 
 xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
@@ -702,10 +884,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			last_retained_ns.store(commit_ns);
 			retained_src_pose = src_pose;
 			retained_src_fov = src_fov;
-			retained_src_near = src_near_z;
-			retained_src_far = src_far_z;
-			dbg_retained_near.store(src_near_z[0], std::memory_order_relaxed);
-			dbg_retained_far.store(src_far_z[0], std::memory_order_relaxed);
+			retained_clip.near_z.store(src_near_z[0], std::memory_order_relaxed);
+			retained_clip.far_z.store(src_far_z[0], std::memory_order_relaxed);
 			if (warp_debug)
 			{
 				// Pose-vs-frame association check (one line per 5 s):
@@ -744,132 +924,34 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// kWarpFreshFrames also warps fresh frames (the app's pose lags
 		// the warp target), reusing the just-refreshed retained
 		// sources. The source is only valid while retention is young
-		// (2 s dead-app bound); older than that the straight repeat
-		// is correct and a warp would be garbage.
+		// (max-retained-age dead-app bound, default 2 s); older than
+		// that the straight repeat is correct and a warp would be garbage.
 		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight.
 		uint64_t last_retained = last_retained_ns.load();
-		bool retained_fresh = last_retained != 0 && commit_ns - last_retained <= kMaxRetainedAgeNs;
+		bool retained_fresh = last_retained != 0 && commit_ns - last_retained <= max_retained_age_ns;
 		// TEMPORARY group-diagnostic captures (remove with wgroup):
 		// gate pose deltas, valid only when the gate below runs.
 		float dbg_gate_dist = 0.f, dbg_gate_ang = 0.f;
 		float dbg_gate_dt_ms = 0.f;
 		bool dbg_gate_ran = false;
-		if ((!app_fresh || kWarpFreshFrames) and has_depth_src and depth_reprojection_enabled and !warp_disabled() and retained_fresh)
-		{
-			xrt_space_relation head{};
-			bool synth_ok = session.get_hmd().get_view_poses(
-			                nullptr,
-			                frame.rendering.predicted_display_time_ns,
-			                XRT_VIEW_TYPE_STEREO,
-			                2,
-			                &head,
-			                synth_fov.data(),
-			                synth.poses.data()) == XRT_SUCCESS;
-
-			// The tracker reports an unservable tick via the head relation
-			// flags while eye poses fall back to identity+offsets: warping
-			// to those produces garbage, so require a valid head pose and
-			// otherwise skip silently (repeat instead).
-			constexpr auto need_pose = XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT;
-			synth_ok = synth_ok && (head.relation_flags & need_pose) == need_pose;
-			if (synth_ok)
-			{
-				// get_view_poses returns head-relative eye offsets in
-				// poses plus the head-in-world relation (Monado device
-				// contract): compose world-space targets here.
-				for (int view = 0; view < 2; ++view)
-				{
-					xrt_relation_chain xrc{};
-					xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
-					m_relation_chain_push_pose_if_not_identity(&xrc, &synth.poses[view]);
-					m_relation_chain_push_relation(&xrc, &head);
-					m_relation_chain_resolve(&xrc, &rel);
-					synth.poses[view] = rel.pose;
-				}
-				// The synthetic tick must postdate the app frame it
-				// replaces; otherwise the warp below is meaningless.
-				synth_ok = frame.rendering.predicted_display_time_ns > app_layer_ts_ns;
-			}
-			if (synth_ok)
-			{
-				// Plausibility gate (see helper): violent ticks splat
-				// mostly-holes; repeat instead.
-				float worst_ms = 0.f, worst_rs = 0.f;
-				float peak_dist_m = 0.f, peak_angle_rad = 0.f;
-				double dt_s = double(frame.rendering.predicted_display_time_ns - app_layer_ts_ns) / 1e9;
-				if (!warp_motion_plausible(src_pose, synth.poses, dt_s, worst_ms, worst_rs,
-				                           peak_dist_m, peak_angle_rad))
-				{
-					note_warp_skip_implausible(worst_ms, worst_rs, dt_s * 1e3,
-					                           peak_dist_m, peak_angle_rad);
-					wcounts.c_gate++;
-					synth_ok = false;
-				}
-				// TEMPORARY: feed the group diagnostic (valid pass or
-				// trip; both describe the tick's pose delta).
-				dbg_gate_dist = peak_dist_m;
-				dbg_gate_ang = peak_angle_rad;
-				dbg_gate_dt_ms = float(dt_s * 1e3);
-				dbg_gate_ran = true;
-			}
-			if (synth_ok)
-			{
-				synth.image = acquire_image();
-				if (synth.image < 0)
-				{
-					// Pool exhausted: degrade to repeat (throttled above).
-					// Count it: the straight fallback still presents, so
-					// this is pool pressure, not a dropped tick.
-					wcounts.c_pool++;
-					synth_ok = false;
-				}
-			}
-			if (synth_ok)
-			{
-				// Failing eye for the degenerate-frustum note below (-1
-				// when both views pass; the loop exits on first failure).
-				int degen_eye = -1;
-				for (int view = 0; view < 2 && synth_ok; ++view)
-				{
-					// Target uses the fresh tracker FOV (not the
-					// render-time one): identical unless the headset
-					// mutates FOV mid-session.
-					bool ok = reprojector.reproject(
-					        cmd,
-					        view,
-					        src_pose[view],
-					        src_fov[view],
-					        src_near_z[view],
-					        src_far_z[view],
-					        synth.poses[view],
-					        synth_fov[view]);
-					if (!ok)
-						degen_eye = view;
-					synth_ok = ok;
-				}
-				if (!synth_ok and synth.image >= 0)
-				{
-					// reproject() only fails on degenerate frustum input
-					// (non-finite or inverted near/far/FOV): throttled, since
-					// a bad upstream header would fail every tick.
-					static std::atomic<uint64_t> last_degenerate_ns{0};
-					uint64_t degenerate_now_ns = uint64_t(os_monotonic_get_ns());
-					if (degenerate_now_ns - last_degenerate_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
-					{
-						last_degenerate_ns.store(degenerate_now_ns, std::memory_order_relaxed);
-						int de = degen_eye >= 0 ? degen_eye : 0;
-						U_LOG_W("compositor: warp rejected (degenerate frustum eye=%d near=%.4f/%.4f far=%.1f/%.1f src_fov=[%.3f,%.3f,%.3f,%.3f] dst_fov=[%.3f,%.3f,%.3f,%.3f], repeat instead)",
-						        degen_eye, src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1],
-						        src_fov[de].angle_left, src_fov[de].angle_right, src_fov[de].angle_up, src_fov[de].angle_down,
-						        synth_fov[de].angle_left, synth_fov[de].angle_right, synth_fov[de].angle_up, synth_fov[de].angle_down);
-					}
-					wcounts.c_degenerate++;
-					images[synth.image].busy = false;
-					synth.image = -1;
-				}
-			}
-			have_synth = synth_ok;
-		}
+		have_synth = try_build_synth_target(
+		        frame.rendering.predicted_display_time_ns,
+		        app_layer_ts_ns,
+		        app_fresh,
+		        has_depth_src,
+		        retained_fresh,
+		        src_pose,
+		        src_fov,
+		        src_near_z,
+		        src_far_z,
+		        cmd,
+		        synth.image,
+		        synth.poses,
+		        synth_fov,
+		        dbg_gate_dist,
+		        dbg_gate_ang,
+		        dbg_gate_dt_ms,
+		        dbg_gate_ran) == synth_skip_reason::ok;
 		// TEMPORARY rotation-only-group diagnostic (remove with wgroup):
 		// one line per closed app-frame group. A rotation-only group
 		// (video shows rotation + holes but no translation, then a
@@ -1211,7 +1293,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			last_heartbeat_ns.store(now_hb_ns, std::memory_order_relaxed);
 			double dt_s = prev_hb_ns == 0 ? 5.0 : double(now_hb_ns - prev_hb_ns) / 1e9;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f) gpu commit %lluns bias %lldns lead %.1fms retained near %.3f far %.1f",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f skip[fresh %llu nodepth %llu dis %llu kill %llu stale %llu poses %llu head %llu tinv %llu]) gpu commit %lluns bias %lldns lead %.1fms retained near %.3f far %.1f",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1223,11 +1305,19 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        (unsigned long long)wcounts.c_present.exchange(0),
 			        wcounts.c_fresh.exchange(0) / dt_s,
 			        wcounts.c_repeat.exchange(0) / dt_s,
+			        (unsigned long long)wcounts.c_skip_fresh.exchange(0),
+			        (unsigned long long)wcounts.c_skip_nodepth.exchange(0),
+			        (unsigned long long)wcounts.c_skip_disabled.exchange(0),
+			        (unsigned long long)wcounts.c_skip_killed.exchange(0),
+			        (unsigned long long)wcounts.c_stale_retained.exchange(0),
+			        (unsigned long long)wcounts.c_skip_poses.exchange(0),
+			        (unsigned long long)wcounts.c_head_invalid.exchange(0),
+			        (unsigned long long)wcounts.c_time_inversion.exchange(0),
 			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
 			        (long long)pacer.learned_render_latency_ns(),
 			        double(last_tick_lead_ns.load(std::memory_order_relaxed)) / 1e6,
-			        dbg_retained_near.load(std::memory_order_relaxed),
-			        dbg_retained_far.load(std::memory_order_relaxed));
+			        retained_clip.near_z.load(std::memory_order_relaxed),
+			        retained_clip.far_z.load(std::memory_order_relaxed));
 		}
 	}
 
@@ -1625,7 +1715,8 @@ compositor::compositor(wivrn_session & session) :
         squasher(vk, render_extent(session.get_info())),
         foveation(vk, images[0].image.info().extent),
         reprojector(vk, vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height}),
-        depth_reprojection_enabled(configuration().reprojection.enabled)
+        depth_reprojection_enabled(configuration().reprojection.enabled),
+        max_retained_age_ns(secs_to_ns(configuration().reprojection.max_retained_age_s))
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
@@ -1687,9 +1778,10 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &warp_times.var, "pre-warp+warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
-	U_LOG_I("depth warp %s (source-reverse-z %s)",
+	U_LOG_I("depth warp %s (source-reverse-z %s, max-retained-age %.3gs)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
-	        configuration().reprojection.source_reverse_z ? "true" : "false");
+	        configuration().reprojection.source_reverse_z ? "true" : "false",
+	        configuration().reprojection.max_retained_age_s);
 	if (warp_disabled())
 		U_LOG_I("depth warp kill-switch active (WIVRN_WARP_DISABLE=1): serving straight/repeat for A/B triage");
 
