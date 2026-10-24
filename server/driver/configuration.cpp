@@ -676,6 +676,13 @@ configuration::configuration()
 							reprojection.max_retained_age_s = age_s;
 					}
 				}
+				if (auto jt = it->find("warp-fresh-frames"); jt != it->end())
+				{
+					if (jt->is_boolean())
+						reprojection.warp_fresh_frames = jt->get<bool>();
+					else
+						U_LOG_W("reprojection.warp-fresh-frames must be a boolean, ignoring");
+				}
 			}
 		}
 

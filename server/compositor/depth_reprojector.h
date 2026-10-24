@@ -23,7 +23,29 @@
 #include "xrt/xrt_defines.h"
 
 #include <array>
+#include <cmath>
 #include <vulkan/vulkan_raii.hpp>
+
+// Norm-rect validation (WV-B6, pure: no GPU, no Vulkan calls — testable
+// without a device). Rect layout is [x, y, w, h] in 0..1 normalized
+// image space. Valid iff every lane is finite, x/y >= 0, w/h > 0, and the
+// rect stays inside the image modulo eps (x+w <= 1+eps, y+h <= 1+eps).
+// A zero/degenerate depth_rect would make every resolve tap read one
+// texel, i.e. globally flat depth, which warps as rotation-only while
+// passing every other check — so callers skip the refresh on false.
+inline bool validate_norm_rect(const std::array<float, 4> & r)
+{
+	constexpr float eps = 1e-6f;
+	for (float v : r)
+		if (!std::isfinite(v))
+			return false;
+	float x = r[0], y = r[1], w = r[2], h = r[3];
+	if (x < 0.f || y < 0.f || w <= 0.f || h <= 0.f)
+		return false;
+	if (x + w > 1.f + eps || y + h > 1.f + eps)
+		return false;
+	return true;
+}
 
 // UBO mirror of server/compositor/shaders/reproject_splat.comp:
 // source clip -> world -> target clip. mat4 arrays are column-major on
@@ -44,6 +66,35 @@ struct reproject_pull_ubo
 	xrt_matrix_4x4 src_vp;
 };
 static_assert(sizeof(reproject_pull_ubo) == 128);
+
+// Push block mirror of reproject_splat.comp (WV-B5; validated: compiles
+// with glslangValidator/glslc).
+struct reproject_splat_push
+{
+	float far_clamp; // depth clamp derived from near/far (see below)
+};
+static_assert(sizeof(reproject_splat_push) == 4);
+
+// Far-plane clamp for the splat pass (WV-B5, pure: unit-testable without
+// GPU). The old hardcoded 0.995 is ~1.4 m at near=0.007/far=10000, so sky
+// smeared to the foreground. This returns 1 - near/far (double precision,
+// cast to float): for far>>near that is the depth at ~half-far eye
+// distance (0.9999993 ~= 5000 m at the observed clip) — still background
+// for parallax, but representably below 1.0 so backward motion does not
+// push sky past the frustum reject (mesh parity: without the clamp the
+// whole background holes). Invalid input falls back to the legacy 0.995
+// (unreachable: reproject() rejects degenerate near/far first).
+inline float splat_far_clamp_depth(float near_z, float far_z)
+{
+	// NaN-safe: NaN fails every comparison, so NaN near/far falls back
+	// here (frustum_gl also rejects it first in reproject()).
+	if (!(near_z > 0) || !(far_z > near_z))
+		return 0.995f;
+	double c = 1.0 - double(near_z) / double(far_z);
+	if (!(c > 0.0) || !(c < 1.0))
+		return 0.995f;
+	return float(c);
+}
 
 // Push block mirror of reproject_resolve.comp.
 struct reproject_resolve_push

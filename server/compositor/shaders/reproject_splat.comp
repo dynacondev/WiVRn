@@ -25,6 +25,14 @@ layout(set = 0, binding = 1) uniform SplatUBO
 
 layout(set = 0, binding = 2, r32ui) uniform coherent uimage2D dst_splat;
 
+// WV-B5: far-plane clamp derived from near/far on the CPU (push constant),
+// not hardcoded. Validated: compiles with glslangValidator/glslc
+// (glslc --target-env=vulkan1.0 -c reproject_splat.comp).
+layout(push_constant) uniform SplatPush
+{
+	float far_clamp; // 1 - near/far (~half-far depth, representably < 1.0)
+} pc;
+
 #define DEPTH_SCALE 16777215.0
 
 void main()
@@ -43,8 +51,11 @@ void main()
 	// Far-plane clamp (mesh parity): sky/clear pixels sit at exactly
 	// 1.0, and without this any backward motion pushes their reprojected
 	// target.z past 1.0 so the frustum reject below drops the whole
-	// background. 0.995 keeps them on the far plane instead.
-	z = min(z, 0.995);
+	// background. Clamp to the CPU-derived ~half-far depth instead: still
+	// background for parallax (e.g. ~5000 m at near=0.007/far=10000),
+	// representably below 1.0. (The old hardcoded 0.995 was ~1.4 m at
+	// that clip and smeared terrain/sky to the foreground.)
+	z = min(z, pc.far_clamp);
 
 	vec4 clip_pos = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
 	vec4 frag_worldspace = ubo.render_inv_vp * clip_pos;

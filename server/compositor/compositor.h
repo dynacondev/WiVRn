@@ -105,7 +105,7 @@ private:
 	enum class synth_skip_reason
 	{
 		ok,             // target built, caller may warp (counted in c_warped)
-		fresh_frame,    // c_skip_fresh: fresh app frame goes straight (kWarpFreshFrames=false)
+		fresh_frame,    // c_skip_fresh: fresh app frame goes straight (warp-fresh-frames=false)
 		no_depth_src,   // c_skip_nodepth: commit carried no depth layer
 		disabled,       // c_skip_disabled: reprojection.enabled=false
 		warp_killed,    // c_skip_killed: WIVRN_WARP_DISABLE=1 kill-switch
@@ -116,6 +116,7 @@ private:
 		implausible,    // c_gate: plausibility gate tripped
 		pool_exhausted, // c_pool: synth present image unavailable
 		degenerate,     // c_degenerate: reproject() rejected degenerate frustum
+		rect_invalid,   // c_skip_rect: refresh-time norm_rect rejected (see below)
 	};
 
 	// Warp debug counters: touched on the EndFrame path, hence relaxed
@@ -150,6 +151,12 @@ private:
 		std::atomic<uint64_t> c_skip_poses{0};
 		std::atomic<uint64_t> c_head_invalid{0};
 		std::atomic<uint64_t> c_time_inversion{0};
+		// WV-B6 refresh-time norm_rect rejections (one per skipped
+		// refresh, counted where the refresh is skipped in layer_commit —
+		// not returned from try_build_synth_target, because a rejected
+		// refresh keeps the previous good retained frame and warps may
+		// still run from it; the enum slot above reserves the taxonomy).
+		std::atomic<uint64_t> c_skip_rect{0};
 	};
 	warp_counters wcounts;
 	// Last collected commit warp GPU time (ns): the heartbeat reports
@@ -190,6 +197,10 @@ private:
 	// kMaxRetainedAgeNs); cached at construction like
 	// depth_reprojection_enabled above.
 	const uint64_t max_retained_age_ns;
+	// Fresh-frame warp policy (WV-B2, ex-TEMPORARY kWarpFreshFrames):
+	// from reprojection.warp-fresh-frames (default true = current
+	// behavior). Cached at construction like the knobs above.
+	const bool warp_fresh_frames;
 
 	// Render-time source metadata for the retained frame (pose/FOV per
 	// eye). Written alongside refresh_retained on fresh depth commits;

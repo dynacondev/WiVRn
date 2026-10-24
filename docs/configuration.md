@@ -127,19 +127,38 @@ Master switch for the warp. `false` disables synthesis entirely (repeat
 last frame). When enabled, the commit path 6DoF-warps display-tick
 replays of the last frame, so the client stops repeating stale ones;
 there is no separate synthesis thread — fabrication happens inline on
-repeat commits, at most one warp per commit. TEMPORARY (pose-lag
-triage, see `kWarpFreshFrames` in `server/compositor/compositor.cpp`):
-while this diagnostic is active fresh app frames are *also* warped from
-the just-refreshed retained sources instead of going straight (plus
-client-side 3DoF timewarp). Do not rely on straight-fresh behavior in
-this build; the steady-state "fresh goes straight" description above
-resumes once the temporary flag is removed.
+repeat commits, at most one warp per commit. Whether fresh app frames
+are also warped is controlled by `warp-fresh-frames` below (default
+`true`); when `false`, fresh frames go straight (plus client-side 3DoF
+timewarp) and only repeats are warped.
 
 ### `source-reverse-z`
 Default value: `true`
 
-Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
-Vulkan). Normal-Z apps set `false` explicitly.
+Depth encoding of the submitting app: `true` = reverse-Z (1 at near,
+X-Plane 12 Vulkan); `false` = standard-Z (0 at near). There is no
+in-band signal carrying this, so the default encodes the pipeline
+assumption — normal-Z apps must set it `false` explicitly. The resolve
+pass converts reverse-Z to standard once at retain time, so all warp
+math downstream stays standard-convention.
+
+Mismatch runbook (WV-B4, static guess, silent catastrophic failure):
+a wrong value swaps near and far. The cockpit flattens onto the far
+plane while the splat far-plane clamp keeps the background alive, so
+warps look "successful" yet show rotation-only motion with no holes
+and zero logging — healthy `dist`/`dst_d` pose deltas with nil image
+translation. No GPU readback exists server-side, so no content signal
+is implementable here; this section is the runbook instead. To verify,
+compare the producer's once-per-pick `REPROJEX_DEBUG` depth range
+(`min`/`max`/`mean`/`far_frac`) against the server's 5 s `warp dbg:`
+`retained near`/`far` heartbeat: with the flag correct the retained
+clip tracks the producer's submitted clip (today `near 0.00742 /
+far 10000.0`); with the flag wrong the retained copy still shows the
+same numbers (the header is unaffected) but warps go rotation-only.
+The server startup line `depth warp <enabled> (source-reverse-z
+<true|false>, max-retained-age <s>, warp-fresh-frames <true|false>)`
+states the active value — confirm it matches the app before chasing
+any other rotation-only cause.
 
 ### `max-retained-age`
 Default value: `2.0` (seconds)
@@ -149,11 +168,16 @@ older sources repeats garbage instead of motion, so ticks past this
 age go out straight. Must be finite and `> 0`; invalid values warn
 and keep the default.
 
-### `hole-fill-radius`
-Removed. The old expanding-ring search (0-8px) grew with hole width;
-disocclusions are now patched with a blurred local average from a
-blit-built mip chain (constant cost per hole pixel). Config files that
-still set the key log a warning and ignore it.
+### `warp-fresh-frames`
+Default value: `true`
+
+Fresh-frame warp policy (WV-B2, ex-TEMPORARY `kWarpFreshFrames`).
+`true` warps fresh app frames from the just-refreshed retained sources,
+like repeats (the app's pose lags the warp target, so real frames carry
+an outdated head pose). `false` sends fresh frames straight (plus
+client-side 3DoF timewarp) and warps repeats only. Must be a boolean;
+invalid values warn and keep the default (`true`, i.e. current
+behavior, zero behavior change).
 
 ### Example
 ```json
@@ -161,7 +185,8 @@ still set the key log a warning and ignore it.
 	"reprojection": {
 		"enabled": true,
 		"source-reverse-z": true,
-		"max-retained-age": 2.0
+		"max-retained-age": 2.0,
+		"warp-fresh-frames": true
 	}
 }
 ```

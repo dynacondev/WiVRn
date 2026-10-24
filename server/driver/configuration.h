@@ -171,6 +171,12 @@ struct configuration
 		// garbage instead of motion. Must be finite and > 0; invalid
 		// values warn and keep the default.
 		double max_retained_age_s = 2.0;
+		// Fresh-frame warp policy (WV-B2, ex-TEMPORARY kWarpFreshFrames):
+		// true (default) warps fresh app frames from the just-refreshed
+		// retained sources, like repeats; false sends fresh frames
+		// straight (plus client-side 3DoF timewarp) and warps repeats
+		// only. Default true preserves the current binary's behavior.
+		bool warp_fresh_frames = true;
 		// Mip-chain hole fill (reproject_fill.comp) patches disoccluded
 		// pixels with the local average from a blit-built mip chain of
 		// the pull output: blurred fill, constant cost per hole pixel.

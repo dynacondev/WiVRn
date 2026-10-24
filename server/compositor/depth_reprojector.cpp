@@ -177,6 +177,14 @@ namespace wivrn
 static constexpr bool kForceDisableBlits = false;
 static constexpr bool kSkipFillDispatch = true;
 static constexpr bool kSkipBlitImage = true;
+// WV-B1 coupling: the fill pass samples mip levels 1..N built by the blit
+// chain, so fill-without-blits (kSkipBlitImage && !kSkipFillDispatch) would
+// sample UNDEFINED/STALE mips. The fill dispatch below therefore conjoins
+// !kSkipBlitImage (fill requires blits); this assert makes the hazardous
+// combo unrepresentable at compile time. Current disabled behavior is
+// unchanged (both still skipped).
+static_assert(!kSkipBlitImage || kSkipFillDispatch,
+              "WV-B1: fill requires blits (kSkipBlitImage => kSkipFillDispatch)");
 
 depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
         reverse_z{configuration().reprojection.source_reverse_z},
@@ -470,11 +478,18 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size) :
 	        }};
 	vk.name(*splat_ds_layout, "depth reprojector splat descriptor set layout");
 
+	vk::PushConstantRange splat_push{
+	        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        .offset = 0,
+	        .size = sizeof(reproject_splat_push),
+	};
 	splat_layout = vk::raii::PipelineLayout{
 	        vk.device,
 	        vk::PipelineLayoutCreateInfo{
 	                .setLayoutCount = 1,
 	                .pSetLayouts = &*splat_ds_layout,
+	                .pushConstantRangeCount = 1,
+	                .pPushConstantRanges = &splat_push,
 	        }};
 	vk.name(*splat_layout, "depth reprojector splat pipeline layout");
 
@@ -1114,6 +1129,12 @@ bool depth_reprojector::reproject(
 	// contents above changed.
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *splat_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *splat_layout, 0, splat_sets[view], {});
+	// WV-B5: far-plane clamp derived from this view's near/far (not
+	// hardcoded 0.995 ~= 1.4 m at near=0.007). Mesh parity: sky at exactly
+	// 1.0 must not reject-and-hole on backward motion, so clamp to
+	// ~half-far depth instead (still background, representably < 1.0).
+	reproject_splat_push splat_push_data{splat_far_clamp_depth(near_z, far_z)};
+	cmd.pushConstants<reproject_splat_push>(*splat_layout, vk::ShaderStageFlagBits::eCompute, 0, splat_push_data);
 	cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
 
 	// Splat writes (atomics) before pull reads, same queue.
@@ -1295,8 +1316,11 @@ bool depth_reprojector::reproject(
 		// View-relative LOD cap: the fill view covers levels 1..N.
 		int32_t max_view_lod = int32_t(mip_levels) - 2;
 		cmd.pushConstants<int32_t>(*fill_layout, vk::ShaderStageFlagBits::eCompute, 0, max_view_lod);
-		// TEMPORARY bisect: blits run, fill dispatch skipped.
-		if (!kSkipFillDispatch)
+		// TEMPORARY bisect: blits run, fill dispatch skipped. WV-B1: fill
+		// requires blits (it samples the blit-built mip chain), so the
+		// dispatch also requires !kSkipBlitImage; the static_assert above
+		// makes fill-without-blits unrepresentable.
+		if (!kSkipFillDispatch && !kSkipBlitImage)
 			cmd.dispatch((extent.width + 7) / 8, (extent.height + 7) / 8, 1);
 	}
 	

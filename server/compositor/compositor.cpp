@@ -301,17 +301,12 @@ static constexpr uint64_t secs_to_ns(double s)
 	return uint64_t(s * 1e9);
 }
 static_assert(secs_to_ns(2.0) == 2'000'000'000ull, "default max-retained-age must stay 2s");
-// TEMPORARY diagnostic blackout (remove after verification): fresh
-// commits present black so only repeat-warps carry image.
-static constexpr bool kBlackoutFreshFrames = false;
-// TEMPORARY diagnostic: warp EVERY frame with depth, including fresh
-// app frames (the headset shows the app's pose lags the warp target,
-// i.e. real frames carry an outdated head pose). Fresh frames are
-// warped from the just-refreshed retained sources, exactly like
-// repeats. Remove after the pose-lag question is settled (expect:
-// everything, including the cockpit, tracks the head; gate trips on
-// violent motion still fall back to straight).
-static constexpr bool kWarpFreshFrames = true;
+// WV-B2: kBlackoutFreshFrames (was false, dead code) is deleted; its block
+// below is removed with it (provably no behavior change: the flag was
+// false, so the block never executed). kWarpFreshFrames (was true) is
+// promoted to the reprojection.warp-fresh-frames config key (default true
+// = current behavior); the member warp_fresh_frames (cached at
+// construction) replaces it at the single use below.
 static bool warp_motion_plausible(const std::array<xrt_pose, 2> & src,
                                   const std::array<xrt_pose, 2> & dst,
                                   double dt_s,
@@ -440,7 +435,7 @@ compositor::synth_skip_reason compositor::try_build_synth_target(
         float & dbg_gate_dt_ms,
         bool & dbg_gate_ran)
 {
-	if (app_fresh && !kWarpFreshFrames)
+	if (app_fresh && !warp_fresh_frames)
 	{
 		wcounts.c_skip_fresh++;
 		return synth_skip_reason::fresh_frame;
@@ -857,7 +852,42 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// Hold the current frame: copy color + depth into the
 		// compositor-owned retained sources so a synthetic below warps from
 		// held data, valid until the next real frame refreshes it.
+		// WV-B6: validate the depth/color norm_rects first ([x,y,w,h]:
+		// x,y>=0, w,h>0, x+w<=1+eps, y+h<=1+eps, finite). A
+		// zero/degenerate depth_rect would make every resolve tap read one
+		// texel (globally flat depth) and warp rotation-only while passing
+		// every other check. On violation the refresh is skipped (the old
+		// retained frame is kept) with a loud throttled warn naming the
+		// eye + plane + rect; the S20 heartbeat counts it (c_skip_rect).
+		bool rect_valid = true;
 		if (has_depth_src and depth_reprojection_enabled and app_fresh)
+		{
+			for (int view = 0; view < 2 && rect_valid; ++view)
+			{
+				if (!validate_norm_rect(src_color_nrect[view]) || !validate_norm_rect(src_depth_nrect[view]))
+					rect_valid = false;
+			}
+			if (!rect_valid)
+			{
+				static std::atomic<uint64_t> last_rect_ns{0};
+				uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+				if (now_ns - last_rect_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+				{
+					last_rect_ns.store(now_ns, std::memory_order_relaxed);
+					for (int view = 0; view < 2; ++view)
+					{
+						if (!validate_norm_rect(src_color_nrect[view]))
+							U_LOG_W("depth warp: skipping retained refresh (invalid color norm_rect eye=%d rect=[%.4f,%.4f,%.4f,%.4f], keeping old retained)",
+							        view, src_color_nrect[view][0], src_color_nrect[view][1], src_color_nrect[view][2], src_color_nrect[view][3]);
+						if (!validate_norm_rect(src_depth_nrect[view]))
+							U_LOG_W("depth warp: skipping retained refresh (invalid depth norm_rect eye=%d rect=[%.4f,%.4f,%.4f,%.4f], keeping old retained)",
+							        view, src_depth_nrect[view][0], src_depth_nrect[view][1], src_depth_nrect[view][2], src_depth_nrect[view][3]);
+					}
+				}
+				wcounts.c_skip_rect++;
+			}
+		}
+		if (has_depth_src and depth_reprojection_enabled and app_fresh and rect_valid)
 		{
 			// Both planes travel the same import chain, so they share one
 			// row-order decision: retained rows mirror so the images stay
@@ -917,13 +947,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 		// Repeat-frame warp: the multi layer recommits at display rate,
 		// so most commits re-present the last app frame with an
-		// identical timestamp (!app_fresh). Fresh commits normally go
-		// straight (plus client-side 3DoF timewarp); repeats are warped
-		// from the retained sources to this tick and served INSTEAD of
-		// the straight repeat (at most one warp per commit). TEMPORARY:
-		// kWarpFreshFrames also warps fresh frames (the app's pose lags
-		// the warp target), reusing the just-refreshed retained
-		// sources. The source is only valid while retention is young
+		// identical timestamp (!app_fresh). Fresh commits go straight
+		// (plus client-side 3DoF timewarp) unless
+		// reprojection.warp-fresh-frames is true (default), in which case
+		// fresh frames are also warped (the app's pose lags the warp
+		// target), reusing the just-refreshed retained sources. Repeats
+		// are warped from the retained sources to this tick and served
+		// INSTEAD of the straight repeat (at most one warp per commit).
+		// The source is only valid while retention is young
 		// (max-retained-age dead-app bound, default 2 s); older than
 		// that the straight repeat is correct and a warp would be garbage.
 		// Kill-switch (WIVRN_WARP_DISABLE=1): stand down to straight.
@@ -1134,57 +1165,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 		}
 
-		// TEMPORARY diagnostic blackout (remove after verification):
-		// fresh (true-frame) commits present black, so any visible
-		// image on the client must come from a repeat-warp. Proves
-		// warps actually present every frame instead of being masked
-		// by straight repeats. Expect black flicker at app cadence
-		// with warped content between: that IS the system working.
-		if (!have_synth && kBlackoutFreshFrames)
-		{
-			static bool blackout_logged = false;
-			if (!blackout_logged)
-			{
-				blackout_logged = true;
-				U_LOG_W("depth warp: TEMPORARY fresh-frame blackout active (remove me)");
-			}
-			uint32_t black_layers = images[i].image.info().arrayLayers;
-			vk::ImageSubresourceRange black_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, black_layers};
-			std::array black_to_dst{
-			        vk::ImageMemoryBarrier2{
-			                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-			                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-			                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-			                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-			                .oldLayout = vk::ImageLayout::eGeneral,
-			                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-			                .image = images[i].image,
-			                .subresourceRange = black_range,
-			        },
-			};
-			cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = black_to_dst.data()});
-			// Zeroed bytes = transparent black. Matches the established
-			// splat_empty_bytes pattern (VULKAN_HPP_NO_CONSTRUCTORS
-			// leaves vk::ClearColorValue without a usable constructor;
-			// the call takes it by const reference).
-			alignas(VkClearColorValue) unsigned char black_bytes[sizeof(VkClearColorValue)] = {};
-			cmd.clearColorImage(images[i].image, vk::ImageLayout::eTransferDstOptimal,
-			                    *reinterpret_cast<const vk::ClearColorValue *>(black_bytes), black_range);
-			std::array black_to_general{
-			        vk::ImageMemoryBarrier2{
-			                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-			                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-			                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-			                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
-			                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
-			                .newLayout = vk::ImageLayout::eGeneral,
-			                .image = images[i].image,
-			                .subresourceRange = black_range,
-			        },
-			};
-			cmd.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = black_to_general.data()});
-		}
-
+		// WV-B2: kBlackoutFreshFrames block deleted (flag was false, dead code).
 		if (!warp_replaces_real)
 			append_encoder_barriers(image_barriers, i, view_info);
 		if (have_synth)
@@ -1293,7 +1274,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			last_heartbeat_ns.store(now_hb_ns, std::memory_order_relaxed);
 			double dt_s = prev_hb_ns == 0 ? 5.0 : double(now_hb_ns - prev_hb_ns) / 1e9;
-			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f skip[fresh %llu nodepth %llu dis %llu kill %llu stale %llu poses %llu head %llu tinv %llu]) gpu commit %lluns bias %lldns lead %.1fms retained near %.3f far %.1f",
+			U_LOG_I("warp dbg: commit %.1f/s (straight %.1f warped %.1f dropped %.1f gate %llu degen %llu prewait %llu pool %llu present %llu fresh %.1f repeat %.1f skip[fresh %llu nodepth %llu dis %llu kill %llu stale %llu poses %llu head %llu tinv %llu rect %llu]) gpu commit %lluns bias %lldns lead %.1fms retained near %.3f far %.1f",
 			        wcounts.c_total.exchange(0) / dt_s,
 			        wcounts.c_straight.exchange(0) / dt_s,
 			        wcounts.c_warped.exchange(0) / dt_s,
@@ -1313,6 +1294,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			        (unsigned long long)wcounts.c_skip_poses.exchange(0),
 			        (unsigned long long)wcounts.c_head_invalid.exchange(0),
 			        (unsigned long long)wcounts.c_time_inversion.exchange(0),
+			        (unsigned long long)wcounts.c_skip_rect.exchange(0),
 			        (unsigned long long)last_commit_warp_ns.load(std::memory_order_relaxed),
 			        (long long)pacer.learned_render_latency_ns(),
 			        double(last_tick_lead_ns.load(std::memory_order_relaxed)) / 1e6,
@@ -1716,7 +1698,8 @@ compositor::compositor(wivrn_session & session) :
         foveation(vk, images[0].image.info().extent),
         reprojector(vk, vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height}),
         depth_reprojection_enabled(configuration().reprojection.enabled),
-        max_retained_age_ns(secs_to_ns(configuration().reprojection.max_retained_age_s))
+        max_retained_age_ns(secs_to_ns(configuration().reprojection.max_retained_age_s)),
+        warp_fresh_frames(configuration().reprojection.warp_fresh_frames)
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
@@ -1778,10 +1761,11 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &warp_times.var, "pre-warp+warp");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
-	U_LOG_I("depth warp %s (source-reverse-z %s, max-retained-age %.3gs)",
+	U_LOG_I("depth warp %s (source-reverse-z %s, max-retained-age %.3gs, warp-fresh-frames %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
 	        configuration().reprojection.source_reverse_z ? "true" : "false",
-	        configuration().reprojection.max_retained_age_s);
+	        configuration().reprojection.max_retained_age_s,
+	        warp_fresh_frames ? "true" : "false");
 	if (warp_disabled())
 		U_LOG_I("depth warp kill-switch active (WIVRN_WARP_DISABLE=1): serving straight/repeat for A/B triage");
 
